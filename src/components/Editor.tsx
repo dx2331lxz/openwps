@@ -9,11 +9,22 @@ import { schema } from '../editor/schema'
 import { paginate, DEFAULT_PAGE_CONFIG } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 
+// ─── Page geometry ───────────────────────────────────────────────────────────
 const CFG = DEFAULT_PAGE_CONFIG
-const PAGE_GAP = 32 // visual gap between page cards
-// The page-break decoration must fill: bottom-margin + gap + top-margin
-const BREAK_WIDGET_HEIGHT = CFG.marginBottom + PAGE_GAP + CFG.marginTop // 224px
+const PAGE_GAP = 32 // px gap between A4 cards
+const CONTENT_H = CFG.pageHeight - CFG.marginTop - CFG.marginBottom // 931px
+// Standard break constant: bottom margin + gap + top margin
+const BREAK_BASE = CFG.marginBottom + PAGE_GAP + CFG.marginTop // 224px
 
+// Widget height for a break after a page that used `usedH` px of content:
+//   = (remaining space on that page) + BREAK_BASE
+//   = (CONTENT_H - usedH) + BREAK_BASE
+// This ensures content after the widget lands exactly at the next card's content top.
+function breakWidgetHeight(usedH: number): number {
+  return Math.max(CONTENT_H - usedH, 0) + BREAK_BASE
+}
+
+// ─── ProseMirror styles ───────────────────────────────────────────────────────
 const PM_STYLES = `
 .ProseMirror {
   outline: none;
@@ -23,13 +34,16 @@ const PM_STYLES = `
   color: #000;
   white-space: pre-wrap;
   word-break: break-word;
-  overflow: visible;
 }
 .ProseMirror p { margin: 0; padding: 0; }
-.pm-page-break { display: block !important; pointer-events: none; }
 `
 
-// ---- Page break plugin ----
+// ─── Page-break decoration plugin ────────────────────────────────────────────
+// Widget decorations are transparent (no background).
+// They only add vertical space so the NEXT paragraph starts at the correct
+// y-offset on the following A4 card. The visual white/gray comes from the
+// absolutely-positioned page card divs rendered beneath the editor.
+
 const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
   state: {
     init: () => ({ decos: DecorationSet.empty }),
@@ -47,34 +61,29 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
   },
 })
 
-function makeBreakWidget(): HTMLElement {
-  const div = document.createElement('div')
-  div.className = 'pm-page-break'
-  // Full A4 width: extend left by marginLeft, total width = contentWidth + marginLeft + marginRight = pageWidth
-  div.style.cssText = [
-    `display: block`,
-    `height: ${BREAK_WIDGET_HEIGHT}px`,
-    `width: ${CFG.pageWidth}px`,
-    `margin-left: -${CFG.marginLeft}px`,
-    `background: #e8e8e8`,
-    `border-top: 2px solid #c8c8c8`,
-    `border-bottom: 2px solid #c8c8c8`,
-    `box-shadow: inset 0 6px 16px rgba(0,0,0,0.10), inset 0 -6px 16px rgba(0,0,0,0.10)`,
-    `pointer-events: none`,
-    `position: relative`,
-    `z-index: 2`,
-  ].join(';')
-  return div
+// Factory: creates a transparent spacer widget of the given height
+function makeWidget(height: number): () => HTMLElement {
+  return () => {
+    const div = document.createElement('div')
+    div.style.cssText = `display:block;height:${height}px;pointer-events:none;background:transparent;`
+    return div
+  }
 }
 
-function buildDecos(doc: EditorState['doc'], breakDocPositions: number[]): DecorationSet {
-  if (!breakDocPositions.length) return DecorationSet.empty
-  const widgets = breakDocPositions.map((pos) =>
-    Decoration.widget(pos, makeBreakWidget, { side: -1, key: `pb-${pos}` })
+function buildDecos(
+  doc: EditorState['doc'],
+  breaks: { pos: number; height: number }[]
+): DecorationSet {
+  if (!breaks.length) return DecorationSet.empty
+  return DecorationSet.create(
+    doc,
+    breaks.map(({ pos, height }) =>
+      Decoration.widget(pos, makeWidget(height), { side: -1, key: `pb-${pos}` })
+    )
   )
-  return DecorationSet.create(doc, widgets)
 }
 
+// ─── Editor state helpers ─────────────────────────────────────────────────────
 function toggleMarkAttr(
   state: EditorState,
   dispatch: ((tr: EditorState['tr']) => void) | undefined,
@@ -88,7 +97,10 @@ function toggleMarkAttr(
   doc.nodesBetween(from, to, (node) => {
     if (node.isText) {
       const mark = node.marks.find((m) => m.type === schema.marks.textStyle)
-      if (mark) { if (mark.attrs[attr]) isActive = true; existing = { ...mark.attrs } }
+      if (mark) {
+        if (mark.attrs[attr]) isActive = true
+        existing = { ...mark.attrs }
+      }
     }
   })
   dispatch(tr.addMark(from, to, schema.marks.textStyle.create({ ...existing, [attr]: !isActive })))
@@ -97,7 +109,7 @@ function toggleMarkAttr(
 
 function initState(): EditorState {
   const div = document.createElement('div')
-  div.innerHTML = '<p>开始输入文字，当内容超过一页时将自动出现分页效果...</p>'
+  div.innerHTML = '<p>开始输入文字，当内容超过一页高度时将自动出现第二张 A4 白纸...</p>'
   const doc = PMDOMParser.fromSchema(schema).parse(div)
   return EditorState.create({
     doc,
@@ -115,73 +127,79 @@ function initState(): EditorState {
   })
 }
 
+// ─── Editor component ─────────────────────────────────────────────────────────
 export const Editor: React.FC = () => {
-  const containerRef = useRef<HTMLDivElement>(null) // PM editor mount point
+  const mountRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const [view, setView] = useState<EditorView | null>(null)
   const [pageCount, setPageCount] = useState(1)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const repaginate = useCallback((_pmDoc: EditorState['doc']) => {
+  const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
     timerRef.current = setTimeout(() => {
       const v = viewRef.current
       if (!v) return
 
-      // Always use the latest doc to keep positions consistent
-      const currentDoc = v.state.doc
-      const pages = paginate(currentDoc, CFG)
+      const doc = v.state.doc
+      const pages = paginate(doc, CFG)
       setPageCount(pages.length)
 
-      // Collect paragraph indices that START a new page (pages 2, 3, ...)
-      const breakParaIndices = new Set<number>()
+      // Build break list: one entry per page boundary (after page 1, 2, ...)
+      const breaks: { pos: number; height: number }[] = []
+
+      // Map paragraphIndex → starting paragraph for each page (page 2 onwards)
+      const breakParaIndices = new Map<number, number>() // paraIdx → page index
       for (let pi = 1; pi < pages.length; pi++) {
-        const firstLine = pages[pi].lines[0]
-        if (firstLine) breakParaIndices.add(firstLine.paragraphIndex)
+        const first = pages[pi].lines[0]
+        if (first) breakParaIndices.set(first.paragraphIndex, pi)
       }
 
-      // Map paragraph indices to absolute document positions.
-      // doc.forEach gives `offset` = offset within doc's CONTENT.
-      // Absolute position = 1 (doc's own opening token) + offset.
-      const breakDocPositions: number[] = []
       let paraIdx = 0
-      currentDoc.forEach((node, offset) => {
-        if (node.type.name === 'paragraph') {
-          if (breakParaIndices.has(paraIdx)) {
-            breakDocPositions.push(offset + 1) // +1 converts content-offset → absolute pos
-          }
-          paraIdx++
+      doc.forEach((node, offset) => {
+        if (node.type.name !== 'paragraph') { paraIdx++; return }
+        const pageIdx = breakParaIndices.get(paraIdx)
+        if (pageIdx !== undefined) {
+          // Absolute doc position before this paragraph's opening token = offset + 1
+          // (Fragment.forEach gives content-relative offset; +1 for doc's own opening token)
+          const pos = offset + 1
+          const prevPageUsed = pages[pageIdx - 1].totalHeight
+          const wh = breakWidgetHeight(prevPageUsed)
+          breaks.push({ pos, height: wh })
+          console.log(
+            `[editor] page break before para ${paraIdx}: doc pos=${pos}, ` +
+            `prevUsed=${prevPageUsed.toFixed(0)}px, widgetH=${wh.toFixed(0)}px`
+          )
         }
+        paraIdx++
       })
 
-      console.log('[editor] pages:', pages.length, 'break before para indices:', [...breakParaIndices], 'abs positions:', breakDocPositions)
-
-      const decos = buildDecos(currentDoc, breakDocPositions)
+      const decos = buildDecos(doc, breaks)
       const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
       v.updateState(v.state.apply(tr))
     }, 150)
   }, [])
 
   useEffect(() => {
-    if (!containerRef.current) return
+    if (!mountRef.current) return
 
     const styleEl = document.createElement('style')
     styleEl.textContent = PM_STYLES
     document.head.appendChild(styleEl)
 
     const state = initState()
-    const editorView = new EditorView(containerRef.current, {
+    const editorView = new EditorView(mountRef.current, {
       state,
       dispatchTransaction(tx) {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
-        if (tx.docChanged) repaginate(next.doc)
+        if (tx.docChanged) repaginate()
       },
     })
 
     viewRef.current = editorView
     setView(editorView)
-    repaginate(state.doc)
+    repaginate()
 
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current)
@@ -190,59 +208,80 @@ export const Editor: React.FC = () => {
     }
   }, [repaginate])
 
-  // Total height of all page cards stacked
-  const totalBgHeight = pageCount * CFG.pageHeight + (pageCount - 1) * PAGE_GAP
+  // Canvas height = all A4 cards stacked with gaps
+  const canvasH = pageCount * CFG.pageHeight + (pageCount - 1) * PAGE_GAP
 
   return (
     <div className="flex flex-col h-screen" style={{ background: '#e8e8e8' }}>
-      <div className="sticky top-0 z-10 shadow">
+      {/* Toolbar */}
+      <div className="sticky top-0 z-10 shadow-sm">
         <Toolbar view={view} />
       </div>
 
-      <div className="flex-1 overflow-auto py-8">
-        {/* Outer container: A4 width, must be at least as tall as all stacked page cards */}
+      {/* Scrollable area */}
+      <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
+        {/*
+          Canvas: explicit height so absolute page cards create scroll space.
+          Width = A4 (794px), centered.
+
+          Layout layers (bottom → top):
+            1. White A4 cards  (absolute, pointer-events:none, z-index:0)
+            2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
+               Inside the editor, transparent widgets push content between cards.
+        */}
         <div
           className="relative mx-auto"
-          style={{ width: CFG.pageWidth, minHeight: totalBgHeight }}
+          style={{ width: CFG.pageWidth, height: canvasH }}
         >
-
-          {/* Background: page cards stacked (absolute, behind the editor) */}
-          <div className="absolute top-0 left-0 w-full pointer-events-none" style={{ height: totalBgHeight }}>
-            {Array.from({ length: pageCount }).map((_, i) => (
+          {/* ── Layer 1: A4 page cards ── */}
+          {Array.from({ length: pageCount }).map((_, i) => (
+            <div
+              key={i}
+              style={{
+                position: 'absolute',
+                top: i * (CFG.pageHeight + PAGE_GAP),
+                left: 0,
+                width: CFG.pageWidth,
+                height: CFG.pageHeight,
+                background: 'white',
+                boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
+                pointerEvents: 'none',
+                zIndex: 0,
+              }}
+            >
               <div
-                key={i}
-                className="absolute bg-white"
                 style={{
-                  top: i * (CFG.pageHeight + PAGE_GAP),
-                  left: 0,
-                  width: CFG.pageWidth,
-                  height: CFG.pageHeight,
-                  boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
+                  position: 'absolute',
+                  bottom: 12,
+                  width: '100%',
+                  textAlign: 'center',
+                  fontSize: 12,
+                  color: '#aaa',
+                  userSelect: 'none',
                 }}
               >
-                {/* Page number */}
-                <div className="absolute bottom-3 w-full text-center text-xs text-gray-400 select-none">
-                  第 {i + 1} 页 / 共 {pageCount} 页
-                </div>
+                {i + 1} / {pageCount}
               </div>
-            ))}
-          </div>
+            </div>
+          ))}
 
-          {/* ProseMirror editor — overlays all page cards.
-              Starts at page-1 content area (marginTop from top, marginLeft/Right inset).
-              Page-break decoration widgets expand to full A4 width to paint the gray gap. */}
+          {/* ── Layer 2: ProseMirror editor ── */}
+          {/*
+            Positioned so its top edge aligns with page-1 content top:
+              canvas y = marginTop (96px)
+            Left/right insets = page margins (113px each) → content width 568px.
+
+            Transparent break widgets inside the editor push paragraphs to the
+            correct y-offset so they land on the matching page card.
+          */}
           <div
-            ref={containerRef}
+            ref={mountRef}
             style={{
-              position: 'relative',
-              marginTop: CFG.marginTop,
-              marginLeft: CFG.marginLeft,
-              marginRight: CFG.marginRight,
-              paddingBottom: CFG.marginBottom,
-              minHeight: CFG.pageHeight - CFG.marginTop - CFG.marginBottom,
+              position: 'absolute',
+              top: CFG.marginTop,
+              left: CFG.marginLeft,
+              right: CFG.marginRight,
               zIndex: 1,
-              // allow the wider decoration widget to extend outside this container
-              overflow: 'visible',
             }}
           />
         </div>

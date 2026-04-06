@@ -2,12 +2,12 @@ import { prepareWithSegments, layoutWithLines } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
 
 export interface PageConfig {
-  pageWidth: number    // px
-  pageHeight: number   // px
-  marginTop: number    // px
-  marginBottom: number // px
-  marginLeft: number   // px
-  marginRight: number  // px
+  pageWidth: number
+  pageHeight: number
+  marginTop: number
+  marginBottom: number
+  marginLeft: number
+  marginRight: number
 }
 
 export const DEFAULT_PAGE_CONFIG: PageConfig = {
@@ -24,110 +24,110 @@ export interface LineInfo {
   paragraphIndex: number
   lineIndex: number
   lineHeight: number
-  spaceBefore?: number  // only for first line of paragraph
-  spaceAfter?: number   // only for last line of paragraph
 }
 
 export interface PageLayout {
   lines: LineInfo[]
+  /** Actual content height used on this page (≤ contentHeight) */
   totalHeight: number
 }
 
-// Extracts dominant text style from a paragraph node for font measurement
-function getParagraphFont(paraNode: PMNode): { fontFamily: string; fontSize: number } {
-  let fontFamily = 'SimSun, serif'
-  let fontSize = 12
-
-  paraNode.forEach((child) => {
-    if (child.isText && child.marks.length > 0) {
-      const textMark = child.marks.find((m) => m.type.name === 'textStyle')
-      if (textMark) {
-        fontFamily = textMark.attrs.fontFamily || fontFamily
-        fontSize = textMark.attrs.fontSize || fontSize
-      }
-    }
-  })
-  return { fontFamily, fontSize }
-}
-
-// Convert pt to px (96dpi)
 function ptToPx(pt: number): number {
   return (pt * 96) / 72
 }
 
+function measureParagraph(
+  paraNode: PMNode,
+  contentWidth: number
+): { lines: LineInfo[]; totalHeight: number } {
+  let fontFamily = 'SimSun, serif'
+  let fontSize = 12 // pt
+
+  paraNode.forEach((child) => {
+    if (child.isText && child.marks.length > 0) {
+      const m = child.marks.find((m) => m.type.name === 'textStyle')
+      if (m) {
+        fontFamily = m.attrs.fontFamily || fontFamily
+        fontSize = m.attrs.fontSize || fontSize
+      }
+    }
+  })
+
+  const lineHeightMult = (paraNode.attrs.lineHeight as number) ?? 1.5
+  const spaceBefore = ptToPx((paraNode.attrs.spaceBefore as number) ?? 0)
+  const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
+
+  const fontSizePx = ptToPx(fontSize)
+  const lineHeight = fontSizePx * lineHeightMult
+  const fontStr = `${fontSizePx}px ${fontFamily}`
+  const text = paraNode.textContent
+
+  let rawLines: { text: string }[]
+  if (!text.trim()) {
+    rawLines = [{ text: '' }]
+  } else {
+    try {
+      const prepared = prepareWithSegments(text, fontStr)
+      rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
+    } catch (err) {
+      console.warn('[paginator] Pretext error, fallback:', err)
+      rawLines = [{ text }]
+    }
+  }
+
+  const lines: LineInfo[] = rawLines.map((l, li) => ({
+    text: l.text,
+    paragraphIndex: 0, // caller sets this
+    lineIndex: li,
+    lineHeight,
+  }))
+
+  const totalHeight = lineHeight * rawLines.length + spaceBefore + spaceAfter
+
+  return { lines, totalHeight }
+}
+
+/**
+ * Paginates the document at paragraph granularity.
+ * No paragraph is split across pages, so widget decorations can be placed
+ * cleanly at paragraph boundaries.
+ *
+ * Returns PageLayout[] where each entry's totalHeight is the actual content
+ * height used on that page. The caller uses this to compute the correct
+ * transparent break-widget height.
+ */
 export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG): PageLayout[] {
   const contentWidth = config.pageWidth - config.marginLeft - config.marginRight
   const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
 
-  const pages: PageLayout[] = []
-  let currentPage: PageLayout = { lines: [], totalHeight: 0 }
-  pages.push(currentPage)
+  const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
+  let cur = pages[0]
+  let paraIdx = 0
 
-  let paragraphIndex = 0
-
-  doc.forEach((paraNode) => {
-    if (paraNode.type.name !== 'paragraph') {
-      paragraphIndex++
+  doc.forEach((node) => {
+    if (node.type.name !== 'paragraph') {
+      paraIdx++
       return
     }
 
-    const text = paraNode.textContent
-    const { fontFamily, fontSize } = getParagraphFont(paraNode)
-    const lineHeightMultiplier = paraNode.attrs.lineHeight as number ?? 1.5
-    const spaceBefore = ptToPx(paraNode.attrs.spaceBefore as number ?? 0)
-    const spaceAfter = ptToPx(paraNode.attrs.spaceAfter as number ?? 0)
+    const { lines, totalHeight } = measureParagraph(node, contentWidth)
+    lines.forEach((l) => (l.paragraphIndex = paraIdx))
 
-    // px font size from pt
-    const fontSizePx = ptToPx(fontSize)
-    const lineHeight = fontSizePx * lineHeightMultiplier
-    const fontStr = `${fontSizePx}px ${fontFamily}`
-
-    let paraLines: { text: string }[]
-
-    if (!text.trim()) {
-      // Empty paragraph still occupies one line height
-      paraLines = [{ text: '' }]
-    } else {
-      try {
-        const prepared = prepareWithSegments(text, fontStr)
-        const result = layoutWithLines(prepared, contentWidth, lineHeight)
-        paraLines = result.lines
-      } catch (err) {
-        console.warn('[paginator] prepareWithSegments failed, fallback:', err)
-        paraLines = [{ text }]
-      }
+    // If this paragraph doesn't fit on the current page and the page has content,
+    // push it to a new page. If the page is empty, add it anyway (very long paragraph).
+    if (cur.totalHeight + totalHeight > contentHeight && cur.lines.length > 0) {
+      cur = { lines: [], totalHeight: 0 }
+      pages.push(cur)
     }
 
-    console.log(`[paginator] paragraph ${paragraphIndex}: "${text.slice(0, 30)}..." → ${paraLines.length} lines @ ${lineHeight.toFixed(1)}px`)
-
-    for (let li = 0; li < paraLines.length; li++) {
-      const isFirst = li === 0
-      const isLast = li === paraLines.length - 1
-
-      const extraBefore = isFirst ? spaceBefore : 0
-      const extraAfter = isLast ? spaceAfter : 0
-      const totalLineHeight = lineHeight + extraBefore + extraAfter
-
-      // If adding this line would overflow the page, start a new page
-      if (currentPage.totalHeight + totalLineHeight > contentHeight && currentPage.lines.length > 0) {
-        currentPage = { lines: [], totalHeight: 0 }
-        pages.push(currentPage)
-      }
-
-      currentPage.lines.push({
-        text: paraLines[li].text,
-        paragraphIndex,
-        lineIndex: li,
-        lineHeight,
-        spaceBefore: isFirst ? spaceBefore : 0,
-        spaceAfter: isLast ? spaceAfter : 0,
-      })
-      currentPage.totalHeight += totalLineHeight
-    }
-
-    paragraphIndex++
+    cur.lines.push(...lines)
+    cur.totalHeight += totalHeight
+    paraIdx++
   })
 
-  console.log(`[paginator] total pages: ${pages.length}`)
+  console.log(
+    `[paginator] ${pages.length} page(s), contentHeight=${contentHeight}px, ` +
+      pages.map((p, i) => `p${i + 1}=${p.totalHeight.toFixed(0)}px`).join(' ')
+  )
   return pages
 }
