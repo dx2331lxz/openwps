@@ -1,6 +1,6 @@
 {
   "endpoint": "https://api.siliconflow.cn/v1",
   "apiKey": "sk-tsecqgrifovrucwvcdvcyzzjluxrpsehbishnwgamhjozwsw",
-  "model": "Qwen/Qwen2.5-72B-Instruct",
+  "model": "Pro/zai-org/GLM-5",
   "provider": "openai"
 }

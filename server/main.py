@@ -6,10 +6,11 @@ openwps 后端服务 - Python FastAPI
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import httpx
 import uvicorn
@@ -311,6 +312,205 @@ async def chat(body: ChatRequest):
         "toolCalls": tool_calls,
         "model": model,
     }
+
+
+# ── SSE helper ────────────────────────────────────────────────
+
+def sse(event_type: str, data: dict) -> str:
+    payload = {"type": event_type, **data}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def stream_ai_call(
+    messages: list,
+    headers: dict,
+    endpoint: str,
+    model: str,
+    tools: list,
+) -> AsyncGenerator[dict, None]:
+    """Stream one AI API call, accumulating tool call deltas, yielding events."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "stream": True,
+    }
+
+    # index → {id, name, args_str}
+    tc_acc: dict[int, dict] = {}
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        async with client.stream(
+            "POST",
+            f"{endpoint}/chat/completions",
+            headers=headers,
+            json=payload,
+        ) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                yield {"type": "error", "message": f"API {resp.status_code}: {body.decode()[:300]}"}
+                return
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except Exception:
+                    continue
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+
+                # thinking / reasoning_content (DeepSeek, Qwen3, etc.)
+                rc = delta.get("reasoning_content") or delta.get("thinking")
+                if rc:
+                    yield {"type": "thinking", "content": rc}
+
+                # normal content
+                c = delta.get("content")
+                if c:
+                    yield {"type": "content", "content": c}
+
+                # tool call deltas (accumulate by index)
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta.get("index", 0)
+                    if idx not in tc_acc:
+                        tc_acc[idx] = {"id": "", "name": "", "args_str": ""}
+                    if tc_delta.get("id"):
+                        tc_acc[idx]["id"] = tc_delta["id"]
+                    fn = tc_delta.get("function") or {}
+                    if fn.get("name"):
+                        tc_acc[idx]["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        tc_acc[idx]["args_str"] += fn["arguments"]
+
+    # Emit completed tool calls after stream ends
+    for idx in sorted(tc_acc.keys()):
+        tc = tc_acc[idx]
+        try:
+            params = json.loads(tc["args_str"]) if tc["args_str"] else {}
+        except Exception:
+            params = {}
+        yield {
+            "type": "tool_call",
+            "id": tc["id"],
+            "name": tc["name"],
+            "params": params,
+        }
+
+
+# ── ReAct streaming endpoint ──────────────────────────────────
+
+MAX_REACT_ROUNDS = 50
+
+
+@app.post("/api/ai/react/stream")
+async def react_stream(body: ChatRequest):
+    """ReAct: multi-round tool-calling loop streamed via SSE."""
+
+    async def generate():
+        cfg = read_config()
+        api_key = cfg.get("apiKey", "")
+        endpoint = cfg.get("endpoint", "").rstrip("/")
+        model = cfg.get("model", "")
+
+        if not api_key:
+            yield sse("error", {"message": "API Key 未配置，请在 ⚙️ 设置 中填写"})
+            return
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Build initial messages
+        messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in body.history[-10:]:
+            messages.append({"role": msg.role, "content": msg.content})
+
+        user_content = body.message
+        if body.context:
+            ctx = body.context
+            user_content += (
+                f" （文档：{ctx.get('paragraphCount', 0)} 段，"
+                f"{ctx.get('wordCount', 0)} 字）"
+            )
+        messages.append({"role": "user", "content": user_content})
+
+        for round_num in range(1, MAX_REACT_ROUNDS + 1):
+            yield sse("round", {"round": round_num, "maxRounds": MAX_REACT_ROUNDS})
+
+            round_tool_calls: list = []
+            assistant_content = ""
+            assistant_thinking = ""
+
+            async for event in stream_ai_call(messages, headers, endpoint, model, TOOLS):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "error":
+                    return
+                elif event["type"] == "content":
+                    assistant_content += event["content"]
+                elif event["type"] == "thinking":
+                    assistant_thinking += event["content"]
+                elif event["type"] == "tool_call":
+                    round_tool_calls.append(event)
+
+            if not round_tool_calls:
+                # No more tool calls → task done
+                yield sse("done", {"reason": "completed", "rounds": round_num})
+                return
+
+            # Add assistant turn + tool results to history
+            messages.append({
+                "role": "assistant",
+                "content": assistant_content or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"] or tc["name"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["params"], ensure_ascii=False),
+                        },
+                    }
+                    for tc in round_tool_calls
+                ],
+            })
+            for tc in round_tool_calls:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"] or tc["name"],
+                    "content": f"✅ {tc['name']} 执行成功",
+                })
+
+            if round_num >= MAX_REACT_ROUNDS:
+                yield sse(
+                    "ask_continue",
+                    {
+                        "message": f"已执行 {round_num} 轮操作，是否继续？",
+                        "rounds": round_num,
+                    },
+                )
+                return
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5174, log_level="info")
