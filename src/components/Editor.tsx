@@ -15,10 +15,18 @@ const PAGE_GAP = 32 // visual gap between page cards
 const BREAK_WIDGET_HEIGHT = CFG.marginBottom + PAGE_GAP + CFG.marginTop // 224px
 
 const PM_STYLES = `
-.ProseMirror { outline: none; font-family: SimSun, serif; font-size: 12pt;
-  line-height: 1.5; color: #000; white-space: pre-wrap; word-break: break-word; }
+.ProseMirror {
+  outline: none;
+  font-family: SimSun, serif;
+  font-size: 12pt;
+  line-height: 1.5;
+  color: #000;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: visible;
+}
 .ProseMirror p { margin: 0; padding: 0; }
-.pm-page-break { display: block; pointer-events: none; }
+.pm-page-break { display: block !important; pointer-events: none; }
 `
 
 // ---- Page break plugin ----
@@ -42,15 +50,20 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
 function makeBreakWidget(): HTMLElement {
   const div = document.createElement('div')
   div.className = 'pm-page-break'
-  div.style.cssText = `
-    height: ${BREAK_WIDGET_HEIGHT}px;
-    width: calc(100% + ${CFG.marginLeft + CFG.marginRight}px);
-    margin-left: -${CFG.marginLeft}px;
-    background: #e8e8e8;
-    border-top: 1px solid #ccc;
-    border-bottom: 1px solid #ccc;
-    box-shadow: inset 0 4px 12px rgba(0,0,0,0.08), inset 0 -4px 12px rgba(0,0,0,0.08);
-  `
+  // Full A4 width: extend left by marginLeft, total width = contentWidth + marginLeft + marginRight = pageWidth
+  div.style.cssText = [
+    `display: block`,
+    `height: ${BREAK_WIDGET_HEIGHT}px`,
+    `width: ${CFG.pageWidth}px`,
+    `margin-left: -${CFG.marginLeft}px`,
+    `background: #e8e8e8`,
+    `border-top: 2px solid #c8c8c8`,
+    `border-bottom: 2px solid #c8c8c8`,
+    `box-shadow: inset 0 6px 16px rgba(0,0,0,0.10), inset 0 -6px 16px rgba(0,0,0,0.10)`,
+    `pointer-events: none`,
+    `position: relative`,
+    `z-index: 2`,
+  ].join(';')
   return div
 }
 
@@ -109,34 +122,41 @@ export const Editor: React.FC = () => {
   const [pageCount, setPageCount] = useState(1)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const repaginate = useCallback((pmDoc: EditorState['doc']) => {
+  const repaginate = useCallback((_pmDoc: EditorState['doc']) => {
     if (timerRef.current) clearTimeout(timerRef.current)
     timerRef.current = setTimeout(() => {
       const v = viewRef.current
       if (!v) return
 
-      const pages = paginate(pmDoc, CFG)
+      // Always use the latest doc to keep positions consistent
+      const currentDoc = v.state.doc
+      const pages = paginate(currentDoc, CFG)
       setPageCount(pages.length)
 
-      // Find doc positions of paragraphs that start a new page (page 2, 3, ...)
+      // Collect paragraph indices that START a new page (pages 2, 3, ...)
       const breakParaIndices = new Set<number>()
       for (let pi = 1; pi < pages.length; pi++) {
         const firstLine = pages[pi].lines[0]
         if (firstLine) breakParaIndices.add(firstLine.paragraphIndex)
       }
 
+      // Map paragraph indices to absolute document positions.
+      // doc.forEach gives `offset` = offset within doc's CONTENT.
+      // Absolute position = 1 (doc's own opening token) + offset.
       const breakDocPositions: number[] = []
       let paraIdx = 0
-      pmDoc.forEach((node, offset) => {
+      currentDoc.forEach((node, offset) => {
         if (node.type.name === 'paragraph') {
-          if (breakParaIndices.has(paraIdx)) breakDocPositions.push(offset)
+          if (breakParaIndices.has(paraIdx)) {
+            breakDocPositions.push(offset + 1) // +1 converts content-offset → absolute pos
+          }
           paraIdx++
         }
       })
 
-      console.log('[editor] pages:', pages.length, 'breaks at paragraphs:', [...breakParaIndices])
+      console.log('[editor] pages:', pages.length, 'break before para indices:', [...breakParaIndices], 'abs positions:', breakDocPositions)
 
-      const decos = buildDecos(v.state.doc, breakDocPositions)
+      const decos = buildDecos(currentDoc, breakDocPositions)
       const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
       v.updateState(v.state.apply(tr))
     }, 150)
@@ -180,10 +200,13 @@ export const Editor: React.FC = () => {
       </div>
 
       <div className="flex-1 overflow-auto py-8">
-        {/* Outer container centers the content at A4 width */}
-        <div className="relative mx-auto" style={{ width: CFG.pageWidth }}>
+        {/* Outer container: A4 width, must be at least as tall as all stacked page cards */}
+        <div
+          className="relative mx-auto"
+          style={{ width: CFG.pageWidth, minHeight: totalBgHeight }}
+        >
 
-          {/* Background: page cards stacked */}
+          {/* Background: page cards stacked (absolute, behind the editor) */}
           <div className="absolute top-0 left-0 w-full pointer-events-none" style={{ height: totalBgHeight }}>
             {Array.from({ length: pageCount }).map((_, i) => (
               <div
@@ -205,19 +228,21 @@ export const Editor: React.FC = () => {
             ))}
           </div>
 
-          {/* ProseMirror editor — absolutely positioned starting at page 1 content top */}
-          {/* The editor overlays all page cards; page-break decorations create visual gaps */}
+          {/* ProseMirror editor — overlays all page cards.
+              Starts at page-1 content area (marginTop from top, marginLeft/Right inset).
+              Page-break decoration widgets expand to full A4 width to paint the gray gap. */}
           <div
             ref={containerRef}
-            className="relative"
             style={{
+              position: 'relative',
               marginTop: CFG.marginTop,
               marginLeft: CFG.marginLeft,
               marginRight: CFG.marginRight,
-              // enough bottom space for last page
               paddingBottom: CFG.marginBottom,
               minHeight: CFG.pageHeight - CFG.marginTop - CFG.marginBottom,
               zIndex: 1,
+              // allow the wider decoration widget to extend outside this container
+              overflow: 'visible',
             }}
           />
         </div>
