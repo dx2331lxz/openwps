@@ -6,22 +6,20 @@ import { keymap } from 'prosemirror-keymap'
 import { baseKeymap } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
-import { paginate, DEFAULT_PAGE_CONFIG } from '../layout/paginator'
+import { paginate, DEFAULT_PAGE_CONFIG, type PageConfig } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
-const CFG = DEFAULT_PAGE_CONFIG
 const PAGE_GAP = 32 // px gap between A4 cards
-const CONTENT_H = CFG.pageHeight - CFG.marginTop - CFG.marginBottom // 931px
-// Standard break constant: bottom margin + gap + top margin
-const BREAK_BASE = CFG.marginBottom + PAGE_GAP + CFG.marginTop // 224px
 
 // Widget height for a break after a page that used `usedH` px of content:
 //   = (remaining space on that page) + BREAK_BASE
 //   = (CONTENT_H - usedH) + BREAK_BASE
 // This ensures content after the widget lands exactly at the next card's content top.
-function breakWidgetHeight(usedH: number): number {
-  return Math.max(CONTENT_H - usedH, 0) + BREAK_BASE
+function breakWidgetHeight(usedH: number, cfg: PageConfig): number {
+  const contentH = cfg.pageHeight - cfg.marginTop - cfg.marginBottom
+  const breakBase = cfg.marginBottom + PAGE_GAP + cfg.marginTop
+  return Math.max(contentH - usedH, 0) + breakBase
 }
 
 // ─── ProseMirror styles ───────────────────────────────────────────────────────
@@ -36,6 +34,40 @@ const PM_STYLES = `
   word-break: break-word;
 }
 .ProseMirror p { margin: 0; padding: 0; }
+.ProseMirror p.list-bullet {
+  padding-left: 2em;
+  position: relative;
+}
+.ProseMirror p.list-bullet::before {
+  content: "•";
+  position: absolute;
+  left: 0.5em;
+}
+.ProseMirror {
+  counter-reset: ol-counter;
+}
+.ProseMirror p:not(.list-ordered) {
+  counter-reset: ol-counter;
+}
+.ProseMirror p.list-ordered {
+  counter-increment: ol-counter;
+  padding-left: 2.5em;
+  position: relative;
+}
+.ProseMirror p.list-ordered::before {
+  content: counter(ol-counter) ".";
+  position: absolute;
+  left: 0;
+}
+.ProseMirror hr {
+  border: none;
+  border-top: 1px solid #ccc;
+  margin: 8px 0;
+}
+.ProseMirror p.page-break-before {
+  border-top: 2px dashed #0066cc;
+  padding-top: 4px;
+}
 `
 
 // ─── Page-break decoration plugin ────────────────────────────────────────────
@@ -120,6 +152,33 @@ function initState(): EditorState {
         'Mod-b': (s, d) => toggleMarkAttr(s, d, 'bold'),
         'Mod-i': (s, d) => toggleMarkAttr(s, d, 'italic'),
         'Mod-u': (s, d) => toggleMarkAttr(s, d, 'underline'),
+        'Tab': (state, dispatch) => {
+          if (!dispatch) return false
+          const { selection, tr } = state
+          let changed = false
+          state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
+            if (node.type.name === 'paragraph') {
+              tr.setNodeMarkup(pos, undefined, { ...node.attrs, firstLineIndent: (node.attrs.firstLineIndent || 0) + 2 })
+              changed = true
+            }
+          })
+          if (changed) { dispatch(tr); return true }
+          return false
+        },
+        'Shift-Tab': (state, dispatch) => {
+          if (!dispatch) return false
+          const { selection, tr } = state
+          let changed = false
+          state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
+            if (node.type.name === 'paragraph') {
+              const newIndent = Math.max(0, (node.attrs.firstLineIndent || 0) - 2)
+              tr.setNodeMarkup(pos, undefined, { ...node.attrs, firstLineIndent: newIndent })
+              changed = true
+            }
+          })
+          if (changed) { dispatch(tr); return true }
+          return false
+        },
       }),
       keymap(baseKeymap),
       pageBreakPlugin,
@@ -132,8 +191,13 @@ export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const [view, setView] = useState<EditorView | null>(null)
+  const [editorState, setEditorState] = useState<EditorState | null>(null)
+  const [pageConfig, setPageConfig] = useState<PageConfig>(DEFAULT_PAGE_CONFIG)
+  const pageConfigRef = useRef<PageConfig>(DEFAULT_PAGE_CONFIG)
   const [pageCount, setPageCount] = useState(1)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
 
   const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
@@ -141,8 +205,9 @@ export const Editor: React.FC = () => {
       const v = viewRef.current
       if (!v) return
 
+      const cfg = pageConfigRef.current
       const doc = v.state.doc
-      const pages = paginate(doc, CFG)
+      const pages = paginate(doc, cfg)
       setPageCount(pages.length)
 
       // Build break list: one entry per page boundary (after page 1, 2, ...)
@@ -164,7 +229,7 @@ export const Editor: React.FC = () => {
           // (Fragment.forEach gives content-relative offset; +1 for doc's own opening token)
           const pos = offset + 1
           const prevPageUsed = pages[pageIdx - 1].totalHeight
-          const wh = breakWidgetHeight(prevPageUsed)
+          const wh = breakWidgetHeight(prevPageUsed, cfg)
           breaks.push({ pos, height: wh })
           console.log(
             `[editor] page break before para ${paraIdx}: doc pos=${pos}, ` +
@@ -193,12 +258,14 @@ export const Editor: React.FC = () => {
       dispatchTransaction(tx) {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
+        setEditorState(next)
         if (tx.docChanged) repaginate()
       },
     })
 
     viewRef.current = editorView
     setView(editorView)
+    setEditorState(state)
     repaginate()
 
     return () => {
@@ -209,40 +276,50 @@ export const Editor: React.FC = () => {
   }, [repaginate])
 
   // Canvas height = all A4 cards stacked with gaps
-  const canvasH = pageCount * CFG.pageHeight + (pageCount - 1) * PAGE_GAP
+  const cfg = pageConfigRef.current
+  const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
 
   return (
     <div className="flex flex-col h-screen" style={{ background: '#e8e8e8' }}>
       {/* Toolbar */}
       <div className="sticky top-0 z-10 shadow-sm">
-        <Toolbar view={view} />
+        <Toolbar
+          view={view}
+          editorState={editorState}
+          pageConfig={pageConfig}
+          onPageConfigChange={(newCfg) => {
+            setPageConfig(newCfg)
+            pageConfigRef.current = newCfg
+            repaginate()
+          }}
+        />
       </div>
 
       {/* Scrollable area */}
       <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
         {/*
           Canvas: explicit height so absolute page cards create scroll space.
-          Width = A4 (794px), centered.
+          Width = page width, centered.
 
           Layout layers (bottom → top):
-            1. White A4 cards  (absolute, pointer-events:none, z-index:0)
+            1. White page cards  (absolute, pointer-events:none, z-index:0)
             2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
                Inside the editor, transparent widgets push content between cards.
         */}
         <div
           className="relative mx-auto"
-          style={{ width: CFG.pageWidth, height: canvasH }}
+          style={{ width: cfg.pageWidth, height: canvasH }}
         >
-          {/* ── Layer 1: A4 page cards ── */}
+          {/* ── Layer 1: page cards ── */}
           {Array.from({ length: pageCount }).map((_, i) => (
             <div
               key={i}
               style={{
                 position: 'absolute',
-                top: i * (CFG.pageHeight + PAGE_GAP),
+                top: i * (cfg.pageHeight + PAGE_GAP),
                 left: 0,
-                width: CFG.pageWidth,
-                height: CFG.pageHeight,
+                width: cfg.pageWidth,
+                height: cfg.pageHeight,
                 background: 'white',
                 boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
                 pointerEvents: 'none',
@@ -266,21 +343,13 @@ export const Editor: React.FC = () => {
           ))}
 
           {/* ── Layer 2: ProseMirror editor ── */}
-          {/*
-            Positioned so its top edge aligns with page-1 content top:
-              canvas y = marginTop (96px)
-            Left/right insets = page margins (113px each) → content width 568px.
-
-            Transparent break widgets inside the editor push paragraphs to the
-            correct y-offset so they land on the matching page card.
-          */}
           <div
             ref={mountRef}
             style={{
               position: 'absolute',
-              top: CFG.marginTop,
-              left: CFG.marginLeft,
-              right: CFG.marginRight,
+              top: cfg.marginTop,
+              left: cfg.marginLeft,
+              right: cfg.marginRight,
               zIndex: 1,
             }}
           />

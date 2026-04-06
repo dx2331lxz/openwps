@@ -2,7 +2,7 @@ import { Schema } from 'prosemirror-model'
 
 export const schema = new Schema({
   nodes: {
-    doc: { content: 'paragraph+' },
+    doc: { content: '(paragraph|horizontal_rule)+' },
     paragraph: {
       attrs: {
         align: { default: 'left' },
@@ -13,6 +13,7 @@ export const schema = new Schema({
         spaceAfter: { default: 0 },
         listType: { default: null },
         listLevel: { default: 0 },
+        pageBreakBefore: { default: false },
       },
       content: 'inline*',
       group: 'block',
@@ -21,8 +22,26 @@ export const schema = new Schema({
         const style: string[] = []
         if (node.attrs.align !== 'left') style.push(`text-align:${node.attrs.align}`)
         if (node.attrs.firstLineIndent) style.push(`text-indent:${node.attrs.firstLineIndent}em`)
-        return ['p', { style: style.join(';') || undefined }, 0]
+        if (node.attrs.indent) style.push(`margin-left:${node.attrs.indent * 2}em`)
+        if (node.attrs.lineHeight !== 1.5) style.push(`line-height:${node.attrs.lineHeight}`)
+        if (node.attrs.spaceBefore) style.push(`margin-top:${node.attrs.spaceBefore * 1.5}em`)
+        if (node.attrs.spaceAfter) style.push(`margin-bottom:${node.attrs.spaceAfter * 1.5}em`)
+
+        const cls: string[] = []
+        if (node.attrs.listType === 'bullet') cls.push('list-bullet')
+        if (node.attrs.listType === 'ordered') cls.push('list-ordered')
+        if (node.attrs.pageBreakBefore) cls.push('page-break-before')
+
+        return ['p', {
+          style: style.join(';') || undefined,
+          class: cls.join(' ') || undefined,
+        }, 0]
       },
+    },
+    horizontal_rule: {
+      group: 'block',
+      parseDOM: [{ tag: 'hr' }],
+      toDOM() { return ['hr'] },
     },
     text: { group: 'inline' },
   },

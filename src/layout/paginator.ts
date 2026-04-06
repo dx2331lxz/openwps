@@ -105,6 +105,12 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
   let paraIdx = 0
 
   doc.forEach((node) => {
+    if (node.type.name === 'horizontal_rule') {
+      cur.totalHeight += 20
+      paraIdx++
+      return
+    }
+
     if (node.type.name !== 'paragraph') {
       paraIdx++
       return
@@ -112,6 +118,12 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
     const { lines, totalHeight } = measureParagraph(node, contentWidth)
     lines.forEach((l) => (l.paragraphIndex = paraIdx))
+
+    // Force page break if paragraph has pageBreakBefore attr
+    if (node.attrs.pageBreakBefore && cur.lines.length > 0) {
+      cur = { lines: [], totalHeight: 0 }
+      pages.push(cur)
+    }
 
     // If this paragraph doesn't fit on the current page and the page has content,
     // push it to a new page. If the page is empty, add it anyway (very long paragraph).
