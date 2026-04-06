@@ -5,13 +5,10 @@ import { TextSelection } from 'prosemirror-state'
 import type { Mark } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
-import type { PageConfig } from '../layout/paginator'
 
 interface ToolbarProps {
   view: EditorView | null
   editorState: EditorState | null
-  pageConfig: PageConfig
-  onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
   onOpenSettings?: (tab?: 'page' | 'ai') => void
@@ -207,86 +204,9 @@ const ColorSwatch: React.FC<{
   </div>
 )
 
-// ─── Page settings modal ──────────────────────────────────────────────────────
-
-const pxToMm = (px: number) => Math.round(px / 3.7795)
-const mmToPx = (mm: number) => Math.round(mm * 3.7795)
-
-const presets: Record<string, { pageWidth: number; pageHeight: number }> = {
-  'A4': { pageWidth: 794, pageHeight: 1123 },
-  'A3': { pageWidth: 1123, pageHeight: 1587 },
-  'Letter': { pageWidth: 816, pageHeight: 1056 },
-}
-
-const PageSettingsModal: React.FC<{
-  config: PageConfig
-  onSave: (c: PageConfig) => void
-  onClose: () => void
-}> = ({ config, onSave, onClose }) => {
-  const [draft, setDraft] = React.useState({ ...config })
-
-  return (
-    <div
-      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-      onClick={onClose}
-    >
-      <div
-        style={{ background: 'white', borderRadius: 8, padding: 24, width: 360, boxShadow: '0 8px 32px rgba(0,0,0,0.2)' }}
-        onClick={e => e.stopPropagation()}
-      >
-        <h3 style={{ margin: '0 0 16px', fontSize: 16, fontWeight: 600 }}>页面设置</h3>
-
-        <label style={{ fontSize: 13 }}>纸张大小</label>
-        <select
-          style={{ display: 'block', width: '100%', margin: '4px 0 12px', padding: '4px 6px', border: '1px solid #ccc', borderRadius: 4 }}
-          value={Object.keys(presets).find(k => presets[k].pageWidth === draft.pageWidth) ?? 'custom'}
-          onChange={e => { const p = presets[e.target.value]; if (p) setDraft(d => ({ ...d, ...p })) }}
-        >
-          {Object.keys(presets).map(k => <option key={k} value={k}>{k}</option>)}
-          <option value="custom">自定义</option>
-        </select>
-
-        <label style={{ fontSize: 13 }}>纸张方向</label>
-        <div style={{ display: 'flex', gap: 8, margin: '4px 0 12px' }}>
-          <button
-            style={{ flex: 1, padding: '6px 0', border: '1px solid #ccc', borderRadius: 4, background: draft.pageWidth < draft.pageHeight ? '#e0edff' : 'white', cursor: 'pointer' }}
-            onMouseDown={() => setDraft(d => ({ ...d, pageWidth: Math.min(d.pageWidth, d.pageHeight), pageHeight: Math.max(d.pageWidth, d.pageHeight) }))}
-          >纵向</button>
-          <button
-            style={{ flex: 1, padding: '6px 0', border: '1px solid #ccc', borderRadius: 4, background: draft.pageWidth > draft.pageHeight ? '#e0edff' : 'white', cursor: 'pointer' }}
-            onMouseDown={() => setDraft(d => ({ ...d, pageWidth: Math.max(d.pageWidth, d.pageHeight), pageHeight: Math.min(d.pageWidth, d.pageHeight) }))}
-          >横向</button>
-        </div>
-
-        <label style={{ fontSize: 13 }}>页边距（mm）</label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, margin: '4px 0 16px' }}>
-          {(['marginTop', 'marginBottom', 'marginLeft', 'marginRight'] as const).map(k => (
-            <label key={k} style={{ fontSize: 12, display: 'flex', flexDirection: 'column', gap: 2 }}>
-              {k === 'marginTop' ? '上' : k === 'marginBottom' ? '下' : k === 'marginLeft' ? '左' : '右'}
-              <input
-                type="number" min={0} max={200} value={pxToMm(draft[k])}
-                onChange={e => setDraft(d => ({ ...d, [k]: mmToPx(Number(e.target.value)) }))}
-                style={{ padding: '3px 6px', border: '1px solid #ccc', borderRadius: 4, width: '100%' }}
-              />
-            </label>
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-          <button onMouseDown={onClose} style={{ padding: '6px 14px', border: '1px solid #ccc', borderRadius: 4, cursor: 'pointer' }}>取消</button>
-          <button
-            onMouseDown={() => { onSave(draft); onClose() }}
-            style={{ padding: '6px 14px', background: '#0066cc', color: 'white', border: 'none', borderRadius: 4, cursor: 'pointer' }}
-          >确认</button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
-export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange, onToggleSidebar, sidebarOpen, onOpenSettings }) => {
+export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, onToggleSidebar, sidebarOpen, onOpenSettings }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)

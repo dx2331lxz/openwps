@@ -291,12 +291,6 @@ export const Editor: React.FC = () => {
         <Toolbar
           view={view}
           editorState={editorState}
-          pageConfig={pageConfig}
-          onPageConfigChange={(newCfg) => {
-            setPageConfig(newCfg)
-            pageConfigRef.current = newCfg
-            repaginate()
-          }}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
           onOpenSettings={(tab = 'page') => { setSettingsTab(tab === 'ai' ? 1 : 0); setSettingsOpen(true) }}
