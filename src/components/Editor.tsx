@@ -8,6 +8,8 @@ import { history, undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
 import { paginate, DEFAULT_PAGE_CONFIG, type PageConfig } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
+import AISidebar from './AISidebar'
+import SettingsModal from './SettingsModal'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -189,6 +191,8 @@ function initState(): EditorState {
 // ─── Editor component ─────────────────────────────────────────────────────────
 export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const viewRef = useRef<EditorView | null>(null)
   const [view, setView] = useState<EditorView | null>(null)
   const [editorState, setEditorState] = useState<EditorState | null>(null)
@@ -292,11 +296,15 @@ export const Editor: React.FC = () => {
             pageConfigRef.current = newCfg
             repaginate()
           }}
+          onToggleSidebar={() => setSidebarOpen(o => !o)}
+          sidebarOpen={sidebarOpen}
         />
       </div>
 
-      {/* Scrollable area */}
-      <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
+      {/* Main content + optional AI sidebar */}
+      <div className="flex flex-1 min-h-0">
+        {/* Scrollable editor area */}
+        <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
         {/*
           Canvas: explicit height so absolute page cards create scroll space.
           Width = page width, centered.
@@ -354,7 +362,28 @@ export const Editor: React.FC = () => {
             }}
           />
         </div>
+        {/* end canvas */}
+        </div>
+        {/* end scrollable editor area */}
+
+      {/* AI Sidebar */}
+      {sidebarOpen && (
+        <AISidebar view={view} onClose={() => setSidebarOpen(false)} />
+      )}
       </div>
+      {/* end main content row */}
+
+      {/* Settings gear button (bottom-left) */}
+      <button
+        onClick={() => setSettingsOpen(true)}
+        className="fixed bottom-4 left-4 z-20 w-9 h-9 flex items-center justify-center bg-white border border-gray-300 rounded-full shadow hover:bg-gray-50 text-lg"
+        title="设置"
+      >
+        ⚙️
+      </button>
+
+      {/* Settings modal */}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </div>
   )
 }

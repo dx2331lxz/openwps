@@ -6,14 +6,14 @@ import type { Mark } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
 import type { PageConfig } from '../layout/paginator'
-import { defaultAgent } from '../ai/agent'
-import { executeTool } from '../ai/executor'
 
 interface ToolbarProps {
   view: EditorView | null
   editorState: EditorState | null
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
+  onToggleSidebar?: () => void
+  sidebarOpen?: boolean
 }
 
 // ─── Format derivation ────────────────────────────────────────────────────────
@@ -285,12 +285,9 @@ const PageSettingsModal: React.FC<{
 
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
-export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange }) => {
+export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange, onToggleSidebar, sidebarOpen }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   const [pageSettingsOpen, setPageSettingsOpen] = React.useState(false)
-  const [aiInput, setAiInput] = React.useState('')
-  const [aiLoading, setAiLoading] = React.useState(false)
-  const [aiStatus, setAiStatus] = React.useState<{ ok: boolean; msg: string } | null>(null)
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
 
@@ -309,32 +306,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
       savedRangeRef.current = { from, to }
     }
   }
-
-  /** Handle AI command from the input box */
-  const handleAICommand = React.useCallback(async (cmd: string) => {
-    if (!view || !cmd.trim()) return
-    setAiLoading(true)
-    setAiStatus(null)
-    try {
-      const calls = await defaultAgent.process(cmd, { wordCount: 0, pageCount: 1, paragraphCount: 0 })
-      const messages: string[] = []
-      for (const call of calls) {
-        if (call.name === '__unknown__') {
-          messages.push('未识别的指令，请尝试更明确的描述')
-          continue
-        }
-        const result = executeTool(view, call.name, call.params, { pageConfig, onPageConfigChange })
-        messages.push(result.message)
-        console.log('[AI]', call.name, result)
-      }
-      setAiStatus({ ok: true, msg: messages.join('；') || '完成' })
-    } catch (err) {
-      setAiStatus({ ok: false, msg: String(err) })
-      console.error('[AI] Error:', err)
-    } finally {
-      setAiLoading(false)
-    }
-  }, [view, pageConfig, onPageConfigChange])
 
   /** Apply a text style using savedRangeRef (falls back to current selection) */
   const applyTextStyleWithSaved = (attrs: Record<string, unknown>) => {
@@ -474,8 +445,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
         {sep}
 
         {/* First-line indent */}
-        <button className={btn(false)} title="增加首行缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
-        <button className={btn(false)} title="减少首行缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
+        <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
+        <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
 
         {/* Overall indent */}
         <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
@@ -530,53 +501,19 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
 
         {sep}
 
-        {/* AI 排版输入框 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input
-            type="text"
-            value={aiInput}
-            placeholder={'AI 排版：如"正文仿宋16号首行缩进2字符"'}
-            disabled={aiLoading}
-            style={{
-              width: 260, padding: '3px 8px', fontSize: 13,
-              border: '1px solid #d1d5db', borderRadius: 4,
-              outline: 'none', color: '#374151',
-            }}
-            onChange={e => setAiInput(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter' && aiInput.trim()) {
-                handleAICommand(aiInput.trim())
-                setAiInput('')
-              }
-            }}
-          />
-          <button
-            title="执行 AI 排版指令（Enter）"
-            disabled={aiLoading || !aiInput.trim()}
-            onMouseDown={e => {
-              e.preventDefault()
-              if (aiInput.trim()) {
-                handleAICommand(aiInput.trim())
-                setAiInput('')
-              }
-            }}
-            style={{
-              padding: '3px 10px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
-              background: aiLoading ? '#93c5fd' : '#2563eb', color: 'white',
-              border: 'none', opacity: aiLoading || !aiInput.trim() ? 0.6 : 1,
-            }}
-          >
-            {aiLoading ? '…' : 'AI'}
-          </button>
-          {aiStatus && (
-            <span style={{
-              fontSize: 12, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap', color: aiStatus.ok ? '#16a34a' : '#dc2626',
-            }} title={aiStatus.msg}>
-              {aiStatus.ok ? '✓' : '✗'} {aiStatus.msg}
-            </span>
-          )}
-        </div>
+        {/* AI Sidebar toggle */}
+        <button
+          title="AI 排版助手"
+          onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
+          style={{
+            padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
+            background: sidebarOpen ? '#2563eb' : '#f3f4f6',
+            color: sidebarOpen ? 'white' : '#374151',
+            border: '1px solid #d1d5db',
+          }}
+        >
+          🤖 AI
+        </button>
       </div>
 
       {pageSettingsOpen && (

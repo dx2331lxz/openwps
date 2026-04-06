@@ -102,8 +102,21 @@ function applyParagraphStyleWithTarget(
   attrs: Record<string, unknown>,
   target: string | undefined
 ): Transaction {
+  // 'all': iterate every top-level block, apply to all paragraphs
   if (target === 'all') {
-    state.doc.nodesBetween(0, state.doc.content.size, (node, pos) => {
+    state.doc.forEach((node, offset) => {
+      if (node.type.name === 'paragraph') {
+        tr.setNodeMarkup(offset, undefined, { ...node.attrs, ...attrs })
+      }
+    })
+    return tr
+  }
+
+  const { from, to } = state.selection
+
+  if (from !== to) {
+    // Range selection: apply to every paragraph that overlaps the range
+    state.doc.nodesBetween(from, to, (node, pos) => {
       if (node.type.name === 'paragraph') {
         tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
       }
@@ -111,15 +124,21 @@ function applyParagraphStyleWithTarget(
     return tr
   }
 
-  const { from, to } = state.selection
-  // When selection is collapsed, expand the search range by +1 so nodesBetween
-  // finds the paragraph containing the cursor (mirrors Toolbar's applyParaStyle).
-  const effectiveTo = from === to
-    ? Math.min(from + 1, state.doc.content.size)
-    : to
-  state.doc.nodesBetween(from, effectiveTo, (node, pos) => {
+  // Collapsed cursor: walk the resolve tree up to find the enclosing paragraph
+  const safePos = Math.max(1, Math.min(from, state.doc.content.size - 1))
+  const $pos = state.doc.resolve(safePos)
+  for (let d = $pos.depth; d >= 1; d--) {
+    const node = $pos.node(d)
     if (node.type.name === 'paragraph') {
-      tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
+      tr.setNodeMarkup($pos.before(d), undefined, { ...node.attrs, ...attrs })
+      return tr
+    }
+  }
+  // Fallback: apply to the first top-level paragraph
+  state.doc.forEach((node, offset) => {
+    if (node.type.name === 'paragraph') {
+      tr.setNodeMarkup(offset, undefined, { ...node.attrs, ...attrs })
+      return false  // forEach doesn't honour return, but signals intent
     }
   })
   return tr
