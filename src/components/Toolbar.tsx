@@ -14,6 +14,7 @@ interface ToolbarProps {
   onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
+  onOpenSettings?: (tab?: 'page' | 'ai') => void
 }
 
 // ─── Format derivation ────────────────────────────────────────────────────────
@@ -285,9 +286,8 @@ const PageSettingsModal: React.FC<{
 
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
-export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange, onToggleSidebar, sidebarOpen }) => {
+export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange, onToggleSidebar, sidebarOpen, onOpenSettings }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
-  const [pageSettingsOpen, setPageSettingsOpen] = React.useState(false)
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
 
@@ -497,7 +497,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
         <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞</button>
 
         {/* Page settings */}
-        <button className={btn(false)} title="页面设置" onMouseDown={e => { e.preventDefault(); setPageSettingsOpen(true) }}>⚙</button>
+        <button className={btn(false)} title="页面设置" onMouseDown={e => { e.preventDefault(); onOpenSettings?.('page') }}>⚙</button>
 
         {sep}
 
@@ -515,14 +515,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
           🤖 AI
         </button>
       </div>
-
-      {pageSettingsOpen && (
-        <PageSettingsModal
-          config={pageConfig}
-          onSave={onPageConfigChange}
-          onClose={() => setPageSettingsOpen(false)}
-        />
-      )}
     </>
   )
 }

@@ -193,6 +193,7 @@ export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<0 | 1>(0)
   const viewRef = useRef<EditorView | null>(null)
   const [view, setView] = useState<EditorView | null>(null)
   const [editorState, setEditorState] = useState<EditorState | null>(null)
@@ -298,6 +299,7 @@ export const Editor: React.FC = () => {
           }}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
+          onOpenSettings={(tab = 'page') => { setSettingsTab(tab === 'ai' ? 1 : 0); setSettingsOpen(true) }}
         />
       </div>
 
@@ -383,7 +385,14 @@ export const Editor: React.FC = () => {
       </button>
 
       {/* Settings modal */}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal
+          defaultTab={settingsTab}
+          pageConfig={pageConfig}
+          onPageConfigChange={(newCfg) => { setPageConfig(newCfg); pageConfigRef.current = newCfg; repaginate() }}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   )
 }
