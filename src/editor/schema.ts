@@ -2,7 +2,7 @@ import { Schema } from 'prosemirror-model'
 
 export const schema = new Schema({
   nodes: {
-    doc: { content: '(paragraph|horizontal_rule)+' },
+    doc: { content: '(paragraph|horizontal_rule|table)+' },
     paragraph: {
       attrs: {
         align: { default: 'left' },
@@ -42,6 +42,30 @@ export const schema = new Schema({
         return ['p', domAttrs, 0]
       },
     },
+    // ─── Table nodes ─────────────────────────────────────────────────────────
+    table: {
+      content: 'table_row+',
+      group: 'block',
+      parseDOM: [{ tag: 'table' }],
+      toDOM() {
+        return ['table', { style: 'border-collapse:collapse;width:100%;margin:8px 0' }, ['tbody', 0]]
+      },
+    },
+    table_row: {
+      content: 'table_cell+',
+      parseDOM: [{ tag: 'tr' }],
+      toDOM() { return ['tr', 0] },
+    },
+    table_cell: {
+      content: 'paragraph+',
+      attrs: { header: { default: false } },
+      parseDOM: [{ tag: 'td' }, { tag: 'th' }],
+      toDOM(node) {
+        const tag = node.attrs.header ? 'th' : 'td'
+        return [tag, { style: 'border:1px solid #ccc;padding:4px 8px;min-width:40px;vertical-align:top' }, 0]
+      },
+    },
+    // ─────────────────────────────────────────────────────────────────────────
     horizontal_rule: {
       group: 'block',
       parseDOM: [{ tag: 'hr' }],

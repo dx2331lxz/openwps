@@ -175,11 +175,18 @@ function parseCommand(message: string): ToolCall[] {
       break
     }
   }
-  // Numeric: "16pt" / "16号" / "16磅" / "16点"
+  // Numeric with unit after: "16pt" / "16号" / "16磅"
   if (textAttrs.fontSize == null) {
-    const sizeMatch = msg.match(/(\d+(?:\.\d+)?)\s*(?:pt|磅|点号|号|pt)/)
+    const sizeMatch = msg.match(/(\d+(?:\.\d+)?)\s*(?:pt|磅|号)/)
     if (sizeMatch) {
       textAttrs.fontSize = parseFloat(sizeMatch[1])
+    }
+  }
+  // Numeric with "字号" prefix: "字号18" / "字号 16"
+  if (textAttrs.fontSize == null) {
+    const ziHaoMatch = msg.match(/字号\s*(\d+(?:\.\d+)?)/)
+    if (ziHaoMatch) {
+      textAttrs.fontSize = parseFloat(ziHaoMatch[1])
     }
   }
 

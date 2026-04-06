@@ -61,10 +61,11 @@ function applyTextStyleWithTarget(
   target: string | undefined
 ): Transaction {
   if (target === 'all') {
-    state.doc.forEach((node, offset) => {
+    // Apply mark to every paragraph's full text range
+    state.doc.nodesBetween(0, state.doc.content.size, (node, pos) => {
       if (node.type.name === 'paragraph' && node.content.size > 0) {
-        const from = offset + 1
-        const to = offset + 1 + node.content.size
+        const from = pos + 1                       // after paragraph's opening token
+        const to = pos + 1 + node.content.size    // before paragraph's closing token
         tr = addTextMark(tr, state, from, to, attrs)
       }
     })
@@ -72,24 +73,26 @@ function applyTextStyleWithTarget(
   }
 
   const { from, to, empty } = state.selection
-  if (empty) {
-    // Apply to current paragraph's text
-    const $pos = state.doc.resolve(Math.max(1, from))
-    for (let d = $pos.depth; d >= 0; d--) {
-      const n = $pos.node(d)
-      if (n.type.name === 'paragraph' && n.content.size > 0) {
-        const start = $pos.start(d)
-        const end = $pos.end(d)
-        tr = addTextMark(tr, state, start, end, attrs)
-        break
-      }
+  if (!empty) {
+    const resolvedFrom = Math.max(1, from)
+    const resolvedTo = Math.min(state.doc.nodeSize - 2, to)
+    if (resolvedFrom < resolvedTo) {
+      tr = addTextMark(tr, state, resolvedFrom, resolvedTo, attrs)
     }
     return tr
   }
 
-  const resolvedFrom = Math.max(1, from)
-  const resolvedTo = Math.min(state.doc.nodeSize - 1, to)
-  return addTextMark(tr, state, resolvedFrom, resolvedTo, attrs)
+  // Empty selection — apply to the full text of the current paragraph
+  const safeFrom = Math.max(0, from)
+  const safeTo = Math.min(from + 1, state.doc.content.size)
+  state.doc.nodesBetween(safeFrom, safeTo, (node, pos) => {
+    if (node.type.name === 'paragraph' && node.content.size > 0) {
+      const pFrom = pos + 1
+      const pTo = pos + 1 + node.content.size
+      tr = addTextMark(tr, state, pFrom, pTo, attrs)
+    }
+  })
+  return tr
 }
 
 /** Apply paragraph attrs to the appropriate target */
@@ -100,29 +103,21 @@ function applyParagraphStyleWithTarget(
   target: string | undefined
 ): Transaction {
   if (target === 'all') {
-    state.doc.forEach((node, offset) => {
+    state.doc.nodesBetween(0, state.doc.content.size, (node, pos) => {
       if (node.type.name === 'paragraph') {
-        tr.setNodeMarkup(offset, undefined, { ...node.attrs, ...attrs })
+        tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
       }
     })
     return tr
   }
 
-  const { from, to, empty } = state.selection
-  if (empty) {
-    // Apply to current paragraph
-    const $pos = state.doc.resolve(Math.max(1, from))
-    for (let d = $pos.depth; d >= 0; d--) {
-      const n = $pos.node(d)
-      if (n.type.name === 'paragraph') {
-        tr.setNodeMarkup($pos.before(d), undefined, { ...n.attrs, ...attrs })
-        break
-      }
-    }
-    return tr
-  }
-
-  state.doc.nodesBetween(from, to, (node, pos) => {
+  const { from, to } = state.selection
+  // When selection is collapsed, expand the search range by +1 so nodesBetween
+  // finds the paragraph containing the cursor (mirrors Toolbar's applyParaStyle).
+  const effectiveTo = from === to
+    ? Math.min(from + 1, state.doc.content.size)
+    : to
+  state.doc.nodesBetween(from, effectiveTo, (node, pos) => {
     if (node.type.name === 'paragraph') {
       tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
     }
@@ -211,7 +206,27 @@ export function executeTool(
       }
 
       case 'insert_table': {
-        return { success: false, message: '当前编辑器暂不支持表格，请手动插入' }
+        const rows = Math.min(20, Math.max(1, Number(params.rows) || 3))
+        const cols = Math.min(10, Math.max(1, Number(params.cols) || 3))
+        const headerRow = Boolean(params.headerRow)
+
+        const makeRow = (isHeader: boolean) =>
+          schema.nodes.table_row.create(
+            null,
+            Array.from({ length: cols }, () =>
+              schema.nodes.table_cell.create(
+                { header: isHeader },
+                schema.nodes.paragraph.create()
+              )
+            )
+          )
+
+        const tableNode = schema.nodes.table.create(
+          null,
+          Array.from({ length: rows }, (_, i) => makeRow(headerRow && i === 0))
+        )
+        tr = state.tr.replaceSelectionWith(tableNode)
+        break
       }
 
       case 'apply_preset_style': {
@@ -289,19 +304,19 @@ function applyPreset(
     if (spaceAfter != null) paraAttrs.spaceAfter = spaceAfter
     if (align) paraAttrs.align = align
 
-    state.doc.forEach((node, offset) => {
+    state.doc.nodesBetween(0, state.doc.content.size, (node, pos) => {
       if (node.type.name !== 'paragraph') return
 
       // Apply text style to all text in the paragraph
       if (Object.keys(textAttrs).length > 0 && node.content.size > 0) {
-        const from = offset + 1
-        const to = offset + 1 + node.content.size
+        const from = pos + 1
+        const to = pos + 1 + node.content.size
         tr = addTextMark(tr, state, from, to, textAttrs)
       }
 
       // Apply paragraph style
       if (Object.keys(paraAttrs).length > 0) {
-        tr.setNodeMarkup(offset, undefined, { ...node.attrs, ...paraAttrs })
+        tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...paraAttrs })
       }
     })
   }
