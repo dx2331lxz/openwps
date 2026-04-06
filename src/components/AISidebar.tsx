@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { EditorView } from 'prosemirror-view'
-import { prepare, layout } from '@chenglou/pretext'
+import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
+import type { PreparedTextWithSegments } from '@chenglou/pretext'
 import { executeTool } from '../ai/executor'
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -20,8 +21,10 @@ interface Message {
   isThinkingExpanded: boolean
   toolCalls: ToolCallResult[]
   streaming: boolean
-  /** pretext-computed height in px; 0 = use natural height */
-  computedHeight: number
+  /** cached PreparedTextWithSegments — set once on finalization */
+  prepared?: PreparedTextWithSegments
+  /** tight bubble width in px; 0 = use CSS max-width (while streaming) */
+  tightWidth: number
 }
 
 interface AskContinueState {
@@ -39,21 +42,43 @@ const MAX_HISTORY = 20
 const SIDEBAR_MIN = 280
 const SIDEBAR_MAX = 600
 const SIDEBAR_DEFAULT = 320
-const BUBBLE_PADDING = 48 // px: horizontal padding inside bubble + container
-const FONT = '14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
-const LINE_HEIGHT_PX = 22
+const FONT = '14px -apple-system, BlinkMacSystemFont, sans-serif'
+const LINE_HEIGHT = 20
+const PADDING_H = 12   // horizontal padding inside bubble (each side)
+const PADDING_V = 8    // vertical padding
+const BUBBLE_MAX_RATIO = 0.85
 
-// ── Pretext measurement ────────────────────────────────────────────────────
+// ── Pretext shrink-wrap ────────────────────────────────────────────────────
 
-function measureHeight(text: string, maxWidth: number): number {
-  if (!text || maxWidth <= 0) return 0
-  try {
-    const prepared = prepare(text, FONT, { whiteSpace: 'pre-wrap' })
-    const { height } = layout(prepared, maxWidth, LINE_HEIGHT_PX)
-    return height + 16 // add vertical padding
-  } catch {
-    return 0
+/**
+ * Binary-search for the minimum wrap width that produces the same number of
+ * lines as `maxWidth`, then return the max line width at that minimum width.
+ * Mirrors findTightWrapMetrics from the pretext bubbles demo.
+ */
+function findTightBubbleWidth(prepared: PreparedTextWithSegments, maxWidth: number): number {
+  if (maxWidth <= 0) return 0
+  const targetLineCount = layout(prepared, maxWidth, LINE_HEIGHT).lineCount
+
+  let lo = 1
+  let hi = Math.ceil(maxWidth)
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2)
+    if (layout(prepared, mid, LINE_HEIGHT).lineCount <= targetLineCount) {
+      hi = mid
+    } else {
+      lo = mid + 1
+    }
   }
+
+  let maxLineWidth = 0
+  walkLineRanges(prepared, lo, line => { if (line.width > maxLineWidth) maxLineWidth = line.width })
+
+  return Math.ceil(maxLineWidth) + PADDING_H * 2
+}
+
+/** Content width limit for a bubble given current sidebar width */
+function bubbleContentMax(sidebarWidth: number): number {
+  return Math.floor(sidebarWidth * BUBBLE_MAX_RATIO) - PADDING_H * 2
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -62,7 +87,7 @@ let msgIdCounter = 0
 function newId() { return `m${++msgIdCounter}` }
 
 function mkMsg(role: 'user' | 'ai', text = ''): Message {
-  return { id: newId(), role, text, thinking: '', isThinkingExpanded: false, toolCalls: [], streaming: false, computedHeight: 0 }
+  return { id: newId(), role, text, thinking: '', isThinkingExpanded: false, toolCalls: [], streaming: false, tightWidth: 0 }
 }
 
 function fmtToolCall(tc: ToolCallResult): string {
@@ -76,9 +101,16 @@ function fmtToolCall(tc: ToolCallResult): string {
 // ── Component ──────────────────────────────────────────────────────────────
 
 export default function AISidebar({ view, onClose }: Props) {
-  const [messages, setMessages] = useState<Message[]>([
-    { ...mkMsg('ai', '你好！我是 AI 排版助手 🤖\n\n示例指令：\n• 帮我排成公文格式\n• 正文宋体小四号，首行缩进2字符\n• 插入3行4列表格\n• 标题居中加粗'), streaming: false },
-  ])
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const welcomeText = '你好！我是 AI 排版助手 🤖\n\n示例指令：\n• 帮我排成公文格式\n• 正文宋体小四号，首行缩进2字符\n• 插入3行4列表格\n• 标题居中加粗'
+    const m = mkMsg('ai', welcomeText)
+    try {
+      const prepared = prepareWithSegments(welcomeText, FONT)
+      m.prepared = prepared
+      m.tightWidth = findTightBubbleWidth(prepared, bubbleContentMax(SIDEBAR_DEFAULT))
+    } catch { /* canvas may not be ready; resize effect will pick it up */ }
+    return [m]
+  })
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
@@ -97,13 +129,13 @@ export default function AISidebar({ view, onClose }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
 
-  // ── Recompute pretext heights on sidebar resize ──────────────────────────
+  // ── Recompute tight widths on sidebar resize ──────────────────────────────
   useEffect(() => {
-    const bubbleWidth = sidebarWidth * 0.85 - BUBBLE_PADDING
+    const contentMax = bubbleContentMax(sidebarWidth)
     setMessages(prev => prev.map(m => {
-      if (m.streaming) return m
-      const h = measureHeight(m.text, bubbleWidth)
-      return h !== m.computedHeight ? { ...m, computedHeight: h } : m
+      if (m.streaming || !m.prepared) return m
+      const tw = findTightBubbleWidth(m.prepared, contentMax)
+      return tw !== m.tightWidth ? { ...m, tightWidth: tw } : m
     }))
   }, [sidebarWidth])
 
@@ -154,6 +186,12 @@ export default function AISidebar({ view, onClose }: Props) {
     if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
 
     const userMsg = mkMsg('user', text)
+    // Pre-compute tight width for user bubble
+    try {
+      const prepared = prepareWithSegments(text, FONT)
+      userMsg.prepared = prepared
+      userMsg.tightWidth = findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth))
+    } catch { /* fallback to CSS max-width */ }
     setMessages(prev => [...prev, userMsg].slice(-MAX_HISTORY))
     historyRef.current.push({ role: 'user', content: text })
 
@@ -230,9 +268,14 @@ export default function AISidebar({ view, onClose }: Props) {
 
             case 'done':
               updateMsg(m => {
-                const bubbleW = sidebarWidth * 0.95 - BUBBLE_PADDING
-                const h = measureHeight(m.text, bubbleW)
-                return { ...m, streaming: false, computedHeight: h }
+                const contentMax = bubbleContentMax(sidebarWidth)
+                try {
+                  const prepared = prepareWithSegments(m.text || ' ', FONT)
+                  const tw = findTightBubbleWidth(prepared, contentMax)
+                  return { ...m, streaming: false, prepared, tightWidth: tw }
+                } catch {
+                  return { ...m, streaming: false }
+                }
               })
               break
 
@@ -242,7 +285,15 @@ export default function AISidebar({ view, onClose }: Props) {
                 rounds: event.rounds as number,
                 message: event.message as string,
               })
-              updateMsg(m => ({ ...m, streaming: false }))
+              updateMsg(m => {
+                try {
+                  const prepared = prepareWithSegments(m.text || ' ', FONT)
+                  const tw = findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth))
+                  return { ...m, streaming: false, prepared, tightWidth: tw }
+                } catch {
+                  return { ...m, streaming: false }
+                }
+              })
               break
 
             case 'error':
@@ -261,14 +312,24 @@ export default function AISidebar({ view, onClose }: Props) {
       }
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        setMessages(prev => prev.map(m => m.id === aiMsg.id ? { ...m, text: m.text || '（已取消）', streaming: false } : m))
+        setMessages(prev => prev.map(m => {
+          if (m.id !== aiMsg.id) return m
+          const finalText = m.text || '（已取消）'
+          try {
+            const prepared = prepareWithSegments(finalText, FONT)
+            return { ...m, text: finalText, streaming: false, prepared, tightWidth: findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth)) }
+          } catch { return { ...m, text: finalText, streaming: false } }
+        }))
       } else {
         const msg = e instanceof Error ? e.message : String(e)
-        setMessages(prev => prev.map(m =>
-          m.id === aiMsg.id
-            ? { ...m, text: `❌ 请求失败：${msg}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`, streaming: false }
-            : m
-        ))
+        const errText = `❌ 请求失败：${msg}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
+        setMessages(prev => prev.map(m => {
+          if (m.id !== aiMsg.id) return m
+          try {
+            const prepared = prepareWithSegments(errText, FONT)
+            return { ...m, text: errText, streaming: false, prepared, tightWidth: findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth)) }
+          } catch { return { ...m, text: errText, streaming: false } }
+        }))
       }
     } finally {
       setLoading(false)
@@ -319,11 +380,15 @@ export default function AISidebar({ view, onClose }: Props) {
           <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
             {m.role === 'user' ? (
               <div
-                className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm max-w-[85%]"
+                className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
                 style={{
+                  // tightWidth already includes PADDING_H*2; fall back to CSS max-width
+                  width: m.tightWidth > 0 ? m.tightWidth : undefined,
+                  maxWidth: m.tightWidth > 0 ? undefined : '85%',
                   wordBreak: 'break-word',
                   whiteSpace: 'pre-wrap',
-                  minHeight: m.computedHeight > 0 ? m.computedHeight : undefined,
+                  paddingTop: PADDING_V,
+                  paddingBottom: PADDING_V,
                 }}
               >
                 {m.text}
@@ -361,9 +426,12 @@ export default function AISidebar({ view, onClose }: Props) {
                   <div
                     className="bg-gray-100 text-gray-800 rounded-2xl rounded-tl-sm px-3 py-2 text-sm"
                     style={{
+                      width: m.tightWidth > 0 ? m.tightWidth : undefined,
+                      maxWidth: m.tightWidth > 0 ? undefined : '95%',
                       wordBreak: 'break-word',
                       whiteSpace: 'pre-wrap',
-                      minHeight: m.computedHeight > 0 ? m.computedHeight : undefined,
+                      paddingTop: PADDING_V,
+                      paddingBottom: PADDING_V,
                     }}
                   >
                     {m.text}
