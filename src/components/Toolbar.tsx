@@ -134,7 +134,10 @@ function insertHR(view: EditorView) {
 function insertPageBreak(view: EditorView) {
   const { state, dispatch } = view
   const { selection, tr } = state
-  const $from = selection.$from
+  // AllSelection ($from.pos=0, depth=0) means entire doc is selected.
+  // Resolve to pos=1 so we land inside the first paragraph.
+  const resolvePos = selection.from === 0 ? 1 : selection.from
+  const $from = state.doc.resolve(resolvePos)
   for (let d = $from.depth; d >= 0; d--) {
     const n = $from.node(d)
     if (n.type.name === 'paragraph') {
