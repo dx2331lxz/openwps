@@ -4,7 +4,7 @@ import healthRouter from './routes/health.js'
 import aiRouter from './routes/ai.js'
 
 const app = express()
-const PORT = 3001
+const PORT = 5174
 
 app.use(cors())
 app.use(express.json())

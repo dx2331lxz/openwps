@@ -1,1 +1,6 @@
-{"endpoint":"https://api.openai.com/v1","apiKey":"","model":"gpt-4o","provider":"openai"}
+{
+  "endpoint": "https://api.siliconflow.cn/v1",
+  "apiKey": "sk-tsecqgrifovrucwvcdvcyzzjluxrpsehbishnwgamhjozwsw",
+  "model": "Qwen/Qwen2.5-72B-Instruct",
+  "provider": "openai"
+}
