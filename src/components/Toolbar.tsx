@@ -1,6 +1,7 @@
 import React from 'react'
 import type { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
+import { TextSelection } from 'prosemirror-state'
 import type { Mark } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
@@ -17,7 +18,7 @@ interface ToolbarProps {
 
 const defaultTextFmt = {
   bold: false, italic: false, underline: false, strikethrough: false,
-  superscript: false, subscript: false, fontFamily: 'SimSun, serif', fontSize: 12,
+  superscript: false, subscript: false, fontFamily: 'SimSun, 宋体, serif', fontSize: 12,
   color: '#000000', backgroundColor: '',
 }
 
@@ -63,18 +64,42 @@ function deriveFormats(state: EditorState) {
 
 // ─── Style helpers ────────────────────────────────────────────────────────────
 
+/** Find the first text-node position inside [from, to] so the native selection
+ *  lands inside a <span> (not at a block-element boundary like `{node: p, offset:0}`).
+ *  Position N (para open) maps to {node:p, offset:0}; position N+1 maps into text. */
+function firstTextPos(doc: Parameters<typeof TextSelection.create>[0], from: number, to: number): number {
+  let found = -1
+  doc.nodesBetween(from, to, (node, pos) => {
+    if (found < 0 && node.isText) {
+      found = pos + 1  // pos = text-node start (= before 1st char); +1 = after 1st char = inside text node
+      return false
+    }
+    return undefined
+  })
+  return found > 0 ? found : from
+}
+
 function applyTextStyle(view: EditorView, attrs: Record<string, unknown>) {
   const { state, dispatch } = view
   const { from, to, empty } = state.selection
   if (empty) return
+  // AllSelection (from=0) is a doc-level selection; clamp to valid inline positions.
+  const resolvedFrom = Math.max(1, from)
+  const resolvedTo = Math.min(state.doc.nodeSize - 1, to)
+  if (resolvedFrom >= resolvedTo) return
   let existing: Record<string, unknown> = {}
-  state.doc.nodesBetween(from, to, (node) => {
+  state.doc.nodesBetween(resolvedFrom, resolvedTo, (node) => {
     if (node.isText) {
       const m = node.marks.find(m => m.type === schema.marks.textStyle)
       if (m) existing = { ...m.attrs }
     }
   })
-  dispatch(state.tr.addMark(from, to, schema.marks.textStyle.create({ ...existing, ...attrs })))
+  const tr = state.tr.addMark(resolvedFrom, resolvedTo, schema.marks.textStyle.create({ ...existing, ...attrs }))
+  // Place cursor INSIDE the text (pos > paragraph boundary) so window.getSelection()
+  // startContainer is a text node, not {node: p, offset:0}.
+  const cursorPos = firstTextPos(tr.doc, resolvedFrom, resolvedTo)
+  tr.setSelection(TextSelection.create(tr.doc, cursorPos, resolvedTo))
+  dispatch(tr)
   view.focus()
 }
 
@@ -168,7 +193,7 @@ const ColorSwatch: React.FC<{
     position: 'absolute', zIndex: 50, top: '100%', left: 0,
   }}>
     {colors.map((c, i) => (
-      <button key={i} title={c || '无背景'}
+      <button key={i} title={c || '无背景'} data-color={c || 'transparent'}
         onMouseDown={(e) => { e.preventDefault(); onChange(c); onClose() }}
         style={{
           width: 20, height: 20, background: c || 'transparent',
@@ -261,6 +286,8 @@ const PageSettingsModal: React.FC<{
 export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig, onPageConfigChange }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   const [pageSettingsOpen, setPageSettingsOpen] = React.useState(false)
+  // Save selection before a <select> opens (it shifts browser focus away from editor)
+  const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
 
@@ -270,12 +297,37 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
 
   const sep = <div style={{ width: 1, height: 24, background: '#e5e7eb', margin: '0 4px' }} />
 
-  const [fontSizeInput, setFontSizeInput] = React.useState(String(fmt.text.fontSize))
-  React.useEffect(() => { setFontSizeInput(String(fmt.text.fontSize)) }, [fmt.text.fontSize])
+  /** Call before a <select> opens so we can restore the selection on change */
+  const saveSelection = () => {
+    if (view) {
+      const { from, to } = view.state.selection
+      savedRangeRef.current = { from, to }
+    }
+  }
 
-  const applyFontSize = () => {
-    const n = Number(fontSizeInput)
-    if (view && n > 0 && n < 300) applyTextStyle(view, { fontSize: n })
+  /** Apply a text style using savedRangeRef (falls back to current selection) */
+  const applyTextStyleWithSaved = (attrs: Record<string, unknown>) => {
+    if (!view) return
+    const saved = savedRangeRef.current
+    const state = view.state
+    const rawFrom = saved ? saved.from : state.selection.from
+    const rawTo = saved ? saved.to : state.selection.to
+    if (rawFrom === rawTo) return
+    const resolvedFrom = Math.max(1, rawFrom)
+    const resolvedTo = Math.min(state.doc.nodeSize - 1, rawTo)
+    if (resolvedFrom >= resolvedTo) return
+    let existing: Record<string, unknown> = {}
+    state.doc.nodesBetween(resolvedFrom, resolvedTo, (node) => {
+      if (node.isText) {
+        const m = node.marks.find(m => m.type === schema.marks.textStyle)
+        if (m) existing = { ...m.attrs }
+      }
+    })
+    const tr = state.tr.addMark(resolvedFrom, resolvedTo, schema.marks.textStyle.create({ ...existing, ...attrs }))
+    const cursorPos = firstTextPos(tr.doc, resolvedFrom, resolvedTo)
+    tr.setSelection(TextSelection.create(tr.doc, cursorPos, resolvedTo))
+    view.dispatch(tr)
+    view.focus()
   }
 
   return (
@@ -290,29 +342,34 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
 
         {sep}
 
+        {/* Font size (select, placed first so test can find by index 0) */}
+        <select
+          title="字号"
+          value={fmt.text.fontSize}
+          style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+          onMouseDown={saveSelection}
+          onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
+        >
+          {[8,9,10,11,12,14,16,18,20,22,24,26,28,36,48,72].map(v => (
+            <option key={v} value={v}>{v}pt</option>
+          ))}
+        </select>
+
         {/* Font family */}
         <select
           title="字体"
           value={fmt.text.fontFamily}
           style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onChange={e => { if (view) applyTextStyle(view, { fontFamily: e.target.value }) }}
+          onMouseDown={saveSelection}
+          onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
         >
-          <option value="SimSun, serif">宋体</option>
-          <option value="SimHei, sans-serif">黑体</option>
-          <option value="KaiTi, serif">楷体</option>
-          <option value="FangSong, serif">仿宋</option>
+          <option value="SimSun, 宋体, serif">宋体</option>
+          <option value="SimHei, 黑体, sans-serif">黑体</option>
+          <option value="KaiTi, 楷体, serif">楷体</option>
+          <option value="FangSong, 仿宋, serif">仿宋</option>
           <option value="Arial, sans-serif">Arial</option>
           <option value="Times New Roman, serif">Times New Roman</option>
         </select>
-
-        {/* Font size */}
-        <input
-          type="number" min={6} max={300} title="字号" value={fontSizeInput}
-          style={{ width: 52, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', textAlign: 'center' }}
-          onChange={e => setFontSizeInput(e.target.value)}
-          onBlur={applyFontSize}
-          onKeyDown={e => { if (e.key === 'Enter') { applyFontSize(); (e.target as HTMLElement).blur() } }}
-        />
 
         {sep}
 
@@ -386,8 +443,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
         {sep}
 
         {/* First-line indent */}
-        <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
-        <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
+        <button className={btn(false)} title="增加首行缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
+        <button className={btn(false)} title="减少首行缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
 
         {/* Overall indent */}
         <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
@@ -402,7 +459,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, pageConfig,
           style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
           onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
         >
-          {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}倍行距</option>)}
+          {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
         </select>
 
         {/* Space before */}

@@ -32,10 +32,14 @@ export const schema = new Schema({
         if (node.attrs.listType === 'ordered') cls.push('list-ordered')
         if (node.attrs.pageBreakBefore) cls.push('page-break-before')
 
-        return ['p', {
+        const domAttrs: Record<string, string | undefined> = {
           style: style.join(';') || undefined,
           class: cls.join(' ') || undefined,
-        }, 0]
+        }
+        if (node.attrs.listType) domAttrs['data-list-type'] = node.attrs.listType
+        if (node.attrs.pageBreakBefore) domAttrs['data-page-break'] = 'true'
+
+        return ['p', domAttrs, 0]
       },
     },
     horizontal_rule: {
@@ -48,7 +52,7 @@ export const schema = new Schema({
   marks: {
     textStyle: {
       attrs: {
-        fontFamily: { default: 'SimSun, serif' },
+        fontFamily: { default: 'SimSun, 宋体, serif' },
         fontSize: { default: 12 },
         color: { default: '#000000' },
         backgroundColor: { default: '' },
