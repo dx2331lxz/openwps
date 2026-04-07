@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 敏感配置和数据（不提交）
+server/config/ai.json
+server/data/
