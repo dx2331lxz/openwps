@@ -220,7 +220,7 @@ export const Editor: React.FC = () => {
       const cfg = pageConfigRef.current
       const doc = v.state.doc
       const pages = paginate(doc, cfg)
-      setPageCount(pages.length)
+      setPageCount(prev => pages.length !== prev ? pages.length : prev)  // 确保 state 更新触发重渲染
 
       // Build break list: one entry per page boundary (after page 1, 2, ...)
       const breaks: { pos: number; height: number }[] = []
@@ -325,7 +325,7 @@ export const Editor: React.FC = () => {
   }, [])
 
   // Canvas height = all A4 cards stacked with gaps
-  const cfg = pageConfigRef.current
+  const cfg = pageConfig  // ← 用 state 而非 ref，确保 React 重渲染时拿到最新值
   const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
 
   return (

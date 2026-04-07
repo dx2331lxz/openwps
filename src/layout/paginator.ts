@@ -69,11 +69,7 @@ function measureParagraph(
   const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
 
   const fontSizePx = ptToPx(fontSize)
-  // 浏览器 CSS line-height: 1.5 实际占高 = fontSize * lineHeightMult
-  // 但字体有内置 leading，实际渲染行高略高于理论值。
-  // 加入 1.08 修正系数补偿字体 leading 差异，确保分页不提前。
-  const LEADING_CORRECTION = 1.08
-  let lineHeight = fontSizePx * lineHeightMult * LEADING_CORRECTION
+  let lineHeight = fontSizePx * lineHeightMult
   const fontStr = `${fontSizePx}px ${fontFamily}`
   const text = paraNode.textContent
   let maxInlineHeight = lineHeight
