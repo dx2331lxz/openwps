@@ -288,6 +288,20 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         {sep}
 
+        {/* 导入/导出 */}
+        <button
+          className={btn(false)}
+          title="导入 .docx"
+          onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
+        >📂 导入</button>
+        <button
+          className={btn(false)}
+          title="导出 .docx"
+          onMouseDown={e => { e.preventDefault(); void onExportDocx?.() }}
+        >💾 导出</button>
+
+        {sep}
+
         {/* Font size (select, placed first so test can find by index 0) */}
         <select
           title="字号"
@@ -458,29 +472,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         >
           🤖 AI
         </button>
-
-        <div className="flex gap-1 ml-auto">
-          <button
-            className={btn(false)}
-            title="导入 .docx"
-            onMouseDown={e => {
-              e.preventDefault()
-              fileInputRef.current?.click()
-            }}
-          >
-            📂 导入
-          </button>
-          <button
-            className={btn(false)}
-            title="导出 .docx"
-            onMouseDown={e => {
-              e.preventDefault()
-              void onExportDocx?.()
-            }}
-          >
-            💾 导出
-          </button>
-        </div>
 
         <input
           type="file"
