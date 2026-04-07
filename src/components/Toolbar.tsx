@@ -12,6 +12,8 @@ interface ToolbarProps {
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
   onOpenSettings?: (tab?: 'page' | 'ai') => void
+  onImportDocx?: (file: File) => void | Promise<void>
+  onExportDocx?: () => void | Promise<void>
 }
 
 // ─── Format derivation ────────────────────────────────────────────────────────
@@ -206,10 +208,19 @@ const ColorSwatch: React.FC<{
 
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
-export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, onToggleSidebar, sidebarOpen, onOpenSettings }) => {
+export const Toolbar: React.FC<ToolbarProps> = ({
+  view,
+  editorState,
+  onToggleSidebar,
+  sidebarOpen,
+  onOpenSettings,
+  onImportDocx,
+  onExportDocx,
+}) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
+  const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
 
@@ -434,6 +445,41 @@ export const Toolbar: React.FC<ToolbarProps> = ({ view, editorState, onToggleSid
         >
           🤖 AI
         </button>
+
+        <div className="flex gap-1 ml-auto">
+          <button
+            className={btn(false)}
+            title="导入 .docx"
+            onMouseDown={e => {
+              e.preventDefault()
+              fileInputRef.current?.click()
+            }}
+          >
+            📂 导入
+          </button>
+          <button
+            className={btn(false)}
+            title="导出 .docx"
+            onMouseDown={e => {
+              e.preventDefault()
+              void onExportDocx?.()
+            }}
+          >
+            💾 导出
+          </button>
+        </div>
+
+        <input
+          type="file"
+          accept=".docx"
+          ref={fileInputRef}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            if (file) void onImportDocx?.(file)
+            event.target.value = ''
+          }}
+          style={{ display: 'none' }}
+        />
       </div>
     </>
   )

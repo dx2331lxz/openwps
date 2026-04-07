@@ -21,7 +21,7 @@ export const DEFAULT_PAGE_CONFIG: PageConfig = {
 
 export interface LineInfo {
   text: string
-  paragraphIndex: number
+  blockIndex: number
   lineIndex: number
   lineHeight: number
 }
@@ -36,15 +36,12 @@ function ptToPx(pt: number): number {
   return (pt * 96) / 72
 }
 
-function measureParagraph(
-  paraNode: PMNode,
-  contentWidth: number
-): { lines: LineInfo[]; totalHeight: number } {
+function getParagraphTextStyle(paraNode: PMNode) {
   let fontFamily = 'SimSun, serif'
-  let fontSize = 12 // pt
+  let fontSize = 12
 
   paraNode.forEach((child) => {
-    if (child.isText && child.marks.length > 0) {
+    if ((child.isText || child.type.name === 'image') && child.marks.length > 0) {
       const m = child.marks.find((m) => m.type.name === 'textStyle')
       if (m) {
         fontFamily = m.attrs.fontFamily || fontFamily
@@ -53,14 +50,34 @@ function measureParagraph(
     }
   })
 
+  return { fontFamily, fontSize }
+}
+
+function estimateImageHeight(node: PMNode): number {
+  if (node.type.name !== 'image') return 0
+  return typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 160
+}
+
+function measureParagraph(
+  paraNode: PMNode,
+  contentWidth: number
+): { lines: LineInfo[]; totalHeight: number } {
+  const { fontFamily, fontSize } = getParagraphTextStyle(paraNode)
+
   const lineHeightMult = (paraNode.attrs.lineHeight as number) ?? 1.5
   const spaceBefore = ptToPx((paraNode.attrs.spaceBefore as number) ?? 0)
   const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
 
   const fontSizePx = ptToPx(fontSize)
-  const lineHeight = fontSizePx * lineHeightMult
+  let lineHeight = fontSizePx * lineHeightMult
   const fontStr = `${fontSizePx}px ${fontFamily}`
   const text = paraNode.textContent
+  let maxInlineHeight = lineHeight
+
+  paraNode.forEach((child) => {
+    maxInlineHeight = Math.max(maxInlineHeight, estimateImageHeight(child))
+  })
+  lineHeight = maxInlineHeight
 
   let rawLines: { text: string }[]
   if (!text.trim()) {
@@ -77,7 +94,7 @@ function measureParagraph(
 
   const lines: LineInfo[] = rawLines.map((l, li) => ({
     text: l.text,
-    paragraphIndex: 0, // caller sets this
+    blockIndex: 0,
     lineIndex: li,
     lineHeight,
   }))
@@ -85,6 +102,70 @@ function measureParagraph(
   const totalHeight = lineHeight * rawLines.length + spaceBefore + spaceAfter
 
   return { lines, totalHeight }
+}
+
+function measureTableCell(cellNode: PMNode, cellWidth: number): number {
+  let totalHeight = 0
+  cellNode.forEach((child) => {
+    if (child.type.name === 'paragraph') {
+      totalHeight += measureParagraph(child, Math.max(cellWidth - 16, 40)).totalHeight
+    } else if (child.type.name === 'table') {
+      totalHeight += measureTable(child, Math.max(cellWidth - 16, 40)).totalHeight
+    } else {
+      totalHeight += 24
+    }
+  })
+  return Math.max(totalHeight, 28)
+}
+
+function countRowColumns(rowNode: PMNode): number {
+  let count = 0
+  rowNode.forEach((cellNode) => {
+    count += Math.max(1, Number(cellNode.attrs.colspan) || 1)
+  })
+  return Math.max(count, 1)
+}
+
+function measureTable(tableNode: PMNode, contentWidth: number): { lines: LineInfo[]; totalHeight: number } {
+  let maxColumns = 1
+  tableNode.forEach((rowNode) => {
+    maxColumns = Math.max(maxColumns, countRowColumns(rowNode))
+  })
+
+  const cellWidth = Math.max(Math.floor(contentWidth / maxColumns), 48)
+  let totalHeight = 16
+
+  tableNode.forEach((rowNode) => {
+    let rowHeight = 28
+    rowNode.forEach((cellNode) => {
+      rowHeight = Math.max(rowHeight, measureTableCell(cellNode, cellWidth))
+    })
+    totalHeight += rowHeight
+  })
+
+  return {
+    lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: totalHeight }],
+    totalHeight,
+  }
+}
+
+function measureBlock(node: PMNode, contentWidth: number): { lines: LineInfo[]; totalHeight: number } {
+  switch (node.type.name) {
+    case 'paragraph':
+      return measureParagraph(node, contentWidth)
+    case 'table':
+      return measureTable(node, contentWidth)
+    case 'horizontal_rule':
+      return {
+        lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: 20 }],
+        totalHeight: 20,
+      }
+    default:
+      return {
+        lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: 24 }],
+        totalHeight: 24,
+      }
+  }
 }
 
 /**
@@ -102,22 +183,11 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
   const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
   let cur = pages[0]
-  let paraIdx = 0
+  let blockIdx = 0
 
   doc.forEach((node) => {
-    if (node.type.name === 'horizontal_rule') {
-      cur.totalHeight += 20
-      paraIdx++
-      return
-    }
-
-    if (node.type.name !== 'paragraph') {
-      paraIdx++
-      return
-    }
-
-    const { lines, totalHeight } = measureParagraph(node, contentWidth)
-    lines.forEach((l) => (l.paragraphIndex = paraIdx))
+    const { lines, totalHeight } = measureBlock(node, contentWidth)
+    lines.forEach((line) => { line.blockIndex = blockIdx })
 
     // Force page break if paragraph has pageBreakBefore attr
     if (node.attrs.pageBreakBefore && cur.lines.length > 0) {
@@ -134,7 +204,7 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
     cur.lines.push(...lines)
     cur.totalHeight += totalHeight
-    paraIdx++
+    blockIdx++
   })
 
   console.log(

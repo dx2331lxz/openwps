@@ -58,11 +58,48 @@ export const schema = new Schema({
     },
     table_cell: {
       content: 'paragraph+',
-      attrs: { header: { default: false } },
-      parseDOM: [{ tag: 'td' }, { tag: 'th' }],
+      attrs: {
+        header: { default: false },
+        colspan: { default: 1 },
+        rowspan: { default: 1 },
+        width: { default: null },
+      },
+      parseDOM: [{
+        tag: 'td',
+        getAttrs: (dom) => {
+          const element = dom as HTMLTableCellElement
+          return {
+            header: false,
+            colspan: element.colSpan || 1,
+            rowspan: element.rowSpan || 1,
+            width: element.style.width || null,
+          }
+        },
+      }, {
+        tag: 'th',
+        getAttrs: (dom) => {
+          const element = dom as HTMLTableCellElement
+          return {
+            header: true,
+            colspan: element.colSpan || 1,
+            rowspan: element.rowSpan || 1,
+            width: element.style.width || null,
+          }
+        },
+      }],
       toDOM(node) {
         const tag = node.attrs.header ? 'th' : 'td'
-        return [tag, { style: 'border:1px solid #ccc;padding:4px 8px;min-width:40px;vertical-align:top' }, 0]
+        return [tag, {
+          colspan: node.attrs.colspan > 1 ? node.attrs.colspan : undefined,
+          rowspan: node.attrs.rowspan > 1 ? node.attrs.rowspan : undefined,
+          style: [
+            'border:1px solid #ccc',
+            'padding:4px 8px',
+            'min-width:40px',
+            'vertical-align:top',
+            node.attrs.width ? `width:${node.attrs.width}` : '',
+          ].filter(Boolean).join(';'),
+        }, 0]
       },
     },
     // ─────────────────────────────────────────────────────────────────────────
@@ -70,6 +107,41 @@ export const schema = new Schema({
       group: 'block',
       parseDOM: [{ tag: 'hr' }],
       toDOM() { return ['hr'] },
+    },
+    image: {
+      inline: true,
+      group: 'inline',
+      draggable: true,
+      attrs: {
+        src: {},
+        alt: { default: '' },
+        title: { default: '' },
+        width: { default: null },
+        height: { default: null },
+      },
+      parseDOM: [{
+        tag: 'img[src]',
+        getAttrs: (dom) => {
+          const element = dom as HTMLImageElement
+          return {
+            src: element.getAttribute('src') ?? '',
+            alt: element.getAttribute('alt') ?? '',
+            title: element.getAttribute('title') ?? '',
+            width: element.getAttribute('width') ? Number(element.getAttribute('width')) : null,
+            height: element.getAttribute('height') ? Number(element.getAttribute('height')) : null,
+          }
+        },
+      }],
+      toDOM(node) {
+        return ['img', {
+          src: node.attrs.src,
+          alt: node.attrs.alt,
+          title: node.attrs.title,
+          width: node.attrs.width ?? undefined,
+          height: node.attrs.height ?? undefined,
+          style: 'display:inline-block;max-width:100%;vertical-align:bottom',
+        }]
+      },
     },
     text: { group: 'inline' },
   },

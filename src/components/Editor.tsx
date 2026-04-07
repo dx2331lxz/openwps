@@ -10,6 +10,8 @@ import { paginate, DEFAULT_PAGE_CONFIG, type PageConfig } from '../layout/pagina
 import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
 import SettingsModal from './SettingsModal'
+import { importDocx } from '../docx/importer'
+import { exportDocx } from '../docx/exporter'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -65,6 +67,11 @@ const PM_STYLES = `
   border: none;
   border-top: 1px solid #ccc;
   margin: 8px 0;
+}
+.ProseMirror img {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: bottom;
 }
 .ProseMirror p.page-break-before {
   border-top: 2px dashed #0066cc;
@@ -218,30 +225,29 @@ export const Editor: React.FC = () => {
       // Build break list: one entry per page boundary (after page 1, 2, ...)
       const breaks: { pos: number; height: number }[] = []
 
-      // Map paragraphIndex → starting paragraph for each page (page 2 onwards)
-      const breakParaIndices = new Map<number, number>() // paraIdx → page index
+      // Map blockIndex → starting block for each page (page 2 onwards)
+      const breakBlockIndices = new Map<number, number>()
       for (let pi = 1; pi < pages.length; pi++) {
         const first = pages[pi].lines[0]
-        if (first) breakParaIndices.set(first.paragraphIndex, pi)
+        if (first) breakBlockIndices.set(first.blockIndex, pi)
       }
 
-      let paraIdx = 0
-      doc.forEach((node, offset) => {
-        if (node.type.name !== 'paragraph') { paraIdx++; return }
-        const pageIdx = breakParaIndices.get(paraIdx)
+      let blockIdx = 0
+      doc.forEach((_, offset) => {
+        const pageIdx = breakBlockIndices.get(blockIdx)
         if (pageIdx !== undefined) {
-          // Absolute doc position before this paragraph's opening token = offset + 1
+          // Absolute doc position before this block's opening token = offset + 1
           // (Fragment.forEach gives content-relative offset; +1 for doc's own opening token)
           const pos = offset + 1
           const prevPageUsed = pages[pageIdx - 1].totalHeight
           const wh = breakWidgetHeight(prevPageUsed, cfg)
           breaks.push({ pos, height: wh })
           console.log(
-            `[editor] page break before para ${paraIdx}: doc pos=${pos}, ` +
+            `[editor] page break before block ${blockIdx}: doc pos=${pos}, ` +
             `prevUsed=${prevPageUsed.toFixed(0)}px, widgetH=${wh.toFixed(0)}px`
           )
         }
-        paraIdx++
+        blockIdx++
       })
 
       const decos = buildDecos(doc, breaks)
@@ -280,6 +286,44 @@ export const Editor: React.FC = () => {
     }
   }, [repaginate])
 
+  const handleImportDocx = useCallback(async (file: File) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    try {
+      const parsed = await importDocx(file)
+      const docNode = schema.nodeFromJSON(parsed.doc)
+      const transaction = editorView.state.tr.replaceWith(
+        0,
+        editorView.state.doc.nodeSize - 2,
+        docNode.content,
+      )
+      editorView.dispatch(transaction)
+      setPageConfig(parsed.pageConfig)
+      pageConfigRef.current = parsed.pageConfig
+      repaginate()
+      window.alert('DOCX 导入成功')
+    } catch (error) {
+      console.error('[Editor] DOCX import failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`DOCX 导入失败：${message}`)
+    }
+  }, [repaginate])
+
+  const handleExportDocx = useCallback(async () => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    try {
+      await exportDocx(editorView.state.doc, pageConfigRef.current)
+      window.alert('DOCX 导出成功')
+    } catch (error) {
+      console.error('[Editor] DOCX export failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`DOCX 导出失败：${message}`)
+    }
+  }, [])
+
   // Canvas height = all A4 cards stacked with gaps
   const cfg = pageConfigRef.current
   const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
@@ -294,6 +338,8 @@ export const Editor: React.FC = () => {
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
           onOpenSettings={(tab = 'page') => { setSettingsTab(tab === 'ai' ? 1 : 0); setSettingsOpen(true) }}
+          onImportDocx={handleImportDocx}
+          onExportDocx={handleExportDocx}
         />
       </div>
 
