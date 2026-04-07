@@ -589,7 +589,30 @@ async function parseDocument(documentXml: string, styleMap: StyleMap, rels: RelM
   for (const child of elementChildren(body)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      content.push(await parseParagraph(child, styleMap, rels, zip))
+      const para = await parseParagraph(child, styleMap, rels, zip)
+      // 跳过开头的连续空段落
+      const isEmpty = !para.content || para.content.length === 0 ||
+        para.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
+      if (isEmpty && content.length === 0) continue
+      if (isEmpty) {
+        const prevIsEmpty = content.length > 0 && (() => {
+          const prev = content[content.length - 1] as PMNodeJSON
+          if (prev.type !== 'paragraph') return false
+          return !prev.content || prev.content.length === 0 ||
+            prev.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
+        })()
+        if (prevIsEmpty) continue
+      }
+      // 文档第一个有内容的段落去掉 spaceBefore（防止标题段前间距把内容往下推）
+      const isFirstContent = content.length === 0 || content.every((n: PMNodeJSON) => {
+        if (n.type !== 'paragraph') return false
+        return !n.content || n.content.length === 0 ||
+          n.content.every((c: PMNodeJSON) => c.type === 'text' && !c.text?.trim())
+      })
+      if (isFirstContent && !isEmpty && para.attrs) {
+        para.attrs = { ...para.attrs, spaceBefore: 0 }
+      }
+      content.push(para)
       continue
     }
     if (localName === 'tbl') {
