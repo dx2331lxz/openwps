@@ -35,7 +35,8 @@ const PM_STYLES = `
   line-height: 1.5;
   color: #000;
   white-space: pre-wrap;
-  word-break: break-word;
+  word-break: break-all;  /* 与 Pretext 测量一致，防止数字/英文把前面中文带走 */
+  overflow-wrap: break-word;
 }
 .ProseMirror p { margin: 0; padding: 0; }
 .ProseMirror p.list-bullet {
