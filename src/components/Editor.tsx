@@ -213,14 +213,17 @@ export const Editor: React.FC = () => {
 
   const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => {
+    timerRef.current = setTimeout(async () => {
       const v = viewRef.current
       if (!v) return
+
+      // 确保字体加载完成，防止 Pretext Canvas 测量失败
+      if (document.fonts?.ready) await document.fonts.ready
 
       const cfg = pageConfigRef.current
       const doc = v.state.doc
       const pages = paginate(doc, cfg)
-      setPageCount(prev => pages.length !== prev ? pages.length : prev)  // 确保 state 更新触发重渲染
+      setPageCount(prev => pages.length !== prev ? pages.length : prev)
 
       // Build break list: one entry per page boundary (after page 1, 2, ...)
       const breaks: { pos: number; height: number }[] = []

@@ -84,23 +84,11 @@ function measureParagraph(
     rawLines = [{ text: '' }]
   } else {
     try {
-      // 超长段落分块测量，避免 Canvas 单次测量过長
-      const CHUNK = 500
-      if (text.length > CHUNK) {
-        const allLines: { text: string }[] = []
-        for (let i = 0; i < text.length; i += CHUNK) {
-          const chunk = text.slice(i, i + CHUNK)
-          const prepared = prepareWithSegments(chunk, fontStr)
-          const result = layoutWithLines(prepared, contentWidth, lineHeight)
-          allLines.push(...result.lines)
-        }
-        rawLines = allLines
-      } else {
-        const prepared = prepareWithSegments(text, fontStr)
-        rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
-      }
+      const prepared = prepareWithSegments(text, fontStr)
+      rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
     } catch (err) {
       console.warn('[paginator] Pretext error, fallback:', err)
+      // 字体未加载时 fallback：用字符数估算行数
       const charsPerLine = Math.max(1, Math.floor(contentWidth / (fontSizePx * 0.6)))
       const estimatedLines = Math.ceil(text.length / charsPerLine)
       rawLines = Array.from({ length: estimatedLines }, (_, i) => ({
