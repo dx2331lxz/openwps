@@ -84,11 +84,28 @@ function measureParagraph(
     rawLines = [{ text: '' }]
   } else {
     try {
-      const prepared = prepareWithSegments(text, fontStr)
-      rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
+      // 超长段落分块测量，避免 Canvas 单次测量过長
+      const CHUNK = 500
+      if (text.length > CHUNK) {
+        const allLines: { text: string }[] = []
+        for (let i = 0; i < text.length; i += CHUNK) {
+          const chunk = text.slice(i, i + CHUNK)
+          const prepared = prepareWithSegments(chunk, fontStr)
+          const result = layoutWithLines(prepared, contentWidth, lineHeight)
+          allLines.push(...result.lines)
+        }
+        rawLines = allLines
+      } else {
+        const prepared = prepareWithSegments(text, fontStr)
+        rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
+      }
     } catch (err) {
       console.warn('[paginator] Pretext error, fallback:', err)
-      rawLines = [{ text }]
+      const charsPerLine = Math.max(1, Math.floor(contentWidth / (fontSizePx * 0.6)))
+      const estimatedLines = Math.ceil(text.length / charsPerLine)
+      rawLines = Array.from({ length: estimatedLines }, (_, i) => ({
+        text: text.slice(i * charsPerLine, (i + 1) * charsPerLine)
+      }))
     }
   }
 
