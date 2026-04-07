@@ -84,10 +84,9 @@ function measureParagraph(
     rawLines = [{ text: '' }]
   } else {
     try {
-      // 在中文和 ASCII（数字/英文）边界插入零宽空格，让 Pretext 知道可以在此断行
-      const breakableText = text
-        .replace(/([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])([\x21-\x7e])/g, '$1​$2')
-        .replace(/([\x21-\x7e])([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])/g, '$1​$2')
+      // 在每个字符之间插入零宽空格，让 Pretext 可以在任意位置断行
+      // （等同于 word-break: break-all，防止数字/英文序列把前面中文一起带走）
+      const breakableText = text.split('').join('\u200b')
       const prepared = prepareWithSegments(breakableText, fontStr)
       rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
     } catch (err) {
