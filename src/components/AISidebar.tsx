@@ -208,7 +208,14 @@ type ReactMessagePayload =
 function buildReactUserContent(text: string, context: Record<string, unknown>) {
   const paragraphCount = Number(context.paragraphCount ?? 0)
   const wordCount = Number(context.wordCount ?? 0)
-  return `${text} （文档：${paragraphCount} 段，${wordCount} 字）`
+  const paragraphs = context.paragraphs as Array<{index: number, text: string}> | undefined
+  let docSummary = `\n\n【当前文档结构：${paragraphCount} 段，共 ${wordCount} 字】`
+  if (paragraphs && paragraphs.length > 0) {
+    docSummary += '\n' + paragraphs.map(p =>
+      `  段落${p.index}：${p.text.slice(0, 50)}${p.text.length > 50 ? '...' : ''}`
+    ).join('\n')
+  }
+  return text + docSummary
 }
 
 function serializeToolResult(result: ExecuteResult) {
@@ -279,13 +286,16 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     if (!editorView) return {}
     let paragraphCount = 0
     let wordCount = 0
-    editorView.state.doc.forEach(node => {
+    const paragraphs: Array<{index: number, text: string, charCount: number}> = []
+    editorView.state.doc.forEach((node, _pos, index) => {
       if (node.type.name === 'paragraph') {
+        const text = node.textContent
+        paragraphs.push({ index: paragraphCount, text: text.slice(0, 100), charCount: text.length })
         paragraphCount += 1
-        wordCount += node.textContent.length
+        wordCount += text.length
       }
     })
-    return { paragraphCount, wordCount, pageCount: 1 }
+    return { paragraphCount, wordCount, pageCount: 1, paragraphs }
   }, [editorView])
 
   const loadConversations = useCallback(async () => {
