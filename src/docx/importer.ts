@@ -88,6 +88,36 @@ const DEFAULT_PARAGRAPH_ATTRS: ParagraphAttrs = {
   pageBreakBefore: false,
 }
 
+function normalizeFont(name: string): string {
+  const trimmed = name.trim()
+  const map: Record<string, string> = {
+    '宋体': 'SimSun, 宋体, serif',
+    'SimSun': 'SimSun, 宋体, serif',
+    '黑体': 'SimHei, 黑体, sans-serif',
+    'SimHei': 'SimHei, 黑体, sans-serif',
+    '楷体': 'KaiTi, 楷体, cursive',
+    '楷体_GB2312': 'KaiTi, 楷体, cursive',
+    '仿宋': 'FangSong, 仿宋, serif',
+    '仿宋_GB2312': 'FangSong, 仿宋, serif',
+    '微软雅黑': 'Microsoft YaHei, 微软雅黑, sans-serif',
+    'Microsoft YaHei': 'Microsoft YaHei, 微软雅黑, sans-serif',
+    'Times New Roman': 'Times New Roman, serif',
+    'Arial': 'Arial, sans-serif',
+    'Calibri': 'Calibri, Arial, sans-serif',
+  }
+
+  if (!trimmed || /--/.test(trimmed) || /[A-Z]{2,}\d/.test(trimmed)) {
+    return DEFAULT_TEXT_STYLE.fontFamily
+  }
+
+  return map[trimmed] ?? trimmed
+}
+
+function clampLineHeight(value: number, fallback = DEFAULT_PARAGRAPH_ATTRS.lineHeight) {
+  if (!Number.isFinite(value)) return fallback
+  return Math.min(3, Math.max(1, value))
+}
+
 function twipToPx(value: number) {
   return value * TWIP_TO_PX
 }
@@ -118,12 +148,19 @@ function getLocalName(element: Element) {
 
 function getAttr(element: Element | undefined, name: string) {
   if (!element) return ''
-  return element.getAttribute(name)
+  const direct = element.getAttribute(name)
     ?? element.getAttribute(`w:${name}`)
     ?? element.getAttribute(`r:${name}`)
     ?? element.getAttribute(`a:${name}`)
     ?? element.getAttribute(`wp:${name}`)
-    ?? ''
+  if (direct != null) return direct
+
+  for (const attr of Array.from(element.attributes)) {
+    const attrLocalName = attr.localName ?? attr.name.split(':').pop() ?? attr.name
+    if (attrLocalName === name) return attr.value
+  }
+
+  return ''
 }
 
 function directChild(parent: Element | undefined, localName: string) {
@@ -240,8 +277,8 @@ function readRunStyle(rPr: Element | undefined, inherited: StyleAttrs): StyleAtt
 
   const attrs: StyleAttrs = {}
   const fonts = directChild(rPr, 'rFonts')
-  const fontFamily = getAttr(fonts, 'ascii') || getAttr(fonts, 'eastAsia') || getAttr(fonts, 'hAnsi')
-  if (fontFamily) attrs.fontFamily = fontFamily
+  const fontFamily = getAttr(fonts, 'eastAsia') || getAttr(fonts, 'ascii') || getAttr(fonts, 'hAnsi')
+  if (fontFamily) attrs.fontFamily = normalizeFont(fontFamily)
 
   const size = parseNumber(getAttr(directChild(rPr, 'sz'), 'val'))
   if (size > 0) attrs.fontSize = halfPtToPt(size)
@@ -432,11 +469,15 @@ async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zi
     }
   }
 
+  const isTrulyEmpty = content.length === 0
+
   const attrs: ParagraphAttrs = {
     ...DEFAULT_PARAGRAPH_ATTRS,
     align: paragraphStyle.align ?? DEFAULT_PARAGRAPH_ATTRS.align,
     firstLineIndent: paragraphStyle.firstLineIndent ?? DEFAULT_PARAGRAPH_ATTRS.firstLineIndent,
-    lineHeight: paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight,
+    lineHeight: isTrulyEmpty
+      ? clampLineHeight(paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight)
+      : (paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight),
     spaceBefore: paragraphStyle.spaceBefore ?? DEFAULT_PARAGRAPH_ATTRS.spaceBefore,
     spaceAfter: paragraphStyle.spaceAfter ?? DEFAULT_PARAGRAPH_ATTRS.spaceAfter,
     pageBreakBefore: paragraphStyle.pageBreakBefore ?? DEFAULT_PARAGRAPH_ATTRS.pageBreakBefore,
@@ -445,7 +486,7 @@ async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zi
   return {
     type: 'paragraph',
     attrs,
-    content,
+    content: isTrulyEmpty ? [createTextNode('', paragraphStyle) ?? { type: 'text', text: '' }] : content,
   }
 }
 
