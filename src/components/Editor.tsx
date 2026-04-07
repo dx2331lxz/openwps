@@ -30,12 +30,14 @@ function breakWidgetHeight(usedH: number, cfg: PageConfig): number {
 const PM_STYLES = `
 .ProseMirror {
   outline: none;
-  font-family: SimSun, serif;
+  font-family: SimSun, 宋体, serif;
   font-size: 12pt;
   line-height: 1.5;
   color: #000;
   white-space: pre-wrap;
   word-break: break-word;
+  /* 全角引号和标点符号占全角宽度，和 WPS 一致 */
+  font-variant-east-asian: full-width;
 }
 .ProseMirror p { margin: 0; padding: 0; }
 .ProseMirror p.list-bullet {

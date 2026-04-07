@@ -117,14 +117,35 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
     children.push(await convertInlineNode(node.child(index)))
   }
 
+  const lineHeight = Number(node.attrs.lineHeight ?? 1.5)
+  const firstLineIndent = Number(node.attrs.firstLineIndent ?? 0)
+
+  // 计算段落内实际字号（取最大字号作为基准）
+  let baseFontSizePt = 12
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i)
+    if (child.type.name === 'text') {
+      const mark = child.marks.find(m => m.type.name === 'textStyle')
+      const sz = Number(mark?.attrs?.fontSize ?? 0)
+      if (sz > baseFontSizePt) baseFontSizePt = sz
+    }
+  }
+
+  // Word 的 1.5倍行距 = 字号pt × 1.5 × 20 twip
+  // 不能直接用 lineHeight × 240（那是基于12pt的）
+  const lineSpacingTwip = Math.round(baseFontSizePt * lineHeight * 20)
+
+  // 首行缩进：用字符单位（em）转 twip，1em = 1个字符宽 = 字号pt
+  const firstLineTwip = firstLineIndent > 0
+    ? Math.round(firstLineIndent * baseFontSizePt * 20)
+    : undefined
+
   return new Paragraph({
     alignment: paragraphAlignment(node.attrs.align as string | undefined),
     pageBreakBefore: Boolean(node.attrs.pageBreakBefore),
-    indent: Number(node.attrs.firstLineIndent) > 0
-      ? { firstLine: Math.round(Number(node.attrs.firstLineIndent) * 12 * 20) }
-      : undefined,
+    indent: firstLineTwip ? { firstLine: firstLineTwip } : undefined,
     spacing: {
-      line: Math.round(Number(node.attrs.lineHeight ?? 1.5) * 240),
+      line: lineSpacingTwip,
       lineRule: LineRuleType.AUTO,
       before: Math.round(Number(node.attrs.spaceBefore ?? 0) * 20),
       after: Math.round(Number(node.attrs.spaceAfter ?? 0) * 20),
