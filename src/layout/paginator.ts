@@ -84,7 +84,11 @@ function measureParagraph(
     rawLines = [{ text: '' }]
   } else {
     try {
-      const prepared = prepareWithSegments(text, fontStr)
+      // 在中文和 ASCII（数字/英文）边界插入零宽空格，让 Pretext 知道可以在此断行
+      const breakableText = text
+        .replace(/([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])([\x21-\x7e])/g, '$1​$2')
+        .replace(/([\x21-\x7e])([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])/g, '$1​$2')
+      const prepared = prepareWithSegments(breakableText, fontStr)
       rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
     } catch (err) {
       console.warn('[paginator] Pretext error, fallback:', err)
