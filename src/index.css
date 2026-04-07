@@ -54,3 +54,5 @@
 .ai-markdown strong { font-weight: 600; }
 .ai-message-content a,
 .ai-markdown a { color: #2563eb; text-decoration: underline; }
+
+.toolbar-row::-webkit-scrollbar { display: none; }

@@ -55,12 +55,6 @@ function parseCommand(message: string): ToolCall[] {
   const msg = message.trim()
   if (!msg) return []
 
-  // ── Preset styles ──
-  const presetMatch = msg.match(/(公文|论文|合同|报告|信函)/)
-  if (presetMatch) {
-    return [{ name: 'apply_preset_style', params: { preset: presetMatch[1] } }]
-  }
-
   // ── Table insertion ──
   const tableMatch = msg.match(
     /插入.*?(\d+)\s*行.*?(\d+)\s*列|(\d+)\s*行.*?(\d+)\s*列.*?表格|插入.*?(\d+)[×xX*](\d+)/
@@ -68,17 +62,17 @@ function parseCommand(message: string): ToolCall[] {
   if (tableMatch || msg.includes('表格')) {
     const rows = parseInt(tableMatch?.[1] ?? tableMatch?.[3] ?? tableMatch?.[5] ?? '3')
     const cols = parseInt(tableMatch?.[2] ?? tableMatch?.[4] ?? tableMatch?.[6] ?? '3')
-    return [{ name: 'insert_table', params: { rows: rows || 3, cols: cols || 3 } }]
+    return [{ name: 'insert_table', params: { afterParagraph: 0, rows: rows || 3, cols: cols || 3 } }]
   }
 
   // ── Insert page break ──
   if (msg.includes('分页符') || (msg.includes('插入') && msg.includes('分页'))) {
-    return [{ name: 'insert_page_break', params: {} }]
+    return [{ name: 'insert_page_break', params: { afterParagraph: 0 } }]
   }
 
   // ── Insert horizontal rule ──
   if (msg.includes('水平线') || msg.includes('分割线') || msg.includes('横线')) {
-    return [{ name: 'insert_horizontal_rule', params: {} }]
+    return [{ name: 'insert_horizontal_rule', params: { afterParagraph: 0 } }]
   }
 
   // ── Page config ──
@@ -101,36 +95,22 @@ function parseCommand(message: string): ToolCall[] {
     }
   }
 
-  // ── Heading level ──
-  const headingMatch = msg.match(/[标题](\d)级?|(\d)级[标题]|设为标题(\d)|heading\s*(\d)/i)
-  if (headingMatch) {
-    const level = parseInt(headingMatch[1] ?? headingMatch[2] ?? headingMatch[3] ?? headingMatch[4])
-    if (level >= 1 && level <= 4) {
-      return [{ name: 'set_heading', params: { level } }]
-    }
-  }
-
-  // ── List ──
-  if (msg.includes('无序列表') || msg.includes('项目符号') || msg.includes('圆点列表')) {
-    return [{ name: 'set_list', params: { type: 'bullet' } }]
-  }
-  if (msg.includes('有序列表') || msg.includes('编号列表') || msg.includes('数字列表')) {
-    return [{ name: 'set_list', params: { type: 'ordered' } }]
-  }
-  if (msg.includes('取消列表') || msg.includes('删除列表') || msg.includes('普通段落')) {
-    return [{ name: 'set_list', params: { type: 'none' } }]
-  }
-
   // ── Compound text + paragraph style ──
   const calls: ToolCall[] = []
   const textAttrs: Record<string, unknown> = {}
   const paraAttrs: Record<string, unknown> = {}
 
-  // Determine target scope
-  let target = 'selection'
-  if (msg.includes('全文') || msg.includes('所有段落') ||
-      msg.includes('正文') || msg.includes('全部')) {
-    target = 'all'
+  let range: Record<string, unknown> = { type: 'selection' }
+  const multiParagraphMatch = msg.match(/第\s*(\d+)\s*(?:到|至|-)\s*(\d+)\s*段/)
+  const singleParagraphMatch = msg.match(/第\s*(\d+)\s*段/)
+  if (multiParagraphMatch) {
+    const from = Math.max(0, parseInt(multiParagraphMatch[1], 10) - 1)
+    const to = Math.max(from, parseInt(multiParagraphMatch[2], 10) - 1)
+    range = { type: 'paragraphs', from, to }
+  } else if (singleParagraphMatch) {
+    range = { type: 'paragraph', paragraphIndex: Math.max(0, parseInt(singleParagraphMatch[1], 10) - 1) }
+  } else if (msg.includes('全文') || msg.includes('所有段落') || msg.includes('全部')) {
+    range = { type: 'all' }
   }
 
   // Bold
@@ -238,12 +218,16 @@ function parseCommand(message: string): ToolCall[] {
   const spaceAfterMatch = msg.match(/段后\s*(\d+(?:\.\d+)?)/)
   if (spaceAfterMatch) paraAttrs.spaceAfter = parseFloat(spaceAfterMatch[1])
 
+  if (msg.includes('无序列表') || msg.includes('项目符号') || msg.includes('圆点列表')) paraAttrs.listType = 'bullet'
+  if (msg.includes('有序列表') || msg.includes('编号列表') || msg.includes('数字列表')) paraAttrs.listType = 'ordered'
+  if (msg.includes('取消列表') || msg.includes('删除列表') || msg.includes('普通段落')) paraAttrs.listType = 'none'
+
   // Emit tool calls
   if (Object.keys(textAttrs).length > 0) {
-    calls.push({ name: 'set_text_style', params: { ...textAttrs, target } })
+    calls.push({ name: 'set_text_style', params: { ...textAttrs, range } })
   }
   if (Object.keys(paraAttrs).length > 0) {
-    calls.push({ name: 'set_paragraph_style', params: { ...paraAttrs, target } })
+    calls.push({ name: 'set_paragraph_style', params: { ...paraAttrs, range } })
   }
 
   if (calls.length === 0) {

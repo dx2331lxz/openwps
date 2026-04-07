@@ -43,58 +43,99 @@ DEFAULT_CONFIG = {
 
 # ── 排版工具 schema（传给 AI）──────────────────────────────────
 
+RANGE_SPEC = {
+    "type": "object",
+    "description": "操作范围",
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": [
+                "all",
+                "paragraph",
+                "paragraphs",
+                "selection",
+                "contains_text",
+                "first_paragraph",
+                "last_paragraph",
+                "odd_paragraphs",
+                "even_paragraphs",
+            ],
+        },
+        "paragraphIndex": {"type": "integer", "description": "段落索引（range.type=paragraph 时使用）"},
+        "from": {"type": "integer", "description": "起始段落索引（range.type=paragraphs 时使用）"},
+        "to": {"type": "integer", "description": "结束段落索引（range.type=paragraphs 时使用，包含）"},
+        "text": {"type": "string", "description": "匹配的文字（range.type=contains_text 时使用）"},
+    },
+}
+
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "set_text_style",
-            "description": "设置文字样式（字体/字号/颜色/加粗/斜体/下划线/删除线）",
+            "name": "get_document_content",
+            "description": "读取文档完整内容，返回每个段落的文字内容和当前样式",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_paragraph",
+            "description": "读取指定段落的内容和样式",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "fontFamily": {"type": "string", "description": "字体名，如 宋体/黑体/楷体/仿宋/Arial"},
-                    "fontSize": {"type": "number", "description": "字号（pt），如 12/16/18/22"},
-                    "color": {"type": "string", "description": "颜色，如 #000000"},
+                    "index": {"type": "integer", "description": "段落索引（从 0 开始）"},
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_text_style",
+            "description": "设置指定范围内文字的样式（字体、字号、颜色、粗体、斜体等）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "range": RANGE_SPEC,
+                    "fontFamily": {"type": "string", "description": "字体名，如 宋体/黑体/楷体/仿宋/Arial/Times New Roman"},
+                    "fontSize": {"type": "number", "description": "字号（磅），如 12/16/22"},
+                    "color": {"type": "string", "description": "文字颜色 hex，如 #FF0000"},
+                    "backgroundColor": {"type": "string", "description": "文字背景色 hex"},
                     "bold": {"type": "boolean"},
                     "italic": {"type": "boolean"},
                     "underline": {"type": "boolean"},
                     "strikethrough": {"type": "boolean"},
-                    "target": {"type": "string", "enum": ["selection", "all", "body"], "description": "应用范围"}
-                }
-            }
-        }
+                    "superscript": {"type": "boolean"},
+                    "subscript": {"type": "boolean"},
+                    "letterSpacing": {"type": "number", "description": "字间距（磅）"},
+                },
+                "required": ["range"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "set_paragraph_style",
-            "description": "设置段落格式（对齐/首行缩进/行距/段间距）",
+            "description": "设置指定范围段落的格式（对齐、缩进、行距、间距）",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "range": RANGE_SPEC,
                     "align": {"type": "string", "enum": ["left", "center", "right", "justify"]},
-                    "firstLineIndent": {"type": "number", "description": "首行缩进 em，如 2"},
-                    "lineHeight": {"type": "number", "description": "行距倍数，如 1.5"},
-                    "spaceBefore": {"type": "number", "description": "段前间距 pt"},
-                    "spaceAfter": {"type": "number", "description": "段后间距 pt"},
-                    "target": {"type": "string", "enum": ["selection", "all", "body"]}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_preset_style",
-            "description": "应用预设样式到整个文档",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "preset": {"type": "string", "enum": ["公文", "论文", "合同", "报告", "信函"]}
+                    "firstLineIndent": {"type": "number", "description": "首行缩进（字符数，如 2）"},
+                    "indent": {"type": "number", "description": "整体左缩进（字符数）"},
+                    "lineHeight": {"type": "number", "description": "行距倍数，如 1.0/1.5/2.0"},
+                    "spaceBefore": {"type": "number", "description": "段前间距（磅）"},
+                    "spaceAfter": {"type": "number", "description": "段后间距（磅）"},
+                    "listType": {"type": "string", "enum": ["none", "bullet", "ordered"], "description": "列表类型"},
                 },
-                "required": ["preset"]
-            }
-        }
+                "required": ["range"],
+            },
+        },
     },
     {
         "type": "function",
@@ -109,77 +150,116 @@ TOOLS = [
                     "marginTop": {"type": "number", "description": "上边距 mm"},
                     "marginBottom": {"type": "number", "description": "下边距 mm"},
                     "marginLeft": {"type": "number", "description": "左边距 mm"},
-                    "marginRight": {"type": "number", "description": "右边距 mm"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "insert_table",
-            "description": "插入表格",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "rows": {"type": "integer", "minimum": 1, "maximum": 20},
-                    "cols": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "headerRow": {"type": "boolean"}
+                    "marginRight": {"type": "number", "description": "右边距 mm"},
                 },
-                "required": ["rows", "cols"]
-            }
-        }
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "insert_page_break",
-            "description": "插入分页符",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "在指定段落后插入分页符",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "afterParagraph": {"type": "integer", "description": "在该段落后插入分页符"},
+                },
+                "required": ["afterParagraph"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
-            "name": "set_list",
-            "description": "设置列表格式",
+            "name": "insert_horizontal_rule",
+            "description": "在指定段落后插入水平分割线",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "type": {"type": "string", "enum": ["none", "bullet", "ordered"]}
-                }
-            }
-        }
+                    "afterParagraph": {"type": "integer", "description": "在该段落后插入分割线"},
+                },
+                "required": ["afterParagraph"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table",
+            "description": "在指定位置插入表格",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "afterParagraph": {"type": "integer", "description": "在该段落后插入表格"},
+                    "rows": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "cols": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "headerRow": {"type": "boolean"},
+                },
+                "required": ["afterParagraph", "rows", "cols"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_text",
+            "description": "在指定段落末尾插入文字",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paragraphIndex": {"type": "integer"},
+                    "text": {"type": "string", "description": "要插入的文字内容"},
+                },
+                "required": ["paragraphIndex", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_paragraph",
+            "description": "删除指定段落",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "段落索引"},
+                },
+                "required": ["index"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "get_document_info",
             "description": "获取文档信息（字数、段落数、页数）",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    }
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文档进行排版操作。
 
 你的职责：
-1. 理解用户的排版需求（如"排成公文格式"、"正文仿宋16号"等）
-2. 调用排版工具函数执行操作
-3. 用简短的中文回复告诉用户做了什么
+1. 理解用户的排版需求
+2. 先读取文档内容，再做精确修改
+3. 调用排版工具函数执行操作
+4. 用简短中文回复结果
 
-排版知识：
-- 公文格式：仿宋16号，首行缩进2字符，行距1.5，标题黑体22号居中
-- 论文格式：宋体12号，首行缩进2字符，行距1.5
-- 合同格式：宋体12号，首行缩进2字符，行距1.5
-- 标准行距：1.5倍
-- 标准首行缩进：2字符（2em）
+工具使用原则：
+1. 先用 get_document_content 读取文档结构，了解段落数量和内容
+2. 用 range 精确指定操作哪些段落，不要用 all，除非用户明确要求全部
+3. 例如“把第一段标题改成黑体”→ 先 get_document_content 确认第一段是否是标题，再调用 set_text_style(range={"type":"paragraph","paragraphIndex":0}, fontFamily="黑体")
+4. 例如“把所有正文缩进2字符”→ 先 get_document_content 找出正文段落索引，再调用 set_paragraph_style(range={"type":"paragraphs","from":1,"to":N}, firstLineIndent=2)
+5. 不要一次性修改整个文档，除非用户明确说“全部”
+6. 询问“第几段是什么内容”“某段内容是什么”“文档有哪些段落”时，优先使用 get_document_content 或 get_paragraph
+7. 插入类工具必须带位置：insert_page_break / insert_table / insert_horizontal_rule 需要 afterParagraph，insert_text 需要 paragraphIndex
 
-注意：
-- 每次对话调用必要的工具完成用户请求
-- 回复要简洁，说明做了什么操作
-- 如果用户说"居中"，调用 set_paragraph_style with align=center
-- 如果用户说"仿宋16号"，调用 set_text_style with fontFamily=仿宋 and fontSize=16
+回复要求：
+- 如果已经完成操作，就简短说明做了什么
+- 如果是读取型问题，就直接根据工具返回内容回答
+- 不要编造不存在的段落内容
 """
 
 # ── 配置管理 ──────────────────────────────────────────────────
@@ -206,6 +286,7 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
     context: dict = {}
     conversationId: Optional[str] = None
+    reactMessages: list[dict] = []
 
 class SettingsUpdate(BaseModel):
     endpoint: Optional[str] = None
@@ -492,12 +573,10 @@ async def stream_ai_call(
 
 # ── ReAct streaming endpoint ──────────────────────────────────
 
-MAX_REACT_ROUNDS = 50
-
 
 @app.post("/api/ai/react/stream")
 async def react_stream(body: ChatRequest):
-    """ReAct: multi-round tool-calling loop streamed via SSE."""
+    """Stream a single assistant round; the client executes tools and feeds results back."""
 
     async def generate():
         cfg = read_config()
@@ -514,98 +593,34 @@ async def react_stream(body: ChatRequest):
             "Content-Type": "application/json",
         }
 
-        # Build initial messages
         messages: list = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for msg in body.history[-10:]:
-            messages.append({"role": msg.role, "content": msg.content})
+        if body.reactMessages:
+            messages.extend(body.reactMessages)
+        else:
+            for msg in body.history[-10:]:
+                messages.append({"role": msg.role, "content": msg.content})
 
-        user_content = body.message
-        if body.context:
-            ctx = body.context
-            user_content += (
-                f" （文档：{ctx.get('paragraphCount', 0)} 段，"
-                f"{ctx.get('wordCount', 0)} 字）"
-            )
-        messages.append({"role": "user", "content": user_content})
-
-        # Persist user message to conversation if provided
-        if body.conversationId:
-            try:
-                p = conv_path(body.conversationId)
-                if p.exists():
-                    conv = json.loads(p.read_text(encoding="utf-8"))
-                    conv["messages"].append({"role": "user", "content": body.message})
-                    write_conversation(conv)
-            except Exception:
-                pass
-
-        final_assistant_content = ""
-
-        for round_num in range(1, MAX_REACT_ROUNDS + 1):
-            yield sse("round", {"round": round_num, "maxRounds": MAX_REACT_ROUNDS})
-
-            round_tool_calls: list = []
-            assistant_content = ""
-            assistant_thinking = ""
-
-            async for event in stream_ai_call(messages, headers, endpoint, model, TOOLS):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event["type"] == "error":
-                    return
-                elif event["type"] == "content":
-                    assistant_content += event["content"]
-                    final_assistant_content += event["content"]
-                elif event["type"] == "thinking":
-                    assistant_thinking += event["content"]
-                elif event["type"] == "tool_call":
-                    round_tool_calls.append(event)
-
-            if not round_tool_calls:
-                # No more tool calls → task done
-                if body.conversationId and final_assistant_content:
-                    try:
-                        p = conv_path(body.conversationId)
-                        if p.exists():
-                            conv = json.loads(p.read_text(encoding="utf-8"))
-                            conv["messages"].append({"role": "assistant", "content": final_assistant_content})
-                            write_conversation(conv)
-                    except Exception:
-                        pass
-                yield sse("done", {"reason": "completed", "rounds": round_num})
-                return
-
-            # Add assistant turn + tool results to history
-            messages.append({
-                "role": "assistant",
-                "content": assistant_content or None,
-                "tool_calls": [
-                    {
-                        "id": tc["id"] or tc["name"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["params"], ensure_ascii=False),
-                        },
-                    }
-                    for tc in round_tool_calls
-                ],
-            })
-            for tc in round_tool_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"] or tc["name"],
-                    "content": f"✅ {tc['name']} 执行成功",
-                })
-
-            if round_num >= MAX_REACT_ROUNDS:
-                yield sse(
-                    "ask_continue",
-                    {
-                        "message": f"已执行 {round_num} 轮操作，是否继续？",
-                        "rounds": round_num,
-                    },
+            user_content = body.message
+            if body.context:
+                ctx = body.context
+                user_content += (
+                    f" （文档：{ctx.get('paragraphCount', 0)} 段，"
+                    f"{ctx.get('wordCount', 0)} 字）"
                 )
+            messages.append({"role": "user", "content": user_content})
+
+        round_tool_calls: list = []
+        async for event in stream_ai_call(messages, headers, endpoint, model, TOOLS):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event["type"] == "error":
                 return
+            if event["type"] == "tool_call":
+                round_tool_calls.append(event)
+
+        if round_tool_calls:
+            yield sse("awaiting_tool_results", {"count": len(round_tool_calls)})
+        else:
+            yield sse("done", {"reason": "completed"})
 
     return StreamingResponse(
         generate(),

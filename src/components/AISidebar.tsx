@@ -4,7 +4,8 @@ import { EditorView } from 'prosemirror-view'
 import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
-import { executeTool } from '../ai/executor'
+import { executeTool, type ExecuteResult } from '../ai/executor'
+import type { PageConfig } from '../layout/paginator'
 
 type View = 'history' | 'chat'
 
@@ -51,6 +52,8 @@ interface AskContinueState {
 
 interface Props {
   view: EditorView | null
+  pageConfig: PageConfig
+  onPageConfigChange: (cfg: PageConfig) => void
   onClose: () => void
 }
 
@@ -64,6 +67,7 @@ const PADDING_V = 8
 const BUBBLE_MAX_RATIO = 0.85
 const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
+const MAX_TOOL_ROUNDS = 50
 
 let msgIdCounter = 0
 
@@ -190,6 +194,41 @@ function toChatHistory(messages: Message[]) {
     }))
 }
 
+interface ToolCallRecord {
+  id: string
+  name: string
+  params: Record<string, unknown>
+  result: ExecuteResult
+}
+
+type ReactMessagePayload =
+  | { role: 'user' | 'assistant'; content: string | null; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> }
+  | { role: 'tool'; tool_call_id: string; content: string }
+
+function buildReactUserContent(text: string, context: Record<string, unknown>) {
+  const paragraphCount = Number(context.paragraphCount ?? 0)
+  const wordCount = Number(context.wordCount ?? 0)
+  return `${text} （文档：${paragraphCount} 段，${wordCount} 字）`
+}
+
+function serializeToolResult(result: ExecuteResult) {
+  return JSON.stringify({
+    success: result.success,
+    message: result.message,
+    data: result.data ?? null,
+  })
+}
+
+function buildReactMessages(messages: Message[], userText: string, context: Record<string, unknown>): ReactMessagePayload[] {
+  return [
+    ...toChatHistory(messages).slice(-20).map(message => ({
+      role: message.role as 'user' | 'assistant',
+      content: message.content,
+    })),
+    { role: 'user', content: buildReactUserContent(userText, context) },
+  ]
+}
+
 function buildErrorText(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   return `❌ 请求失败：${message}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
@@ -199,7 +238,7 @@ function makeConversationTitle(text: string) {
   return text.trim().slice(0, 30) || '新会话'
 }
 
-export default function AISidebar({ view: editorView, onClose }: Props) {
+export default function AISidebar({ view: editorView, pageConfig, onPageConfigChange, onClose }: Props) {
   const [viewMode, setViewMode] = useState<View>('history')
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
@@ -380,6 +419,9 @@ export default function AISidebar({ view: editorView, onClose }: Props) {
     }
 
     let conversationId = shouldStartNewConversation ? null : currentConversationIdRef.current
+    const context = getContext()
+    let persistedAssistantText = ''
+    let conversationPersisted = false
 
     try {
       if (!conversationId) {
@@ -397,98 +439,157 @@ export default function AISidebar({ view: editorView, onClose }: Props) {
         void loadConversations()
       }
 
-      const response = await fetch('/api/ai/react/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          message: text,
-          history: toChatHistory(previousMessages).slice(-20),
-          context: getContext(),
-          conversationId,
-        }),
-      })
+      let reactMessages = buildReactMessages(previousMessages, text, context)
+      let finished = false
 
-      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+      for (let round = 1; round <= MAX_TOOL_ROUNDS && !finished; round += 1) {
+        const response = await fetch('/api/ai/react/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            message: text,
+            history: toChatHistory(previousMessages).slice(-20),
+            context,
+            conversationId,
+            reactMessages,
+          }),
+        })
 
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
+        if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let awaitingToolResults = false
+        let roundAssistantText = ''
+        const toolResults: ToolCallRecord[] = []
 
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          let event: Record<string, unknown>
-          try {
-            event = JSON.parse(line.slice(6)) as Record<string, unknown>
-          } catch {
-            continue
-          }
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? ''
 
-          switch (event.type) {
-            case 'thinking':
-              updateMessage(message => ({ ...message, thinking: message.thinking + String(event.content ?? '') }))
-              break
-
-            case 'content':
-              updateMessage(message => ({ ...message, text: message.text + String(event.content ?? '') }))
-              break
-
-            case 'tool_call': {
-              const toolCall: ToolCallResult = {
-                id: typeof event.id === 'string' ? event.id : undefined,
-                name: String(event.name ?? ''),
-                params: normalizeToolParams(event.params),
-                status: 'pending',
-              }
-              if (editorView) {
-                try {
-                  executeTool(editorView, toolCall.name, toolCall.params)
-                  toolCall.status = 'ok'
-                } catch (error) {
-                  console.error('[AISidebar] tool error', toolCall.name, error)
-                  toolCall.status = 'err'
-                }
-              }
-              updateMessage(message => ({ ...message, toolCalls: [...message.toolCalls, toolCall] }))
-              break
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            let event: Record<string, unknown>
+            try {
+              event = JSON.parse(line.slice(6)) as Record<string, unknown>
+            } catch {
+              continue
             }
 
-            case 'done':
-              updateMessage(message => ({ ...message, streaming: false }))
-              break
+            switch (event.type) {
+              case 'thinking':
+                updateMessage(message => ({ ...message, thinking: message.thinking + String(event.content ?? '') }))
+                break
 
-            case 'ask_continue':
-              setAskContinue({
-                visible: true,
-                rounds: Number(event.rounds ?? 0),
-                message: String(event.message ?? ''),
-              })
-              updateMessage(message => ({ ...message, streaming: false }))
-              break
+              case 'content': {
+                const chunk = String(event.content ?? '')
+                roundAssistantText += chunk
+                persistedAssistantText += chunk
+                updateMessage(message => ({ ...message, text: message.text + chunk }))
+                break
+              }
 
-            case 'error':
-              updateMessage(message => ({
-                ...message,
-                text: message.text + `\n❌ ${String(event.message ?? '')}`,
-                streaming: false,
-              }))
-              break
+              case 'tool_call': {
+                const toolCall: ToolCallResult = {
+                  id: typeof event.id === 'string' ? event.id : undefined,
+                  name: String(event.name ?? ''),
+                  params: normalizeToolParams(event.params),
+                  status: 'pending',
+                }
+                const result = editorView
+                  ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange })
+                  : { success: false, message: '编辑器尚未就绪' }
 
-            case 'round':
-              break
+                toolCall.status = result.success ? 'ok' : 'err'
+                toolResults.push({
+                  id: toolCall.id ?? toolCall.name,
+                  name: toolCall.name,
+                  params: toolCall.params,
+                  result,
+                })
+                updateMessage(message => ({ ...message, toolCalls: [...message.toolCalls, toolCall] }))
+                break
+              }
+
+              case 'awaiting_tool_results':
+                awaitingToolResults = true
+                break
+
+              case 'done':
+                finished = true
+                updateMessage(message => ({ ...message, streaming: false }))
+                break
+
+              case 'error':
+                throw new Error(String(event.message ?? 'AI 请求失败'))
+
+              case 'ask_continue':
+              case 'round':
+                break
+            }
           }
         }
+
+        if (finished) break
+        if (!awaitingToolResults || toolResults.length === 0) {
+          updateMessage(message => ({ ...message, streaming: false }))
+          finished = true
+          break
+        }
+
+        reactMessages = [
+          ...reactMessages,
+          {
+            role: 'assistant',
+            content: roundAssistantText || null,
+            tool_calls: toolResults.map(tool => ({
+                id: tool.id,
+                type: 'function',
+                function: {
+                  name: tool.name,
+                  arguments: JSON.stringify(tool.params),
+                },
+              })),
+          },
+          ...toolResults.map(tool => ({
+            role: 'tool' as const,
+            tool_call_id: tool.id,
+            content: serializeToolResult(tool.result),
+          })),
+        ]
+
+        if (round === MAX_TOOL_ROUNDS) {
+          setAskContinue({
+            visible: true,
+            rounds: round,
+            message: `已执行 ${round} 轮操作，请重新发起下一步指令。`,
+          })
+          updateMessage(message => ({ ...message, streaming: false }))
+        }
+      }
+
+      if (conversationId) {
+        await fetch(`/api/conversations/${conversationId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [
+              { role: 'user', content: text },
+              { role: 'assistant', content: persistedAssistantText || '（无回复）' },
+            ],
+          }),
+        })
+        conversationPersisted = true
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
+        persistedAssistantText = '（已取消）'
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
@@ -498,6 +599,7 @@ export default function AISidebar({ view: editorView, onClose }: Props) {
         )
       } else {
         const errorText = buildErrorText(error)
+        persistedAssistantText = errorText
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
@@ -506,13 +608,30 @@ export default function AISidebar({ view: editorView, onClose }: Props) {
           ),
         )
       }
+
+      if (conversationId && !conversationPersisted) {
+        try {
+          await fetch(`/api/conversations/${conversationId}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: [
+                { role: 'user', content: text },
+                { role: 'assistant', content: persistedAssistantText || '（无回复）' },
+              ],
+            }),
+          })
+        } catch (persistError) {
+          console.error('[AISidebar] persist conversation failed', persistError)
+        }
+      }
     } finally {
       setLoading(false)
       abortRef.current = null
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [editorView, getContext, input, loadConversations, loading, resetTextareaHeight, sidebarWidth, viewMode])
+  }, [editorView, getContext, input, loadConversations, loading, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 

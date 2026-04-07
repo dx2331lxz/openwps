@@ -265,10 +265,23 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
   return (
     <>
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 2, padding: '6px 12px',
-        background: 'white', borderBottom: '1px solid #e5e7eb', flexWrap: 'wrap',
-      }}>
+      <div
+        className="toolbar-row"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 2,
+          padding: '4px 8px',
+          background: 'white',
+          borderBottom: '1px solid #e5e7eb',
+          flexWrap: 'nowrap',
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          whiteSpace: 'nowrap',
+          minHeight: 36,
+          scrollbarWidth: 'none',
+        }}
+      >
         {/* Undo / Redo */}
         <button className={btn(false)} title="撤销 (Ctrl+Z)" onMouseDown={e => { e.preventDefault(); if (view) undo(view.state, view.dispatch) }}>↩</button>
         <button className={btn(false)} title="重做 (Ctrl+Y)" onMouseDown={e => { e.preventDefault(); if (view) redo(view.state, view.dispatch) }}>↪</button>

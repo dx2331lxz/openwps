@@ -412,7 +412,16 @@ export const Editor: React.FC = () => {
 
       {/* AI Sidebar */}
       {sidebarOpen && (
-        <AISidebar view={view} onClose={() => setSidebarOpen(false)} />
+        <AISidebar
+          view={view}
+          pageConfig={pageConfig}
+          onPageConfigChange={(newCfg) => {
+            setPageConfig(newCfg)
+            pageConfigRef.current = newCfg
+            repaginate()
+          }}
+          onClose={() => setSidebarOpen(false)}
+        />
       )}
       </div>
       {/* end main content row */}
