@@ -287,7 +287,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     let paragraphCount = 0
     let wordCount = 0
     const paragraphs: Array<{index: number, text: string, charCount: number}> = []
-    editorView.state.doc.forEach((node, _pos, index) => {
+    editorView.state.doc.forEach((node, _pos, _index) => {
       if (node.type.name === 'paragraph') {
         const text = node.textContent
         paragraphs.push({ index: paragraphCount, text: text.slice(0, 100), charCount: text.length })
