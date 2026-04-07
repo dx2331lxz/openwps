@@ -1,10 +1,28 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { EditorView } from 'prosemirror-view'
+import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
 import { executeTool } from '../ai/executor'
 
-// ── Types ──────────────────────────────────────────────────────────────────
+type View = 'history' | 'chat'
+
+interface ConversationSummary {
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+}
+
+interface StoredMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+interface ConversationDetail extends ConversationSummary {
+  messages: StoredMessage[]
+}
 
 interface ToolCallResult {
   id?: string
@@ -21,9 +39,7 @@ interface Message {
   isThinkingExpanded: boolean
   toolCalls: ToolCallResult[]
   streaming: boolean
-  /** cached PreparedTextWithSegments — set once on finalization */
   prepared?: PreparedTextWithSegments
-  /** tight bubble width in px; 0 = use CSS max-width (while streaming) */
   tightWidth: number
 }
 
@@ -38,23 +54,24 @@ interface Props {
   onClose: () => void
 }
 
-const MAX_HISTORY = 20
 const SIDEBAR_MIN = 280
 const SIDEBAR_MAX = 600
 const SIDEBAR_DEFAULT = 320
 const FONT = '14px -apple-system, BlinkMacSystemFont, sans-serif'
 const LINE_HEIGHT = 20
-const PADDING_H = 12   // horizontal padding inside bubble (each side)
-const PADDING_V = 8    // vertical padding
+const PADDING_H = 12
+const PADDING_V = 8
 const BUBBLE_MAX_RATIO = 0.85
+const TEXTAREA_MIN_HEIGHT = 72
+const TEXTAREA_MAX_HEIGHT = 200
 
-// ── Pretext shrink-wrap ────────────────────────────────────────────────────
+let msgIdCounter = 0
 
-/**
- * Binary-search for the minimum wrap width that produces the same number of
- * lines as `maxWidth`, then return the max line width at that minimum width.
- * Mirrors findTightWrapMetrics from the pretext bubbles demo.
- */
+function newId() {
+  msgIdCounter += 1
+  return `m${msgIdCounter}`
+}
+
 function findTightBubbleWidth(prepared: PreparedTextWithSegments, maxWidth: number): number {
   if (maxWidth <= 0) return 0
   const targetLineCount = layout(prepared, maxWidth, LINE_HEIGHT).lineCount
@@ -63,90 +80,224 @@ function findTightBubbleWidth(prepared: PreparedTextWithSegments, maxWidth: numb
   let hi = Math.ceil(maxWidth)
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2)
-    if (layout(prepared, mid, LINE_HEIGHT).lineCount <= targetLineCount) {
-      hi = mid
-    } else {
-      lo = mid + 1
-    }
+    if (layout(prepared, mid, LINE_HEIGHT).lineCount <= targetLineCount) hi = mid
+    else lo = mid + 1
   }
 
   let maxLineWidth = 0
-  walkLineRanges(prepared, lo, line => { if (line.width > maxLineWidth) maxLineWidth = line.width })
-
+  walkLineRanges(prepared, lo, line => {
+    if (line.width > maxLineWidth) maxLineWidth = line.width
+  })
   return Math.ceil(maxLineWidth) + PADDING_H * 2
 }
 
-/** Content width limit for a bubble given current sidebar width */
 function bubbleContentMax(sidebarWidth: number): number {
   return Math.floor(sidebarWidth * BUBBLE_MAX_RATIO) - PADDING_H * 2
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+function truncateTitle(title: string, maxLength = 20) {
+  return title.length > maxLength ? `${title.slice(0, maxLength)}...` : title
+}
 
-let msgIdCounter = 0
-function newId() { return `m${++msgIdCounter}` }
+function formatConversationTime(value: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
 
-function mkMsg(role: 'user' | 'ai', text = ''): Message {
-  return { id: newId(), role, text, thinking: '', isThinkingExpanded: false, toolCalls: [], streaming: false, tightWidth: 0 }
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const yesterday = new Date(today)
+  yesterday.setDate(today.getDate() - 1)
+  const targetDay = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+
+  if (targetDay.getTime() === today.getTime()) return `今天${time}`
+  if (targetDay.getTime() === yesterday.getTime()) return `昨天${time}`
+  return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
 function fmtToolCall(tc: ToolCallResult): string {
-  const short = Object.entries(tc.params).map(([k, v]) => {
-    const vs = typeof v === 'string' ? v : JSON.stringify(v)
-    return `${k}=${vs}`
-  }).join(', ')
+  const short = Object.entries(tc.params)
+    .map(([k, v]) => {
+      const vs = typeof v === 'string' ? v : JSON.stringify(v)
+      return `${k}=${vs}`
+    })
+    .join(', ')
   return `${tc.name}(${short})`
 }
 
-// ── Component ──────────────────────────────────────────────────────────────
+function toHtml(markdown: string) {
+  const parsed = marked.parse(markdown)
+  return typeof parsed === 'string' ? parsed : markdown
+}
 
-export default function AISidebar({ view, onClose }: Props) {
-  const [messages, setMessages] = useState<Message[]>(() => {
-    const welcomeText = '你好！我是 AI 排版助手 🤖\n\n示例指令：\n• 帮我排成公文格式\n• 正文宋体小四号，首行缩进2字符\n• 插入3行4列表格\n• 标题居中加粗'
-    const m = mkMsg('ai', welcomeText)
-    try {
-      const prepared = prepareWithSegments(welcomeText, FONT)
-      m.prepared = prepared
-      m.tightWidth = findTightBubbleWidth(prepared, bubbleContentMax(SIDEBAR_DEFAULT))
-    } catch { /* canvas may not be ready; resize effect will pick it up */ }
-    return [m]
-  })
+function normalizeToolParams(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value))
+    : {}
+}
+
+function makeUserMessage(text: string, sidebarWidth: number): Message {
+  const message: Message = {
+    id: newId(),
+    role: 'user',
+    text,
+    thinking: '',
+    isThinkingExpanded: false,
+    toolCalls: [],
+    streaming: false,
+    tightWidth: 0,
+  }
+
+  try {
+    const prepared = prepareWithSegments(text || ' ', FONT)
+    message.prepared = prepared
+    message.tightWidth = findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth))
+  } catch {
+    // Canvas may be unavailable briefly; CSS max-width is the fallback.
+  }
+
+  return message
+}
+
+function makeAiMessage(text = '', streaming = false): Message {
+  return {
+    id: newId(),
+    role: 'ai',
+    text,
+    thinking: '',
+    isThinkingExpanded: false,
+    toolCalls: [],
+    streaming,
+    tightWidth: 0,
+  }
+}
+
+function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Message[] {
+  return messages.map(msg =>
+    msg.role === 'user'
+      ? makeUserMessage(msg.content, sidebarWidth)
+      : makeAiMessage(msg.content, false),
+  )
+}
+
+function toChatHistory(messages: Message[]) {
+  return messages
+    .filter(message => message.role === 'user' || message.text.trim())
+    .map(message => ({
+      role: message.role === 'user' ? 'user' : 'assistant',
+      content: message.text,
+    }))
+}
+
+function buildErrorText(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  return `❌ 请求失败：${message}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
+}
+
+function makeConversationTitle(text: string) {
+  return text.trim().slice(0, 30) || '新会话'
+}
+
+export default function AISidebar({ view: editorView, onClose }: Props) {
+  const [viewMode, setViewMode] = useState<View>('history')
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null)
+  const [currentConversationTitle, setCurrentConversationTitle] = useState('')
+  const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const isDragging = useRef(false)
+  const messagesRef = useRef<Message[]>([])
+  const currentConversationIdRef = useRef<string | null>(null)
 
-  // History for multi-turn context (user + ai text messages)
-  const historyRef = useRef<Array<{ role: string; content: string }>>([])
-
-  // ── Auto-scroll ──────────────────────────────────────────────────────────
   useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
+
+  useEffect(() => {
+    currentConversationIdRef.current = currentConversationId
+  }, [currentConversationId])
+
+  const autoResize = useCallback((el: HTMLTextAreaElement) => {
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, TEXTAREA_MIN_HEIGHT), TEXTAREA_MAX_HEIGHT)}px`
+  }, [])
+
+  const resetTextareaHeight = useCallback(() => {
+    if (!textareaRef.current) return
+    textareaRef.current.style.height = `${TEXTAREA_MIN_HEIGHT}px`
+  }, [])
+
+  const getContext = useCallback(() => {
+    if (!editorView) return {}
+    let paragraphCount = 0
+    let wordCount = 0
+    editorView.state.doc.forEach(node => {
+      if (node.type.name === 'paragraph') {
+        paragraphCount += 1
+        wordCount += node.textContent.length
+      }
+    })
+    return { paragraphCount, wordCount, pageCount: 1 }
+  }, [editorView])
+
+  const loadConversations = useCallback(async () => {
+    setHistoryLoading(true)
+    try {
+      const response = await fetch('/api/conversations')
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const data = (await response.json()) as ConversationSummary[]
+      setConversations(data)
+    } catch (error) {
+      console.error('[AISidebar] load conversations failed', error)
+      setConversations([])
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadConversations()
+  }, [loadConversations])
+
+  useEffect(() => {
+    if (viewMode !== 'chat') return
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, loading])
+  }, [messages, loading, askContinue, viewMode])
 
-  // ── Recompute tight widths on sidebar resize ──────────────────────────────
   useEffect(() => {
-    const contentMax = bubbleContentMax(sidebarWidth)
-    setMessages(prev => prev.map(m => {
-      if (m.streaming || !m.prepared) return m
-      const tw = findTightBubbleWidth(m.prepared, contentMax)
-      return tw !== m.tightWidth ? { ...m, tightWidth: tw } : m
-    }))
+    setMessages(prev =>
+      prev.map(message => {
+        if (message.role !== 'user' || message.streaming || !message.prepared) return message
+        const tightWidth = findTightBubbleWidth(message.prepared, bubbleContentMax(sidebarWidth))
+        return tightWidth !== message.tightWidth ? { ...message, tightWidth } : message
+      }),
+    )
   }, [sidebarWidth])
 
-  // ── Drag-resize handle ────────────────────────────────────────────────────
-  const onDragStart = useCallback((e: React.MouseEvent) => {
-    e.preventDefault()
+  useEffect(() => {
+    resetTextareaHeight()
+    if (textareaRef.current) autoResize(textareaRef.current)
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }, [viewMode, autoResize, resetTextareaHeight])
+
+  const onDragStart = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
     isDragging.current = true
-    const handleMove = (ev: MouseEvent) => {
+
+    const handleMove = (moveEvent: MouseEvent) => {
       if (!isDragging.current) return
-      setSidebarWidth(Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - ev.clientX)))
+      setSidebarWidth(Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - moveEvent.clientX)))
     }
+
     const handleUp = () => {
       isDragging.current = false
       document.removeEventListener('mousemove', handleMove)
@@ -154,362 +305,462 @@ export default function AISidebar({ view, onClose }: Props) {
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
     }
+
     document.body.style.cursor = 'col-resize'
     document.body.style.userSelect = 'none'
     document.addEventListener('mousemove', handleMove)
     document.addEventListener('mouseup', handleUp)
   }, [])
 
-  // ── Textarea auto-resize ──────────────────────────────────────────────────
-  function autoResize(el: HTMLTextAreaElement) {
-    el.style.height = 'auto'
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px'
-  }
+  const openConversation = useCallback(async (conversationId: string) => {
+    if (loading) return
+    setAskContinue({ visible: false, rounds: 0, message: '' })
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}`)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const data = (await response.json()) as ConversationDetail
+      setCurrentConversationId(data.id)
+      setCurrentConversationTitle(data.title || '新会话')
+      setMessages(fromStoredMessages(data.messages ?? [], sidebarWidth))
+      setViewMode('chat')
+    } catch (error) {
+      console.error('[AISidebar] open conversation failed', error)
+    }
+  }, [loading, sidebarWidth])
 
-  // ── Doc context ───────────────────────────────────────────────────────────
-  function getContext() {
-    if (!view) return {}
-    let paragraphCount = 0, wordCount = 0
-    view.state.doc.forEach(n => {
-      if (n.type.name === 'paragraph') { paragraphCount++; wordCount += n.textContent.length }
-    })
-    return { paragraphCount, wordCount, pageCount: 1 }
-  }
+  const deleteConversation = useCallback(async (conversationId: string) => {
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      setConversations(prev => prev.filter(conversation => conversation.id !== conversationId))
+      if (currentConversationIdRef.current === conversationId) {
+        setCurrentConversationId(null)
+        setCurrentConversationTitle('')
+        setMessages([])
+        setAskContinue({ visible: false, rounds: 0, message: '' })
+      }
+    } catch (error) {
+      console.error('[AISidebar] delete conversation failed', error)
+    }
+  }, [])
 
-  // ── SSE send ──────────────────────────────────────────────────────────────
-  async function handleSend(overrideText?: string) {
+  const handleCancel = useCallback(() => {
+    abortRef.current?.abort()
+  }, [])
+
+  const handleSend = useCallback(async (overrideText?: string) => {
     const text = (overrideText ?? input).trim()
     if (!text || loading) return
 
+    const shouldStartNewConversation = viewMode === 'history'
+    const nextTitle = makeConversationTitle(text)
+    const previousMessages = shouldStartNewConversation ? [] : messagesRef.current
+    const userMessage = makeUserMessage(text, sidebarWidth)
+    const aiMessage = makeAiMessage('', true)
+
     setAskContinue({ visible: false, rounds: 0, message: '' })
     setInput('')
-    if (textareaRef.current) { textareaRef.current.style.height = 'auto' }
+    resetTextareaHeight()
 
-    const userMsg = mkMsg('user', text)
-    // Pre-compute tight width for user bubble
-    try {
-      const prepared = prepareWithSegments(text, FONT)
-      userMsg.prepared = prepared
-      userMsg.tightWidth = findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth))
-    } catch { /* fallback to CSS max-width */ }
-    setMessages(prev => [...prev, userMsg].slice(-MAX_HISTORY))
-    historyRef.current.push({ role: 'user', content: text })
-
-    const aiMsg = mkMsg('ai')
-    aiMsg.streaming = true
-    setMessages(prev => [...prev, aiMsg].slice(-MAX_HISTORY))
+    if (shouldStartNewConversation) {
+      setCurrentConversationId(null)
+      setCurrentConversationTitle(nextTitle)
+      setMessages([userMessage, aiMessage])
+      setViewMode('chat')
+    } else {
+      setMessages(prev => [...prev, userMessage, aiMessage])
+    }
 
     setLoading(true)
-    abortRef.current = new AbortController()
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    const updateMessage = (updater: (message: Message) => Message) => {
+      setMessages(prev => prev.map(message => (message.id === aiMessage.id ? updater(message) : message)))
+    }
+
+    let conversationId = shouldStartNewConversation ? null : currentConversationIdRef.current
 
     try {
-      const res = await fetch('/api/ai/react/stream', {
+      if (!conversationId) {
+        const createResponse = await fetch('/api/conversations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: nextTitle }),
+        })
+        if (!createResponse.ok) throw new Error(`HTTP ${createResponse.status}`)
+        const created = (await createResponse.json()) as { id: string }
+        conversationId = created.id
+        currentConversationIdRef.current = created.id
+        setCurrentConversationId(created.id)
+        setCurrentConversationTitle(nextTitle)
+        void loadConversations()
+      }
+
+      const response = await fetch('/api/ai/react/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        signal: abortRef.current.signal,
+        signal: controller.signal,
         body: JSON.stringify({
           message: text,
-          history: historyRef.current.slice(-20),
+          history: toChatHistory(previousMessages).slice(-20),
           context: getContext(),
+          conversationId,
         }),
       })
 
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
 
-      const reader = res.body.getReader()
+      const reader = response.body.getReader()
       const decoder = new TextDecoder()
-      let buf = ''
-
-      const updateMsg = (updater: (m: Message) => Message) => {
-        setMessages(prev => prev.map(m => m.id === aiMsg.id ? updater(m) : m))
-      }
+      let buffer = ''
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? ''
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
           let event: Record<string, unknown>
-          try { event = JSON.parse(line.slice(6)) } catch { continue }
+          try {
+            event = JSON.parse(line.slice(6)) as Record<string, unknown>
+          } catch {
+            continue
+          }
 
           switch (event.type) {
             case 'thinking':
-              updateMsg(m => ({ ...m, thinking: m.thinking + (event.content as string) }))
+              updateMessage(message => ({ ...message, thinking: message.thinking + String(event.content ?? '') }))
               break
 
             case 'content':
-              updateMsg(m => ({ ...m, text: m.text + (event.content as string) }))
+              updateMessage(message => ({ ...message, text: message.text + String(event.content ?? '') }))
               break
 
             case 'tool_call': {
-              const tc: ToolCallResult = {
-                id: event.id as string | undefined,
-                name: event.name as string,
-                params: (event.params ?? {}) as Record<string, unknown>,
+              const toolCall: ToolCallResult = {
+                id: typeof event.id === 'string' ? event.id : undefined,
+                name: String(event.name ?? ''),
+                params: normalizeToolParams(event.params),
                 status: 'pending',
               }
-              // Execute tool on editor
-              if (view) {
+              if (editorView) {
                 try {
-                  executeTool(view, tc.name, tc.params)
-                  tc.status = 'ok'
-                } catch (e) {
-                  console.error('[AISidebar] tool error', tc.name, e)
-                  tc.status = 'err'
+                  executeTool(editorView, toolCall.name, toolCall.params)
+                  toolCall.status = 'ok'
+                } catch (error) {
+                  console.error('[AISidebar] tool error', toolCall.name, error)
+                  toolCall.status = 'err'
                 }
               }
-              updateMsg(m => ({ ...m, toolCalls: [...m.toolCalls, tc] }))
+              updateMessage(message => ({ ...message, toolCalls: [...message.toolCalls, toolCall] }))
               break
             }
 
             case 'done':
-              updateMsg(m => {
-                const contentMax = bubbleContentMax(sidebarWidth)
-                try {
-                  const prepared = prepareWithSegments(m.text || ' ', FONT)
-                  const tw = findTightBubbleWidth(prepared, contentMax)
-                  return { ...m, streaming: false, prepared, tightWidth: tw }
-                } catch {
-                  return { ...m, streaming: false }
-                }
-              })
+              updateMessage(message => ({ ...message, streaming: false }))
               break
 
             case 'ask_continue':
               setAskContinue({
                 visible: true,
-                rounds: event.rounds as number,
-                message: event.message as string,
+                rounds: Number(event.rounds ?? 0),
+                message: String(event.message ?? ''),
               })
-              updateMsg(m => {
-                try {
-                  const prepared = prepareWithSegments(m.text || ' ', FONT)
-                  const tw = findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth))
-                  return { ...m, streaming: false, prepared, tightWidth: tw }
-                } catch {
-                  return { ...m, streaming: false }
-                }
-              })
+              updateMessage(message => ({ ...message, streaming: false }))
               break
 
             case 'error':
-              updateMsg(m => ({
-                ...m,
-                text: m.text + `\n❌ ${event.message as string}`,
+              updateMessage(message => ({
+                ...message,
+                text: message.text + `\n❌ ${String(event.message ?? '')}`,
                 streaming: false,
               }))
               break
 
             case 'round':
-              // Could show round indicator; skip for now
               break
           }
         }
       }
-    } catch (e) {
-      if ((e as Error).name === 'AbortError') {
-        setMessages(prev => prev.map(m => {
-          if (m.id !== aiMsg.id) return m
-          const finalText = m.text || '（已取消）'
-          try {
-            const prepared = prepareWithSegments(finalText, FONT)
-            return { ...m, text: finalText, streaming: false, prepared, tightWidth: findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth)) }
-          } catch { return { ...m, text: finalText, streaming: false } }
-        }))
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        setMessages(prev =>
+          prev.map(message =>
+            message.id === aiMessage.id
+              ? { ...message, text: message.text || '（已取消）', streaming: false }
+              : message,
+          ),
+        )
       } else {
-        const msg = e instanceof Error ? e.message : String(e)
-        const errText = `❌ 请求失败：${msg}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
-        setMessages(prev => prev.map(m => {
-          if (m.id !== aiMsg.id) return m
-          try {
-            const prepared = prepareWithSegments(errText, FONT)
-            return { ...m, text: errText, streaming: false, prepared, tightWidth: findTightBubbleWidth(prepared, bubbleContentMax(sidebarWidth)) }
-          } catch { return { ...m, text: errText, streaming: false } }
-        }))
+        const errorText = buildErrorText(error)
+        setMessages(prev =>
+          prev.map(message =>
+            message.id === aiMessage.id
+              ? { ...message, text: errorText, streaming: false }
+              : message,
+          ),
+        )
       }
     } finally {
       setLoading(false)
       abortRef.current = null
-      // Update history with AI response
-      setMessages(prev => {
-        const last = prev.find(m => m.id === aiMsg.id)
-        if (last?.text) historyRef.current.push({ role: 'assistant', content: last.text })
-        return prev
-      })
+      void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }
+  }, [editorView, getContext, input, loadConversations, loading, resetTextareaHeight, sidebarWidth, viewMode])
 
-  function handleCancel() {
-    abortRef.current?.abort()
-  }
+  const historyEmpty = !historyLoading && conversations.length === 0
 
-  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div
-      className="flex flex-col bg-white border-l border-gray-200 shadow-lg relative flex-shrink-0"
+      className="relative flex flex-col flex-shrink-0 bg-white border-l border-gray-200 shadow-lg"
       style={{ width: sidebarWidth }}
     >
-      {/* Drag handle */}
       <div
         onMouseDown={onDragStart}
-        className="absolute left-0 top-0 bottom-0 w-1 hover:bg-blue-400 active:bg-blue-500 cursor-col-resize z-10 transition-colors"
+        className="absolute left-0 top-0 bottom-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-blue-400 active:bg-blue-500"
         style={{ touchAction: 'none' }}
       />
 
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
-        <div className="flex items-center gap-1.5 min-w-0">
-          <span className="text-sm">🤖</span>
-          <span className="font-semibold text-sm truncate">AI 排版助手</span>
+      {viewMode === 'history' ? (
+        <div className="flex items-center justify-between px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
+          <div className="min-w-0">
+            <span className="font-semibold text-sm truncate">🤖 AI 排版助手</span>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
+            title="关闭侧边栏"
+          >
+            ×
+          </button>
         </div>
-        <button
-          onClick={onClose}
-          className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
-          title="关闭侧边栏"
-        >×</button>
-      </div>
+      ) : (
+        <div className="flex items-center gap-2 px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
+          <button
+            onClick={() => {
+              setViewMode('history')
+              setAskContinue({ visible: false, rounds: 0, message: '' })
+            }}
+            className="px-1.5 py-0.5 rounded hover:bg-blue-500 text-sm flex-shrink-0"
+            title="返回会话历史"
+          >
+            ←
+          </button>
+          <div className="min-w-0 flex-1 font-semibold text-sm truncate">{currentConversationTitle || '新会话'}</div>
+          <button
+            onClick={onClose}
+            className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
+            title="关闭侧边栏"
+          >
+            ×
+          </button>
+        </div>
+      )}
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3 min-h-0">
-        {messages.map((m) => (
-          <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            {m.role === 'user' ? (
-              <div
-                className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
-                style={{
-                  // tightWidth already includes PADDING_H*2; fall back to CSS max-width
-                  width: m.tightWidth > 0 ? m.tightWidth : undefined,
-                  maxWidth: m.tightWidth > 0 ? undefined : '85%',
-                  wordBreak: 'break-word',
-                  whiteSpace: 'pre-wrap',
-                  paddingTop: PADDING_V,
-                  paddingBottom: PADDING_V,
-                }}
-              >
-                {m.text}
-              </div>
-            ) : (
-              <div className="max-w-[95%] space-y-1.5 min-w-0">
-                {/* Thinking section */}
-                {m.thinking && (
-                  <div className="border border-gray-200 rounded-lg overflow-hidden text-xs">
-                    <button
-                      className="w-full flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-50 hover:bg-gray-100 text-gray-500 text-left"
-                      onClick={() => setMessages(prev => prev.map(msg =>
-                        msg.id === m.id ? { ...msg, isThinkingExpanded: !msg.isThinkingExpanded } : msg
-                      ))}
-                    >
-                      <span className="flex-shrink-0">{m.isThinkingExpanded ? '▼' : '▶'}</span>
-                      <span>思考过程</span>
-                      {m.streaming && m.thinking && (
-                        <span className="ml-auto animate-pulse text-blue-400">思考中…</span>
-                      )}
-                    </button>
-                    {m.isThinkingExpanded && (
-                      <div
-                        className="px-3 py-2 text-gray-600 bg-white border-t border-gray-100 max-h-48 overflow-y-auto"
-                        style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}
-                      >
-                        {m.thinking}
-                      </div>
-                    )}
-                  </div>
-                )}
+      <div className="flex-1 overflow-y-auto min-h-0 p-3">
+        {viewMode === 'history' ? (
+          historyEmpty ? (
+            <div className="h-full flex items-center justify-center text-sm text-gray-400">
+              暂无会话，输入指令开始
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {historyLoading && conversations.length === 0 && (
+                <div className="text-sm text-gray-400 text-center py-8">加载中...</div>
+              )}
+              {conversations.map(conversation => (
+                <div
+                  key={conversation.id}
+                  className="group w-full flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-left hover:border-blue-300 hover:bg-blue-50 transition-colors"
+                >
+                  <button
+                    type="button"
+                    onClick={() => void openConversation(conversation.id)}
+                    className="min-w-0 flex-1"
+                  >
+                    <div className="text-sm text-gray-800 truncate">{truncateTitle(conversation.title || '新会话')}</div>
+                    <div className="text-xs text-gray-400 mt-0.5">{formatConversationTime(conversation.updatedAt || conversation.createdAt)}</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void deleteConversation(conversation.id)}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-red-500 text-sm flex-shrink-0"
+                    title="删除会话"
+                  >
+                    🗑
+                  </button>
+                </div>
+              ))}
+            </div>
+          )
+        ) : (
+          <div className="space-y-3">
+            {messages.length === 0 && (
+              <div className="text-sm text-gray-400 text-center py-8">开始一段新的排版对话</div>
+            )}
 
-                {/* AI text bubble */}
-                {(m.text || m.streaming) && (
+            {messages.map(message => (
+              <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                {message.role === 'user' ? (
                   <div
-                    className="bg-gray-100 text-gray-800 rounded-2xl rounded-tl-sm px-3 py-2 text-sm"
+                    className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
                     style={{
-                      width: m.tightWidth > 0 ? m.tightWidth : undefined,
-                      maxWidth: m.tightWidth > 0 ? undefined : '95%',
+                      width: message.tightWidth > 0 ? message.tightWidth : undefined,
+                      maxWidth: message.tightWidth > 0 ? undefined : '85%',
                       wordBreak: 'break-word',
                       whiteSpace: 'pre-wrap',
                       paddingTop: PADDING_V,
                       paddingBottom: PADDING_V,
                     }}
                   >
-                    {m.text}
-                    {m.streaming && (
-                      <span
-                        className="inline-block w-0.5 h-4 bg-gray-600 ml-0.5 align-middle"
-                        style={{ animation: 'blink 1s step-end infinite' }}
-                      />
+                    {message.text}
+                  </div>
+                ) : (
+                  <div className="w-full min-w-0 space-y-1.5">
+                    {message.thinking && (
+                      <div className="border border-gray-200 rounded-lg overflow-hidden text-xs">
+                        <button
+                          className="w-full flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-50 hover:bg-gray-100 text-gray-500 text-left"
+                          onClick={() => {
+                            setMessages(prev =>
+                              prev.map(item =>
+                                item.id === message.id
+                                  ? { ...item, isThinkingExpanded: !item.isThinkingExpanded }
+                                  : item,
+                              ),
+                            )
+                          }}
+                        >
+                          <span className="flex-shrink-0">{message.isThinkingExpanded ? '▼' : '▶'}</span>
+                          <span>思考过程</span>
+                          {message.streaming && (
+                            <span className="ml-auto animate-pulse text-blue-400">思考中…</span>
+                          )}
+                        </button>
+                        {message.isThinkingExpanded && (
+                          <div
+                            className="px-3 py-2 text-gray-600 bg-white border-t border-gray-100 max-h-48 overflow-y-auto"
+                            style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}
+                          >
+                            {message.thinking}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {(message.text || message.streaming) && (
+                      message.streaming ? (
+                        <div
+                          className="w-full text-sm text-gray-800 leading-6"
+                          style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+                        >
+                          {message.text}
+                          <span
+                            className="inline-block w-0.5 h-4 bg-gray-600 ml-0.5 align-middle"
+                            style={{ animation: 'blink 1s step-end infinite' }}
+                          />
+                        </div>
+                      ) : (
+                        <div
+                          className="ai-markdown w-full text-sm text-gray-800 leading-6"
+                          dangerouslySetInnerHTML={{ __html: toHtml(message.text) }}
+                        />
+                      )
+                    )}
+
+                    {message.toolCalls.length > 0 && (
+                      <div className="bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 space-y-1">
+                        {message.toolCalls.map((toolCall, index) => (
+                          <div
+                            key={`${toolCall.id ?? toolCall.name}-${index}`}
+                            className={`flex items-start gap-1.5 text-xs font-mono ${
+                              toolCall.status === 'ok'
+                                ? 'text-green-700'
+                                : toolCall.status === 'err'
+                                  ? 'text-red-600'
+                                  : 'text-gray-400'
+                            }`}
+                          >
+                            <span className="flex-shrink-0">
+                              {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
+                            </span>
+                            <span className="break-all">{fmtToolCall(toolCall)}</span>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
                 )}
+              </div>
+            ))}
 
-                {/* Tool calls */}
-                {m.toolCalls.length > 0 && (
-                  <div className="bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 space-y-1">
-                    {m.toolCalls.map((tc, j) => (
-                      <div
-                        key={j}
-                        className={`flex items-start gap-1.5 text-xs font-mono ${tc.status === 'ok' ? 'text-green-700' : tc.status === 'err' ? 'text-red-600' : 'text-gray-400'}`}
-                      >
-                        <span className="flex-shrink-0">
-                          {tc.status === 'ok' ? '✅' : tc.status === 'err' ? '❌' : '⏳'}
-                        </span>
-                        <span className="break-all">{fmtToolCall(tc)}</span>
-                      </div>
+            {loading && !messages.find(message => message.streaming) && (
+              <div className="flex justify-start">
+                <div className="rounded-2xl rounded-tl-sm px-3 py-2 bg-gray-100">
+                  <span className="inline-flex gap-1">
+                    {[0, 150, 300].map(delay => (
+                      <span
+                        key={delay}
+                        className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce"
+                        style={{ animationDelay: `${delay}ms` }}
+                      />
                     ))}
-                  </div>
-                )}
+                  </span>
+                </div>
               </div>
             )}
-          </div>
-        ))}
 
-        {/* Loading dots */}
-        {loading && !messages.find(m => m.streaming) && (
-          <div className="flex justify-start">
-            <div className="bg-gray-100 rounded-2xl rounded-tl-sm px-3 py-2">
-              <span className="inline-flex gap-1">
-                {[0, 150, 300].map(d => (
-                  <span key={d} className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />
-                ))}
-              </span>
-            </div>
-          </div>
-        )}
+            {askContinue.visible && (
+              <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2.5 space-y-2 text-sm">
+                <p className="text-yellow-800 text-xs">{askContinue.message}</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      setAskContinue(state => ({ ...state, visible: false }))
+                      void handleSend('继续执行刚才的操作')
+                    }}
+                    className="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white text-xs rounded-lg"
+                  >
+                    ✅ 继续执行
+                  </button>
+                  <button
+                    onClick={() => setAskContinue(state => ({ ...state, visible: false }))}
+                    className="px-3 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs rounded-lg"
+                  >
+                    ⏹ 停止
+                  </button>
+                </div>
+              </div>
+            )}
 
-        {/* Ask-continue confirmation */}
-        {askContinue.visible && (
-          <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2.5 space-y-2 text-sm">
-            <p className="text-yellow-800 text-xs">{askContinue.message}</p>
-            <div className="flex gap-2">
-              <button
-                onClick={() => { setAskContinue(s => ({ ...s, visible: false })); handleSend('继续执行刚才的操作') }}
-                className="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white text-xs rounded-lg"
-              >✅ 继续执行</button>
-              <button
-                onClick={() => setAskContinue(s => ({ ...s, visible: false }))}
-                className="px-3 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs rounded-lg"
-              >⏹ 停止</button>
-            </div>
+            <div ref={bottomRef} />
           </div>
         )}
-
-        <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
       <div className="border-t border-gray-200 p-2 flex gap-1.5 items-end flex-shrink-0">
         <textarea
           ref={textareaRef}
           className="flex-1 text-sm border border-gray-300 rounded-xl px-2.5 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
-          rows={1}
-          placeholder="输入排版指令… (Enter 发送)"
+          rows={3}
+          placeholder={viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…'}
           value={input}
-          style={{ minHeight: 36, maxHeight: 200, resize: 'none', overflowY: 'auto' }}
-          onChange={e => { setInput(e.target.value); autoResize(e.target) }}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+          style={{ minHeight: '72px', maxHeight: '200px', resize: 'none', overflowY: 'auto' }}
+          onChange={event => {
+            setInput(event.target.value)
+            autoResize(event.target)
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              void handleSend()
+            }
           }}
           disabled={loading}
         />
@@ -518,19 +769,22 @@ export default function AISidebar({ view, onClose }: Props) {
             onClick={handleCancel}
             className="px-2.5 py-1.5 bg-red-400 hover:bg-red-500 text-white text-xs rounded-xl flex-shrink-0 whitespace-nowrap"
             title="取消"
-          >⏹</button>
+          >
+            ⏹
+          </button>
         ) : (
           <button
-            onClick={() => handleSend()}
+            onClick={() => void handleSend()}
             disabled={!input.trim()}
             className="px-2.5 py-1.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm rounded-xl flex-shrink-0 transition-colors"
             title="发送 (Enter)"
-          >↵</button>
+          >
+            ↵
+          </button>
         )}
       </div>
 
-      {/* Blinking cursor CSS */}
-      <style>{`@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }`}</style>
+      <style>{'@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }'}</style>
     </div>
   )
 }

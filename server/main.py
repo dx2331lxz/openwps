@@ -5,6 +5,8 @@ openwps 后端服务 - Python FastAPI
 """
 import json
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 
@@ -26,6 +28,9 @@ app.add_middleware(
 
 CONFIG_PATH = Path(__file__).parent / "config" / "ai.json"
 CONFIG_PATH.parent.mkdir(exist_ok=True)
+
+CONVERSATIONS_DIR = Path(__file__).parent / "data" / "conversations"
+CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
     "endpoint": "https://api.siliconflow.cn/v1",
@@ -198,11 +203,51 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     context: dict = {}
+    conversationId: Optional[str] = None
 
 class SettingsUpdate(BaseModel):
     endpoint: Optional[str] = None
     apiKey: Optional[str] = None
     model: Optional[str] = None
+
+class AppendMessagesRequest(BaseModel):
+    messages: list[ChatMessage]
+
+# ── Conversation helpers ───────────────────────────────────────
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+def conv_path(conv_id: str) -> Path:
+    return CONVERSATIONS_DIR / f"{conv_id}.json"
+
+def read_conversation(conv_id: str) -> dict:
+    p = conv_path(conv_id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def write_conversation(conv: dict) -> None:
+    conv["updatedAt"] = now_iso()
+    conv_path(conv["id"]).write_text(
+        json.dumps(conv, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+def list_conversations() -> list[dict]:
+    convs = []
+    for p in CONVERSATIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            convs.append({
+                "id": data["id"],
+                "title": data.get("title", ""),
+                "createdAt": data.get("createdAt", ""),
+                "updatedAt": data.get("updatedAt", ""),
+            })
+        except Exception:
+            pass
+    convs.sort(key=lambda c: c.get("updatedAt", ""), reverse=True)
+    return convs
 
 # ── Routes ────────────────────────────────────────────────────
 
@@ -229,6 +274,41 @@ def update_settings(body: SettingsUpdate):
     if body.model is not None:
         cfg["model"] = body.model
     write_config(cfg)
+    return {"success": True}
+
+# ── Conversation routes ────────────────────────────────────────
+
+@app.get("/api/conversations")
+def get_conversations():
+    return list_conversations()
+
+@app.post("/api/conversations")
+def create_conversation(body: dict = {}):
+    conv_id = str(uuid.uuid4())
+    title = str(body.get("title", "新会话"))[:30]
+    ts = now_iso()
+    conv = {"id": conv_id, "title": title, "createdAt": ts, "updatedAt": ts, "messages": []}
+    write_conversation(conv)
+    return {"id": conv_id}
+
+@app.get("/api/conversations/{conv_id}")
+def get_conversation(conv_id: str):
+    return read_conversation(conv_id)
+
+@app.post("/api/conversations/{conv_id}/messages")
+def append_messages(conv_id: str, body: AppendMessagesRequest):
+    conv = read_conversation(conv_id)
+    for msg in body.messages:
+        conv["messages"].append({"role": msg.role, "content": msg.content})
+    write_conversation(conv)
+    return {"success": True}
+
+@app.delete("/api/conversations/{conv_id}")
+def delete_conversation(conv_id: str):
+    p = conv_path(conv_id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="会话不存在")
+    p.unlink()
     return {"success": True}
 
 @app.post("/api/ai/chat")
@@ -446,6 +526,19 @@ async def react_stream(body: ChatRequest):
             )
         messages.append({"role": "user", "content": user_content})
 
+        # Persist user message to conversation if provided
+        if body.conversationId:
+            try:
+                p = conv_path(body.conversationId)
+                if p.exists():
+                    conv = json.loads(p.read_text(encoding="utf-8"))
+                    conv["messages"].append({"role": "user", "content": body.message})
+                    write_conversation(conv)
+            except Exception:
+                pass
+
+        final_assistant_content = ""
+
         for round_num in range(1, MAX_REACT_ROUNDS + 1):
             yield sse("round", {"round": round_num, "maxRounds": MAX_REACT_ROUNDS})
 
@@ -459,6 +552,7 @@ async def react_stream(body: ChatRequest):
                     return
                 elif event["type"] == "content":
                     assistant_content += event["content"]
+                    final_assistant_content += event["content"]
                 elif event["type"] == "thinking":
                     assistant_thinking += event["content"]
                 elif event["type"] == "tool_call":
@@ -466,6 +560,15 @@ async def react_stream(body: ChatRequest):
 
             if not round_tool_calls:
                 # No more tool calls → task done
+                if body.conversationId and final_assistant_content:
+                    try:
+                        p = conv_path(body.conversationId)
+                        if p.exists():
+                            conv = json.loads(p.read_text(encoding="utf-8"))
+                            conv["messages"].append({"role": "assistant", "content": final_assistant_content})
+                            write_conversation(conv)
+                    except Exception:
+                        pass
                 yield sse("done", {"reason": "completed", "rounds": round_num})
                 return
 

@@ -1,1 +1,56 @@
 @import "tailwindcss";
+
+/* ── AI message markdown styles ────────────────────────────────────────────── */
+.ai-message-content h1,
+.ai-message-content h2,
+.ai-message-content h3,
+.ai-markdown h1,
+.ai-markdown h2,
+.ai-markdown h3 { font-weight: 600; margin: 8px 0 4px; }
+.ai-message-content h1,
+.ai-markdown h1 { font-size: 1.1em; }
+.ai-message-content h2,
+.ai-markdown h2 { font-size: 1.0em; }
+.ai-message-content h3,
+.ai-markdown h3 { font-size: 0.95em; }
+.ai-message-content code,
+.ai-markdown code {
+  background: #f3f4f6;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+}
+.ai-message-content pre,
+.ai-markdown pre {
+  background: #f3f4f6;
+  padding: 10px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+.ai-message-content pre code,
+.ai-markdown pre code { background: none; padding: 0; }
+.ai-message-content ul,
+.ai-message-content ol,
+.ai-markdown ul,
+.ai-markdown ol { padding-left: 20px; margin: 4px 0; }
+.ai-message-content li,
+.ai-markdown li { margin: 2px 0; }
+.ai-message-content blockquote,
+.ai-markdown blockquote {
+  border-left: 3px solid #d1d5db;
+  padding-left: 8px;
+  color: #6b7280;
+  margin: 4px 0;
+}
+.ai-message-content p,
+.ai-markdown p { margin: 4px 0; }
+.ai-message-content p:first-child,
+.ai-markdown p:first-child { margin-top: 0; }
+.ai-message-content p:last-child,
+.ai-markdown p:last-child { margin-bottom: 0; }
+.ai-message-content strong,
+.ai-markdown strong { font-weight: 600; }
+.ai-message-content a,
+.ai-markdown a { color: #2563eb; text-decoration: underline; }
