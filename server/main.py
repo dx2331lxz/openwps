@@ -13,6 +13,8 @@ from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
 from pydantic import BaseModel
 import httpx
 import uvicorn
@@ -613,6 +615,35 @@ async def react_stream(body: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── 静态文件托管（生产模式：前后端合并单端口）────────────────────────────────
+
+DIST_DIR = Path(__file__).parent.parent / "dist"
+
+if DIST_DIR.exists():
+    # 挂载静态资源（/assets /icons.svg 等）
+    app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
+
+    @app.get("/favicon.svg")
+    async def favicon():
+        return FileResponse(DIST_DIR / "favicon.svg")
+
+    @app.get("/icons.svg")
+    async def icons():
+        return FileResponse(DIST_DIR / "icons.svg")
+
+    # SPA fallback：所有非 API 请求返回 index.html
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        index = DIST_DIR / "index.html"
+        if index.exists():
+            return FileResponse(index)
+        return {"error": "dist 目录不存在，请先执行 npm run build"}
+else:
+    @app.get("/")
+    async def no_dist():
+        return {"message": "dist 目录不存在，请执行 npm run build"}
 
 
 if __name__ == "__main__":
