@@ -20,7 +20,7 @@ interface ToolbarProps {
 
 const defaultTextFmt = {
   bold: false, italic: false, underline: false, strikethrough: false,
-  superscript: false, subscript: false, fontFamily: 'SimSun, 宋体, serif', fontSize: 12,
+  superscript: false, subscript: false, fontFamily: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif', fontSize: 12,
   color: '#000000', backgroundColor: '',
 }
 
@@ -223,6 +223,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
+  const fontSizeOptions = Array.from(new Set([
+    8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72,
+    Number(fmt.text.fontSize),
+  ])).sort((a, b) => a - b)
 
   const btn = (active: boolean) =>
     'px-2 py-1 rounded text-sm font-medium cursor-pointer select-none ' +
@@ -305,13 +309,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         {/* Font size (select, placed first so test can find by index 0) */}
         <select
           title="字号"
-          value={fmt.text.fontSize}
+          value={String(fmt.text.fontSize)}
           style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
           onMouseDown={saveSelection}
           onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
         >
-          {[8,9,10,11,12,14,16,18,20,22,24,26,28,36,48,72].map(v => (
-            <option key={v} value={v}>{v}pt</option>
+          {fontSizeOptions.map(v => (
+            <option key={v} value={String(v)}>{v}pt</option>
           ))}
         </select>
 
@@ -323,10 +327,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           onMouseDown={saveSelection}
           onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
         >
-          <option value="SimSun, 宋体, serif">宋体</option>
-          <option value="SimHei, 黑体, sans-serif">黑体</option>
-          <option value="KaiTi, 楷体, serif">楷体</option>
-          <option value="FangSong, 仿宋, serif">仿宋</option>
+          <option value={'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif'}>宋体</option>
+          <option value={'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif'}>黑体</option>
+          <option value={'KaiTi, 楷体, "Kaiti SC", cursive'}>楷体</option>
+          <option value={'FangSong, 仿宋, STFangsong, serif'}>仿宋</option>
           <option value="Arial, sans-serif">Arial</option>
           <option value="Times New Roman, serif">Times New Roman</option>
         </select>

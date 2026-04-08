@@ -30,7 +30,7 @@ function breakWidgetHeight(usedH: number, cfg: PageConfig): number {
 const PM_STYLES = `
 .ProseMirror {
   outline: none;
-  font-family: SimSun, 完宋体, serif;
+  font-family: SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif;
   font-size: 12pt;
   line-height: 1.5;
   color: #000;

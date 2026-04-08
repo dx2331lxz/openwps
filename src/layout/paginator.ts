@@ -44,8 +44,7 @@ export interface PaginateResult {
   lineBreaks: number[]
 }
 
-const MIN_LINES_AT_PAGE_BOTTOM = 2
-const PRETEXT_LAYOUT_SAFETY_PX = 6
+const PRETEXT_LAYOUT_SAFETY_PX = 2
 
 interface MeasuredBlock {
   lines: LineInfo[]
@@ -60,7 +59,7 @@ function ptToPx(pt: number): number {
 }
 
 function getParagraphTextStyle(paraNode: PMNode) {
-  let fontFamily = 'SimSun, serif'
+  let fontFamily = 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif'
   let fontSize = 12
 
   paraNode.forEach((child) => {
@@ -366,34 +365,7 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
         heightSum = lineNeededHeight(measured, startLineIndex, lastLineIndex)
       }
 
-      const pageHasPreviousContent = currentPage.lines.length > 0
-      const isParagraphStart = startLineIndex === 0
-      const paragraphRemaining = measured.lines.length - startLineIndex
       const remainingAfterFit = measured.lines.length - (startLineIndex + fitCount)
-
-      if (
-        pageHasPreviousContent &&
-        isParagraphStart &&
-        paragraphRemaining > fitCount &&
-        fitCount < MIN_LINES_AT_PAGE_BOTTOM
-      ) {
-        currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
-        continue
-      }
-
-      if (
-        pageHasPreviousContent &&
-        fitCount < MIN_LINES_AT_PAGE_BOTTOM &&
-        paragraphRemaining > fitCount
-      ) {
-        currentPage = pushPageBreak(
-          breaks,
-          pages,
-          currentPage,
-          measured.lines[startLineIndex]!.startPos ?? nodePos
-        )
-        continue
-      }
 
       for (let lineIndex = startLineIndex; lineIndex < startLineIndex + fitCount; lineIndex += 1) {
         currentPage.lines.push(measured.lines[lineIndex]!)

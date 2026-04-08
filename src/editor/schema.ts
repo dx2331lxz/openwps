@@ -24,8 +24,8 @@ export const schema = new Schema({
         if (node.attrs.firstLineIndent) style.push(`text-indent:${node.attrs.firstLineIndent}em`)
         if (node.attrs.indent) style.push(`margin-left:${node.attrs.indent * 2}em`)
         if (node.attrs.lineHeight !== 1.5) style.push(`line-height:${node.attrs.lineHeight}`)
-        if (node.attrs.spaceBefore) style.push(`margin-top:${node.attrs.spaceBefore * 1.5}em`)
-        if (node.attrs.spaceAfter) style.push(`margin-bottom:${node.attrs.spaceAfter * 1.5}em`)
+        if (node.attrs.spaceBefore) style.push(`margin-top:${node.attrs.spaceBefore}pt`)
+        if (node.attrs.spaceAfter) style.push(`margin-bottom:${node.attrs.spaceAfter}pt`)
 
         const cls: string[] = []
         if (node.attrs.listType === 'bullet') cls.push('list-bullet')
@@ -148,7 +148,7 @@ export const schema = new Schema({
   marks: {
     textStyle: {
       attrs: {
-        fontFamily: { default: 'SimSun, 宋体, serif' },
+        fontFamily: { default: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif' },
         fontSize: { default: 12 },
         color: { default: '#000000' },
         backgroundColor: { default: '' },

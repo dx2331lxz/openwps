@@ -62,8 +62,25 @@ interface RawStyle {
 type StyleMap = Record<string, StyleAttrs>
 type RelMap = Record<string, string>
 
+interface ThemeFonts {
+  majorAscii?: string
+  minorAscii?: string
+  majorEastAsia?: string
+  minorEastAsia?: string
+}
+
+interface ParsedStylesResult {
+  styleMap: StyleMap
+  defaultParagraphStyle: StyleAttrs
+}
+
+interface DocumentLayout {
+  pageConfig: PageConfig
+  docGridLinePitchPt: number | null
+}
+
 const DEFAULT_TEXT_STYLE: TextStyleAttrs = {
-  fontFamily: 'SimSun, 宋体, serif',
+  fontFamily: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
   fontSize: 12,
   color: '#000000',
   backgroundColor: '',
@@ -91,16 +108,16 @@ const DEFAULT_PARAGRAPH_ATTRS: ParagraphAttrs = {
 function normalizeFont(name: string): string {
   const trimmed = name.trim()
   const map: Record<string, string> = {
-    '宋体': 'SimSun, 宋体, serif',
-    'SimSun': 'SimSun, 宋体, serif',
-    '黑体': 'SimHei, 黑体, sans-serif',
-    'SimHei': 'SimHei, 黑体, sans-serif',
-    '楷体': 'KaiTi, 楷体, cursive',
-    '楷体_GB2312': 'KaiTi, 楷体, cursive',
-    '仿宋': 'FangSong, 仿宋, serif',
-    '仿宋_GB2312': 'FangSong, 仿宋, serif',
-    '微软雅黑': 'Microsoft YaHei, 微软雅黑, sans-serif',
-    'Microsoft YaHei': 'Microsoft YaHei, 微软雅黑, sans-serif',
+    '宋体': 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
+    'SimSun': 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
+    '黑体': 'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif',
+    'SimHei': 'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif',
+    '楷体': 'KaiTi, 楷体, "Kaiti SC", cursive',
+    '楷体_GB2312': 'KaiTi, 楷体, "Kaiti SC", cursive',
+    '仿宋': 'FangSong, 仿宋, STFangsong, serif',
+    '仿宋_GB2312': 'FangSong, 仿宋, STFangsong, serif',
+    '微软雅黑': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
+    'Microsoft YaHei': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
     'Times New Roman': 'Times New Roman, serif',
     'Arial': 'Arial, sans-serif',
     'Calibri': 'Calibri, Arial, sans-serif',
@@ -113,9 +130,46 @@ function normalizeFont(name: string): string {
   return map[trimmed] ?? trimmed
 }
 
+function resolveThemeFont(themeFonts: ThemeFonts, themeKey: string) {
+  switch (themeKey) {
+    case 'majorEastAsia':
+      return themeFonts.majorEastAsia
+    case 'minorEastAsia':
+      return themeFonts.minorEastAsia
+    case 'majorAscii':
+    case 'majorHAnsi':
+      return themeFonts.majorAscii
+    case 'minorAscii':
+    case 'minorHAnsi':
+      return themeFonts.minorAscii
+    default:
+      return undefined
+  }
+}
+
 function clampLineHeight(value: number, fallback = DEFAULT_PARAGRAPH_ATTRS.lineHeight) {
   if (!Number.isFinite(value)) return fallback
   return Math.min(3, Math.max(1, value))
+}
+
+function parseWordLineHeight(
+  line: number,
+  lineRule: string,
+  baseFontSize: number,
+  docGridLinePitchPt: number | null
+) {
+  if (line <= 0) return DEFAULT_PARAGRAPH_ATTRS.lineHeight
+  if (lineRule === 'auto') return clampLineHeight(line / 240)
+
+  // WPS 文档常把小数值行距和文档网格一起使用。
+  // 对于小于 240 的值，优先按半磅解释；若启用了行网格，则至少对齐到网格节距。
+  const linePt = line < 240 ? halfPtToPt(line) : twipToPt(line)
+  const effectiveLinePt = docGridLinePitchPt != null
+    ? Math.max(linePt, docGridLinePitchPt)
+    : linePt
+  const lineHeight = effectiveLinePt / Math.max(baseFontSize, 1)
+
+  return clampLineHeight(lineHeight)
 }
 
 function twipToPx(value: number) {
@@ -233,7 +287,35 @@ function createTextNode(text: string, attrs: Partial<TextStyleAttrs>): PMNodeJSO
   }
 }
 
-function readParagraphStyle(pPr: Element | undefined, inherited: StyleAttrs): StyleAttrs {
+function parseThemeFonts(themeXml: string): ThemeFonts {
+  if (!themeXml) return {}
+
+  const dom = parseXml(themeXml)
+  const majorFont = findDescendant(dom, 'majorFont')
+  const minorFont = findDescendant(dom, 'minorFont')
+
+  const findScriptFont = (parent: Element | undefined, script: string) =>
+    elementChildren(parent ?? dom).find((child) =>
+      getLocalName(child) === 'font' && getAttr(child, 'script') === script
+    )
+
+  return {
+    majorAscii: getAttr(directChild(majorFont, 'latin'), 'typeface') || undefined,
+    minorAscii: getAttr(directChild(minorFont, 'latin'), 'typeface') || undefined,
+    majorEastAsia: getAttr(findScriptFont(majorFont, 'Hans'), 'typeface')
+      || getAttr(directChild(majorFont, 'ea'), 'typeface')
+      || undefined,
+    minorEastAsia: getAttr(findScriptFont(minorFont, 'Hans'), 'typeface')
+      || getAttr(directChild(minorFont, 'ea'), 'typeface')
+      || undefined,
+  }
+}
+
+function readParagraphStyle(
+  pPr: Element | undefined,
+  inherited: StyleAttrs,
+  docGridLinePitchPt: number | null
+): StyleAttrs {
   if (!pPr) return {}
 
   const alignMap: Record<string, Align> = {
@@ -263,8 +345,9 @@ function readParagraphStyle(pPr: Element | undefined, inherited: StyleAttrs): St
   if (before > 0) attrs.spaceBefore = twipToPt(before)
   if (after > 0) attrs.spaceAfter = twipToPt(after)
   if (line > 0) {
-    if (lineRule === 'auto') attrs.lineHeight = line / 240
-    else attrs.lineHeight = twipToPt(line) / baseFontSize
+    attrs.lineHeight = parseWordLineHeight(line, lineRule, baseFontSize, docGridLinePitchPt)
+  } else if (docGridLinePitchPt != null) {
+    attrs.lineHeight = clampLineHeight(docGridLinePitchPt / Math.max(baseFontSize, 1))
   }
 
   if (truthyElement(directChild(pPr, 'pageBreakBefore'))) attrs.pageBreakBefore = true
@@ -272,12 +355,18 @@ function readParagraphStyle(pPr: Element | undefined, inherited: StyleAttrs): St
   return attrs
 }
 
-function readRunStyle(rPr: Element | undefined, inherited: StyleAttrs): StyleAttrs {
-  if (!rPr) return {}
+function readRunStyle(rPr: Element | undefined, inherited: StyleAttrs, themeFonts: ThemeFonts): StyleAttrs {
+  if (!rPr) return { ...inherited }
 
   const attrs: StyleAttrs = {}
   const fonts = directChild(rPr, 'rFonts')
-  const fontFamily = getAttr(fonts, 'eastAsia') || getAttr(fonts, 'ascii') || getAttr(fonts, 'hAnsi')
+  const fontFamily =
+    getAttr(fonts, 'eastAsia')
+    || getAttr(fonts, 'ascii')
+    || getAttr(fonts, 'hAnsi')
+    || resolveThemeFont(themeFonts, getAttr(fonts, 'eastAsiaTheme'))
+    || resolveThemeFont(themeFonts, getAttr(fonts, 'asciiTheme'))
+    || resolveThemeFont(themeFonts, getAttr(fonts, 'hAnsiTheme'))
   if (fontFamily) attrs.fontFamily = normalizeFont(fontFamily)
 
   const size = parseNumber(getAttr(directChild(rPr, 'sz'), 'val'))
@@ -299,21 +388,42 @@ function readRunStyle(rPr: Element | undefined, inherited: StyleAttrs): StyleAtt
   return { ...inherited, ...attrs }
 }
 
-function parseStyles(stylesXml: string): StyleMap {
+function parseStyleDefaults(stylesXml: string, themeFonts: ThemeFonts): StyleAttrs {
   if (!stylesXml) return {}
 
   const dom = parseXml(stylesXml)
+  const docDefaults = findDescendant(dom, 'docDefaults')
+  const pPrDefault = directChild(directChild(docDefaults, 'pPrDefault'), 'pPr')
+  const rPrDefault = directChild(directChild(docDefaults, 'rPrDefault'), 'rPr')
+  const runDefaults = readRunStyle(rPrDefault, {}, themeFonts)
+  const paragraphDefaults = readParagraphStyle(pPrDefault, runDefaults, null)
+  return { ...runDefaults, ...paragraphDefaults }
+}
+
+function parseStyles(stylesXml: string, themeFonts: ThemeFonts, docDefaults: StyleAttrs): ParsedStylesResult {
+  if (!stylesXml) {
+    return {
+      styleMap: {},
+      defaultParagraphStyle: { ...docDefaults },
+    }
+  }
+
+  const dom = parseXml(stylesXml)
   const rawStyles: Record<string, RawStyle> = {}
+  let defaultParagraphStyleId: string | undefined
 
   for (const styleEl of Array.from(dom.getElementsByTagNameNS(W_NS, 'style'))) {
     const styleId = getAttr(styleEl, 'styleId')
     if (!styleId) continue
+    if (getAttr(styleEl, 'type') === 'paragraph' && getAttr(styleEl, 'default') === '1') {
+      defaultParagraphStyleId = styleId
+    }
 
     const basedOn = getAttr(directChild(styleEl, 'basedOn'), 'val') || undefined
     const pPr = directChild(styleEl, 'pPr')
     const rPr = directChild(styleEl, 'rPr')
-    const runAttrs = readRunStyle(rPr, {})
-    const paraAttrs = readParagraphStyle(pPr, runAttrs)
+    const runAttrs = readRunStyle(rPr, {}, themeFonts)
+    const paraAttrs = readParagraphStyle(pPr, runAttrs, null)
     rawStyles[styleId] = { basedOn, attrs: { ...runAttrs, ...paraAttrs } }
   }
 
@@ -328,10 +438,10 @@ function parseStyles(stylesXml: string): StyleMap {
     const raw = rawStyles[styleId]
     if (!raw) {
       resolving.delete(styleId)
-      return {}
+      return { ...docDefaults }
     }
 
-    const base = raw.basedOn ? resolveStyle(raw.basedOn) : {}
+    const base = raw.basedOn ? resolveStyle(raw.basedOn) : { ...docDefaults }
     const merged = { ...base, ...raw.attrs }
     resolved[styleId] = merged
     resolving.delete(styleId)
@@ -339,7 +449,12 @@ function parseStyles(stylesXml: string): StyleMap {
   }
 
   Object.keys(rawStyles).forEach(resolveStyle)
-  return resolved
+  return {
+    styleMap: resolved,
+    defaultParagraphStyle: defaultParagraphStyleId
+      ? (resolved[defaultParagraphStyleId] ?? { ...docDefaults })
+      : { ...docDefaults },
+  }
 }
 
 function parseRels(relsXml: string): RelMap {
@@ -356,11 +471,12 @@ function parseRels(relsXml: string): RelMap {
   return rels
 }
 
-function parsePageConfig(documentXml: string): PageConfig {
+function parseDocumentLayout(documentXml: string): DocumentLayout {
   const dom = parseXml(documentXml)
   const sectPr = findDescendant(dom, 'sectPr')
   const pgSz = directChild(sectPr, 'pgSz')
   const pgMar = directChild(sectPr, 'pgMar')
+  const docGrid = directChild(sectPr, 'docGrid')
 
   const widthTwip = parseNumber(getAttr(pgSz, 'w'), 11906)
   const heightTwip = parseNumber(getAttr(pgSz, 'h'), 16838)
@@ -368,14 +484,18 @@ function parsePageConfig(documentXml: string): PageConfig {
   const marginBottomTwip = parseNumber(getAttr(pgMar, 'bottom'), 1440)
   const marginLeftTwip = parseNumber(getAttr(pgMar, 'left'), 1800)
   const marginRightTwip = parseNumber(getAttr(pgMar, 'right'), 1800)
+  const linePitchTwip = parseNumber(getAttr(docGrid, 'linePitch'))
 
   return {
-    pageWidth: Math.round(twipToPx(widthTwip)),
-    pageHeight: Math.round(twipToPx(heightTwip)),
-    marginTop: Math.round(twipToPx(marginTopTwip)),
-    marginBottom: Math.round(twipToPx(marginBottomTwip)),
-    marginLeft: Math.round(twipToPx(marginLeftTwip)),
-    marginRight: Math.round(twipToPx(marginRightTwip)),
+    pageConfig: {
+      pageWidth: Math.round(twipToPx(widthTwip)),
+      pageHeight: Math.round(twipToPx(heightTwip)),
+      marginTop: Math.round(twipToPx(marginTopTwip)),
+      marginBottom: Math.round(twipToPx(marginBottomTwip)),
+      marginLeft: Math.round(twipToPx(marginLeftTwip)),
+      marginRight: Math.round(twipToPx(marginRightTwip)),
+    },
+    docGridLinePitchPt: linePitchTwip > 0 ? twipToPt(linePitchTwip) : null,
   }
 }
 
@@ -407,10 +527,21 @@ async function parseImageNode(drawingEl: Element, rels: RelMap, zip: JSZip): Pro
   }
 }
 
-async function parseRunNodes(rEl: Element, styleMap: StyleMap, paragraphStyle: StyleAttrs, rels: RelMap, zip: JSZip): Promise<PMNodeJSON[]> {
+async function parseRunNodes(
+  rEl: Element,
+  styleMap: StyleMap,
+  paragraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  rels: RelMap,
+  zip: JSZip
+): Promise<PMNodeJSON[]> {
   const rPr = directChild(rEl, 'rPr')
   const styleId = getAttr(directChild(rPr, 'rStyle'), 'val')
-  const effectiveStyle = readRunStyle(rPr, { ...paragraphStyle, ...(styleId ? styleMap[styleId] : {}) })
+  const effectiveStyle = readRunStyle(
+    rPr,
+    { ...paragraphStyle, ...(styleId ? styleMap[styleId] : {}) },
+    themeFonts
+  )
 
   const nodes: PMNodeJSON[] = []
   let textBuffer = ''
@@ -447,11 +578,21 @@ async function parseRunNodes(rEl: Element, styleMap: StyleMap, paragraphStyle: S
   return nodes
 }
 
-async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zip: JSZip): Promise<PMNodeJSON> {
+async function parseParagraph(
+  pEl: Element,
+  styleMap: StyleMap,
+  defaultParagraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  rels: RelMap,
+  zip: JSZip
+): Promise<PMNodeJSON> {
   const pPr = directChild(pEl, 'pPr')
   const styleId = getAttr(directChild(pPr, 'pStyle'), 'val')
-  const baseStyle = styleId ? styleMap[styleId] ?? {} : {}
-  const paragraphStyle = { ...baseStyle, ...readParagraphStyle(pPr, baseStyle) }
+  const baseStyle = styleId
+    ? styleMap[styleId] ?? { ...defaultParagraphStyle }
+    : { ...defaultParagraphStyle }
+  const paragraphStyle = { ...baseStyle, ...readParagraphStyle(pPr, baseStyle, docGridLinePitchPt) }
 
   const content: PMNodeJSON[] = []
 
@@ -459,12 +600,12 @@ async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zi
     const localName = getLocalName(child)
     if (localName === 'pPr') continue
     if (localName === 'r') {
-      content.push(...await parseRunNodes(child, styleMap, paragraphStyle, rels, zip))
+      content.push(...await parseRunNodes(child, styleMap, paragraphStyle, themeFonts, rels, zip))
       continue
     }
     if (localName === 'hyperlink') {
       for (const run of directChildren(child, 'r')) {
-        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, rels, zip))
+        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip))
       }
     }
   }
@@ -475,9 +616,7 @@ async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zi
     ...DEFAULT_PARAGRAPH_ATTRS,
     align: paragraphStyle.align ?? DEFAULT_PARAGRAPH_ATTRS.align,
     firstLineIndent: paragraphStyle.firstLineIndent ?? DEFAULT_PARAGRAPH_ATTRS.firstLineIndent,
-    lineHeight: isTrulyEmpty
-      ? clampLineHeight(paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight)
-      : (paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight),
+    lineHeight: clampLineHeight(paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight),
     spaceBefore: paragraphStyle.spaceBefore ?? DEFAULT_PARAGRAPH_ATTRS.spaceBefore,
     spaceAfter: paragraphStyle.spaceAfter ?? DEFAULT_PARAGRAPH_ATTRS.spaceAfter,
     pageBreakBefore: paragraphStyle.pageBreakBefore ?? DEFAULT_PARAGRAPH_ATTRS.pageBreakBefore,
@@ -490,7 +629,16 @@ async function parseParagraph(pEl: Element, styleMap: StyleMap, rels: RelMap, zi
   }
 }
 
-async function parseTableCell(tcEl: Element, isHeader: boolean, styleMap: StyleMap, rels: RelMap, zip: JSZip): Promise<{ node?: PMNodeJSON; colspan: number; continueMerge: boolean }> {
+async function parseTableCell(
+  tcEl: Element,
+  isHeader: boolean,
+  styleMap: StyleMap,
+  defaultParagraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  rels: RelMap,
+  zip: JSZip
+): Promise<{ node?: PMNodeJSON; colspan: number; continueMerge: boolean }> {
   const tcPr = directChild(tcEl, 'tcPr')
   const colspan = Math.max(1, parseNumber(getAttr(directChild(tcPr, 'gridSpan'), 'val'), 1))
   const vMerge = directChild(tcPr, 'vMerge')
@@ -510,7 +658,7 @@ async function parseTableCell(tcEl: Element, isHeader: boolean, styleMap: StyleM
   for (const child of elementChildren(tcEl)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      content.push(await parseParagraph(child, styleMap, rels, zip))
+      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip))
     }
   }
 
@@ -530,7 +678,15 @@ async function parseTableCell(tcEl: Element, isHeader: boolean, styleMap: StyleM
   }
 }
 
-async function parseTable(tblEl: Element, styleMap: StyleMap, rels: RelMap, zip: JSZip): Promise<PMNodeJSON> {
+async function parseTable(
+  tblEl: Element,
+  styleMap: StyleMap,
+  defaultParagraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  rels: RelMap,
+  zip: JSZip
+): Promise<PMNodeJSON> {
   const rows: PMNodeJSON[] = []
   const mergeAnchors = new Map<number, PMNodeJSON>()
 
@@ -541,7 +697,7 @@ async function parseTable(tblEl: Element, styleMap: StyleMap, rels: RelMap, zip:
     let columnIndex = 0
 
     for (const tcEl of directChildren(trEl, 'tc')) {
-      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, rels, zip)
+      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip)
       const colspan = parsedCell.colspan
 
       if (parsedCell.continueMerge) {
@@ -581,7 +737,15 @@ async function parseTable(tblEl: Element, styleMap: StyleMap, rels: RelMap, zip:
   return { type: 'table', content: rows }
 }
 
-async function parseDocument(documentXml: string, styleMap: StyleMap, rels: RelMap, zip: JSZip): Promise<PMNodeJSON> {
+async function parseDocument(
+  documentXml: string,
+  styleMap: StyleMap,
+  defaultParagraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  rels: RelMap,
+  zip: JSZip
+): Promise<PMNodeJSON> {
   const dom = parseXml(documentXml)
   const body = dom.getElementsByTagNameNS(W_NS, 'body')[0]
   const content: PMNodeJSON[] = []
@@ -589,7 +753,7 @@ async function parseDocument(documentXml: string, styleMap: StyleMap, rels: RelM
   for (const child of elementChildren(body)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      const para = await parseParagraph(child, styleMap, rels, zip)
+      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip)
       // 跳过开头的连续空段落
       const isEmpty = !para.content || para.content.length === 0 ||
         para.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
@@ -616,7 +780,7 @@ async function parseDocument(documentXml: string, styleMap: StyleMap, rels: RelM
       continue
     }
     if (localName === 'tbl') {
-      content.push(await parseTable(child, styleMap, rels, zip))
+      content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip))
     }
   }
 
@@ -633,11 +797,22 @@ export async function importDocx(file: File): Promise<DocxImportResult> {
 
   const stylesXml = await zip.file('word/styles.xml')?.async('string') ?? ''
   const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string') ?? ''
+  const themeXml = await zip.file('word/theme/theme1.xml')?.async('string') ?? ''
 
   const rels = parseRels(relsXml)
-  const styleMap = parseStyles(stylesXml)
-  const pageConfig = parsePageConfig(documentXml)
-  const doc = await parseDocument(documentXml, styleMap, rels, zip)
+  const themeFonts = parseThemeFonts(themeXml)
+  const docDefaults = parseStyleDefaults(stylesXml, themeFonts)
+  const { styleMap, defaultParagraphStyle } = parseStyles(stylesXml, themeFonts, docDefaults)
+  const { pageConfig, docGridLinePitchPt } = parseDocumentLayout(documentXml)
+  const doc = await parseDocument(
+    documentXml,
+    styleMap,
+    defaultParagraphStyle,
+    themeFonts,
+    docGridLinePitchPt,
+    rels,
+    zip
+  )
 
   return { doc, pageConfig }
 }
