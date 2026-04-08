@@ -24,12 +24,35 @@ export interface LineInfo {
   blockIndex: number
   lineIndex: number
   lineHeight: number
+  startPos: number | null
 }
 
 export interface PageLayout {
   lines: LineInfo[]
-  /** Actual content height used on this page (≤ contentHeight) */
   totalHeight: number
+}
+
+export interface PageBreakInfo {
+  pos: number
+  pageIndex: number
+  prevPageUsed: number
+}
+
+export interface PaginateResult {
+  pages: PageLayout[]
+  breaks: PageBreakInfo[]
+  lineBreaks: number[]
+}
+
+const MIN_LINES_AT_PAGE_BOTTOM = 2
+const PRETEXT_LAYOUT_SAFETY_PX = 6
+
+interface MeasuredBlock {
+  lines: LineInfo[]
+  totalHeight: number
+  canSplit: boolean
+  spaceBefore: number
+  spaceAfter: number
 }
 
 function ptToPx(pt: number): number {
@@ -42,10 +65,10 @@ function getParagraphTextStyle(paraNode: PMNode) {
 
   paraNode.forEach((child) => {
     if ((child.isText || child.type.name === 'image') && child.marks.length > 0) {
-      const m = child.marks.find((m) => m.type.name === 'textStyle')
-      if (m) {
-        fontFamily = m.attrs.fontFamily || fontFamily
-        fontSize = m.attrs.fontSize || fontSize
+      const mark = child.marks.find((item) => item.type.name === 'textStyle')
+      if (mark) {
+        fontFamily = mark.attrs.fontFamily || fontFamily
+        fontSize = mark.attrs.fontSize || fontSize
       }
     }
   })
@@ -58,12 +81,44 @@ function estimateImageHeight(node: PMNode): number {
   return typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 160
 }
 
+function paragraphHasOnlyTextInlines(paraNode: PMNode): boolean {
+  let ok = true
+  paraNode.forEach((child) => {
+    if (!child.isText) ok = false
+  })
+  return ok
+}
+
+function buildParagraphCharPositions(paraNode: PMNode, paraPos: number, textLength: number): number[] {
+  const positions = new Array<number>(textLength + 1)
+  const contentStart = paraPos + 1
+  let charOffset = 0
+  positions[0] = contentStart
+
+  paraNode.forEach((child, offset) => {
+    if (!child.isText) return
+    const childStart = contentStart + offset
+    const text = child.text ?? ''
+    for (let index = 0; index < text.length; index += 1) {
+      charOffset += 1
+      positions[charOffset] = childStart + index + 1
+    }
+  })
+
+  for (let index = 1; index < positions.length; index += 1) {
+    if (positions[index] == null) positions[index] = positions[index - 1]!
+  }
+
+  return positions
+}
+
 function measureParagraph(
   paraNode: PMNode,
+  paraPos: number,
+  blockIndex: number,
   contentWidth: number
-): { lines: LineInfo[]; totalHeight: number } {
+): MeasuredBlock {
   const { fontFamily, fontSize } = getParagraphTextStyle(paraNode)
-
   const lineHeightMult = (paraNode.attrs.lineHeight as number) ?? 1.5
   const spaceBefore = ptToPx((paraNode.attrs.spaceBefore as number) ?? 0)
   const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
@@ -71,6 +126,7 @@ function measureParagraph(
   const fontSizePx = ptToPx(fontSize)
   let lineHeight = fontSizePx * lineHeightMult
   const fontStr = `${fontSizePx}px ${fontFamily}`
+  const layoutWidth = Math.max(1, contentWidth - PRETEXT_LAYOUT_SAFETY_PX)
   const text = paraNode.textContent
   let maxInlineHeight = lineHeight
 
@@ -79,44 +135,71 @@ function measureParagraph(
   })
   lineHeight = maxInlineHeight
 
-  let rawLines: { text: string }[]
   if (!text.trim()) {
-    rawLines = [{ text: '' }]
-  } else {
-    try {
-      // 在每个字符之间插入零宽空格，让 Pretext 可以在任意位置断行
-      // （等同于 word-break: break-all，防止数字/英文序列把前面中文一起带走）
-      const breakableText = text.split('').join('\u200b')
-      const prepared = prepareWithSegments(breakableText, fontStr)
-      rawLines = layoutWithLines(prepared, contentWidth, lineHeight).lines
-    } catch (err) {
-      console.warn('[paginator] Pretext error, fallback:', err)
-      // 字体未加载时 fallback：用字符数估算行数
-      const charsPerLine = Math.max(1, Math.floor(contentWidth / (fontSizePx * 0.6)))
-      const estimatedLines = Math.ceil(text.length / charsPerLine)
-      rawLines = Array.from({ length: estimatedLines }, (_, i) => ({
-        text: text.slice(i * charsPerLine, (i + 1) * charsPerLine)
-      }))
+    return {
+      canSplit: false,
+      spaceBefore,
+      spaceAfter,
+      lines: [{
+        text: '',
+        blockIndex,
+        lineIndex: 0,
+        lineHeight,
+        startPos: paraPos + 1,
+      }],
+      totalHeight: lineHeight + spaceBefore + spaceAfter,
     }
   }
 
-  const lines: LineInfo[] = rawLines.map((l, li) => ({
-    text: l.text,
-    blockIndex: 0,
-    lineIndex: li,
-    lineHeight,
-  }))
+  let rawLines: { text: string }[]
+  try {
+    // 与编辑器的 word-break: break-all 保持一致，避免长数字/英文串把前面的中文带走。
+    const breakableText = text.split('').join('\u200b')
+    const prepared = prepareWithSegments(breakableText, fontStr, { whiteSpace: 'pre-wrap' })
+    // DOM 与 canvas/font fallback 在边界处仍可能有细微偏差，保守收窄一点版心，
+    // 优先避免“Pretext 认为一行能放下，但浏览器实际又折成两行”的中途裂行。
+    rawLines = layoutWithLines(prepared, layoutWidth, lineHeight).lines
+  } catch (error) {
+    console.warn('[paginator] Pretext error, fallback:', error)
+    const charsPerLine = Math.max(1, Math.floor(layoutWidth / (fontSizePx * 0.6)))
+    const estimatedLines = Math.ceil(text.length / charsPerLine)
+    rawLines = Array.from({ length: estimatedLines }, (_, index) => ({
+      text: text.slice(index * charsPerLine, (index + 1) * charsPerLine),
+    }))
+  }
 
-  const totalHeight = lineHeight * rawLines.length + spaceBefore + spaceAfter
+  const charPositions = paragraphHasOnlyTextInlines(paraNode)
+    ? buildParagraphCharPositions(paraNode, paraPos, text.length)
+    : null
 
-  return { lines, totalHeight }
+  let consumedChars = 0
+  const lines: LineInfo[] = rawLines.map((line, lineIndex) => {
+    const charCount = line.text.replace(/\u200b/g, '').length
+    const startPos = charPositions ? charPositions[consumedChars] ?? paraPos + 1 : null
+    consumedChars += charCount
+    return {
+      text: line.text,
+      blockIndex,
+      lineIndex,
+      lineHeight,
+      startPos,
+    }
+  })
+
+  return {
+    lines,
+    totalHeight: lineHeight * rawLines.length + spaceBefore + spaceAfter,
+    canSplit: Boolean(charPositions) && rawLines.length > 1,
+    spaceBefore,
+    spaceAfter,
+  }
 }
 
 function measureTableCell(cellNode: PMNode, cellWidth: number): number {
   let totalHeight = 0
   cellNode.forEach((child) => {
     if (child.type.name === 'paragraph') {
-      totalHeight += measureParagraph(child, Math.max(cellWidth - 16, 40)).totalHeight
+      totalHeight += measureParagraph(child, 0, 0, Math.max(cellWidth - 16, 40)).totalHeight
     } else if (child.type.name === 'table') {
       totalHeight += measureTable(child, Math.max(cellWidth - 16, 40)).totalHeight
     } else {
@@ -134,7 +217,7 @@ function countRowColumns(rowNode: PMNode): number {
   return Math.max(count, 1)
 }
 
-function measureTable(tableNode: PMNode, contentWidth: number): { lines: LineInfo[]; totalHeight: number } {
+function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
   let maxColumns = 1
   tableNode.forEach((rowNode) => {
     maxColumns = Math.max(maxColumns, countRowColumns(rowNode))
@@ -152,72 +235,189 @@ function measureTable(tableNode: PMNode, contentWidth: number): { lines: LineInf
   })
 
   return {
-    lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: totalHeight }],
+    canSplit: false,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: totalHeight, startPos: null }],
     totalHeight,
   }
 }
 
-function measureBlock(node: PMNode, contentWidth: number): { lines: LineInfo[]; totalHeight: number } {
+function measureBlock(
+  node: PMNode,
+  nodePos: number,
+  blockIndex: number,
+  contentWidth: number
+): MeasuredBlock {
   switch (node.type.name) {
     case 'paragraph':
-      return measureParagraph(node, contentWidth)
-    case 'table':
-      return measureTable(node, contentWidth)
+      return measureParagraph(node, nodePos, blockIndex, contentWidth)
+    case 'table': {
+      const measured = measureTable(node, contentWidth)
+      measured.lines[0] = { ...measured.lines[0]!, blockIndex }
+      return measured
+    }
     case 'horizontal_rule':
       return {
-        lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: 20 }],
+        canSplit: false,
+        spaceBefore: 0,
+        spaceAfter: 0,
+        lines: [{ text: '', blockIndex, lineIndex: 0, lineHeight: 20, startPos: nodePos + 1 }],
         totalHeight: 20,
       }
     default:
       return {
-        lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: 24 }],
+        canSplit: false,
+        spaceBefore: 0,
+        spaceAfter: 0,
+        lines: [{ text: '', blockIndex, lineIndex: 0, lineHeight: 24, startPos: nodePos + 1 }],
         totalHeight: 24,
       }
   }
 }
 
-/**
- * Paginates the document at paragraph granularity.
- * No paragraph is split across pages, so widget decorations can be placed
- * cleanly at paragraph boundaries.
- *
- * Returns PageLayout[] where each entry's totalHeight is the actual content
- * height used on that page. The caller uses this to compute the correct
- * transparent break-widget height.
- */
-export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG): PageLayout[] {
+function pushPageBreak(
+  breaks: PageBreakInfo[],
+  pages: PageLayout[],
+  currentPage: PageLayout,
+  breakPos: number
+): PageLayout {
+  breaks.push({
+    pos: breakPos,
+    pageIndex: pages.length,
+    prevPageUsed: currentPage.totalHeight,
+  })
+  const nextPage: PageLayout = { lines: [], totalHeight: 0 }
+  pages.push(nextPage)
+  return nextPage
+}
+
+function lineNeededHeight(
+  measured: MeasuredBlock,
+  lineIndex: number,
+  lastLineIndex: number
+): number {
+  const line = measured.lines[lineIndex]!
+  const extraBefore = lineIndex === 0 ? measured.spaceBefore : 0
+  const extraAfter = lineIndex === lastLineIndex ? measured.spaceAfter : 0
+  return extraBefore + line.lineHeight + extraAfter
+}
+
+export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG): PaginateResult {
   const contentWidth = config.pageWidth - config.marginLeft - config.marginRight
   const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
 
   const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
-  let cur = pages[0]
-  let blockIdx = 0
+  const breaks: PageBreakInfo[] = []
+  const lineBreakSet = new Set<number>()
+  let currentPage = pages[0]!
+  let blockIndex = 0
 
-  doc.forEach((node) => {
-    const { lines, totalHeight } = measureBlock(node, contentWidth)
-    lines.forEach((line) => { line.blockIndex = blockIdx })
+  doc.forEach((node, offset) => {
+    const nodePos = offset + 1
+    const measured = measureBlock(node, nodePos, blockIndex, contentWidth)
 
-    // Force page break if paragraph has pageBreakBefore attr
-    if (node.attrs.pageBreakBefore && cur.lines.length > 0) {
-      cur = { lines: [], totalHeight: 0 }
-      pages.push(cur)
+    if (measured.canSplit) {
+      for (let lineIndex = 1; lineIndex < measured.lines.length; lineIndex += 1) {
+        const pos = measured.lines[lineIndex]!.startPos
+        if (typeof pos === 'number' && pos > 0) lineBreakSet.add(pos)
+      }
     }
 
-    // If this paragraph doesn't fit on the current page and the page has content,
-    // push it to a new page. If the page is empty, add it anyway (very long paragraph).
-    if (cur.totalHeight + totalHeight > contentHeight && cur.lines.length > 0) {
-      cur = { lines: [], totalHeight: 0 }
-      pages.push(cur)
+    if (node.attrs.pageBreakBefore && currentPage.lines.length > 0) {
+      currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
     }
 
-    cur.lines.push(...lines)
-    cur.totalHeight += totalHeight
-    blockIdx++
+    if (!measured.canSplit) {
+      if (currentPage.totalHeight + measured.totalHeight > contentHeight && currentPage.lines.length > 0) {
+        currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
+      }
+      currentPage.lines.push(...measured.lines)
+      currentPage.totalHeight += measured.totalHeight
+      blockIndex += 1
+      return
+    }
+
+    const lastLineIndex = measured.lines.length - 1
+    let startLineIndex = 0
+
+    while (startLineIndex < measured.lines.length) {
+      let fitCount = 0
+      let heightSum = 0
+
+      for (let lineIndex = startLineIndex; lineIndex < measured.lines.length; lineIndex += 1) {
+        const neededHeight = lineNeededHeight(measured, lineIndex, lastLineIndex)
+        if (currentPage.totalHeight + heightSum + neededHeight > contentHeight) break
+        fitCount += 1
+        heightSum += neededHeight
+      }
+
+      if (fitCount === 0) {
+        if (currentPage.lines.length > 0) {
+          currentPage = pushPageBreak(
+            breaks,
+            pages,
+            currentPage,
+            measured.lines[startLineIndex]!.startPos ?? nodePos
+          )
+          continue
+        }
+        fitCount = 1
+        heightSum = lineNeededHeight(measured, startLineIndex, lastLineIndex)
+      }
+
+      const pageHasPreviousContent = currentPage.lines.length > 0
+      const isParagraphStart = startLineIndex === 0
+      const paragraphRemaining = measured.lines.length - startLineIndex
+      const remainingAfterFit = measured.lines.length - (startLineIndex + fitCount)
+
+      if (
+        pageHasPreviousContent &&
+        isParagraphStart &&
+        paragraphRemaining > fitCount &&
+        fitCount < MIN_LINES_AT_PAGE_BOTTOM
+      ) {
+        currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
+        continue
+      }
+
+      if (
+        pageHasPreviousContent &&
+        fitCount < MIN_LINES_AT_PAGE_BOTTOM &&
+        paragraphRemaining > fitCount
+      ) {
+        currentPage = pushPageBreak(
+          breaks,
+          pages,
+          currentPage,
+          measured.lines[startLineIndex]!.startPos ?? nodePos
+        )
+        continue
+      }
+
+      for (let lineIndex = startLineIndex; lineIndex < startLineIndex + fitCount; lineIndex += 1) {
+        currentPage.lines.push(measured.lines[lineIndex]!)
+      }
+      currentPage.totalHeight += heightSum
+      startLineIndex += fitCount
+
+      if (remainingAfterFit > 0) {
+        currentPage = pushPageBreak(
+          breaks,
+          pages,
+          currentPage,
+          measured.lines[startLineIndex]!.startPos ?? nodePos
+        )
+      }
+    }
+
+    blockIndex += 1
   })
 
   console.log(
     `[paginator] ${pages.length} page(s), contentHeight=${contentHeight}px, ` +
-      pages.map((p, i) => `p${i + 1}=${p.totalHeight.toFixed(0)}px`).join(' ')
+      pages.map((page, index) => `p${index + 1}=${page.totalHeight.toFixed(0)}px`).join(' ')
   )
-  return pages
+
+  return { pages, breaks, lineBreaks: Array.from(lineBreakSet).sort((a, b) => a - b) }
 }

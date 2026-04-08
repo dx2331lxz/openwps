@@ -103,26 +103,74 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
   },
 })
 
-// Factory: creates a transparent spacer widget of the given height
-function makeWidget(height: number): () => HTMLElement {
+// Factory: creates a transparent spacer widget of the given height.
+// Use a block-level span so the same widget can be inserted both at block
+// boundaries and in the middle of a paragraph.
+function makePageBreakWidget(height: number): () => HTMLElement {
   return () => {
-    const div = document.createElement('div')
-    div.style.cssText = `display:block;height:${height}px;pointer-events:none;background:transparent;`
-    return div
+    const span = document.createElement('span')
+    span.style.cssText = [
+      'display:block',
+      `height:${height}px`,
+      'pointer-events:none',
+      'background:transparent',
+      'line-height:0',
+      'font-size:0',
+    ].join(';')
+    return span
   }
 }
 
 function buildDecos(
   doc: EditorState['doc'],
-  breaks: { pos: number; height: number }[]
+  pageBreaks: { pos: number; height: number }[]
 ): DecorationSet {
-  if (!breaks.length) return DecorationSet.empty
+  if (!pageBreaks.length) return DecorationSet.empty
   return DecorationSet.create(
     doc,
-    breaks.map(({ pos, height }) =>
-      Decoration.widget(pos, makeWidget(height), { side: -1, key: `pb-${pos}` })
+    pageBreaks.map(({ pos, height }) =>
+      Decoration.widget(pos, makePageBreakWidget(height), { side: -1, key: `pb-${pos}` })
     )
   )
+}
+
+function snapBreakPosToRenderedLineStart(view: EditorView, pos: number): number {
+  const doc = view.state.doc
+  const safePos = Math.max(1, Math.min(pos, doc.nodeSize - 2))
+  const $pos = doc.resolve(safePos)
+
+  let paragraphDepth = $pos.depth
+  while (paragraphDepth > 0 && $pos.node(paragraphDepth).type.name !== 'paragraph') {
+    paragraphDepth -= 1
+  }
+  if (paragraphDepth === 0 || $pos.node(paragraphDepth).type.name !== 'paragraph') return safePos
+
+  const paragraphStart = $pos.start(paragraphDepth)
+  const paragraphEnd = $pos.end(paragraphDepth)
+  if (safePos <= paragraphStart || safePos >= paragraphEnd) return safePos
+
+  let lastLineStart = paragraphStart
+  let lastTop: number | null = null
+
+  for (let cursorPos = paragraphStart; cursorPos <= safePos; cursorPos += 1) {
+    try {
+      const coords = view.coordsAtPos(cursorPos)
+      if (lastTop === null) {
+        lastTop = coords.top
+        lastLineStart = cursorPos
+        continue
+      }
+
+      if (Math.abs(coords.top - lastTop) > 1) {
+        lastTop = coords.top
+        lastLineStart = cursorPos
+      }
+    } catch {
+      return safePos
+    }
+  }
+
+  return lastLineStart
 }
 
 // ─── Editor state helpers ─────────────────────────────────────────────────────
@@ -221,40 +269,31 @@ export const Editor: React.FC = () => {
       // 确保字体加载完成，防止 Pretext Canvas 测量失败
       if (document.fonts?.ready) await document.fonts.ready
 
-      const cfg = pageConfigRef.current
-      const doc = v.state.doc
-      const pages = paginate(doc, cfg)
-      setPageCount(prev => pages.length !== prev ? pages.length : prev)
-
-      // Build break list: one entry per page boundary (after page 1, 2, ...)
-      const breaks: { pos: number; height: number }[] = []
-
-      // Map blockIndex → starting block for each page (page 2 onwards)
-      const breakBlockIndices = new Map<number, number>()
-      for (let pi = 1; pi < pages.length; pi++) {
-        const first = pages[pi].lines[0]
-        if (first) breakBlockIndices.set(first.blockIndex, pi)
+      // 先移除已有分页 decorations，再基于浏览器的自然换行结果校准断点。
+      // 否则上一次分页插入的 spacer 会反过来影响本次真实行首的判定，造成断点漂移。
+      if (pageBreakPlugin.getState(v.state)?.decos !== DecorationSet.empty) {
+        const clearTr = v.state.tr
+          .setMeta('pageBreakDecos', DecorationSet.empty)
+          .setMeta('addToHistory', false)
+        v.updateState(v.state.apply(clearTr))
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
       }
 
-      let blockIdx = 0
-      doc.forEach((_, offset) => {
-        const pageIdx = breakBlockIndices.get(blockIdx)
-        if (pageIdx !== undefined) {
-          // Absolute doc position before this block's opening token = offset + 1
-          // (Fragment.forEach gives content-relative offset; +1 for doc's own opening token)
-          const pos = offset + 1
-          const prevPageUsed = pages[pageIdx - 1].totalHeight
-          const wh = breakWidgetHeight(prevPageUsed, cfg)
-          breaks.push({ pos, height: wh })
-          console.log(
-            `[editor] page break before block ${blockIdx}: doc pos=${pos}, ` +
-            `prevUsed=${prevPageUsed.toFixed(0)}px, widgetH=${wh.toFixed(0)}px`
-          )
-        }
-        blockIdx++
-      })
+      const cfg = pageConfigRef.current
+      const doc = v.state.doc
+      const { pages, breaks } = paginate(doc, cfg)
+      setPageCount(prev => pages.length !== prev ? pages.length : prev)
 
-      const decos = buildDecos(doc, breaks)
+      const pageBreakDecos = breaks.map((item) => {
+          const snappedPos = snapBreakPosToRenderedLineStart(v, item.pos)
+          const height = breakWidgetHeight(item.prevPageUsed, cfg)
+          console.log(
+            `[editor] page break before page ${item.pageIndex + 1}: rawPos=${item.pos}, snappedPos=${snappedPos}, ` +
+            `prevUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
+          )
+          return { pos: snappedPos, height }
+        })
+      const decos = buildDecos(doc, pageBreakDecos)
       const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
       v.updateState(v.state.apply(tr))
     }, 150)

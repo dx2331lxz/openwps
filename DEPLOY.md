@@ -88,9 +88,9 @@ openwps/
 │   │   └── ai.json            # AI 配置（端点/Key/模型）
 │   └── data/
 │       └── conversations/     # 会话历史持久化
+├── docs/
+│   └── PRETEXT.md             # Pretext 排版原理与项目接入说明
 ├── dist/                 # 构建产物（npm run build 生成）
-├── CLAUDE.md             # Copilot 项目规范
-├── TASKS.md              # 任务看板
 └── package.json
 ```
 

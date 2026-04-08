@@ -59,6 +59,16 @@ git add -A && git commit -m "描述" && git push
 | AI | OpenAI 兼容接口（硅基流动/OpenAI/Claude/Ollama） |
 | Markdown | marked |
 
+## 排版引擎说明
+
+项目的文本测量与分页都以 `@chenglou/pretext` 为基础。
+
+- `prepare/prepareWithSegments`：对文本做一次性预处理与宽度测量缓存
+- `layout/layoutWithLines`：在给定宽度下做纯算术断行与高度计算
+- `walkLineRanges/layoutNextLine`：支持更细粒度的逐行排版，适合分页、多栏、绕排
+
+详细原理和在本项目中的接入方式见 [docs/PRETEXT.md](./docs/PRETEXT.md)
+
 ## 目录结构
 
 ```
@@ -68,6 +78,7 @@ openwps/
 │   ├── main.py       # FastAPI 入口
 │   ├── config/       # AI 配置（不提交）
 │   └── data/         # 会话数据（不提交）
+├── docs/             # 项目设计说明
 └── dist/             # 构建产物
 ```
 
