@@ -59,6 +59,7 @@ export type PMNodeJSON = {
 export interface DocxImportResult {
   doc: PMNodeJSON
   pageConfig: PageConfig
+  docGridLinePitchPt: number | null
   typography: DocxTypographyConfig
 }
 
@@ -108,8 +109,16 @@ interface DocumentLayout {
 
 export interface DocxTypographyConfig {
   punctuationCompression: boolean
+  noPunctuationKerning: boolean
+  spaceForUnderline: boolean
+  balanceSingleByteDoubleByteWidth: boolean
+  doNotLeaveBackslashAlone: boolean
+  underlineTrailingSpaces: boolean
+  doNotExpandShiftReturn: boolean
+  adjustLineHeightInTable: boolean
   doNotWrapTextWithPunct: boolean
   doNotUseEastAsianBreakRules: boolean
+  useFELayout: boolean
 }
 
 const DEFAULT_TEXT_STYLE: TextStyleAttrs = {
@@ -643,8 +652,16 @@ function parseTypographySettings(settingsXml: string): DocxTypographyConfig {
   if (!settingsXml) {
     return {
       punctuationCompression: false,
+      noPunctuationKerning: false,
+      spaceForUnderline: false,
+      balanceSingleByteDoubleByteWidth: false,
+      doNotLeaveBackslashAlone: false,
+      underlineTrailingSpaces: false,
+      doNotExpandShiftReturn: false,
+      adjustLineHeightInTable: false,
       doNotWrapTextWithPunct: false,
       doNotUseEastAsianBreakRules: false,
+      useFELayout: false,
     }
   }
 
@@ -654,8 +671,16 @@ function parseTypographySettings(settingsXml: string): DocxTypographyConfig {
 
   return {
     punctuationCompression: characterSpacingControl === 'compressPunctuation',
+    noPunctuationKerning: truthyElement(findDescendant(dom, 'noPunctuationKerning')),
+    spaceForUnderline: !!directChild(compat, 'spaceForUL'),
+    balanceSingleByteDoubleByteWidth: !!directChild(compat, 'balanceSingleByteDoubleByteWidth'),
+    doNotLeaveBackslashAlone: !!directChild(compat, 'doNotLeaveBackslashAlone'),
+    underlineTrailingSpaces: !!directChild(compat, 'ulTrailSpace'),
+    doNotExpandShiftReturn: !!directChild(compat, 'doNotExpandShiftReturn'),
+    adjustLineHeightInTable: !!directChild(compat, 'adjustLineHeightInTable'),
     doNotWrapTextWithPunct: !!directChild(compat, 'doNotWrapTextWithPunct'),
     doNotUseEastAsianBreakRules: !!directChild(compat, 'doNotUseEastAsianBreakRules'),
+    useFELayout: !!directChild(compat, 'useFELayout'),
   }
 }
 
@@ -1016,5 +1041,5 @@ export async function importDocx(file: File): Promise<DocxImportResult> {
     zip
   )
 
-  return { doc, pageConfig, typography }
+  return { doc, pageConfig, docGridLinePitchPt, typography }
 }

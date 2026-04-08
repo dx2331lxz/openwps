@@ -1,6 +1,7 @@
 import {
   AlignmentType,
   Document,
+  DocumentGridType,
   ImageRun,
   ExternalHyperlink,
   LevelFormat,
@@ -18,12 +19,19 @@ import {
   type ParagraphChild,
 } from 'docx'
 import { saveAs } from 'file-saver'
+import JSZip from 'jszip'
 import type { Node as PMNode } from 'prosemirror-model'
 import type { PageConfig } from '../layout/paginator'
+import type { DocxTypographyConfig } from './importer'
 
 const PX_TO_TWIP = 1440 / 96
 
 type ImageKind = 'png' | 'jpg' | 'gif' | 'bmp'
+
+export interface DocxExportOptions {
+  docGridLinePitchPt?: number | null
+  typography?: DocxTypographyConfig | null
+}
 
 function pxToTwip(value: number) {
   return Math.round(value * PX_TO_TWIP)
@@ -127,7 +135,7 @@ async function convertInlineNode(node: PMNode): Promise<ParagraphChild> {
   return child
 }
 
-async function convertParagraph(node: PMNode): Promise<Paragraph> {
+async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions): Promise<Paragraph> {
   const children: ParagraphChild[] = []
   for (let index = 0; index < node.childCount; index += 1) {
     children.push(await convertInlineNode(node.child(index)))
@@ -150,9 +158,13 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
     }
   }
 
-  // Word 的 1.5倍行距 = 字号pt × 1.5 × 20 twip
-  // 不能直接用 lineHeight × 240（那是基于12pt的）
+  const docGridLinePitchTwip = exportOptions.docGridLinePitchPt != null
+    ? Math.round(exportOptions.docGridLinePitchPt * 20)
+    : null
   const lineSpacingTwip = Math.round(baseFontSizePt * lineHeight * 20)
+  const effectiveLineSpacingTwip = docGridLinePitchTwip != null
+    ? Math.max(lineSpacingTwip, docGridLinePitchTwip)
+    : lineSpacingTwip
 
   // 首行缩进：用字符单位（em）转 twip，1em = 1个字符宽 = 字号pt
   const firstLineTwip = firstLineIndent > 0
@@ -182,8 +194,8 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
         }
       : undefined,
     spacing: {
-      line: lineSpacingTwip,
-      lineRule: LineRuleType.AUTO,
+      line: effectiveLineSpacingTwip,
+      lineRule: docGridLinePitchTwip != null ? LineRuleType.AT_LEAST : LineRuleType.AUTO,
       before: Math.round(Number(node.attrs.spaceBefore ?? 0) * 20),
       after: Math.round(Number(node.attrs.spaceAfter ?? 0) * 20),
     },
@@ -192,11 +204,11 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
   })
 }
 
-async function convertTableCell(node: PMNode): Promise<TableCell> {
+async function convertTableCell(node: PMNode, exportOptions: DocxExportOptions): Promise<TableCell> {
   const children: (Paragraph | Table)[] = []
   for (let index = 0; index < node.childCount; index += 1) {
     const child = node.child(index)
-    children.push(child.type.name === 'table' ? await convertTable(child) : await convertParagraph(child))
+    children.push(child.type.name === 'table' ? await convertTable(child, exportOptions) : await convertParagraph(child, exportOptions))
   }
 
   return new TableCell({
@@ -209,7 +221,7 @@ async function convertTableCell(node: PMNode): Promise<TableCell> {
   })
 }
 
-async function convertTable(node: PMNode): Promise<Table> {
+async function convertTable(node: PMNode, exportOptions: DocxExportOptions): Promise<Table> {
   const rows: TableRow[] = []
 
   for (let rowIndex = 0; rowIndex < node.childCount; rowIndex += 1) {
@@ -217,7 +229,7 @@ async function convertTable(node: PMNode): Promise<Table> {
     const cells: TableCell[] = []
 
     for (let cellIndex = 0; cellIndex < rowNode.childCount; cellIndex += 1) {
-      cells.push(await convertTableCell(rowNode.child(cellIndex)))
+      cells.push(await convertTableCell(rowNode.child(cellIndex), exportOptions))
     }
 
     rows.push(new TableRow({ children: cells }))
@@ -229,15 +241,55 @@ async function convertTable(node: PMNode): Promise<Table> {
   })
 }
 
-async function convertNode(node: PMNode): Promise<Paragraph | Table> {
-  if (node.type.name === 'table') return convertTable(node)
-  return convertParagraph(node)
+async function convertNode(node: PMNode, exportOptions: DocxExportOptions): Promise<Paragraph | Table> {
+  if (node.type.name === 'table') return convertTable(node, exportOptions)
+  return convertParagraph(node, exportOptions)
 }
 
-export async function exportDocx(pmDoc: PMNode, pageConfig: PageConfig) {
+function insertIntoSettingsXml(settingsXml: string, snippet: string, beforeTag = '<w:compat>') {
+  if (settingsXml.includes(snippet)) return settingsXml
+  if (settingsXml.includes(beforeTag)) return settingsXml.replace(beforeTag, `${snippet}${beforeTag}`)
+  return settingsXml.replace('</w:settings>', `${snippet}</w:settings>`)
+}
+
+async function patchDocxSettings(
+  blob: Blob,
+  exportOptions: DocxExportOptions
+) {
+  const typography = exportOptions.typography
+  if (!typography) return blob
+
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer())
+  const settingsFile = zip.file('word/settings.xml')
+  if (!settingsFile) return blob
+
+  let settingsXml = await settingsFile.async('string')
+
+  if (typography.noPunctuationKerning) {
+    settingsXml = insertIntoSettingsXml(settingsXml, '<w:noPunctuationKerning w:val="1"/>')
+  }
+
+  if (typography.punctuationCompression) {
+    settingsXml = insertIntoSettingsXml(settingsXml, '<w:characterSpacingControl w:val="compressPunctuation"/>')
+  }
+
+  zip.file('word/settings.xml', settingsXml)
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    compression: 'DEFLATE',
+  })
+}
+
+export async function buildDocxBlob(
+  pmDoc: PMNode,
+  pageConfig: PageConfig,
+  exportOptions: DocxExportOptions = {}
+) {
   const children: (Paragraph | Table)[] = []
   for (let index = 0; index < pmDoc.childCount; index += 1) {
-    children.push(await convertNode(pmDoc.child(index)))
+    children.push(await convertNode(pmDoc.child(index), exportOptions))
   }
 
   const sections = [{
@@ -255,11 +307,32 @@ export async function exportDocx(pmDoc: PMNode, pageConfig: PageConfig) {
           right: pxToTwip(pageConfig.marginRight),
         },
       },
+      grid: exportOptions.docGridLinePitchPt != null
+        ? {
+            type: DocumentGridType.LINES,
+            linePitch: Math.round(exportOptions.docGridLinePitchPt * 20),
+            charSpace: 0,
+          }
+        : undefined,
     },
     children,
   }]
 
   const doc = new Document({
+    compatibility: exportOptions.typography
+      ? {
+          version: 14,
+          spaceForUnderline: exportOptions.typography.spaceForUnderline,
+          balanceSingleByteDoubleByteWidth: exportOptions.typography.balanceSingleByteDoubleByteWidth,
+          doNotLeaveBackslashAlone: exportOptions.typography.doNotLeaveBackslashAlone,
+          underlineTrailingSpaces: exportOptions.typography.underlineTrailingSpaces,
+          doNotExpandShiftReturn: exportOptions.typography.doNotExpandShiftReturn,
+          adjustLineHeightInTable: exportOptions.typography.adjustLineHeightInTable,
+          doNotWrapTextWithPunctuation: exportOptions.typography.doNotWrapTextWithPunct,
+          doNotUseEastAsianBreakRules: exportOptions.typography.doNotUseEastAsianBreakRules,
+          useFELayout: exportOptions.typography.useFELayout,
+        }
+      : undefined,
     numbering: {
       config: [
         {
@@ -282,6 +355,16 @@ export async function exportDocx(pmDoc: PMNode, pageConfig: PageConfig) {
     },
     sections,
   })
+
   const blob = await Packer.toBlob(doc)
+  return patchDocxSettings(blob, exportOptions)
+}
+
+export async function exportDocx(
+  pmDoc: PMNode,
+  pageConfig: PageConfig,
+  exportOptions: DocxExportOptions = {}
+) {
+  const blob = await buildDocxBlob(pmDoc, pageConfig, exportOptions)
   saveAs(blob, 'document.docx')
 }

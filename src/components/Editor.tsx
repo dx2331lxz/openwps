@@ -11,7 +11,7 @@ import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
 import SettingsModal from './SettingsModal'
 import { importDocx } from '../docx/importer'
-import { exportDocx } from '../docx/exporter'
+import { exportDocx, type DocxExportOptions } from '../docx/exporter'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -351,6 +351,7 @@ export const Editor: React.FC = () => {
   const [editorState, setEditorState] = useState<EditorState | null>(null)
   const [pageConfig, setPageConfig] = useState<PageConfig>(DEFAULT_PAGE_CONFIG)
   const pageConfigRef = useRef<PageConfig>(DEFAULT_PAGE_CONFIG)
+  const docxExportOptionsRef = useRef<DocxExportOptions>({})
   const [pageCount, setPageCount] = useState(1)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -456,6 +457,10 @@ export const Editor: React.FC = () => {
       editorView.dispatch(transaction)
       setPageConfig(parsed.pageConfig)
       pageConfigRef.current = parsed.pageConfig
+      docxExportOptionsRef.current = {
+        docGridLinePitchPt: parsed.docGridLinePitchPt,
+        typography: parsed.typography,
+      }
       setDocxLetterSpacingPx(parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0)
       console.log(
         `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
@@ -476,7 +481,7 @@ export const Editor: React.FC = () => {
     if (!editorView) return
 
     try {
-      await exportDocx(editorView.state.doc, pageConfigRef.current)
+      await exportDocx(editorView.state.doc, pageConfigRef.current, docxExportOptionsRef.current)
       window.alert('DOCX 导出成功')
     } catch (error) {
       console.error('[Editor] DOCX export failed', error)
