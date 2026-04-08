@@ -2,10 +2,13 @@ import {
   AlignmentType,
   Document,
   ImageRun,
+  ExternalHyperlink,
+  LevelFormat,
   LineRuleType,
   Packer,
   PageOrientation,
   Paragraph,
+  ShadingType,
   Table,
   TableCell,
   TableRow,
@@ -68,6 +71,11 @@ function getTextStyleAttrs(node: PMNode) {
   return (mark?.attrs ?? {}) as Record<string, unknown>
 }
 
+function getLinkAttrs(node: PMNode) {
+  const mark = node.marks.find((item) => item.type.name === 'link')
+  return (mark?.attrs ?? {}) as Record<string, unknown>
+}
+
 async function convertImageNode(node: PMNode): Promise<ImageRun> {
   const src = String(node.attrs.src ?? '')
   const { bytes } = await imageSourceToBytes(src)
@@ -91,6 +99,8 @@ function convertTextRun(node: PMNode): TextRun {
   const fontFamily = String(attrs.fontFamily ?? 'SimSun, 宋体, serif').split(',')[0]?.trim() || 'SimSun'
   const fontSize = Number(attrs.fontSize ?? 12)
   const color = String(attrs.color ?? '#000000').replace('#', '')
+  const backgroundColor = String(attrs.backgroundColor ?? '').replace('#', '')
+  const letterSpacing = Number(attrs.letterSpacing ?? 0)
 
   return new TextRun({
     text: node.text ?? '',
@@ -103,12 +113,18 @@ function convertTextRun(node: PMNode): TextRun {
     strike: Boolean(attrs.strikethrough),
     superScript: Boolean(attrs.superscript),
     subScript: Boolean(attrs.subscript),
+    characterSpacing: letterSpacing ? Math.round(letterSpacing * 20) : undefined,
+    shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor, color: 'auto' } : undefined,
   })
 }
 
 async function convertInlineNode(node: PMNode): Promise<ParagraphChild> {
-  if (node.type.name === 'image') return convertImageNode(node)
-  return convertTextRun(node)
+  const child = node.type.name === 'image' ? await convertImageNode(node) : convertTextRun(node)
+  const href = String(getLinkAttrs(node).href ?? '')
+  if (href && /^https?:\/\//i.test(href)) {
+    return new ExternalHyperlink({ link: href, children: [child] })
+  }
+  return child
 }
 
 async function convertParagraph(node: PMNode): Promise<Paragraph> {
@@ -119,6 +135,9 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
 
   const lineHeight = Number(node.attrs.lineHeight ?? 1.5)
   const firstLineIndent = Number(node.attrs.firstLineIndent ?? 0)
+  const indent = Number(node.attrs.indent ?? 0)
+  const listType = String(node.attrs.listType ?? '')
+  const listLevel = Math.max(0, Number(node.attrs.listLevel ?? 0))
 
   // 计算段落内实际字号（取最大字号作为基准）
   let baseFontSizePt = 12
@@ -139,11 +158,29 @@ async function convertParagraph(node: PMNode): Promise<Paragraph> {
   const firstLineTwip = firstLineIndent > 0
     ? Math.round(firstLineIndent * baseFontSizePt * 20)
     : undefined
+  const hangingTwip = firstLineIndent < 0
+    ? Math.round(Math.abs(firstLineIndent) * baseFontSizePt * 20)
+    : undefined
+  const leftTwip = indent > 0
+    ? Math.round(indent * 2 * baseFontSizePt * 20)
+    : undefined
 
   return new Paragraph({
     alignment: paragraphAlignment(node.attrs.align as string | undefined),
     pageBreakBefore: Boolean(node.attrs.pageBreakBefore),
-    indent: firstLineTwip ? { firstLine: firstLineTwip } : undefined,
+    indent: firstLineTwip || hangingTwip || leftTwip
+      ? {
+          firstLine: firstLineTwip,
+          hanging: hangingTwip,
+          left: leftTwip,
+        }
+      : undefined,
+    numbering: listType
+      ? {
+          reference: listType === 'bullet' ? 'pm-bullet' : 'pm-ordered',
+          level: listLevel,
+        }
+      : undefined,
     spacing: {
       line: lineSpacingTwip,
       lineRule: LineRuleType.AUTO,
@@ -222,7 +259,29 @@ export async function exportDocx(pmDoc: PMNode, pageConfig: PageConfig) {
     children,
   }]
 
-  const doc = new Document({ sections })
+  const doc = new Document({
+    numbering: {
+      config: [
+        {
+          reference: 'pm-bullet',
+          levels: Array.from({ length: 9 }, (_, level) => ({
+            level,
+            format: LevelFormat.BULLET,
+            text: '•',
+          })),
+        },
+        {
+          reference: 'pm-ordered',
+          levels: Array.from({ length: 9 }, (_, level) => ({
+            level,
+            format: LevelFormat.DECIMAL,
+            text: `%${level + 1}.`,
+          })),
+        },
+      ],
+    },
+    sections,
+  })
   const blob = await Packer.toBlob(doc)
   saveAs(blob, 'document.docx')
 }

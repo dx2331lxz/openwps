@@ -15,6 +15,7 @@ import { exportDocx } from '../docx/exporter'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
+const DOCX_PUNCTUATION_COMPRESSION_PX = -0.34
 
 // Widget height for a break after a page that used `usedH` px of content:
 //   = (remaining space on that page) + BREAK_BASE
@@ -35,18 +36,20 @@ const PM_STYLES = `
   line-height: 1.5;
   color: #000;
   white-space: pre-wrap;
-  word-break: break-all;  /* 与 Pretext 测量一致，防止数字/英文把前面中文带走 */
-  overflow-wrap: break-word;
+  word-break: normal;
+  line-break: strict;
+  overflow-wrap: anywhere;
 }
 .ProseMirror p { margin: 0; padding: 0; }
+.ProseMirror p { letter-spacing: var(--docx-letter-spacing, 0px); }
 .ProseMirror p.list-bullet {
-  padding-left: 2em;
+  padding-left: calc(2em + var(--list-level, 0) * 2em);
   position: relative;
 }
 .ProseMirror p.list-bullet::before {
   content: "•";
   position: absolute;
-  left: 0.5em;
+  left: calc(var(--list-level, 0) * 2em + 0.5em);
 }
 .ProseMirror {
   counter-reset: ol-counter;
@@ -56,13 +59,17 @@ const PM_STYLES = `
 }
 .ProseMirror p.list-ordered {
   counter-increment: ol-counter;
-  padding-left: 2.5em;
+  padding-left: calc(2.5em + var(--list-level, 0) * 2em);
   position: relative;
 }
 .ProseMirror p.list-ordered::before {
   content: counter(ol-counter) ".";
   position: absolute;
-  left: 0;
+  left: calc(var(--list-level, 0) * 2em);
+}
+.ProseMirror a {
+  color: #0b57d0;
+  text-decoration: underline;
 }
 .ProseMirror hr {
   border: none;
@@ -173,6 +180,95 @@ function snapBreakPosToRenderedLineStart(view: EditorView, pos: number): number 
   return lastLineStart
 }
 
+function getRenderedYOffsetForPos(view: EditorView, pos: number): number | null {
+  try {
+    const coords = view.coordsAtPos(pos)
+    const editorRect = view.dom.getBoundingClientRect()
+    return Math.max(0, coords.top - editorRect.top)
+  } catch {
+    return null
+  }
+}
+
+function collectRenderedLineStartPositions(view: EditorView): number[] {
+  const positions: number[] = []
+  const seen = new Set<number>()
+
+  view.state.doc.nodesBetween(0, view.state.doc.content.size, (node, pos) => {
+    if (node.type.name !== 'paragraph') return
+
+    const paragraphStart = pos + 1
+    const paragraphEnd = pos + node.nodeSize - 1
+    let lastTop: number | null = null
+
+    for (let cursorPos = paragraphStart; cursorPos <= paragraphEnd; cursorPos += 1) {
+      try {
+        const coords = view.coordsAtPos(cursorPos)
+        if (lastTop === null) {
+          lastTop = coords.top
+          if (!seen.has(cursorPos)) {
+            seen.add(cursorPos)
+            positions.push(cursorPos)
+          }
+          continue
+        }
+
+        if (Math.abs(coords.top - lastTop) > 1) {
+          lastTop = coords.top
+          if (!seen.has(cursorPos)) {
+            seen.add(cursorPos)
+            positions.push(cursorPos)
+          }
+        }
+      } catch {
+        break
+      }
+    }
+  })
+
+  return positions.sort((a, b) => a - b)
+}
+
+function calibrateBreaksToRenderedLines(
+  view: EditorView,
+  candidatePositions: number[],
+  config: PageConfig
+): { pos: number; used: number }[] {
+  const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
+  const candidates = Array.from(new Set(candidatePositions))
+    .map((pos) => snapBreakPosToRenderedLineStart(view, pos))
+    .filter((pos, index, arr) => pos > 0 && arr.indexOf(pos) === index)
+    .sort((a, b) => a - b)
+    .map((pos) => ({ pos, offset: getRenderedYOffsetForPos(view, pos) }))
+    .filter((item): item is { pos: number; offset: number } => item.offset != null)
+
+  const calibrated: { pos: number; used: number }[] = []
+  let previousOffset = 0
+  let cursor = 0
+
+  while (cursor < candidates.length) {
+    let lastFit: { pos: number; offset: number } | null = null
+
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor]!
+      const segmentUsed = candidate.offset - previousOffset
+      if (segmentUsed > contentHeight + 0.5) break
+      lastFit = candidate
+      cursor += 1
+    }
+
+    if (cursor >= candidates.length || !lastFit) break
+
+    calibrated.push({
+      pos: lastFit.pos,
+      used: Math.max(0, lastFit.offset - previousOffset),
+    })
+    previousOffset = lastFit.offset
+  }
+
+  return calibrated
+}
+
 // ─── Editor state helpers ─────────────────────────────────────────────────────
 function toggleMarkAttr(
   state: EditorState,
@@ -256,6 +352,7 @@ export const Editor: React.FC = () => {
   const [pageConfig, setPageConfig] = useState<PageConfig>(DEFAULT_PAGE_CONFIG)
   const pageConfigRef = useRef<PageConfig>(DEFAULT_PAGE_CONFIG)
   const [pageCount, setPageCount] = useState(1)
+  const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
@@ -281,17 +378,28 @@ export const Editor: React.FC = () => {
 
       const cfg = pageConfigRef.current
       const doc = v.state.doc
-      const { pages, breaks } = paginate(doc, cfg)
-      setPageCount(prev => pages.length !== prev ? pages.length : prev)
+      const { breaks } = paginate(doc, cfg)
+      const renderedLineStarts = collectRenderedLineStartPositions(v)
+      const calibratedBreaks = calibrateBreaksToRenderedLines(
+        v,
+        [...renderedLineStarts, ...breaks.map((item) => item.pos)],
+        cfg
+      )
+      const effectiveBreaks = calibratedBreaks.length > 0
+        ? calibratedBreaks
+        : breaks.map((item) => ({
+            pos: snapBreakPosToRenderedLineStart(v, item.pos),
+            used: item.prevPageUsed,
+          }))
 
-      const pageBreakDecos = breaks.map((item) => {
-          const snappedPos = snapBreakPosToRenderedLineStart(v, item.pos)
-          const height = breakWidgetHeight(item.prevPageUsed, cfg)
+      setPageCount(prev => effectiveBreaks.length + 1 !== prev ? effectiveBreaks.length + 1 : prev)
+
+      const pageBreakDecos = effectiveBreaks.map((item, index) => {
+          const height = breakWidgetHeight(item.used, cfg)
           console.log(
-            `[editor] page break before page ${item.pageIndex + 1}: rawPos=${item.pos}, snappedPos=${snappedPos}, ` +
-            `prevUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
+            `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.used.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
           )
-          return { pos: snappedPos, height }
+          return { pos: item.pos, height }
         })
       const decos = buildDecos(doc, pageBreakDecos)
       const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
@@ -329,6 +437,10 @@ export const Editor: React.FC = () => {
     }
   }, [repaginate])
 
+  useEffect(() => {
+    if (viewRef.current) repaginate()
+  }, [docxLetterSpacingPx, repaginate])
+
   const handleImportDocx = useCallback(async (file: File) => {
     const editorView = viewRef.current
     if (!editorView) return
@@ -344,6 +456,12 @@ export const Editor: React.FC = () => {
       editorView.dispatch(transaction)
       setPageConfig(parsed.pageConfig)
       pageConfigRef.current = parsed.pageConfig
+      setDocxLetterSpacingPx(parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0)
+      console.log(
+        `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
+          `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
+          `doNotUseEastAsianBreakRules=${parsed.typography.doNotUseEastAsianBreakRules}`
+      )
       repaginate()
       window.alert('DOCX 导入成功')
     } catch (error) {
@@ -443,6 +561,7 @@ export const Editor: React.FC = () => {
               top: cfg.marginTop,
               left: cfg.marginLeft,
               right: cfg.marginRight,
+              ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
               zIndex: 1,
             }}
           />

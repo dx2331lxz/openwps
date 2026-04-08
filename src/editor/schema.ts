@@ -26,6 +26,7 @@ export const schema = new Schema({
         if (node.attrs.lineHeight !== 1.5) style.push(`line-height:${node.attrs.lineHeight}`)
         if (node.attrs.spaceBefore) style.push(`margin-top:${node.attrs.spaceBefore}pt`)
         if (node.attrs.spaceAfter) style.push(`margin-bottom:${node.attrs.spaceAfter}pt`)
+        if (node.attrs.listType) style.push(`--list-level:${node.attrs.listLevel ?? 0}`)
 
         const cls: string[] = []
         if (node.attrs.listType === 'bullet') cls.push('list-bullet')
@@ -37,6 +38,7 @@ export const schema = new Schema({
           class: cls.join(' ') || undefined,
         }
         if (node.attrs.listType) domAttrs['data-list-type'] = node.attrs.listType
+        if (node.attrs.listType) domAttrs['data-list-level'] = String(node.attrs.listLevel ?? 0)
         if (node.attrs.pageBreakBefore) domAttrs['data-page-break'] = 'true'
 
         return ['p', domAttrs, 0]
@@ -175,6 +177,25 @@ export const schema = new Schema({
         if (mark.attrs.subscript) style.push('vertical-align:sub;font-size:smaller')
         if (mark.attrs.letterSpacing) style.push(`letter-spacing:${mark.attrs.letterSpacing}pt`)
         return ['span', { style: style.join(';') }]
+      },
+    },
+    link: {
+      attrs: {
+        href: {},
+      },
+      inclusive: false,
+      parseDOM: [{
+        tag: 'a[href]',
+        getAttrs: (dom) => ({
+          href: (dom as HTMLAnchorElement).getAttribute('href') ?? '',
+        }),
+      }],
+      toDOM(mark) {
+        return ['a', {
+          href: mark.attrs.href,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+        }, 0]
       },
     },
   },

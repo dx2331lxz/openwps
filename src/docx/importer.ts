@@ -29,15 +29,24 @@ interface ParagraphAttrs extends Record<string, unknown> {
   lineHeight: number
   spaceBefore: number
   spaceAfter: number
-  listType: null
+  listType: 'bullet' | 'ordered' | null
   listLevel: number
   pageBreakBefore: boolean
 }
 
-type PMMarkJSON = {
+type PMTextStyleMarkJSON = {
   type: 'textStyle'
   attrs: TextStyleAttrs
 }
+
+type PMLinkMarkJSON = {
+  type: 'link'
+  attrs: {
+    href: string
+  }
+}
+
+type PMMarkJSON = PMTextStyleMarkJSON | PMLinkMarkJSON
 
 export type PMNodeJSON = {
   type: string
@@ -50,9 +59,10 @@ export type PMNodeJSON = {
 export interface DocxImportResult {
   doc: PMNodeJSON
   pageConfig: PageConfig
+  typography: DocxTypographyConfig
 }
 
-type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'pageBreakBefore'>>
+type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'indent' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'listType' | 'listLevel' | 'pageBreakBefore'>>
 
 interface RawStyle {
   basedOn?: string
@@ -60,7 +70,24 @@ interface RawStyle {
 }
 
 type StyleMap = Record<string, StyleAttrs>
-type RelMap = Record<string, string>
+
+type ListType = ParagraphAttrs['listType']
+
+interface NumberingLevelInfo {
+  listType: Exclude<ListType, null>
+  listLevel: number
+}
+
+type NumberingMap = Record<string, Record<number, NumberingLevelInfo>>
+
+interface RelInfo {
+  target: string
+  zipPath?: string
+  type: string
+  targetMode?: string
+}
+
+type RelMap = Record<string, RelInfo>
 
 interface ThemeFonts {
   majorAscii?: string
@@ -77,6 +104,12 @@ interface ParsedStylesResult {
 interface DocumentLayout {
   pageConfig: PageConfig
   docGridLinePitchPt: number | null
+}
+
+export interface DocxTypographyConfig {
+  punctuationCompression: boolean
+  doNotWrapTextWithPunct: boolean
+  doNotUseEastAsianBreakRules: boolean
 }
 
 const DEFAULT_TEXT_STYLE: TextStyleAttrs = {
@@ -247,6 +280,33 @@ function normalizeColor(raw: string) {
   return raw && raw !== 'auto' ? `#${raw}` : DEFAULT_TEXT_STYLE.color
 }
 
+function normalizeFill(raw: string) {
+  return raw && !['auto', 'none', 'nil', 'clear'].includes(raw) ? `#${raw}` : ''
+}
+
+function highlightToColor(raw: string) {
+  const map: Record<string, string> = {
+    yellow: '#ffff00',
+    green: '#00ff00',
+    cyan: '#00ffff',
+    magenta: '#ff00ff',
+    blue: '#0000ff',
+    red: '#ff0000',
+    darkBlue: '#00008b',
+    darkCyan: '#008b8b',
+    darkGreen: '#006400',
+    darkMagenta: '#8b008b',
+    darkRed: '#8b0000',
+    darkYellow: '#b8860b',
+    darkGray: '#a9a9a9',
+    lightGray: '#d3d3d3',
+    black: '#000000',
+    white: '#ffffff',
+  }
+
+  return map[raw] ?? ''
+}
+
 function normalizePath(path: string) {
   const parts = path.split('/').filter(Boolean)
   const stack: string[] = []
@@ -265,6 +325,11 @@ function relTargetToZipPath(target: string) {
   return normalizePath(`word/${target}`)
 }
 
+function parseListType(raw: string): Exclude<ListType, null> | null {
+  if (!raw || raw === 'none') return null
+  return raw === 'bullet' ? 'bullet' : 'ordered'
+}
+
 function mimeFromPath(path: string) {
   const lower = path.toLowerCase()
   if (lower.endsWith('.png')) return 'image/png'
@@ -275,7 +340,11 @@ function mimeFromPath(path: string) {
   return 'application/octet-stream'
 }
 
-function createTextNode(text: string, attrs: Partial<TextStyleAttrs>): PMNodeJSON | null {
+function createTextNode(
+  text: string,
+  attrs: Partial<TextStyleAttrs>,
+  extraMarks: PMMarkJSON[] = []
+): PMNodeJSON | null {
   if (!text) return null
   return {
     type: 'text',
@@ -283,7 +352,7 @@ function createTextNode(text: string, attrs: Partial<TextStyleAttrs>): PMNodeJSO
     marks: [{
       type: 'textStyle',
       attrs: { ...DEFAULT_TEXT_STYLE, ...attrs },
-    }],
+    }, ...extraMarks],
   }
 }
 
@@ -311,10 +380,44 @@ function parseThemeFonts(themeXml: string): ThemeFonts {
   }
 }
 
+function parseNumbering(numberingXml: string): NumberingMap {
+  if (!numberingXml) return {}
+
+  const dom = parseXml(numberingXml)
+  const abstractNums: Record<string, Record<number, NumberingLevelInfo>> = {}
+
+  for (const abstractNum of Array.from(dom.getElementsByTagNameNS(W_NS, 'abstractNum'))) {
+    const abstractNumId = getAttr(abstractNum, 'abstractNumId')
+    if (!abstractNumId) continue
+
+    const levels: Record<number, NumberingLevelInfo> = {}
+    for (const lvl of directChildren(abstractNum, 'lvl')) {
+      const level = parseNumber(getAttr(lvl, 'ilvl'))
+      const numFmt = getAttr(directChild(lvl, 'numFmt'), 'val')
+      const listType = parseListType(numFmt)
+      if (!listType) continue
+      levels[level] = { listType, listLevel: level }
+    }
+
+    abstractNums[abstractNumId] = levels
+  }
+
+  const numberingMap: NumberingMap = {}
+  for (const num of Array.from(dom.getElementsByTagNameNS(W_NS, 'num'))) {
+    const numId = getAttr(num, 'numId')
+    const abstractNumId = getAttr(directChild(num, 'abstractNumId'), 'val')
+    if (!numId || !abstractNumId) continue
+    numberingMap[numId] = abstractNums[abstractNumId] ?? {}
+  }
+
+  return numberingMap
+}
+
 function readParagraphStyle(
   pPr: Element | undefined,
   inherited: StyleAttrs,
-  docGridLinePitchPt: number | null
+  docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap = {}
 ): StyleAttrs {
   if (!pPr) return {}
 
@@ -333,8 +436,12 @@ function readParagraphStyle(
 
   const baseFontSize = inherited.fontSize ?? DEFAULT_TEXT_STYLE.fontSize
   const ind = directChild(pPr, 'ind')
+  const leftIndent = parseNumber(getAttr(ind, 'left') || getAttr(ind, 'start'))
   const firstLine = parseNumber(getAttr(ind, 'firstLine'))
+  const hanging = parseNumber(getAttr(ind, 'hanging'))
+  if (leftIndent > 0) attrs.indent = twipToEm(leftIndent, baseFontSize) / 2
   if (firstLine > 0) attrs.firstLineIndent = twipToEm(firstLine, baseFontSize)
+  if (hanging > 0) attrs.firstLineIndent = -twipToEm(hanging, baseFontSize)
 
   const spacing = directChild(pPr, 'spacing')
   const before = parseNumber(getAttr(spacing, 'before'))
@@ -351,6 +458,15 @@ function readParagraphStyle(
   }
 
   if (truthyElement(directChild(pPr, 'pageBreakBefore'))) attrs.pageBreakBefore = true
+
+  const numPr = directChild(pPr, 'numPr')
+  const numId = getAttr(directChild(numPr, 'numId'), 'val')
+  const ilvl = parseNumber(getAttr(directChild(numPr, 'ilvl'), 'val'))
+  const numberingLevel = numberingMap[numId]?.[ilvl]
+  if (numberingLevel) {
+    attrs.listType = numberingLevel.listType
+    attrs.listLevel = numberingLevel.listLevel
+  }
 
   return attrs
 }
@@ -375,6 +491,16 @@ function readRunStyle(rPr: Element | undefined, inherited: StyleAttrs, themeFont
   const color = getAttr(directChild(rPr, 'color'), 'val')
   if (color) attrs.color = normalizeColor(color)
 
+  const highlight = getAttr(directChild(rPr, 'highlight'), 'val')
+  if (highlight) attrs.backgroundColor = highlightToColor(highlight) || attrs.backgroundColor || ''
+
+  const shading = directChild(rPr, 'shd')
+  const fill = normalizeFill(getAttr(shading, 'fill'))
+  if (fill) attrs.backgroundColor = fill
+
+  const spacing = parseNumber(getAttr(directChild(rPr, 'spacing'), 'val'))
+  if (spacing !== 0) attrs.letterSpacing = twipToPt(spacing)
+
   if (truthyElement(directChild(rPr, 'b'))) attrs.bold = true
   if (truthyElement(directChild(rPr, 'i'))) attrs.italic = true
   if (truthyElement(directChild(rPr, 'u'))) attrs.underline = true
@@ -396,11 +522,16 @@ function parseStyleDefaults(stylesXml: string, themeFonts: ThemeFonts): StyleAtt
   const pPrDefault = directChild(directChild(docDefaults, 'pPrDefault'), 'pPr')
   const rPrDefault = directChild(directChild(docDefaults, 'rPrDefault'), 'rPr')
   const runDefaults = readRunStyle(rPrDefault, {}, themeFonts)
-  const paragraphDefaults = readParagraphStyle(pPrDefault, runDefaults, null)
+  const paragraphDefaults = readParagraphStyle(pPrDefault, runDefaults, null, {})
   return { ...runDefaults, ...paragraphDefaults }
 }
 
-function parseStyles(stylesXml: string, themeFonts: ThemeFonts, docDefaults: StyleAttrs): ParsedStylesResult {
+function parseStyles(
+  stylesXml: string,
+  themeFonts: ThemeFonts,
+  docDefaults: StyleAttrs,
+  numberingMap: NumberingMap
+): ParsedStylesResult {
   if (!stylesXml) {
     return {
       styleMap: {},
@@ -423,7 +554,7 @@ function parseStyles(stylesXml: string, themeFonts: ThemeFonts, docDefaults: Sty
     const pPr = directChild(styleEl, 'pPr')
     const rPr = directChild(styleEl, 'rPr')
     const runAttrs = readRunStyle(rPr, {}, themeFonts)
-    const paraAttrs = readParagraphStyle(pPr, runAttrs, null)
+    const paraAttrs = readParagraphStyle(pPr, runAttrs, null, numberingMap)
     rawStyles[styleId] = { basedOn, attrs: { ...runAttrs, ...paraAttrs } }
   }
 
@@ -465,7 +596,16 @@ function parseRels(relsXml: string): RelMap {
   for (const rel of Array.from(dom.getElementsByTagName('Relationship'))) {
     const id = getAttr(rel, 'Id')
     const target = getAttr(rel, 'Target')
-    if (id && target) rels[id] = relTargetToZipPath(target)
+    const type = getAttr(rel, 'Type')
+    const targetMode = getAttr(rel, 'TargetMode') || undefined
+    if (id && target) {
+      rels[id] = {
+        target,
+        zipPath: targetMode === 'External' ? undefined : relTargetToZipPath(target),
+        type,
+        targetMode,
+      }
+    }
   }
 
   return rels
@@ -499,12 +639,33 @@ function parseDocumentLayout(documentXml: string): DocumentLayout {
   }
 }
 
+function parseTypographySettings(settingsXml: string): DocxTypographyConfig {
+  if (!settingsXml) {
+    return {
+      punctuationCompression: false,
+      doNotWrapTextWithPunct: false,
+      doNotUseEastAsianBreakRules: false,
+    }
+  }
+
+  const dom = parseXml(settingsXml)
+  const characterSpacingControl = getAttr(findDescendant(dom, 'characterSpacingControl'), 'val')
+  const compat = findDescendant(dom, 'compat')
+
+  return {
+    punctuationCompression: characterSpacingControl === 'compressPunctuation',
+    doNotWrapTextWithPunct: !!directChild(compat, 'doNotWrapTextWithPunct'),
+    doNotUseEastAsianBreakRules: !!directChild(compat, 'doNotUseEastAsianBreakRules'),
+  }
+}
+
 async function parseImageNode(drawingEl: Element, rels: RelMap, zip: JSZip): Promise<PMNodeJSON | null> {
   const blip = findDescendant(drawingEl, 'blip')
   const relId = getAttr(blip, 'embed')
-  if (!relId || !rels[relId]) return null
+  const relInfo = relId ? rels[relId] : undefined
+  if (!relId || !relInfo?.zipPath) return null
 
-  const target = rels[relId]
+  const target = relInfo.zipPath
   const file = zip.file(target)
   if (!file) return null
 
@@ -533,7 +694,8 @@ async function parseRunNodes(
   paragraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
   rels: RelMap,
-  zip: JSZip
+  zip: JSZip,
+  linkHref?: string
 ): Promise<PMNodeJSON[]> {
   const rPr = directChild(rEl, 'rPr')
   const styleId = getAttr(directChild(rPr, 'rStyle'), 'val')
@@ -542,12 +704,13 @@ async function parseRunNodes(
     { ...paragraphStyle, ...(styleId ? styleMap[styleId] : {}) },
     themeFonts
   )
+  const extraMarks = linkHref ? [{ type: 'link', attrs: { href: linkHref } } satisfies PMLinkMarkJSON] : []
 
   const nodes: PMNodeJSON[] = []
   let textBuffer = ''
 
   const flushText = () => {
-    const node = createTextNode(textBuffer, effectiveStyle)
+    const node = createTextNode(textBuffer, effectiveStyle, extraMarks)
     if (node) nodes.push(node)
     textBuffer = ''
   }
@@ -563,8 +726,34 @@ async function parseRunNodes(
       textBuffer += '\t'
       continue
     }
+    if (localName === 'noBreakHyphen') {
+      textBuffer += '\u2011'
+      continue
+    }
+    if (localName === 'softHyphen') {
+      textBuffer += '\u00ad'
+      continue
+    }
     if (localName === 'br' || localName === 'cr') {
+      if (getAttr(child, 'type') === 'page') {
+        flushText()
+        nodes.push({
+          type: 'text',
+          text: '\n',
+          marks: [{
+            type: 'textStyle',
+            attrs: { ...DEFAULT_TEXT_STYLE, ...effectiveStyle },
+          }, ...extraMarks],
+        })
+        continue
+      }
       textBuffer += '\n'
+      continue
+    }
+    if (localName === 'sym') {
+      const charCode = getAttr(child, 'char')
+      const parsed = Number.parseInt(charCode, 16)
+      if (Number.isFinite(parsed)) textBuffer += String.fromCharCode(parsed)
       continue
     }
     if (localName === 'drawing') {
@@ -584,6 +773,7 @@ async function parseParagraph(
   defaultParagraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
   docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
   rels: RelMap,
   zip: JSZip
 ): Promise<PMNodeJSON> {
@@ -592,7 +782,7 @@ async function parseParagraph(
   const baseStyle = styleId
     ? styleMap[styleId] ?? { ...defaultParagraphStyle }
     : { ...defaultParagraphStyle }
-  const paragraphStyle = { ...baseStyle, ...readParagraphStyle(pPr, baseStyle, docGridLinePitchPt) }
+  const paragraphStyle = { ...baseStyle, ...readParagraphStyle(pPr, baseStyle, docGridLinePitchPt, numberingMap) }
 
   const content: PMNodeJSON[] = []
 
@@ -604,8 +794,12 @@ async function parseParagraph(
       continue
     }
     if (localName === 'hyperlink') {
+      const relId = getAttr(child, 'id')
+      const anchor = getAttr(child, 'anchor')
+      const relTarget = relId ? rels[relId]?.target : ''
+      const linkHref = relTarget || (anchor ? `#${anchor}` : '')
       for (const run of directChildren(child, 'r')) {
-        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip))
+        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip, linkHref || undefined))
       }
     }
   }
@@ -636,6 +830,7 @@ async function parseTableCell(
   defaultParagraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
   docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
   rels: RelMap,
   zip: JSZip
 ): Promise<{ node?: PMNodeJSON; colspan: number; continueMerge: boolean }> {
@@ -658,7 +853,7 @@ async function parseTableCell(
   for (const child of elementChildren(tcEl)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip))
+      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip))
     }
   }
 
@@ -684,6 +879,7 @@ async function parseTable(
   defaultParagraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
   docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
   rels: RelMap,
   zip: JSZip
 ): Promise<PMNodeJSON> {
@@ -697,7 +893,7 @@ async function parseTable(
     let columnIndex = 0
 
     for (const tcEl of directChildren(trEl, 'tc')) {
-      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip)
+      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip)
       const colspan = parsedCell.colspan
 
       if (parsedCell.continueMerge) {
@@ -743,6 +939,7 @@ async function parseDocument(
   defaultParagraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
   docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
   rels: RelMap,
   zip: JSZip
 ): Promise<PMNodeJSON> {
@@ -753,7 +950,7 @@ async function parseDocument(
   for (const child of elementChildren(body)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip)
+      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip)
       // 跳过开头的连续空段落
       const isEmpty = !para.content || para.content.length === 0 ||
         para.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
@@ -780,7 +977,7 @@ async function parseDocument(
       continue
     }
     if (localName === 'tbl') {
-      content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, rels, zip))
+      content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip))
     }
   }
 
@@ -796,23 +993,28 @@ export async function importDocx(file: File): Promise<DocxImportResult> {
   if (!documentXml) throw new Error('DOCX 缺少 word/document.xml')
 
   const stylesXml = await zip.file('word/styles.xml')?.async('string') ?? ''
+  const settingsXml = await zip.file('word/settings.xml')?.async('string') ?? ''
   const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string') ?? ''
+  const numberingXml = await zip.file('word/numbering.xml')?.async('string') ?? ''
   const themeXml = await zip.file('word/theme/theme1.xml')?.async('string') ?? ''
 
   const rels = parseRels(relsXml)
+  const numberingMap = parseNumbering(numberingXml)
   const themeFonts = parseThemeFonts(themeXml)
   const docDefaults = parseStyleDefaults(stylesXml, themeFonts)
-  const { styleMap, defaultParagraphStyle } = parseStyles(stylesXml, themeFonts, docDefaults)
+  const { styleMap, defaultParagraphStyle } = parseStyles(stylesXml, themeFonts, docDefaults, numberingMap)
   const { pageConfig, docGridLinePitchPt } = parseDocumentLayout(documentXml)
+  const typography = parseTypographySettings(settingsXml)
   const doc = await parseDocument(
     documentXml,
     styleMap,
     defaultParagraphStyle,
     themeFonts,
     docGridLinePitchPt,
+    numberingMap,
     rels,
     zip
   )
 
-  return { doc, pageConfig }
+  return { doc, pageConfig, typography }
 }
