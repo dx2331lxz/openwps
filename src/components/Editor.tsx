@@ -71,6 +71,9 @@ const PM_STYLES = `
 }
 .ProseMirror p { margin: 0; padding: 0; }
 .ProseMirror p { letter-spacing: var(--docx-letter-spacing, 0px); }
+.ProseMirror .pm-script-gap {
+  padding-right: 0.25em;
+}
 .ProseMirror p.list-bullet {
   padding-left: calc(2em + var(--list-level, 0) * 2em);
   position: relative;
@@ -130,6 +133,73 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
       if (meta !== undefined) return { decos: meta }
       if (tr.docChanged) return { decos: prev.decos.map(tr.mapping, tr.doc) }
       return prev
+    },
+  },
+  props: {
+    decorations(state) {
+      return this.getState(state)?.decos ?? DecorationSet.empty
+    },
+  },
+})
+
+const HAN_CHAR_RE = /\p{Script=Han}/u
+const LATIN_ALPHA_RE = /[A-Za-z]/
+
+function isHanChar(char: string) {
+  return HAN_CHAR_RE.test(char)
+}
+
+function isLatinAlphaChar(char: string) {
+  return LATIN_ALPHA_RE.test(char)
+}
+
+function shouldInsertMixedScriptGap(prevChar: string, nextChar: string) {
+  return (
+    (isLatinAlphaChar(prevChar) && isHanChar(nextChar)) ||
+    (isHanChar(prevChar) && isLatinAlphaChar(nextChar))
+  )
+}
+
+function buildMixedScriptSpacingDecos(doc: EditorState['doc']): DecorationSet {
+  const decos: Decoration[] = []
+
+  doc.descendants((node, pos) => {
+    if (node.type.name !== 'paragraph') return
+    const paragraphStart = pos + 1
+    const chars: Array<{ char: string; from: number; to: number }> = []
+
+    node.forEach((child, offset) => {
+      if (!child.isText) return
+      const text = child.text ?? ''
+      const childStart = paragraphStart + offset
+      for (let index = 0; index < text.length; index += 1) {
+        chars.push({
+          char: text[index] ?? '',
+          from: childStart + index,
+          to: childStart + index + 1,
+        })
+      }
+    })
+
+    for (let index = 0; index < chars.length - 1; index += 1) {
+      const current = chars[index]
+      const next = chars[index + 1]
+      if (!current || !next) continue
+      if (shouldInsertMixedScriptGap(current.char, next.char)) {
+        decos.push(Decoration.inline(current.from, current.to, { class: 'pm-script-gap' }))
+      }
+    }
+  })
+
+  return DecorationSet.create(doc, decos)
+}
+
+const mixedScriptSpacingPlugin = new Plugin<{ decos: DecorationSet }>({
+  state: {
+    init: (_, state) => ({ decos: buildMixedScriptSpacingDecos(state.doc) }),
+    apply(tr, prev, _oldState, newState) {
+      if (!tr.docChanged) return prev
+      return { decos: buildMixedScriptSpacingDecos(newState.doc) }
     },
   },
   props: {
@@ -371,6 +441,7 @@ function initState(): EditorState {
         },
       }),
       keymap(baseKeymap),
+      mixedScriptSpacingPlugin,
       pageBreakPlugin,
     ],
   })

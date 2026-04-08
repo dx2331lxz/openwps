@@ -77,11 +77,32 @@ function getParagraphTextStyle(paraNode: PMNode) {
 }
 
 function normalizeTextForPretext(text: string) {
-  return text
+  const normalizedQuotes = text
     // WPS 的中文引号会更贴近字面宽度，浏览器 fallback 字体常把它们留得更松。
     // 这里仅用于测量，帮助 Pretext 的逐行结果更接近实际中文文档版式。
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
+
+  const chars = Array.from(normalizedQuotes)
+  let result = ''
+
+  for (let index = 0; index < chars.length; index += 1) {
+    const current = chars[index] ?? ''
+    const next = chars[index + 1] ?? ''
+    result += current
+
+    const currentIsLatin = /[A-Za-z]/.test(current)
+    const nextIsLatin = /[A-Za-z]/.test(next)
+    const currentIsHan = /\p{Script=Han}/u.test(current)
+    const nextIsHan = /\p{Script=Han}/u.test(next)
+
+    if ((currentIsLatin && nextIsHan) || (currentIsHan && nextIsLatin)) {
+      // 四分之一 em 的测量补偿，和编辑器里的右侧 padding 保持一致。
+      result += '\u2005'
+    }
+  }
+
+  return result
 }
 
 function estimateImageHeight(node: PMNode): number {
