@@ -1,8 +1,8 @@
 export const FONT_STACKS = {
-  song: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
-  hei: 'SimHei, 黑体, "Heiti SC", STHeiti, "Microsoft YaHei", "PingFang SC", sans-serif',
-  kai: 'KaiTi, 楷体, "Kaiti SC", STKaiti, serif',
-  fang: 'FangSong, 仿宋, STFangsong, serif',
+  song: '"OpenWPSSong", SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
+  hei: '"OpenWPSHei", SimHei, 黑体, "Heiti SC", STHeiti, "Microsoft YaHei", "PingFang SC", sans-serif',
+  kai: '"OpenWPSKai", KaiTi, 楷体, "Kaiti SC", STKaiti, serif',
+  fang: '"OpenWPSFang", FangSong, 仿宋, STFangsong, serif',
   arial: 'Arial, sans-serif',
   timesNewRoman: 'Times New Roman, serif',
   courierNew: 'Courier New, monospace',
@@ -31,6 +31,10 @@ export function fontStackFromName(name: string): string | undefined {
 
 export function fontNameFromFamily(fontFamily: string | undefined): string | undefined {
   if (!fontFamily) return undefined
+  if (fontFamily.includes('OpenWPSFang')) return '仿宋'
+  if (fontFamily.includes('OpenWPSKai')) return '楷体'
+  if (fontFamily.includes('OpenWPSHei')) return '黑体'
+  if (fontFamily.includes('OpenWPSSong')) return '宋体'
   if (fontFamily.includes('FangSong') || fontFamily.includes('仿宋') || fontFamily.includes('STFangsong')) return '仿宋'
   if (fontFamily.includes('KaiTi') || fontFamily.includes('楷体') || fontFamily.includes('Kaiti') || fontFamily.includes('STKaiti')) return '楷体'
   if (fontFamily.includes('SimHei') || fontFamily.includes('黑体') || fontFamily.includes('Heiti') || fontFamily.includes('STHeiti')) return '黑体'

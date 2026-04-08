@@ -30,6 +30,32 @@ function breakWidgetHeight(usedH: number, cfg: PageConfig): number {
 
 // ─── ProseMirror styles ───────────────────────────────────────────────────────
 const PM_STYLES = `
+@font-face {
+  font-family: "OpenWPSSong";
+  src: local("SimSun"), local("宋体"), local("Songti SC"), local("STSong"), local("Noto Serif CJK SC");
+}
+@font-face {
+  font-family: "OpenWPSSong";
+  src: local("SimHei"), local("黑体"), local("Heiti SC"), local("STHeiti"), local("Microsoft YaHei");
+  unicode-range: U+2018-2019, U+201C-201D;
+}
+@font-face {
+  font-family: "OpenWPSHei";
+  src: local("SimHei"), local("黑体"), local("Heiti SC"), local("STHeiti"), local("Microsoft YaHei"), local("PingFang SC");
+}
+@font-face {
+  font-family: "OpenWPSKai";
+  src: local("KaiTi"), local("楷体"), local("Kaiti SC"), local("STKaiti");
+}
+@font-face {
+  font-family: "OpenWPSKai";
+  src: local("SimHei"), local("黑体"), local("Heiti SC"), local("STHeiti"), local("Microsoft YaHei");
+  unicode-range: U+2018-2019, U+201C-201D;
+}
+@font-face {
+  font-family: "OpenWPSFang";
+  src: local("FangSong"), local("仿宋"), local("STFangsong");
+}
 .ProseMirror {
   outline: none;
   font-family: ${DEFAULT_EDITOR_FONT_STACK};
@@ -45,18 +71,6 @@ const PM_STYLES = `
 }
 .ProseMirror p { margin: 0; padding: 0; }
 .ProseMirror p { letter-spacing: var(--docx-letter-spacing, 0px); }
-.ProseMirror .pm-fullwidth-quote {
-  display: inline-block;
-  width: 1em;
-  line-height: inherit;
-  font-variant-east-asian: full-width;
-}
-.ProseMirror .pm-fullwidth-quote-open {
-  text-align: right;
-}
-.ProseMirror .pm-fullwidth-quote-close {
-  text-align: left;
-}
 .ProseMirror p.list-bullet {
   padding-left: calc(2em + var(--list-level, 0) * 2em);
   position: relative;
@@ -116,42 +130,6 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
       if (meta !== undefined) return { decos: meta }
       if (tr.docChanged) return { decos: prev.decos.map(tr.mapping, tr.doc) }
       return prev
-    },
-  },
-  props: {
-    decorations(state) {
-      return this.getState(state)?.decos ?? DecorationSet.empty
-    },
-  },
-})
-
-function buildFullwidthQuoteDecos(doc: EditorState['doc']): DecorationSet {
-  const decos: Decoration[] = []
-  const openQuotes = new Set(['“', '‘'])
-  const closeQuotes = new Set(['”', '’'])
-
-  doc.descendants((node, pos) => {
-    if (!node.isText) return
-    const text = node.text ?? ''
-    for (let index = 0; index < text.length; index += 1) {
-      const char = text[index] ?? ''
-      if (openQuotes.has(char)) {
-        decos.push(Decoration.inline(pos + index, pos + index + 1, { class: 'pm-fullwidth-quote pm-fullwidth-quote-open' }))
-      } else if (closeQuotes.has(char)) {
-        decos.push(Decoration.inline(pos + index, pos + index + 1, { class: 'pm-fullwidth-quote pm-fullwidth-quote-close' }))
-      }
-    }
-  })
-
-  return DecorationSet.create(doc, decos)
-}
-
-const fullwidthQuotePlugin = new Plugin<{ decos: DecorationSet }>({
-  state: {
-    init: (_, state) => ({ decos: buildFullwidthQuoteDecos(state.doc) }),
-    apply(tr, prev, _oldState, newState) {
-      if (!tr.docChanged) return prev
-      return { decos: buildFullwidthQuoteDecos(newState.doc) }
     },
   },
   props: {
@@ -393,7 +371,6 @@ function initState(): EditorState {
         },
       }),
       keymap(baseKeymap),
-      fullwidthQuotePlugin,
       pageBreakPlugin,
     ],
   })
