@@ -4,6 +4,7 @@ import type { EditorView } from 'prosemirror-view'
 import { schema } from '../editor/schema'
 import type { PageConfig } from '../layout/paginator'
 import { mapFontFamily } from './presets'
+import { fontNameFromFamily } from '../fonts'
 
 const PAPER_SIZES: Record<string, { pageWidth: number; pageHeight: number }> = {
   A4: { pageWidth: 794, pageHeight: 1123 },
@@ -25,6 +26,7 @@ export interface ExecuteResult {
 export interface ExecuteOptions {
   pageConfig?: PageConfig
   onPageConfigChange?: (cfg: PageConfig) => void
+  onDocumentStyleMutation?: () => void
 }
 
 type RangeType =
@@ -188,14 +190,7 @@ function insertBlockAfterParagraph(state: EditorState, paragraphIndex: number, n
 }
 
 function describeFontFamily(fontFamily: string | undefined) {
-  if (!fontFamily) return '宋体'
-  if (fontFamily.includes('FangSong') || fontFamily.includes('仿宋')) return '仿宋'
-  if (fontFamily.includes('SimHei') || fontFamily.includes('黑体')) return '黑体'
-  if (fontFamily.includes('KaiTi') || fontFamily.includes('楷体')) return '楷体'
-  if (fontFamily.includes('Arial')) return 'Arial'
-  if (fontFamily.includes('Times New Roman')) return 'Times New Roman'
-  if (fontFamily.includes('SimSun') || fontFamily.includes('宋体')) return '宋体'
-  return fontFamily
+  return fontNameFromFamily(fontFamily) ?? fontFamily ?? '宋体'
 }
 
 function getRepresentativeTextStyle(node: PMNode) {
@@ -328,6 +323,7 @@ export function executeTool(
         }
         tr = applyTextStyle(state, tr, range, styleAttrs)
         dispatch(tr)
+        options?.onDocumentStyleMutation?.()
         view.focus()
         return { success: true, message: '文字样式已更新' }
       }
@@ -341,6 +337,7 @@ export function executeTool(
         if (paraAttrs.listType === 'none') paraAttrs.listType = null
         tr = applyParagraphStyle(state, tr, range, paraAttrs)
         dispatch(tr)
+        options?.onDocumentStyleMutation?.()
         view.focus()
         return { success: true, message: '段落格式已更新' }
       }

@@ -1,4 +1,5 @@
 import { Schema } from 'prosemirror-model'
+import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 
 export const schema = new Schema({
   nodes: {
@@ -150,7 +151,7 @@ export const schema = new Schema({
   marks: {
     textStyle: {
       attrs: {
-        fontFamily: { default: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif' },
+        fontFamily: { default: DEFAULT_EDITOR_FONT_STACK },
         fontSize: { default: 12 },
         color: { default: '#000000' },
         backgroundColor: { default: '' },

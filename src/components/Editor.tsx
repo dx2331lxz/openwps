@@ -12,6 +12,7 @@ import AISidebar from './AISidebar'
 import SettingsModal from './SettingsModal'
 import { importDocx } from '../docx/importer'
 import { exportDocx, type DocxExportOptions } from '../docx/exporter'
+import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -31,7 +32,7 @@ function breakWidgetHeight(usedH: number, cfg: PageConfig): number {
 const PM_STYLES = `
 .ProseMirror {
   outline: none;
-  font-family: SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif;
+  font-family: ${DEFAULT_EDITOR_FONT_STACK};
   font-size: 12pt;
   line-height: 1.5;
   color: #000;
@@ -39,9 +40,23 @@ const PM_STYLES = `
   word-break: normal;
   line-break: strict;
   overflow-wrap: anywhere;
+  font-variant-east-asian: proportional-width;
+  font-kerning: normal;
 }
 .ProseMirror p { margin: 0; padding: 0; }
 .ProseMirror p { letter-spacing: var(--docx-letter-spacing, 0px); }
+.ProseMirror .pm-fullwidth-quote {
+  display: inline-block;
+  width: 1em;
+  line-height: inherit;
+  font-variant-east-asian: full-width;
+}
+.ProseMirror .pm-fullwidth-quote-open {
+  text-align: right;
+}
+.ProseMirror .pm-fullwidth-quote-close {
+  text-align: left;
+}
 .ProseMirror p.list-bullet {
   padding-left: calc(2em + var(--list-level, 0) * 2em);
   position: relative;
@@ -101,6 +116,42 @@ const pageBreakPlugin = new Plugin<{ decos: DecorationSet }>({
       if (meta !== undefined) return { decos: meta }
       if (tr.docChanged) return { decos: prev.decos.map(tr.mapping, tr.doc) }
       return prev
+    },
+  },
+  props: {
+    decorations(state) {
+      return this.getState(state)?.decos ?? DecorationSet.empty
+    },
+  },
+})
+
+function buildFullwidthQuoteDecos(doc: EditorState['doc']): DecorationSet {
+  const decos: Decoration[] = []
+  const openQuotes = new Set(['“', '‘'])
+  const closeQuotes = new Set(['”', '’'])
+
+  doc.descendants((node, pos) => {
+    if (!node.isText) return
+    const text = node.text ?? ''
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index] ?? ''
+      if (openQuotes.has(char)) {
+        decos.push(Decoration.inline(pos + index, pos + index + 1, { class: 'pm-fullwidth-quote pm-fullwidth-quote-open' }))
+      } else if (closeQuotes.has(char)) {
+        decos.push(Decoration.inline(pos + index, pos + index + 1, { class: 'pm-fullwidth-quote pm-fullwidth-quote-close' }))
+      }
+    }
+  })
+
+  return DecorationSet.create(doc, decos)
+}
+
+const fullwidthQuotePlugin = new Plugin<{ decos: DecorationSet }>({
+  state: {
+    init: (_, state) => ({ decos: buildFullwidthQuoteDecos(state.doc) }),
+    apply(tr, prev, _oldState, newState) {
+      if (!tr.docChanged) return prev
+      return { decos: buildFullwidthQuoteDecos(newState.doc) }
     },
   },
   props: {
@@ -269,6 +320,13 @@ function calibrateBreaksToRenderedLines(
   return calibrated
 }
 
+function transactionHasStyleMutation(tx: EditorState['tr']) {
+  return tx.steps.some((step) => {
+    const stepType = step.toJSON().stepType
+    return stepType === 'addMark' || stepType === 'removeMark' || stepType === 'replaceAround'
+  })
+}
+
 // ─── Editor state helpers ─────────────────────────────────────────────────────
 function toggleMarkAttr(
   state: EditorState,
@@ -335,6 +393,7 @@ function initState(): EditorState {
         },
       }),
       keymap(baseKeymap),
+      fullwidthQuotePlugin,
       pageBreakPlugin,
     ],
   })
@@ -347,6 +406,7 @@ export const Editor: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<0 | 1>(0)
   const viewRef = useRef<EditorView | null>(null)
+  const applyingImportedDocxRef = useRef(false)
   const [view, setView] = useState<EditorView | null>(null)
   const [editorState, setEditorState] = useState<EditorState | null>(null)
   const [pageConfig, setPageConfig] = useState<PageConfig>(DEFAULT_PAGE_CONFIG)
@@ -357,6 +417,13 @@ export const Editor: React.FC = () => {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
+
+  const clearImportedDocxCompatibility = useCallback(() => {
+    if (docxLetterSpacingPx === 0 && Object.keys(docxExportOptionsRef.current).length === 0) return
+    docxExportOptionsRef.current = {}
+    setDocxLetterSpacingPx(0)
+    console.log('[docx] imported compatibility metadata cleared after style mutation')
+  }, [docxLetterSpacingPx])
 
   const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
@@ -422,6 +489,9 @@ export const Editor: React.FC = () => {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
         setEditorState(next)
+        if (tx.docChanged && !applyingImportedDocxRef.current && transactionHasStyleMutation(tx)) {
+          clearImportedDocxCompatibility()
+        }
         if (tx.docChanged) repaginate()
       },
     })
@@ -449,6 +519,7 @@ export const Editor: React.FC = () => {
     try {
       const parsed = await importDocx(file)
       const docNode = schema.nodeFromJSON(parsed.doc)
+      applyingImportedDocxRef.current = true
       const transaction = editorView.state.tr.replaceWith(
         0,
         editorView.state.doc.nodeSize - 2,
@@ -473,6 +544,8 @@ export const Editor: React.FC = () => {
       console.error('[Editor] DOCX import failed', error)
       const message = error instanceof Error ? error.message : String(error)
       window.alert(`DOCX 导入失败：${message}`)
+    } finally {
+      applyingImportedDocxRef.current = false
     }
   }, [repaginate])
 
@@ -585,6 +658,7 @@ export const Editor: React.FC = () => {
             pageConfigRef.current = newCfg
             repaginate()
           }}
+          onDocumentStyleMutation={clearImportedDocxCompatibility}
           onClose={() => setSidebarOpen(false)}
         />
       )}

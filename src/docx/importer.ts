@@ -1,5 +1,6 @@
 import JSZip from 'jszip'
 import type { PageConfig } from '../layout/paginator'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
 
 const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 const TWIP_TO_PX = 96 / 1440
@@ -122,7 +123,7 @@ export interface DocxTypographyConfig {
 }
 
 const DEFAULT_TEXT_STYLE: TextStyleAttrs = {
-  fontFamily: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
+  fontFamily: DEFAULT_EDITOR_FONT_STACK,
   fontSize: 12,
   color: '#000000',
   backgroundColor: '',
@@ -150,18 +151,27 @@ const DEFAULT_PARAGRAPH_ATTRS: ParagraphAttrs = {
 function normalizeFont(name: string): string {
   const trimmed = name.trim()
   const map: Record<string, string> = {
-    '宋体': 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
-    'SimSun': 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif',
-    '黑体': 'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif',
-    'SimHei': 'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif',
-    '楷体': 'KaiTi, 楷体, "Kaiti SC", cursive',
-    '楷体_GB2312': 'KaiTi, 楷体, "Kaiti SC", cursive',
-    '仿宋': 'FangSong, 仿宋, STFangsong, serif',
-    '仿宋_GB2312': 'FangSong, 仿宋, STFangsong, serif',
+    '宋体': FONT_STACKS.song,
+    'SimSun': FONT_STACKS.song,
+    'Songti SC': FONT_STACKS.song,
+    'STSong': FONT_STACKS.song,
+    '黑体': FONT_STACKS.hei,
+    'SimHei': FONT_STACKS.hei,
+    'Heiti SC': FONT_STACKS.hei,
+    'STHeiti': FONT_STACKS.hei,
+    '楷体': FONT_STACKS.kai,
+    '楷体_GB2312': FONT_STACKS.kai,
+    'KaiTi': FONT_STACKS.kai,
+    'Kaiti SC': FONT_STACKS.kai,
+    'STKaiti': FONT_STACKS.kai,
+    '仿宋': FONT_STACKS.fang,
+    '仿宋_GB2312': FONT_STACKS.fang,
+    'FangSong': FONT_STACKS.fang,
+    'STFangsong': FONT_STACKS.fang,
     '微软雅黑': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
     'Microsoft YaHei': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
-    'Times New Roman': 'Times New Roman, serif',
-    'Arial': 'Arial, sans-serif',
+    'Times New Roman': FONT_STACKS.timesNewRoman,
+    'Arial': FONT_STACKS.arial,
     'Calibri': 'Calibri, Arial, sans-serif',
   }
 

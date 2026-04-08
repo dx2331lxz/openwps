@@ -23,6 +23,7 @@ import JSZip from 'jszip'
 import type { Node as PMNode } from 'prosemirror-model'
 import type { PageConfig } from '../layout/paginator'
 import type { DocxTypographyConfig } from './importer'
+import { toDocxFontName } from '../fonts'
 
 const PX_TO_TWIP = 1440 / 96
 
@@ -104,7 +105,7 @@ async function convertImageNode(node: PMNode): Promise<ImageRun> {
 
 function convertTextRun(node: PMNode): TextRun {
   const attrs = getTextStyleAttrs(node)
-  const fontFamily = String(attrs.fontFamily ?? 'SimSun, 宋体, serif').split(',')[0]?.trim() || 'SimSun'
+  const fontFamily = toDocxFontName(String(attrs.fontFamily ?? ''))
   const fontSize = Number(attrs.fontSize ?? 12)
   const color = String(attrs.color ?? '#000000').replace('#', '')
   const backgroundColor = String(attrs.backgroundColor ?? '').replace('#', '')
@@ -161,10 +162,10 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
   const docGridLinePitchTwip = exportOptions.docGridLinePitchPt != null
     ? Math.round(exportOptions.docGridLinePitchPt * 20)
     : null
-  const lineSpacingTwip = Math.round(baseFontSizePt * lineHeight * 20)
-  const effectiveLineSpacingTwip = docGridLinePitchTwip != null
-    ? Math.max(lineSpacingTwip, docGridLinePitchTwip)
-    : lineSpacingTwip
+  const exactLineSpacingTwip = Math.round(baseFontSizePt * lineHeight * 20)
+  const exportedLineSpacing = docGridLinePitchTwip != null
+    ? Math.max(exactLineSpacingTwip, docGridLinePitchTwip)
+    : exactLineSpacingTwip
 
   // 首行缩进：用字符单位（em）转 twip，1em = 1个字符宽 = 字号pt
   const firstLineTwip = firstLineIndent > 0
@@ -194,8 +195,8 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
         }
       : undefined,
     spacing: {
-      line: effectiveLineSpacingTwip,
-      lineRule: docGridLinePitchTwip != null ? LineRuleType.AT_LEAST : LineRuleType.AUTO,
+      line: exportedLineSpacing,
+      lineRule: LineRuleType.AT_LEAST,
       before: Math.round(Number(node.attrs.spaceBefore ?? 0) * 20),
       after: Math.round(Number(node.attrs.spaceAfter ?? 0) * 20),
     },

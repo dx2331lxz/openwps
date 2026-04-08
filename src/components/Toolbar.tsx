@@ -5,6 +5,7 @@ import { TextSelection } from 'prosemirror-state'
 import type { Mark } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
 
 interface ToolbarProps {
   view: EditorView | null
@@ -20,7 +21,7 @@ interface ToolbarProps {
 
 const defaultTextFmt = {
   bold: false, italic: false, underline: false, strikethrough: false,
-  superscript: false, subscript: false, fontFamily: 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif', fontSize: 12,
+  superscript: false, subscript: false, fontFamily: DEFAULT_EDITOR_FONT_STACK, fontSize: 12,
   color: '#000000', backgroundColor: '',
 }
 
@@ -327,12 +328,12 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           onMouseDown={saveSelection}
           onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
         >
-          <option value={'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif'}>宋体</option>
-          <option value={'SimHei, 黑体, "Heiti SC", "Microsoft YaHei", sans-serif'}>黑体</option>
-          <option value={'KaiTi, 楷体, "Kaiti SC", cursive'}>楷体</option>
-          <option value={'FangSong, 仿宋, STFangsong, serif'}>仿宋</option>
-          <option value="Arial, sans-serif">Arial</option>
-          <option value="Times New Roman, serif">Times New Roman</option>
+          <option value={FONT_STACKS.song}>宋体</option>
+          <option value={FONT_STACKS.hei}>黑体</option>
+          <option value={FONT_STACKS.kai}>楷体</option>
+          <option value={FONT_STACKS.fang}>仿宋</option>
+          <option value={FONT_STACKS.arial}>Arial</option>
+          <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
         </select>
 
         {sep}

@@ -1,3 +1,5 @@
+import { SUPPORTED_AI_FONT_NAMES } from '../fonts'
+
 const rangeProperties = {
   type: {
     type: 'string',
@@ -42,7 +44,7 @@ export const layoutTools = [
       type: 'object',
       properties: {
         range: { type: 'object', description: '操作范围', properties: rangeProperties },
-        fontFamily: { type: 'string', description: '字体名，如 宋体/黑体/楷体/仿宋/Arial/Times New Roman' },
+        fontFamily: { type: 'string', enum: [...SUPPORTED_AI_FONT_NAMES], description: '字体名，仅支持 宋体/黑体/楷体/仿宋' },
         fontSize: { type: 'number', description: '字号（磅），如 12/16/22' },
         color: { type: 'string', description: '文字颜色 hex，如 #FF0000' },
         backgroundColor: { type: 'string', description: '文字背景色 hex' },

@@ -54,6 +54,7 @@ interface Props {
   view: EditorView | null
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
+  onDocumentStyleMutation?: () => void
   onClose: () => void
 }
 
@@ -245,7 +246,7 @@ function makeConversationTitle(text: string) {
   return text.trim().slice(0, 30) || '新会话'
 }
 
-export default function AISidebar({ view: editorView, pageConfig, onPageConfigChange, onClose }: Props) {
+export default function AISidebar({ view: editorView, pageConfig, onPageConfigChange, onDocumentStyleMutation, onClose }: Props) {
   const [viewMode, setViewMode] = useState<View>('history')
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
@@ -513,7 +514,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                   status: 'pending',
                 }
                 const result = editorView
-                  ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange })
+                  ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange, onDocumentStyleMutation })
                   : { success: false, message: '编辑器尚未就绪' }
 
                 toolCall.status = result.success ? 'ok' : 'err'
@@ -641,7 +642,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [editorView, getContext, input, loadConversations, loading, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
+  }, [editorView, getContext, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 

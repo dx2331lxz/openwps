@@ -1,3 +1,5 @@
+import { FONT_STACKS, normalizeFontFamily } from '../fonts'
+
 export interface BodyStyle {
   fontFamily?: string
   fontSize?: number
@@ -68,17 +70,12 @@ export const presetStyles: Record<string, PresetStyle> = {
 
 /** Map Chinese font short names to CSS font stacks */
 export const fontFamilyMap: Record<string, string> = {
-  仿宋: 'FangSong, 仿宋, serif',
-  宋体: 'SimSun, 宋体, serif',
-  黑体: 'SimHei, 黑体, sans-serif',
-  楷体: 'KaiTi, 楷体, serif',
-  隶书: 'LiSu, 隶书, serif',
-  幼圆: 'YouYuan, 幼圆, sans-serif',
-  Arial: 'Arial, sans-serif',
-  'Times New Roman': 'Times New Roman, serif',
-  'Courier New': 'Courier New, monospace',
+  仿宋: FONT_STACKS.fang,
+  宋体: FONT_STACKS.song,
+  黑体: FONT_STACKS.hei,
+  楷体: FONT_STACKS.kai,
 }
 
 export function mapFontFamily(name: string): string {
-  return fontFamilyMap[name] ?? name
+  return fontFamilyMap[name] ?? normalizeFontFamily(name)
 }

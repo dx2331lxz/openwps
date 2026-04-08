@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
     "provider": "openai"
 }
 
+SUPPORTED_AI_FONTS = ["宋体", "黑体", "楷体", "仿宋"]
+
 # ── 排版工具 schema（传给 AI）──────────────────────────────────
 
 RANGE_SPEC = {
@@ -100,7 +102,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "range": RANGE_SPEC,
-                    "fontFamily": {"type": "string", "description": "字体名，如 宋体/黑体/楷体/仿宋/Arial/Times New Roman"},
+                    "fontFamily": {"type": "string", "enum": SUPPORTED_AI_FONTS, "description": "字体名，仅支持 宋体/黑体/楷体/仿宋"},
                     "fontSize": {"type": "number", "description": "字号（磅），如 12/16/22"},
                     "color": {"type": "string", "description": "文字颜色 hex，如 #FF0000"},
                     "backgroundColor": {"type": "string", "description": "文字背景色 hex"},
@@ -255,6 +257,7 @@ SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文
 5. 不要一次性修改整个文档，除非用户明确说“全部”
 6. 询问“第几段是什么内容”“某段内容是什么”“文档有哪些段落”时，优先使用 get_document_content 或 get_paragraph
 7. 插入类工具必须带位置：insert_page_break / insert_table / insert_horizontal_rule 需要 afterParagraph，insert_text 需要 paragraphIndex
+8. 涉及字体时，只能使用这 4 种字体：宋体、黑体、楷体、仿宋。不要调用其他字体名
 
 回复要求：
 - 如果已经完成操作，就简短说明做了什么

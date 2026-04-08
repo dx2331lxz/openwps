@@ -1,5 +1,6 @@
 import { prepareWithSegments, layoutWithLines } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
+import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 
 export interface PageConfig {
   pageWidth: number
@@ -59,7 +60,7 @@ function ptToPx(pt: number): number {
 }
 
 function getParagraphTextStyle(paraNode: PMNode) {
-  let fontFamily = 'SimSun, 宋体, "Songti SC", STSong, "Noto Serif CJK SC", serif'
+  let fontFamily = DEFAULT_EDITOR_FONT_STACK
   let fontSize = 12
 
   paraNode.forEach((child) => {
@@ -73,6 +74,14 @@ function getParagraphTextStyle(paraNode: PMNode) {
   })
 
   return { fontFamily, fontSize }
+}
+
+function normalizeTextForPretext(text: string) {
+  return text
+    // WPS 的中文引号会更贴近字面宽度，浏览器 fallback 字体常把它们留得更松。
+    // 这里仅用于测量，帮助 Pretext 的逐行结果更接近实际中文文档版式。
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
 }
 
 function estimateImageHeight(node: PMNode): number {
@@ -153,7 +162,7 @@ function measureParagraph(
   let rawLines: { text: string }[]
   try {
     // 与编辑器的 word-break: break-all 保持一致，避免长数字/英文串把前面的中文带走。
-    const breakableText = text.split('').join('\u200b')
+    const breakableText = normalizeTextForPretext(text).split('').join('\u200b')
     const prepared = prepareWithSegments(breakableText, fontStr, { whiteSpace: 'pre-wrap' })
     // DOM 与 canvas/font fallback 在边界处仍可能有细微偏差，保守收窄一点版心，
     // 优先避免“Pretext 认为一行能放下，但浏览器实际又折成两行”的中途裂行。
