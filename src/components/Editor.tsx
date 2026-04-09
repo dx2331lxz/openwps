@@ -362,16 +362,19 @@ export const Editor: React.FC = () => {
   const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
   const [editorFocused, setEditorFocused] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
+  const docxLetterSpacingRef = useRef(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
+  useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
 
   const clearImportedDocxCompatibility = useCallback(() => {
-    if (docxLetterSpacingPx === 0 && Object.keys(docxExportOptionsRef.current).length === 0) return
+    if (docxLetterSpacingRef.current === 0 && Object.keys(docxExportOptionsRef.current).length === 0) return
     docxExportOptionsRef.current = {}
+    docxLetterSpacingRef.current = 0
     setDocxLetterSpacingPx(0)
     console.log('[docx] imported compatibility metadata cleared after style mutation')
-  }, [docxLetterSpacingPx])
+  }, [])
 
   const updateLayoutSnapshot = useCallback((doc: EditorState['doc']) => {
     const layout = paginate(doc, pageConfigRef.current)
@@ -489,7 +492,8 @@ export const Editor: React.FC = () => {
         docGridLinePitchPt: parsed.docGridLinePitchPt,
         typography: parsed.typography,
       }
-      setDocxLetterSpacingPx(parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0)
+      docxLetterSpacingRef.current = parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0
+      setDocxLetterSpacingPx(docxLetterSpacingRef.current)
       console.log(
         `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
           `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
@@ -526,6 +530,19 @@ export const Editor: React.FC = () => {
 
     const clampedPos = Math.max(0, Math.min(pos, editorView.state.doc.content.size))
     const selection = TextSelection.create(editorView.state.doc, clampedPos)
+    const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
+    editorView.dispatch(tr)
+    editorView.focus()
+  }, [])
+
+  const handleRequestSelectionRange = useCallback((anchor: number, head: number) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const maxPos = editorView.state.doc.content.size
+    const clampedAnchor = Math.max(0, Math.min(anchor, maxPos))
+    const clampedHead = Math.max(0, Math.min(head, maxPos))
+    const selection = TextSelection.create(editorView.state.doc, clampedAnchor, clampedHead)
     const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
     editorView.dispatch(tr)
     editorView.focus()
@@ -606,8 +623,12 @@ export const Editor: React.FC = () => {
               pageConfig={cfg}
               pageGap={PAGE_GAP}
               caretPos={editorState?.selection.head ?? null}
+              selectionFrom={editorState?.selection.from ?? null}
+              selectionTo={editorState?.selection.to ?? null}
               showCaret={editorFocused && Boolean(editorState?.selection.empty)}
+              showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty)}
               onRequestCaretPos={handleRequestCaretPos}
+              onRequestSelectionRange={handleRequestSelectionRange}
             />
           )}
 

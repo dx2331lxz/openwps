@@ -17,8 +17,12 @@ interface ConversationSummary {
 }
 
 interface StoredMessage {
-  role: 'user' | 'assistant'
-  content: string
+  role: 'user' | 'assistant' | 'tool'
+  content?: string | null
+  thinking?: string
+  toolCalls?: ToolCallResult[]
+  tool_calls?: Array<{ id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }>
+  tool_call_id?: string
 }
 
 interface ConversationDetail extends ConversationSummary {
@@ -30,6 +34,7 @@ interface ToolCallResult {
   name: string
   params: Record<string, unknown>
   status: 'pending' | 'ok' | 'err'
+  message?: string
 }
 
 interface Message {
@@ -178,23 +183,6 @@ function makeAiMessage(text = '', streaming = false): Message {
   }
 }
 
-function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Message[] {
-  return messages.map(msg =>
-    msg.role === 'user'
-      ? makeUserMessage(msg.content, sidebarWidth)
-      : makeAiMessage(msg.content, false),
-  )
-}
-
-function toChatHistory(messages: Message[]) {
-  return messages
-    .filter(message => message.role === 'user' || message.text.trim())
-    .map(message => ({
-      role: message.role === 'user' ? 'user' : 'assistant',
-      content: message.text,
-    }))
-}
-
 interface ToolCallRecord {
   id: string
   name: string
@@ -206,17 +194,36 @@ type ReactMessagePayload =
   | { role: 'user' | 'assistant'; content: string | null; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> }
   | { role: 'tool'; tool_call_id: string; content: string }
 
-function buildReactUserContent(text: string, context: Record<string, unknown>) {
-  const paragraphCount = Number(context.paragraphCount ?? 0)
-  const wordCount = Number(context.wordCount ?? 0)
-  const paragraphs = context.paragraphs as Array<{index: number, text: string}> | undefined
-  let docSummary = `\n\n【当前文档结构：${paragraphCount} 段，共 ${wordCount} 字】`
-  if (paragraphs && paragraphs.length > 0) {
-    docSummary += '\n' + paragraphs.map(p =>
-      `  段落${p.index}：${p.text.slice(0, 50)}${p.text.length > 50 ? '...' : ''}`
-    ).join('\n')
+function normalizeReactToolCalls(
+  toolCalls: StoredMessage['tool_calls'] | ToolCallResult[] | undefined,
+): Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> | undefined {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return undefined
+
+  if ('params' in toolCalls[0]) {
+    return (toolCalls as ToolCallResult[]).map(tool => ({
+      id: tool.id ?? tool.name,
+      type: 'function',
+      function: {
+        name: tool.name,
+        arguments: JSON.stringify(tool.params),
+      },
+    }))
   }
-  return text + docSummary
+
+  return (toolCalls as NonNullable<StoredMessage['tool_calls']>)
+    .map(call => {
+      const name = call.function?.name
+      if (!call.id || !name) return null
+      return {
+        id: call.id,
+        type: 'function' as const,
+        function: {
+          name,
+          arguments: String(call.function?.arguments ?? '{}'),
+        },
+      }
+    })
+    .filter((call): call is { id: string; type: 'function'; function: { name: string; arguments: string } } => Boolean(call))
 }
 
 function serializeToolResult(result: ExecuteResult) {
@@ -227,14 +234,117 @@ function serializeToolResult(result: ExecuteResult) {
   })
 }
 
-function buildReactMessages(messages: Message[], userText: string, context: Record<string, unknown>): ReactMessagePayload[] {
-  return [
-    ...toChatHistory(messages).slice(-20).map(message => ({
-      role: message.role as 'user' | 'assistant',
-      content: message.content,
-    })),
-    { role: 'user', content: buildReactUserContent(userText, context) },
-  ]
+function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
+  if (Array.isArray(message.toolCalls)) {
+    return message.toolCalls.map(toolCall => ({
+      id: toolCall.id,
+      name: toolCall.name,
+      params: normalizeToolParams(toolCall.params),
+      status: toolCall.status,
+      message: toolCall.message,
+    }))
+  }
+
+  if (Array.isArray(message.tool_calls)) {
+    return message.tool_calls.map(call => {
+      let params: Record<string, unknown> = {}
+      const rawArguments = call.function?.arguments
+      if (typeof rawArguments === 'string') {
+        try {
+          params = normalizeToolParams(JSON.parse(rawArguments))
+        } catch {
+          params = {}
+        }
+      }
+      return {
+        id: call.id,
+        name: String(call.function?.name ?? ''),
+        params,
+        status: 'pending' as const,
+      }
+    })
+  }
+
+  return []
+}
+
+function applyStoredToolResult(message: Message | undefined, stored: StoredMessage) {
+  if (!message || message.role !== 'ai' || stored.role !== 'tool') return
+
+  let parsed: { success?: boolean; message?: string } | null = null
+  if (typeof stored.content === 'string') {
+    try {
+      parsed = JSON.parse(stored.content) as { success?: boolean; message?: string }
+    } catch {
+      parsed = null
+    }
+  }
+
+  const nextStatus = parsed?.success === false ? 'err' : 'ok'
+  const nextMessage = parsed?.message ?? (typeof stored.content === 'string' ? stored.content : '')
+  const targetId = stored.tool_call_id
+  let matched = false
+
+  message.toolCalls = message.toolCalls.map((toolCall, index, array) => {
+    const shouldUse =
+      (!matched && targetId && toolCall.id === targetId) ||
+      (!matched && !targetId && index === array.length - 1)
+    if (!shouldUse) return toolCall
+    matched = true
+    return { ...toolCall, status: nextStatus, message: nextMessage }
+  })
+}
+
+function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Message[] {
+  const restored: Message[] = []
+
+  for (const stored of messages) {
+    if (stored.role === 'user') {
+      restored.push(makeUserMessage(stored.content ?? '', sidebarWidth))
+      continue
+    }
+
+    if (stored.role === 'assistant') {
+      const aiMessage = makeAiMessage(stored.content ?? '', false)
+      aiMessage.thinking = stored.thinking ?? ''
+      aiMessage.toolCalls = normalizeStoredToolCalls(stored)
+      restored.push(aiMessage)
+      continue
+    }
+
+    applyStoredToolResult(restored.at(-1), stored)
+  }
+
+  return restored
+}
+
+function buildReactMessages(messages: StoredMessage[], userText: string): ReactMessagePayload[] {
+  const history = messages
+    .map(message => {
+      if (message.role === 'tool') {
+        return {
+          role: 'tool' as const,
+          tool_call_id: String(message.tool_call_id ?? ''),
+          content: typeof message.content === 'string' ? message.content : '',
+        }
+      }
+
+      if (message.role === 'assistant') {
+        return {
+          role: 'assistant' as const,
+          content: typeof message.content === 'string' ? message.content : null,
+          tool_calls: normalizeReactToolCalls(message.tool_calls ?? message.toolCalls),
+        }
+      }
+
+      return {
+        role: 'user' as const,
+        content: typeof message.content === 'string' ? message.content : '',
+      }
+    })
+    .slice(-40)
+
+  return [...history, { role: 'user', content: userText }]
 }
 
 function buildErrorText(error: unknown) {
@@ -262,12 +372,8 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const isDragging = useRef(false)
-  const messagesRef = useRef<Message[]>([])
   const currentConversationIdRef = useRef<string | null>(null)
-
-  useEffect(() => {
-    messagesRef.current = messages
-  }, [messages])
+  const conversationMessagesRef = useRef<StoredMessage[]>([])
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
@@ -371,7 +477,8 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
       const data = (await response.json()) as ConversationDetail
       setCurrentConversationId(data.id)
       setCurrentConversationTitle(data.title || '新会话')
-      setMessages(fromStoredMessages(data.messages ?? [], sidebarWidth))
+      conversationMessagesRef.current = data.messages ?? []
+      setMessages(fromStoredMessages(conversationMessagesRef.current, sidebarWidth))
       setViewMode('chat')
     } catch (error) {
       console.error('[AISidebar] open conversation failed', error)
@@ -386,6 +493,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
       if (currentConversationIdRef.current === conversationId) {
         setCurrentConversationId(null)
         setCurrentConversationTitle('')
+        conversationMessagesRef.current = []
         setMessages([])
         setAskContinue({ visible: false, rounds: 0, message: '' })
       }
@@ -404,7 +512,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
 
     const shouldStartNewConversation = viewMode === 'history'
     const nextTitle = makeConversationTitle(text)
-    const previousMessages = shouldStartNewConversation ? [] : messagesRef.current
+    const previousConversationMessages = shouldStartNewConversation ? [] : conversationMessagesRef.current
     const userMessage = makeUserMessage(text, sidebarWidth)
     const aiMessage = makeAiMessage('', true)
 
@@ -415,6 +523,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     if (shouldStartNewConversation) {
       setCurrentConversationId(null)
       setCurrentConversationTitle(nextTitle)
+      conversationMessagesRef.current = []
       setMessages([userMessage, aiMessage])
       setViewMode('chat')
     } else {
@@ -433,6 +542,39 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     const context = getContext()
     let persistedAssistantText = ''
     let conversationPersisted = false
+    const persistedRecords: StoredMessage[] = [{ role: 'user', content: text }]
+
+    const appendAssistantRound = (
+      assistantText: string,
+      thinkingText: string,
+      toolResults: ToolCallRecord[],
+    ) => {
+      if (!assistantText && !thinkingText && toolResults.length === 0) return
+      persistedRecords.push({
+        role: 'assistant',
+        content: assistantText || null,
+        thinking: thinkingText || undefined,
+        tool_calls: toolResults.length > 0
+          ? toolResults.map(tool => ({
+              id: tool.id,
+              type: 'function' as const,
+              function: {
+                name: tool.name,
+                arguments: JSON.stringify(tool.params),
+              },
+            }))
+          : undefined,
+        toolCalls: toolResults.length > 0
+          ? toolResults.map(tool => ({
+              id: tool.id,
+              name: tool.name,
+              params: tool.params,
+              status: tool.result.success ? 'ok' : 'err',
+              message: tool.result.message,
+            }))
+          : undefined,
+      })
+    }
 
     try {
       if (!conversationId) {
@@ -450,7 +592,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
         void loadConversations()
       }
 
-      let reactMessages = buildReactMessages(previousMessages, text, context)
+      let reactMessages = buildReactMessages(previousConversationMessages, text)
       let finished = false
 
       for (let round = 1; round <= MAX_TOOL_ROUNDS && !finished; round += 1) {
@@ -460,7 +602,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
           signal: controller.signal,
           body: JSON.stringify({
             message: text,
-            history: toChatHistory(previousMessages).slice(-20),
+            history: previousConversationMessages.filter(message => message.role !== 'tool').slice(-20),
             context,
             conversationId,
             reactMessages,
@@ -474,6 +616,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
         let buffer = ''
         let awaitingToolResults = false
         let roundAssistantText = ''
+        let roundThinkingText = ''
         const toolResults: ToolCallRecord[] = []
 
         while (true) {
@@ -495,6 +638,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
 
             switch (event.type) {
               case 'thinking':
+                roundThinkingText += String(event.content ?? '')
                 updateMessage(message => ({ ...message, thinking: message.thinking + String(event.content ?? '') }))
                 break
 
@@ -518,12 +662,16 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                   : { success: false, message: '编辑器尚未就绪' }
 
                 toolCall.status = result.success ? 'ok' : 'err'
+                toolCall.message = result.message
                 toolResults.push({
                   id: toolCall.id ?? toolCall.name,
                   name: toolCall.name,
                   params: toolCall.params,
                   result,
                 })
+                if (!result.success) {
+                  console.error('[AISidebar] tool call failed', toolCall.name, toolCall.params, result.message)
+                }
                 updateMessage(message => ({ ...message, toolCalls: [...message.toolCalls, toolCall] }))
                 break
               }
@@ -547,12 +695,25 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
           }
         }
 
-        if (finished) break
+        if (finished) {
+          appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+          break
+        }
         if (!awaitingToolResults || toolResults.length === 0) {
+          appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
           updateMessage(message => ({ ...message, streaming: false }))
           finished = true
           break
         }
+
+        appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+        persistedRecords.push(
+          ...toolResults.map(tool => ({
+            role: 'tool' as const,
+            tool_call_id: tool.id,
+            content: serializeToolResult(tool.result),
+          })),
+        )
 
         reactMessages = [
           ...reactMessages,
@@ -590,17 +751,18 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            messages: [
-              { role: 'user', content: text },
-              { role: 'assistant', content: persistedAssistantText || '（无回复）' },
-            ],
+            messages: persistedRecords,
           }),
         })
         conversationPersisted = true
+        conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         persistedAssistantText = '（已取消）'
+        if (!persistedRecords.some(message => message.role === 'assistant')) {
+          persistedRecords.push({ role: 'assistant', content: persistedAssistantText })
+        }
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
@@ -611,6 +773,9 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
       } else {
         const errorText = buildErrorText(error)
         persistedAssistantText = errorText
+        if (!persistedRecords.some(message => message.role === 'assistant')) {
+          persistedRecords.push({ role: 'assistant', content: errorText })
+        }
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
@@ -624,14 +789,12 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
         try {
           await fetch(`/api/conversations/${conversationId}/messages`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              messages: [
-                { role: 'user', content: text },
-                { role: 'assistant', content: persistedAssistantText || '（无回复）' },
-              ],
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+              messages: persistedRecords,
             }),
           })
+          conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
         } catch (persistError) {
           console.error('[AISidebar] persist conversation failed', persistError)
         }
@@ -809,7 +972,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                         {message.toolCalls.map((toolCall, index) => (
                           <div
                             key={`${toolCall.id ?? toolCall.name}-${index}`}
-                            className={`flex items-start gap-1.5 text-xs font-mono ${
+                            className={`text-xs font-mono ${
                               toolCall.status === 'ok'
                                 ? 'text-green-700'
                                 : toolCall.status === 'err'
@@ -817,10 +980,15 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                                   : 'text-gray-400'
                             }`}
                           >
-                            <span className="flex-shrink-0">
-                              {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
-                            </span>
-                            <span className="break-all">{fmtToolCall(toolCall)}</span>
+                            <div className="flex items-start gap-1.5">
+                              <span className="flex-shrink-0">
+                                {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
+                              </span>
+                              <span className="break-all">{fmtToolCall(toolCall)}</span>
+                            </div>
+                            {toolCall.message && (
+                              <div className="pl-5 mt-0.5 break-all opacity-80">{toolCall.message}</div>
+                            )}
                           </div>
                         ))}
                       </div>

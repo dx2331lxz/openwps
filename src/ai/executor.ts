@@ -54,6 +54,32 @@ interface ParagraphRef {
   index: number
 }
 
+function describeRange(range?: RangeSpec) {
+  if (!range?.type) return '整个文档'
+  switch (range.type) {
+    case 'paragraph':
+      return typeof range.paragraphIndex === 'number' ? `第 ${range.paragraphIndex + 1} 段` : '单段范围'
+    case 'paragraphs':
+      return `第 ${(range.from ?? 0) + 1} 到第 ${(range.to ?? range.from ?? 0) + 1} 段`
+    case 'selection':
+      return '当前选区'
+    case 'contains_text':
+      return `包含“${range.text ?? ''}”的段落`
+    case 'first_paragraph':
+      return '第一段'
+    case 'last_paragraph':
+      return '最后一段'
+    case 'odd_paragraphs':
+      return '奇数段'
+    case 'even_paragraphs':
+      return '偶数段'
+    case 'all':
+      return '整个文档'
+    default:
+      return '指定范围'
+  }
+}
+
 function getParagraphs(state: EditorState): ParagraphRef[] {
   const paragraphs: ParagraphRef[] = []
   let paraIndex = 0
@@ -314,6 +340,10 @@ export function executeTool(
     switch (toolName) {
       case 'set_text_style': {
         const range = params.range as RangeSpec | undefined
+        if (!range) return { success: false, message: 'set_text_style 缺少 range 参数' }
+        if (range.type !== 'selection' && resolveRange(state, range).length === 0) {
+          return { success: false, message: `未找到可设置文字样式的范围：${describeRange(range)}` }
+        }
         const { range: _range, ...rawStyleAttrs } = params
         const styleAttrs = Object.fromEntries(
           Object.entries(rawStyleAttrs).filter(([, value]) => value !== undefined)
@@ -330,6 +360,10 @@ export function executeTool(
 
       case 'set_paragraph_style': {
         const range = params.range as RangeSpec | undefined
+        if (!range) return { success: false, message: 'set_paragraph_style 缺少 range 参数' }
+        if (range.type !== 'selection' && resolveRange(state, range).length === 0) {
+          return { success: false, message: `未找到可设置段落格式的范围：${describeRange(range)}` }
+        }
         const { range: _range, ...rawParaAttrs } = params
         const paraAttrs = Object.fromEntries(
           Object.entries(rawParaAttrs).filter(([, value]) => value !== undefined)
@@ -448,7 +482,7 @@ export function executeTool(
         return { success: false, message: `未知工具: ${toolName}` }
     }
   } catch (error) {
-    console.error('[executor] Error executing tool', toolName, error)
+    console.error('[executor] Error executing tool', toolName, params, error)
     return { success: false, message: error instanceof Error ? error.message : String(error) }
   }
 }

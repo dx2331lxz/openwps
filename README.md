@@ -18,7 +18,7 @@ AI 驱动的 WPS 级排版 Web 文档编辑器。
 ```bash
 # 安装依赖
 npm install
-pip3 install fastapi uvicorn httpx --break-system-packages
+pip3 install -r server/requirements.txt --break-system-packages
 
 # 配置 AI（在设置界面或直接编辑）
 # server/config/ai.json 填写端点和 API Key
@@ -55,7 +55,7 @@ git add -A && git commit -m "描述" && git push
 | 框架 | React + TypeScript + Vite |
 | 文档模型 | ProseMirror |
 | 布局引擎 | @chenglou/pretext |
-| 后端 | Python FastAPI |
+| 后端 | Python FastAPI + LangGraph |
 | AI | OpenAI 兼容接口（硅基流动/OpenAI/Claude/Ollama） |
 | Markdown | marked |
 
@@ -75,7 +75,9 @@ git add -A && git commit -m "描述" && git push
 openwps/
 ├── src/              # 前端源码
 ├── server/           # Python 后端
-│   ├── main.py       # FastAPI 入口
+│   ├── main.py       # FastAPI 入口壳
+│   ├── app/          # LangGraph/路由/配置/存储
+│   ├── requirements.txt
 │   ├── config/       # AI 配置（不提交）
 │   └── data/         # 会话数据（不提交）
 ├── docs/             # 项目设计说明
