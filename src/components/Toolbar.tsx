@@ -109,11 +109,27 @@ function applyTextStyle(view: EditorView, attrs: Record<string, unknown>) {
 function applyParaStyle(view: EditorView, attrs: Record<string, unknown>) {
   const { state, dispatch } = view
   const { selection, tr } = state
-  state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
-    if (node.type.name === 'paragraph') {
-      tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
+
+  if (selection.empty) {
+    // Cursor (no selection): find the paragraph the cursor is inside
+    const $from = selection.$from
+    for (let d = $from.depth; d >= 0; d--) {
+      const node = $from.node(d)
+      if (node.type.name === 'paragraph') {
+        const pos = $from.before(d)
+        tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
+        break
+      }
     }
-  })
+  } else {
+    // Range selection: apply to all paragraphs in range
+    state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
+      if (node.type.name === 'paragraph') {
+        tr.setNodeMarkup(pos, undefined, { ...node.attrs, ...attrs })
+      }
+    })
+  }
+
   dispatch(tr)
   view.focus()
 }
@@ -207,6 +223,84 @@ const ColorSwatch: React.FC<{
   </div>
 )
 
+// ─── Spacing popover ──────────────────────────────────────────────────────────
+
+const SPACE_PRESETS = [0, 3, 6, 12, 18, 24]
+
+const SpacingPopover: React.FC<{
+  anchorRect: DOMRect
+  value: number
+  onChange: (v: number) => void
+  onClose: () => void
+}> = ({ anchorRect, value, onChange, onClose }) => {
+  const [editing, setEditing] = React.useState(false)
+  const [draft, setDraft] = React.useState(String(value))
+
+  const commit = () => {
+    const n = parseFloat(draft)
+    if (!isNaN(n) && n >= 0) onChange(Math.round(n * 10) / 10)
+    onClose()
+  }
+
+  return (
+    <div
+      onMouseDown={e => e.stopPropagation()}
+      style={{
+        position: 'fixed',
+        top: anchorRect.bottom + 2,
+        left: anchorRect.left,
+        zIndex: 9999,
+        background: 'white', border: '1px solid #d1d5db', borderRadius: 6,
+        boxShadow: '0 4px 12px rgba(0,0,0,0.15)', overflow: 'hidden', minWidth: 108,
+      }}
+    >
+      {/* Current value row — click to enter custom value */}
+      {editing ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '4px 8px', borderBottom: '1px solid #e5e7eb', background: '#f9fafb' }}>
+          <input
+            type="number" min={0} step={0.5}
+            value={draft}
+            autoFocus
+            onChange={e => setDraft(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') onClose() }}
+            onBlur={commit}
+            style={{ width: 52, fontSize: 13, border: '1px solid #93c5fd', borderRadius: 3, padding: '1px 4px', outline: 'none' }}
+          />
+          <span style={{ fontSize: 12, color: '#6b7280' }}>pt</span>
+        </div>
+      ) : (
+        <div
+          onMouseDown={e => { e.preventDefault(); setDraft(String(value)); setEditing(true) }}
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '4px 8px', borderBottom: '1px solid #e5e7eb', background: '#f9fafb',
+            cursor: 'text', fontSize: 13,
+          }}
+        >
+          <span style={{ color: '#374151', fontVariantNumeric: 'tabular-nums' }}>{value}pt</span>
+          <span style={{ fontSize: 11, color: '#9ca3af', marginLeft: 4 }}>✎</span>
+        </div>
+      )}
+
+      {/* Preset options */}
+      {SPACE_PRESETS.map(p => (
+        <div
+          key={p}
+          onMouseDown={e => { e.preventDefault(); onChange(p); onClose() }}
+          style={{
+            padding: '4px 12px', fontSize: 13, cursor: 'pointer',
+            background: value === p ? '#eff6ff' : 'transparent',
+            color: value === p ? '#2563eb' : '#374151',
+            fontWeight: value === p ? 500 : 400,
+          }}
+        >
+          {p}pt
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
 export const Toolbar: React.FC<ToolbarProps> = ({
@@ -219,6 +313,15 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onExportDocx,
 }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
+  const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
+
+  // Close spacing popover on outside click
+  React.useEffect(() => {
+    if (!spacingPopover) return
+    const handler = () => setSpacingPopover(null)
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [spacingPopover])
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
@@ -428,28 +531,34 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </select>
 
         {/* Space before */}
-        <select
+        <button
           title="段前间距"
-          value={fmt.para.spaceBefore}
-          style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onChange={e => { if (view) applyParaStyle(view, { spaceBefore: Number(e.target.value) }) }}
+          className={btn(spacingPopover?.which === 'before')}
+          style={{ minWidth: 52, fontSize: 12 }}
+          onMouseDown={e => {
+            e.preventDefault()
+            e.stopPropagation()
+            if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
+            setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
+          }}
         >
-          <option value={0}>段前0</option>
-          <option value={0.5}>段前0.5行</option>
-          <option value={1}>段前1行</option>
-        </select>
+          段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
+        </button>
 
         {/* Space after */}
-        <select
+        <button
           title="段后间距"
-          value={fmt.para.spaceAfter}
-          style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onChange={e => { if (view) applyParaStyle(view, { spaceAfter: Number(e.target.value) }) }}
+          className={btn(spacingPopover?.which === 'after')}
+          style={{ minWidth: 52, fontSize: 12 }}
+          onMouseDown={e => {
+            e.preventDefault()
+            e.stopPropagation()
+            if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
+            setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
+          }}
         >
-          <option value={0}>段后0</option>
-          <option value={0.5}>段后0.5行</option>
-          <option value={1}>段后1行</option>
-        </select>
+          段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
+        </button>
 
         {sep}
 
@@ -490,6 +599,24 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           style={{ display: 'none' }}
         />
       </div>
+
+      {/* Spacing popovers — rendered at root to escape toolbar overflow:hidden */}
+      {spacingPopover?.which === 'before' && (
+        <SpacingPopover
+          anchorRect={spacingPopover.rect}
+          value={fmt.para.spaceBefore as number}
+          onChange={v => { if (view) applyParaStyle(view, { spaceBefore: v }) }}
+          onClose={() => setSpacingPopover(null)}
+        />
+      )}
+      {spacingPopover?.which === 'after' && (
+        <SpacingPopover
+          anchorRect={spacingPopover.rect}
+          value={fmt.para.spaceAfter as number}
+          onChange={v => { if (view) applyParaStyle(view, { spaceAfter: v }) }}
+          onClose={() => setSpacingPopover(null)}
+        />
+      )}
     </>
   )
 }

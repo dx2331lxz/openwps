@@ -134,6 +134,12 @@ const PM_STYLES = `
   -webkit-text-fill-color: transparent;
   text-shadow: none !important;
 }
+.pretext-driving-editor .ProseMirror ::selection,
+.pretext-driving-editor .ProseMirror *::selection {
+  background: transparent !important;
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+}
 .pretext-driving-editor .ProseMirror img,
 .pretext-driving-editor .ProseMirror hr,
 .pretext-driving-editor .ProseMirror table {

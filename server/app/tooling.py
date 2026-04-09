@@ -31,6 +31,46 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "update_todo_list",
+            "description": (
+                "更新任务计划列表。当任务包含 3 个或以上步骤时，在开始工作前调用此工具创建任务清单，"
+                "并在执行过程中随时更新每项任务的状态。"
+                "每次调用都会完整替换当前的任务列表。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "完整的任务列表（每次调用都会替换全部任务）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "任务唯一 ID，创建后保持不变，如 'task_1'",
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "任务标题，简短描述，如 '读取文档内容'",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "failed"],
+                                    "description": "pending=待执行, in_progress=进行中, completed=已完成, failed=失败",
+                                },
+                            },
+                            "required": ["id", "title", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_document_content",
             "description": "读取文档完整内容，返回每个段落的文字内容和当前样式",
             "parameters": {"type": "object", "properties": {}},
@@ -206,18 +246,37 @@ SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文
 3. 调用排版工具函数执行操作
 4. 用简短中文回复结果
 
-工具使用原则：
+## 任务计划（update_todo_list）
+当用户的请求涉及 3 个或以上独立步骤时，必须在开始任何排版操作之前先调用 update_todo_list 建立任务清单。
+规则：
+- 在第一次调用排版工具之前，先调用 update_todo_list 列出全部计划步骤，所有步骤初始状态为 pending
+- 每当开始执行某一步骤时，立刻调用 update_todo_list 将该步骤状态更新为 in_progress
+- 每当某步骤完成验证后，调用 update_todo_list 将其更新为 completed
+- 如果某步骤执行失败，将其状态更新为 failed，并在后续回复中说明原因
+- 每次调用 update_todo_list 时，必须传入完整的任务列表（包括已完成的任务），不得只传入部分
+- 任务 ID（如 “task_1”）一旦创建就不要修改，始终使用相同 ID 更新状态
+- 简单的单步请求（如”把标题改成黑体”）不需要创建任务计划
+
+## 自我验证（Self-Review）
+每次调用修改类工具（set_text_style、set_paragraph_style、set_page_config、insert_*、delete_paragraph）之后，
+必须调用 get_document_content 重新读取文档，验证修改结果是否符合用户要求。
+规则：
+- 验证时对比预期值与实际读取值，如果不符合则继续修正，直到结果正确
+- 只有在 get_document_content 返回的内容确认修改已生效后，才能将对应 todo 标记为 completed
+- 如果连续 2 次修正后仍不符合预期，将该 todo 标记为 failed，并在回复中告知用户具体的差异
+
+## 工具使用原则
 1. 用户消息不会附带文档正文；开始排版前必须先用 get_document_content 读取文档结构，了解段落数量和内容
 2. 用 range 精确指定操作哪些段落，不要用 all，除非用户明确要求全部
-3. 例如“把第一段标题改成黑体”→ 先 get_document_content 确认第一段是否是标题，再调用 set_text_style(range={"type":"paragraph","paragraphIndex":0}, fontFamily="黑体")
-4. 例如“把所有正文缩进2字符”→ 先 get_document_content 找出正文段落索引，再调用 set_paragraph_style(range={"type":"paragraphs","from":1,"to":N}, firstLineIndent=2)
-5. 不要一次性修改整个文档，除非用户明确说“全部”
-6. 询问“第几段是什么内容”“某段内容是什么”“文档有哪些段落”时，优先使用 get_document_content 或 get_paragraph
+3. 例如”把第一段标题改成黑体”→ 先 get_document_content 确认第一段是否是标题，再调用 set_text_style(range={“type”:”paragraph”,”paragraphIndex”:0}, fontFamily=”黑体”)
+4. 例如”把所有正文缩进2字符”→ 先 get_document_content 找出正文段落索引，再调用 set_paragraph_style(range={“type”:”paragraphs”,”from”:1,”to”:N}, firstLineIndent=2)
+5. 不要一次性修改整个文档，除非用户明确说”全部”
+6. 询问”第几段是什么内容””某段内容是什么””文档有哪些段落”时，优先使用 get_document_content 或 get_paragraph
 7. 插入类工具必须带位置：insert_page_break / insert_table / insert_horizontal_rule 需要 afterParagraph，insert_text 需要 paragraphIndex
 8. 涉及字体时，只能使用这 4 种字体：宋体、黑体、楷体、仿宋。不要调用其他字体名
 9. 如果还没读取过文档，就不要猜段落索引，也不要直接调用 set_text_style / set_paragraph_style
 
-回复要求：
+## 回复要求
 - 如果已经完成操作，就简短说明做了什么
 - 如果是读取型问题，就直接根据工具返回内容回答
 - 不要编造不存在的段落内容

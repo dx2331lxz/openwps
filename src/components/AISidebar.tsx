@@ -55,6 +55,12 @@ interface AskContinueState {
   message: string
 }
 
+interface TodoItem {
+  id: string
+  title: string
+  status: 'pending' | 'in_progress' | 'completed' | 'failed'
+}
+
 interface Props {
   view: EditorView | null
   pageConfig: PageConfig
@@ -367,6 +373,8 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
+  const [todos, setTodos] = useState<TodoItem[]>([])
+  const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(true)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -517,6 +525,8 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     const aiMessage = makeAiMessage('', true)
 
     setAskContinue({ visible: false, rounds: 0, message: '' })
+    setTodos([])
+    setIsTodoPanelExpanded(true)
     setInput('')
     resetTextareaHeight()
 
@@ -657,9 +667,29 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                   params: normalizeToolParams(event.params),
                   status: 'pending',
                 }
-                const result = editorView
-                  ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange, onDocumentStyleMutation })
-                  : { success: false, message: '编辑器尚未就绪' }
+
+                // Intercept update_todo_list: update UI state locally instead of running on editor
+                let result: { success: boolean; message: string; data?: unknown }
+                if (toolCall.name === 'update_todo_list') {
+                  const rawTodos = Array.isArray(toolCall.params.todos) ? toolCall.params.todos : []
+                  const nextTodos: TodoItem[] = rawTodos
+                    .filter((t): t is Record<string, unknown> => t !== null && typeof t === 'object')
+                    .map(t => ({
+                      id: String(t.id ?? ''),
+                      title: String(t.title ?? ''),
+                      status: (['pending', 'in_progress', 'completed', 'failed'].includes(String(t.status))
+                        ? t.status
+                        : 'pending') as TodoItem['status'],
+                    }))
+                  setTodos(nextTodos)
+                  const hasActive = nextTodos.some(t => t.status !== 'completed' && t.status !== 'failed')
+                  setIsTodoPanelExpanded(hasActive)
+                  result = { success: true, message: 'todo list updated' }
+                } else {
+                  result = editorView
+                    ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange, onDocumentStyleMutation })
+                    : { success: false, message: '编辑器尚未就绪' }
+                }
 
                 toolCall.status = result.success ? 'ok' : 'err'
                 toolCall.message = result.message
@@ -898,6 +928,61 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
               <div className="text-sm text-gray-400 text-center py-8">开始一段新的排版对话</div>
             )}
 
+            {/* Todo Panel */}
+            {todos.length > 0 && (
+              <div className="border border-blue-200 rounded-xl overflow-hidden bg-blue-50 flex-shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsTodoPanelExpanded(prev => !prev)}
+                  className="w-full flex items-center justify-between px-3 py-2 bg-blue-100 hover:bg-blue-200 transition-colors text-left select-none"
+                >
+                  <span className="text-xs font-semibold text-blue-700 tracking-wide">📋 任务计划</span>
+                  <span className="text-xs text-blue-500 flex items-center gap-1.5">
+                    <span>
+                      {todos.filter(t => t.status === 'completed').length}/{todos.length}
+                    </span>
+                    <span>{isTodoPanelExpanded ? '▲' : '▼'}</span>
+                  </span>
+                </button>
+                {isTodoPanelExpanded && (
+                  <ul className="px-3 py-2 space-y-1.5">
+                    {todos.map(todo => (
+                      <li key={todo.id} className="flex items-start gap-2 text-xs">
+                        <span className="flex-shrink-0 mt-px">
+                          {todo.status === 'completed' ? '✅' :
+                           todo.status === 'in_progress' ? '🔄' :
+                           todo.status === 'failed' ? '❌' :
+                           '⬜'}
+                        </span>
+                        <span
+                          className={
+                            todo.status === 'completed'
+                              ? 'text-gray-400 line-through'
+                              : todo.status === 'in_progress'
+                                ? 'text-blue-700 font-medium'
+                                : todo.status === 'failed'
+                                  ? 'text-red-500'
+                                  : 'text-gray-600'
+                          }
+                        >
+                          {todo.title}
+                          {todo.status === 'in_progress' && (
+                            <span
+                              className="ml-1.5 inline-block text-blue-400"
+                              style={{ animation: 'blink 1.2s step-end infinite' }}
+                            >
+                              …
+                            </span>
+                          )}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            {/* End Todo Panel */}
+
             {messages.map(message => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {message.role === 'user' ? (
@@ -967,9 +1052,9 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                       )
                     )}
 
-                    {message.toolCalls.length > 0 && (
+                    {message.toolCalls.filter(tc => tc.name !== 'update_todo_list').length > 0 && (
                       <div className="bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 space-y-1">
-                        {message.toolCalls.map((toolCall, index) => (
+                        {message.toolCalls.filter(tc => tc.name !== 'update_todo_list').map((toolCall, index) => (
                           <div
                             key={`${toolCall.id ?? toolCall.name}-${index}`}
                             className={`text-xs font-mono ${
