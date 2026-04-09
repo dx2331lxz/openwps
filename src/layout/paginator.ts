@@ -1,4 +1,4 @@
-import { prepareWithSegments, layoutWithLines } from '@chenglou/pretext'
+import { prepareWithSegments } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 
@@ -28,8 +28,48 @@ export interface LineInfo {
   startPos: number | null
 }
 
+export interface RenderTextStyle {
+  fontFamily: string
+  fontSize: number
+  color: string
+  backgroundColor: string
+  bold: boolean
+  italic: boolean
+  underline: boolean
+  strikethrough: boolean
+  superscript: boolean
+  subscript: boolean
+  letterSpacing: number
+}
+
+export interface RenderUnit {
+  text: string
+  startPos: number | null
+  endPos: number | null
+  style: RenderTextStyle
+  width: number
+  renderWidth: number
+  glyphWidth: number
+  anchor: 'start' | 'end'
+}
+
+export interface RenderedLine extends LineInfo {
+  units: RenderUnit[]
+  align: 'left' | 'center' | 'right' | 'justify'
+  availableWidth: number
+  xOffset: number
+  usedWidth: number
+  renderedWidth: number
+  isLastLineOfParagraph: boolean
+}
+
 export interface PageLayout {
   lines: LineInfo[]
+  totalHeight: number
+}
+
+export interface RenderedPage {
+  lines: Array<RenderedLine & { top: number }>
   totalHeight: number
 }
 
@@ -41,68 +81,498 @@ export interface PageBreakInfo {
 
 export interface PaginateResult {
   pages: PageLayout[]
+  renderedPages: RenderedPage[]
   breaks: PageBreakInfo[]
   lineBreaks: number[]
 }
 
 const PRETEXT_LAYOUT_SAFETY_PX = 2
+const COMPRESSIBLE_PUNCT_RE = /^[，。、；：！？,.!?:;、（）()〈〉《》「」『』【】〔〕〖〗〘〙〚〛‘’“”…]+$/
 
 interface MeasuredBlock {
-  lines: LineInfo[]
+  lines: RenderedLine[]
   totalHeight: number
   canSplit: boolean
   spaceBefore: number
   spaceAfter: number
 }
 
+interface MeasureUnit {
+  displayText: string
+  measuredText: string
+  style: RenderTextStyle
+  fontStr: string
+  width: number
+  compressedWidth: number
+  compressionCapacity: number
+  sourceCharCount: number
+  startPos: number | null
+  endPos: number | null
+}
+
+interface FittedLine {
+  text: string
+  sourceCharCount: number
+  units: RenderUnit[]
+  usedWidth: number
+  renderedWidth: number
+  availableWidth: number
+}
+
+interface FittedGroup {
+  lines: FittedLine[]
+}
+
+const HAN_CHAR_RE = /\p{Script=Han}/u
+const LATIN_ALPHA_RE = /[A-Za-z]/
+const OPENING_PUNCT_RE = /^[（(〈《「『【〔〖〘〚“‘]$/
+const END_ANCHORED_PUNCT_RE = /^[，。、；：！？,.!?:;、）)〉》」』】〕〗〙〛”’…]$/
+const TEXT_COMPRESSION_TRIGGER_RATIO = 0.42
+const TEXT_COMPRESSION_MAX_RATIO = 0.65
+
+const DEFAULT_TEXT_STYLE: RenderTextStyle = {
+  fontFamily: DEFAULT_EDITOR_FONT_STACK,
+  fontSize: 12,
+  color: '#000000',
+  backgroundColor: '',
+  bold: false,
+  italic: false,
+  underline: false,
+  strikethrough: false,
+  superscript: false,
+  subscript: false,
+  letterSpacing: 0,
+}
+
 function ptToPx(pt: number): number {
   return (pt * 96) / 72
 }
 
+function resolveTextStyle(node: PMNode): RenderTextStyle {
+  const mark = node.marks.find((item) => item.type.name === 'textStyle')
+  if (!mark) return { ...DEFAULT_TEXT_STYLE }
+
+  return {
+    fontFamily: mark.attrs.fontFamily || DEFAULT_TEXT_STYLE.fontFamily,
+    fontSize: mark.attrs.fontSize || DEFAULT_TEXT_STYLE.fontSize,
+    color: mark.attrs.color || DEFAULT_TEXT_STYLE.color,
+    backgroundColor: mark.attrs.backgroundColor || DEFAULT_TEXT_STYLE.backgroundColor,
+    bold: Boolean(mark.attrs.bold),
+    italic: Boolean(mark.attrs.italic),
+    underline: Boolean(mark.attrs.underline),
+    strikethrough: Boolean(mark.attrs.strikethrough),
+    superscript: Boolean(mark.attrs.superscript),
+    subscript: Boolean(mark.attrs.subscript),
+    letterSpacing: Number(mark.attrs.letterSpacing) || 0,
+  }
+}
+
 function getParagraphTextStyle(paraNode: PMNode) {
-  let fontFamily = DEFAULT_EDITOR_FONT_STACK
-  let fontSize = 12
+  let fontFamily = DEFAULT_TEXT_STYLE.fontFamily
+  let fontSize = DEFAULT_TEXT_STYLE.fontSize
 
   paraNode.forEach((child) => {
     if ((child.isText || child.type.name === 'image') && child.marks.length > 0) {
-      const mark = child.marks.find((item) => item.type.name === 'textStyle')
-      if (mark) {
-        fontFamily = mark.attrs.fontFamily || fontFamily
-        fontSize = mark.attrs.fontSize || fontSize
-      }
+      const style = resolveTextStyle(child)
+      fontFamily = style.fontFamily || fontFamily
+      fontSize = style.fontSize || fontSize
     }
   })
 
   return { fontFamily, fontSize }
 }
 
-function normalizeTextForPretext(text: string) {
-  const normalizedQuotes = text
-    // WPS 的中文引号会更贴近字面宽度，浏览器 fallback 字体常把它们留得更松。
-    // 这里仅用于测量，帮助 Pretext 的逐行结果更接近实际中文文档版式。
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
+function textStyleToFontStr(style: RenderTextStyle) {
+  const fontSizePx = ptToPx(style.fontSize)
+  const fontStyle = style.italic ? 'italic ' : ''
+  const fontWeight = style.bold ? '700 ' : ''
+  return `${fontStyle}${fontWeight}${fontSizePx}px ${style.fontFamily}`
+}
 
-  const chars = Array.from(normalizedQuotes)
-  let result = ''
+function isHanChar(char: string) {
+  return HAN_CHAR_RE.test(char)
+}
 
-  for (let index = 0; index < chars.length; index += 1) {
-    const current = chars[index] ?? ''
-    const next = chars[index + 1] ?? ''
-    result += current
+function isLatinAlphaChar(char: string) {
+  return LATIN_ALPHA_RE.test(char)
+}
 
-    const currentIsLatin = /[A-Za-z]/.test(current)
-    const nextIsLatin = /[A-Za-z]/.test(next)
-    const currentIsHan = /\p{Script=Han}/u.test(current)
-    const nextIsHan = /\p{Script=Han}/u.test(next)
+function shouldInsertMixedScriptGap(prevChar: string, nextChar: string) {
+  return (
+    (isLatinAlphaChar(prevChar) && isHanChar(nextChar)) ||
+    (isHanChar(prevChar) && isLatinAlphaChar(nextChar))
+  )
+}
 
-    if ((currentIsLatin && nextIsHan) || (currentIsHan && nextIsLatin)) {
-      // 四分之一 em 的测量补偿，和编辑器里的右侧 padding 保持一致。
-      result += '\u2005'
-    }
+let measureCanvasContext: CanvasRenderingContext2D | null = null
+
+function getMeasureCanvasContext() {
+  if (measureCanvasContext) return measureCanvasContext
+  const canvas = document.createElement('canvas')
+  measureCanvasContext = canvas.getContext('2d')
+  return measureCanvasContext
+}
+
+function measureAdvanceWidth(text: string, fontStr: string) {
+  const ctx = getMeasureCanvasContext()
+  if (!ctx) return 0
+  ctx.font = fontStr
+  return ctx.measureText(text).width
+}
+
+function measureCompressedLineEndWidth(text: string, fontStr: string) {
+  const ctx = getMeasureCanvasContext()
+  if (!ctx) return measureAdvanceWidth(text, fontStr)
+  ctx.font = fontStr
+
+  let totalWidth = 0
+  for (const char of Array.from(text)) {
+    const metrics = ctx.measureText(char)
+    const inkWidth = Math.max(
+      0,
+      (metrics.actualBoundingBoxLeft ?? 0) + (metrics.actualBoundingBoxRight ?? 0)
+    )
+    totalWidth += inkWidth > 0 ? Math.min(metrics.width, inkWidth) : metrics.width
   }
 
-  return result
+  return totalWidth
+}
+
+function normalizeMeasuredChar(char: string) {
+  return char
+}
+
+function isCompressiblePunctuation(char: string) {
+  return COMPRESSIBLE_PUNCT_RE.test(char)
+}
+
+function isOpeningPunctuation(char: string) {
+  return OPENING_PUNCT_RE.test(char)
+}
+
+function isEndAnchoredPunctuation(char: string) {
+  return END_ANCHORED_PUNCT_RE.test(char)
+}
+
+function getPunctuationAnchor(char: string): 'start' | 'end' {
+  if (isOpeningPunctuation(char)) return 'end'
+  if (isEndAnchoredPunctuation(char)) return 'start'
+  return 'start'
+}
+
+interface SourceChar {
+  char: string
+  style: RenderTextStyle
+  startPos: number | null
+  endPos: number | null
+}
+
+function extractParagraphSourceChars(paraNode: PMNode, paraPos: number): SourceChar[] | null {
+  if (!paragraphHasOnlyTextInlines(paraNode)) return null
+
+  const chars: SourceChar[] = []
+  const contentStart = paraPos + 1
+  paraNode.forEach((child, offset) => {
+    if (!child.isText) return
+    const text = child.text ?? ''
+    const childStart = contentStart + offset
+    const style = resolveTextStyle(child)
+
+    for (let index = 0; index < text.length; index += 1) {
+      chars.push({
+        char: text[index] ?? '',
+        style,
+        startPos: childStart + index,
+        endPos: childStart + index + 1,
+      })
+    }
+  })
+
+  return chars
+}
+
+function splitSourceCharsByNewline(chars: SourceChar[]): SourceChar[][] {
+  const groups: SourceChar[][] = [[]]
+
+  chars.forEach((char) => {
+    if (char.char === '\n') {
+      groups.push([])
+      return
+    }
+    groups[groups.length - 1]!.push(char)
+  })
+
+  return groups
+}
+
+function assignMeasuredWidths(units: MeasureUnit[]) {
+  if (!units.length) return
+
+  let startIndex = 0
+  while (startIndex < units.length) {
+    const fontStr = units[startIndex]!.fontStr
+    let endIndex = startIndex + 1
+    while (endIndex < units.length && units[endIndex]!.fontStr === fontStr) {
+      endIndex += 1
+    }
+
+    const group = units.slice(startIndex, endIndex)
+    let measuredWidths: number[] | null = null
+
+    try {
+      const breakableText = group.map((unit) => unit.measuredText).join('\u200b')
+      const prepared = prepareWithSegments(breakableText, fontStr, { whiteSpace: 'pre-wrap' })
+      const widths = prepared.segments.flatMap((segment, index) => (
+        segment === '\u200b' ? [] : [prepared.widths[index] ?? 0]
+      ))
+      if (widths.length === group.length) measuredWidths = widths
+    } catch (error) {
+      console.warn('[paginator] Pretext prepare error, fallback to canvas widths:', error)
+    }
+
+    for (let index = 0; index < group.length; index += 1) {
+      const unit = group[index]!
+      const width = measuredWidths?.[index] ?? measureAdvanceWidth(unit.measuredText, fontStr)
+      const compressedWidth = isCompressiblePunctuation(unit.displayText)
+        ? measureCompressedLineEndWidth(unit.measuredText, fontStr)
+        : width
+      unit.width = width
+      unit.compressedWidth = compressedWidth
+      unit.compressionCapacity = Math.max(0, width - compressedWidth)
+    }
+
+    startIndex = endIndex
+  }
+}
+
+function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
+  if (!chars.length) return []
+
+  const units: MeasureUnit[] = []
+  for (let index = 0; index < chars.length; index += 1) {
+    const sourceChar = chars[index]!
+    const next = chars[index + 1]?.char ?? ''
+    let measuredText = normalizeMeasuredChar(sourceChar.char)
+    if (shouldInsertMixedScriptGap(sourceChar.char, next)) {
+      // 混排空隙始终跟随前一个字符，避免被拆到下一行开头。
+      measuredText += '\u2005'
+    }
+    units.push({
+      displayText: sourceChar.char,
+      measuredText,
+      style: sourceChar.style,
+      fontStr: textStyleToFontStr(sourceChar.style),
+      width: 0,
+      compressedWidth: 0,
+      compressionCapacity: 0,
+      sourceCharCount: 1,
+      startPos: sourceChar.startPos,
+      endPos: sourceChar.endPos,
+    })
+  }
+
+  assignMeasuredWidths(units)
+  return units
+}
+
+function fitUnitsToLines(
+  units: MeasureUnit[],
+  layoutWidth: number,
+  firstLineWidth = layoutWidth
+): FittedLine[] {
+  if (units.length === 0) {
+    return [{
+      text: '',
+      sourceCharCount: 0,
+      units: [],
+      usedWidth: 0,
+      renderedWidth: 0,
+      availableWidth: Math.max(1, firstLineWidth),
+    }]
+  }
+
+  const lines: FittedLine[] = []
+  let currentUnits: MeasureUnit[] = []
+  let currentWidth = 0
+  let currentCompressionCapacity = 0
+  let currentSourceCharCount = 0
+  let currentLineWidth = Math.max(1, firstLineWidth)
+
+  const appendUnit = (unit: MeasureUnit) => {
+    currentUnits.push(unit)
+    currentWidth += unit.width
+    currentCompressionCapacity += unit.compressionCapacity
+    currentSourceCharCount += unit.sourceCharCount
+  }
+
+  const canFitWithCompression = (extraUnits: MeasureUnit[]) => {
+    const extraWidth = extraUnits.reduce((sum, unit) => sum + unit.width, 0)
+    const extraCapacity = extraUnits.reduce((sum, unit) => sum + unit.compressionCapacity, 0)
+    return currentWidth + extraWidth - (currentCompressionCapacity + extraCapacity) <= currentLineWidth + 0.5
+  }
+
+  const shouldPullTextUnit = (unit: MeasureUnit) => {
+    const remainingSpace = Math.max(0, currentLineWidth - currentWidth)
+    const requiredCompression = currentWidth + unit.width - currentLineWidth
+    const triggerGap = unit.width * TEXT_COMPRESSION_TRIGGER_RATIO
+    const maxCompression = unit.width * TEXT_COMPRESSION_MAX_RATIO
+
+    return (
+      remainingSpace > triggerGap &&
+      requiredCompression > 0 &&
+      requiredCompression <= maxCompression + 0.5 &&
+      canFitWithCompression([unit])
+    )
+  }
+
+  const collectTailPunctuationUnits = (startIndex: number) => {
+    const collected: MeasureUnit[] = []
+
+    for (let index = startIndex; index < units.length; index += 1) {
+      const unit = units[index]!
+      if (!isEndAnchoredPunctuation(unit.displayText)) break
+      const nextCollected = [...collected, unit]
+      if (!canFitWithCompression(nextCollected)) break
+      collected.push(unit)
+    }
+
+    return collected
+  }
+
+  const shouldMoveOpeningPunctuationToNextLine = (index: number) => {
+    const unit = units[index]
+    if (!unit || !isOpeningPunctuation(unit.displayText) || currentUnits.length === 0) return false
+
+    const nextUnit = units[index + 1]
+    if (!nextUnit) return false
+
+    const pairFitsNormally = currentWidth + unit.width + nextUnit.width <= currentLineWidth + 0.5
+    const pairFitsWithCompression = canFitWithCompression([unit, nextUnit])
+
+    return !pairFitsNormally && !pairFitsWithCompression
+  }
+
+  const buildRenderedUnits = (lineUnits: MeasureUnit[], overflow: number): RenderUnit[] => {
+    if (overflow <= 0) {
+      return lineUnits.map((unit) => ({
+        text: unit.displayText,
+        startPos: unit.startPos,
+        endPos: unit.endPos,
+        style: unit.style,
+        width: unit.width,
+        renderWidth: unit.width,
+        glyphWidth: unit.compressedWidth,
+        anchor: getPunctuationAnchor(unit.displayText),
+      }))
+    }
+
+    let remaining = overflow
+    const capacitySum = lineUnits.reduce((sum, unit) => sum + unit.compressionCapacity, 0)
+
+    return lineUnits.map((unit, index) => {
+      if (unit.compressionCapacity <= 0 || capacitySum <= 0) {
+        return {
+          text: unit.displayText,
+          startPos: unit.startPos,
+          endPos: unit.endPos,
+          style: unit.style,
+          width: unit.width,
+          renderWidth: unit.width,
+          glyphWidth: unit.compressedWidth,
+          anchor: getPunctuationAnchor(unit.displayText),
+        }
+      }
+
+      const rawShare = index === lineUnits.length - 1
+        ? remaining
+        : overflow * (unit.compressionCapacity / capacitySum)
+      const applied = Math.min(unit.compressionCapacity, Math.max(0, rawShare), remaining)
+      remaining -= applied
+
+      return {
+        text: unit.displayText,
+        startPos: unit.startPos,
+        endPos: unit.endPos,
+        style: unit.style,
+        width: unit.width,
+        renderWidth: Math.max(unit.compressedWidth, unit.width - applied),
+        glyphWidth: unit.compressedWidth,
+        anchor: getPunctuationAnchor(unit.displayText),
+      }
+    })
+  }
+
+  const pushCurrentLine = () => {
+    const overflow = Math.max(0, currentWidth - currentLineWidth)
+    const renderedUnits = buildRenderedUnits(currentUnits, overflow)
+    const renderedWidth = renderedUnits.reduce((sum, unit) => sum + unit.renderWidth, 0)
+    lines.push({
+      text: currentUnits.map((unit) => unit.displayText).join(''),
+      sourceCharCount: currentSourceCharCount,
+      units: renderedUnits,
+      usedWidth: currentWidth,
+      renderedWidth,
+      availableWidth: currentLineWidth,
+    })
+    currentUnits = []
+    currentWidth = 0
+    currentCompressionCapacity = 0
+    currentSourceCharCount = 0
+    currentLineWidth = Math.max(1, layoutWidth)
+  }
+
+  for (let index = 0; index < units.length;) {
+    const unit = units[index]!
+
+    if (shouldMoveOpeningPunctuationToNextLine(index)) {
+      pushCurrentLine()
+      continue
+    }
+
+    const candidateWidth = currentWidth + unit.width
+    const candidateCompressionCapacity = currentCompressionCapacity + unit.compressionCapacity
+    const fitsNormally = candidateWidth <= currentLineWidth + 0.5
+    const fitsWithCompression = candidateWidth - candidateCompressionCapacity <= currentLineWidth + 0.5
+
+    if (fitsNormally) {
+      appendUnit(unit)
+      index += 1
+      continue
+    }
+
+    if (currentUnits.length === 0) {
+      appendUnit(unit)
+      index += 1
+      continue
+    }
+
+    if (isEndAnchoredPunctuation(unit.displayText)) {
+      const tailPunctuationUnits = collectTailPunctuationUnits(index)
+      if (tailPunctuationUnits.length > 0) {
+        tailPunctuationUnits.forEach(appendUnit)
+        index += tailPunctuationUnits.length
+        pushCurrentLine()
+        continue
+      }
+    } else if (fitsWithCompression && shouldPullTextUnit(unit)) {
+      appendUnit(unit)
+      index += 1
+
+      const tailPunctuationUnits = collectTailPunctuationUnits(index)
+      if (tailPunctuationUnits.length > 0) {
+        tailPunctuationUnits.forEach(appendUnit)
+        index += tailPunctuationUnits.length
+      }
+
+      pushCurrentLine()
+      continue
+    }
+
+    pushCurrentLine()
+  }
+
+  if (currentUnits.length > 0) pushCurrentLine()
+  return lines
 }
 
 function estimateImageHeight(node: PMNode): number {
@@ -118,49 +588,34 @@ function paragraphHasOnlyTextInlines(paraNode: PMNode): boolean {
   return ok
 }
 
-function buildParagraphCharPositions(paraNode: PMNode, paraPos: number, textLength: number): number[] {
-  const positions = new Array<number>(textLength + 1)
-  const contentStart = paraPos + 1
-  let charOffset = 0
-  positions[0] = contentStart
-
-  paraNode.forEach((child, offset) => {
-    if (!child.isText) return
-    const childStart = contentStart + offset
-    const text = child.text ?? ''
-    for (let index = 0; index < text.length; index += 1) {
-      charOffset += 1
-      positions[charOffset] = childStart + index + 1
-    }
-  })
-
-  for (let index = 1; index < positions.length; index += 1) {
-    if (positions[index] == null) positions[index] = positions[index - 1]!
-  }
-
-  return positions
-}
-
 function measureParagraph(
   paraNode: PMNode,
   paraPos: number,
   blockIndex: number,
   contentWidth: number
 ): MeasuredBlock {
-  const { fontFamily, fontSize } = getParagraphTextStyle(paraNode)
+  const { fontSize } = getParagraphTextStyle(paraNode)
+  const align = ((paraNode.attrs.align as string) ?? 'left') as RenderedLine['align']
   const lineHeightMult = (paraNode.attrs.lineHeight as number) ?? 1.5
   const spaceBefore = ptToPx((paraNode.attrs.spaceBefore as number) ?? 0)
   const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
+  const paragraphIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.indent as number) ?? 0) * 2)))
+  const firstLineIndentPx = Math.max(0, ptToPx(fontSize * ((paraNode.attrs.firstLineIndent as number) ?? 0)))
 
   const fontSizePx = ptToPx(fontSize)
   let lineHeight = fontSizePx * lineHeightMult
-  const fontStr = `${fontSizePx}px ${fontFamily}`
-  const layoutWidth = Math.max(1, contentWidth - PRETEXT_LAYOUT_SAFETY_PX)
+  const layoutWidth = Math.max(1, contentWidth - paragraphIndentPx - PRETEXT_LAYOUT_SAFETY_PX)
+  const firstLineWidth = Math.max(1, layoutWidth - firstLineIndentPx)
   const text = paraNode.textContent
+  const sourceChars = extractParagraphSourceChars(paraNode, paraPos)
   let maxInlineHeight = lineHeight
 
   paraNode.forEach((child) => {
     maxInlineHeight = Math.max(maxInlineHeight, estimateImageHeight(child))
+    if (child.isText) {
+      const childStyle = resolveTextStyle(child)
+      maxInlineHeight = Math.max(maxInlineHeight, ptToPx(childStyle.fontSize) * lineHeightMult)
+    }
   })
   lineHeight = maxInlineHeight
 
@@ -175,50 +630,88 @@ function measureParagraph(
         lineIndex: 0,
         lineHeight,
         startPos: paraPos + 1,
+        units: [],
+        align,
+        availableWidth: firstLineWidth,
+        xOffset: paragraphIndentPx + firstLineIndentPx,
+        usedWidth: 0,
+        renderedWidth: 0,
+        isLastLineOfParagraph: true,
       }],
       totalHeight: lineHeight + spaceBefore + spaceAfter,
     }
   }
 
-  let rawLines: { text: string }[]
+  let fittedGroups: FittedGroup[]
   try {
-    // 与编辑器的 word-break: break-all 保持一致，避免长数字/英文串把前面的中文带走。
-    const breakableText = normalizeTextForPretext(text).split('').join('\u200b')
-    const prepared = prepareWithSegments(breakableText, fontStr, { whiteSpace: 'pre-wrap' })
-    // DOM 与 canvas/font fallback 在边界处仍可能有细微偏差，保守收窄一点版心，
-    // 优先避免“Pretext 认为一行能放下，但浏览器实际又折成两行”的中途裂行。
-    rawLines = layoutWithLines(prepared, layoutWidth, lineHeight).lines
+    const groups = sourceChars ? splitSourceCharsByNewline(sourceChars) : []
+    fittedGroups = (groups.length ? groups : [[]]).map((groupChars, groupIndex) => {
+      const units = buildMeasureUnits(groupChars)
+      return { lines: fitUnitsToLines(units, layoutWidth, groupIndex === 0 ? firstLineWidth : layoutWidth) }
+    })
   } catch (error) {
-    console.warn('[paginator] Pretext error, fallback:', error)
+    console.warn('[paginator] Dynamic punctuation layout error, fallback:', error)
     const charsPerLine = Math.max(1, Math.floor(layoutWidth / (fontSizePx * 0.6)))
-    const estimatedLines = Math.ceil(text.length / charsPerLine)
-    rawLines = Array.from({ length: estimatedLines }, (_, index) => ({
-      text: text.slice(index * charsPerLine, (index + 1) * charsPerLine),
-    }))
+    const estimatedLines = Math.max(1, Math.ceil(text.length / charsPerLine))
+    fittedGroups = [{
+      lines: Array.from({ length: estimatedLines }, (_, index) => {
+        const slice = text.slice(index * charsPerLine, (index + 1) * charsPerLine)
+        return {
+          text: slice,
+          sourceCharCount: slice.length,
+          units: Array.from(slice).map((char) => ({
+            text: char,
+            startPos: null,
+            endPos: null,
+            style: { ...DEFAULT_TEXT_STYLE, fontSize },
+            width: fontSizePx,
+            renderWidth: fontSizePx,
+            glyphWidth: fontSizePx,
+            anchor: getPunctuationAnchor(char),
+          })),
+          usedWidth: slice.length * fontSizePx,
+          renderedWidth: slice.length * fontSizePx,
+          availableWidth: index === 0 ? firstLineWidth : layoutWidth,
+        }
+      }),
+    }]
   }
 
-  const charPositions = paragraphHasOnlyTextInlines(paraNode)
-    ? buildParagraphCharPositions(paraNode, paraPos, text.length)
-    : null
+  const fittedLines = fittedGroups.flatMap((group) => group.lines)
+  const canSplit = Boolean(sourceChars) && fittedLines.length > 1
+  const lines: RenderedLine[] = []
+  let lineIndex = 0
 
-  let consumedChars = 0
-  const lines: LineInfo[] = rawLines.map((line, lineIndex) => {
-    const charCount = line.text.replace(/\u200b/g, '').length
-    const startPos = charPositions ? charPositions[consumedChars] ?? paraPos + 1 : null
-    consumedChars += charCount
-    return {
-      text: line.text,
-      blockIndex,
-      lineIndex,
-      lineHeight,
-      startPos,
-    }
+  fittedGroups.forEach((group) => {
+    group.lines.forEach((line) => {
+      const startPos = line.units[0]?.startPos ?? paraPos + 1
+      const isFirstLine = lineIndex === 0
+      lines.push({
+        text: line.text,
+        blockIndex,
+        lineIndex,
+        lineHeight,
+        startPos,
+        units: line.units,
+        align,
+        availableWidth: line.availableWidth,
+        xOffset: paragraphIndentPx + (isFirstLine ? firstLineIndentPx : 0),
+        usedWidth: line.usedWidth,
+        renderedWidth: line.renderedWidth,
+        isLastLineOfParagraph: false,
+      })
+      lineIndex += 1
+    })
   })
+
+  if (lines.length > 0) {
+    lines[lines.length - 1] = { ...lines[lines.length - 1]!, isLastLineOfParagraph: true }
+  }
 
   return {
     lines,
-    totalHeight: lineHeight * rawLines.length + spaceBefore + spaceAfter,
-    canSplit: Boolean(charPositions) && rawLines.length > 1,
+    totalHeight: lineHeight * fittedLines.length + spaceBefore + spaceAfter,
+    canSplit,
     spaceBefore,
     spaceAfter,
   }
@@ -267,7 +760,20 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
     canSplit: false,
     spaceBefore: 0,
     spaceAfter: 0,
-    lines: [{ text: '', blockIndex: 0, lineIndex: 0, lineHeight: totalHeight, startPos: null }],
+    lines: [{
+      text: '',
+      blockIndex: 0,
+      lineIndex: 0,
+      lineHeight: totalHeight,
+      startPos: null,
+      units: [],
+      align: 'left',
+      availableWidth: contentWidth,
+      xOffset: 0,
+      usedWidth: 0,
+      renderedWidth: 0,
+      isLastLineOfParagraph: true,
+    }],
     totalHeight,
   }
 }
@@ -291,7 +797,20 @@ function measureBlock(
         canSplit: false,
         spaceBefore: 0,
         spaceAfter: 0,
-        lines: [{ text: '', blockIndex, lineIndex: 0, lineHeight: 20, startPos: nodePos + 1 }],
+        lines: [{
+          text: '',
+          blockIndex,
+          lineIndex: 0,
+          lineHeight: 20,
+          startPos: nodePos + 1,
+          units: [],
+          align: 'left',
+          availableWidth: contentWidth,
+          xOffset: 0,
+          usedWidth: 0,
+          renderedWidth: 0,
+          isLastLineOfParagraph: true,
+        }],
         totalHeight: 20,
       }
     default:
@@ -299,7 +818,20 @@ function measureBlock(
         canSplit: false,
         spaceBefore: 0,
         spaceAfter: 0,
-        lines: [{ text: '', blockIndex, lineIndex: 0, lineHeight: 24, startPos: nodePos + 1 }],
+        lines: [{
+          text: '',
+          blockIndex,
+          lineIndex: 0,
+          lineHeight: 24,
+          startPos: nodePos + 1,
+          units: [],
+          align: 'left',
+          availableWidth: contentWidth,
+          xOffset: 0,
+          usedWidth: 0,
+          renderedWidth: 0,
+          isLastLineOfParagraph: true,
+        }],
         totalHeight: 24,
       }
   }
@@ -321,6 +853,32 @@ function pushPageBreak(
   return nextPage
 }
 
+function pushRenderedLines(
+  renderedPage: RenderedPage,
+  measured: MeasuredBlock,
+  startLineIndex: number,
+  endLineIndex: number,
+  lastLineIndex: number
+) {
+  let cursor = renderedPage.totalHeight
+
+  for (let lineIndex = startLineIndex; lineIndex < endLineIndex; lineIndex += 1) {
+    const line = measured.lines[lineIndex]!
+    const extraBefore = lineIndex === 0 ? measured.spaceBefore : 0
+    const extraAfter = lineIndex === lastLineIndex ? measured.spaceAfter : 0
+    const top = cursor + extraBefore
+
+    renderedPage.lines.push({
+      ...line,
+      top,
+    })
+
+    cursor += extraBefore + line.lineHeight + extraAfter
+  }
+
+  renderedPage.totalHeight = cursor
+}
+
 function lineNeededHeight(
   measured: MeasuredBlock,
   lineIndex: number,
@@ -337,13 +895,15 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
   const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
 
   const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
+  const renderedPages: RenderedPage[] = [{ lines: [], totalHeight: 0 }]
   const breaks: PageBreakInfo[] = []
   const lineBreakSet = new Set<number>()
   let currentPage = pages[0]!
+  let currentRenderedPage = renderedPages[0]!
   let blockIndex = 0
 
   doc.forEach((node, offset) => {
-    const nodePos = offset + 1
+    const nodePos = offset
     const measured = measureBlock(node, nodePos, blockIndex, contentWidth)
 
     if (measured.canSplit) {
@@ -355,14 +915,19 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
     if (node.attrs.pageBreakBefore && currentPage.lines.length > 0) {
       currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
+      currentRenderedPage = { lines: [], totalHeight: 0 }
+      renderedPages.push(currentRenderedPage)
     }
 
     if (!measured.canSplit) {
       if (currentPage.totalHeight + measured.totalHeight > contentHeight && currentPage.lines.length > 0) {
         currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
+        currentRenderedPage = { lines: [], totalHeight: 0 }
+        renderedPages.push(currentRenderedPage)
       }
       currentPage.lines.push(...measured.lines)
       currentPage.totalHeight += measured.totalHeight
+      pushRenderedLines(currentRenderedPage, measured, 0, measured.lines.length, measured.lines.length - 1)
       blockIndex += 1
       return
     }
@@ -389,6 +954,8 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
             currentPage,
             measured.lines[startLineIndex]!.startPos ?? nodePos
           )
+          currentRenderedPage = { lines: [], totalHeight: 0 }
+          renderedPages.push(currentRenderedPage)
           continue
         }
         fitCount = 1
@@ -401,6 +968,13 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
         currentPage.lines.push(measured.lines[lineIndex]!)
       }
       currentPage.totalHeight += heightSum
+      pushRenderedLines(
+        currentRenderedPage,
+        measured,
+        startLineIndex,
+        startLineIndex + fitCount,
+        lastLineIndex
+      )
       startLineIndex += fitCount
 
       if (remainingAfterFit > 0) {
@@ -410,6 +984,8 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
           currentPage,
           measured.lines[startLineIndex]!.startPos ?? nodePos
         )
+        currentRenderedPage = { lines: [], totalHeight: 0 }
+        renderedPages.push(currentRenderedPage)
       }
     }
 
@@ -421,5 +997,10 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
       pages.map((page, index) => `p${index + 1}=${page.totalHeight.toFixed(0)}px`).join(' ')
   )
 
-  return { pages, breaks, lineBreaks: Array.from(lineBreakSet).sort((a, b) => a - b) }
+  return {
+    pages,
+    renderedPages,
+    breaks,
+    lineBreaks: Array.from(lineBreakSet).sort((a, b) => a - b),
+  }
 }

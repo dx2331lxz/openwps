@@ -149,7 +149,7 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
   const listLevel = Math.max(0, Number(node.attrs.listLevel ?? 0))
 
   // 计算段落内实际字号（取最大字号作为基准）
-  let baseFontSizePt = 12
+  let baseFontSizePt = 0
   for (let i = 0; i < node.childCount; i++) {
     const child = node.child(i)
     if (child.type.name === 'text') {
@@ -158,6 +158,7 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
       if (sz > baseFontSizePt) baseFontSizePt = sz
     }
   }
+  if (baseFontSizePt <= 0) baseFontSizePt = 12
 
   const docGridLinePitchTwip = exportOptions.docGridLinePitchPt != null
     ? Math.round(exportOptions.docGridLinePitchPt * 20)

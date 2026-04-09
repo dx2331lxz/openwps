@@ -1,18 +1,24 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { EditorState, Plugin } from 'prosemirror-state'
+import { EditorState, Plugin, TextSelection } from 'prosemirror-state'
 import { EditorView, Decoration, DecorationSet } from 'prosemirror-view'
 import { DOMParser as PMDOMParser } from 'prosemirror-model'
 import { keymap } from 'prosemirror-keymap'
 import { baseKeymap } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
-import { paginate, DEFAULT_PAGE_CONFIG, type PageConfig } from '../layout/paginator'
+import {
+  paginate,
+  DEFAULT_PAGE_CONFIG,
+  type PageConfig,
+  type PaginateResult,
+} from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
 import SettingsModal from './SettingsModal'
 import { importDocx } from '../docx/importer'
 import { exportDocx, type DocxExportOptions } from '../docx/exporter'
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
+import { PretextPageRenderer } from './PretextPageRenderer'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -116,6 +122,26 @@ const PM_STYLES = `
 .ProseMirror p.page-break-before {
   border-top: 2px dashed #0066cc;
   padding-top: 4px;
+}
+.pretext-driving-editor .ProseMirror {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: transparent;
+  text-rendering: geometricPrecision;
+}
+.pretext-driving-editor .ProseMirror * {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent;
+  text-shadow: none !important;
+}
+.pretext-driving-editor .ProseMirror img,
+.pretext-driving-editor .ProseMirror hr,
+.pretext-driving-editor .ProseMirror table {
+  opacity: 0;
+}
+@keyframes openwps-caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
 }
 `
 
@@ -240,134 +266,6 @@ function buildDecos(
   )
 }
 
-function snapBreakPosToRenderedLineStart(view: EditorView, pos: number): number {
-  const doc = view.state.doc
-  const safePos = Math.max(1, Math.min(pos, doc.nodeSize - 2))
-  const $pos = doc.resolve(safePos)
-
-  let paragraphDepth = $pos.depth
-  while (paragraphDepth > 0 && $pos.node(paragraphDepth).type.name !== 'paragraph') {
-    paragraphDepth -= 1
-  }
-  if (paragraphDepth === 0 || $pos.node(paragraphDepth).type.name !== 'paragraph') return safePos
-
-  const paragraphStart = $pos.start(paragraphDepth)
-  const paragraphEnd = $pos.end(paragraphDepth)
-  if (safePos <= paragraphStart || safePos >= paragraphEnd) return safePos
-
-  let lastLineStart = paragraphStart
-  let lastTop: number | null = null
-
-  for (let cursorPos = paragraphStart; cursorPos <= safePos; cursorPos += 1) {
-    try {
-      const coords = view.coordsAtPos(cursorPos)
-      if (lastTop === null) {
-        lastTop = coords.top
-        lastLineStart = cursorPos
-        continue
-      }
-
-      if (Math.abs(coords.top - lastTop) > 1) {
-        lastTop = coords.top
-        lastLineStart = cursorPos
-      }
-    } catch {
-      return safePos
-    }
-  }
-
-  return lastLineStart
-}
-
-function getRenderedYOffsetForPos(view: EditorView, pos: number): number | null {
-  try {
-    const coords = view.coordsAtPos(pos)
-    const editorRect = view.dom.getBoundingClientRect()
-    return Math.max(0, coords.top - editorRect.top)
-  } catch {
-    return null
-  }
-}
-
-function collectRenderedLineStartPositions(view: EditorView): number[] {
-  const positions: number[] = []
-  const seen = new Set<number>()
-
-  view.state.doc.nodesBetween(0, view.state.doc.content.size, (node, pos) => {
-    if (node.type.name !== 'paragraph') return
-
-    const paragraphStart = pos + 1
-    const paragraphEnd = pos + node.nodeSize - 1
-    let lastTop: number | null = null
-
-    for (let cursorPos = paragraphStart; cursorPos <= paragraphEnd; cursorPos += 1) {
-      try {
-        const coords = view.coordsAtPos(cursorPos)
-        if (lastTop === null) {
-          lastTop = coords.top
-          if (!seen.has(cursorPos)) {
-            seen.add(cursorPos)
-            positions.push(cursorPos)
-          }
-          continue
-        }
-
-        if (Math.abs(coords.top - lastTop) > 1) {
-          lastTop = coords.top
-          if (!seen.has(cursorPos)) {
-            seen.add(cursorPos)
-            positions.push(cursorPos)
-          }
-        }
-      } catch {
-        break
-      }
-    }
-  })
-
-  return positions.sort((a, b) => a - b)
-}
-
-function calibrateBreaksToRenderedLines(
-  view: EditorView,
-  candidatePositions: number[],
-  config: PageConfig
-): { pos: number; used: number }[] {
-  const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
-  const candidates = Array.from(new Set(candidatePositions))
-    .map((pos) => snapBreakPosToRenderedLineStart(view, pos))
-    .filter((pos, index, arr) => pos > 0 && arr.indexOf(pos) === index)
-    .sort((a, b) => a - b)
-    .map((pos) => ({ pos, offset: getRenderedYOffsetForPos(view, pos) }))
-    .filter((item): item is { pos: number; offset: number } => item.offset != null)
-
-  const calibrated: { pos: number; used: number }[] = []
-  let previousOffset = 0
-  let cursor = 0
-
-  while (cursor < candidates.length) {
-    let lastFit: { pos: number; offset: number } | null = null
-
-    while (cursor < candidates.length) {
-      const candidate = candidates[cursor]!
-      const segmentUsed = candidate.offset - previousOffset
-      if (segmentUsed > contentHeight + 0.5) break
-      lastFit = candidate
-      cursor += 1
-    }
-
-    if (cursor >= candidates.length || !lastFit) break
-
-    calibrated.push({
-      pos: lastFit.pos,
-      used: Math.max(0, lastFit.offset - previousOffset),
-    })
-    previousOffset = lastFit.offset
-  }
-
-  return calibrated
-}
-
 function transactionHasStyleMutation(tx: EditorState['tr']) {
   return tx.steps.some((step) => {
     const stepType = step.toJSON().stepType
@@ -461,6 +359,8 @@ export const Editor: React.FC = () => {
   const pageConfigRef = useRef<PageConfig>(DEFAULT_PAGE_CONFIG)
   const docxExportOptionsRef = useRef<DocxExportOptions>({})
   const [pageCount, setPageCount] = useState(1)
+  const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
+  const [editorFocused, setEditorFocused] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -472,6 +372,13 @@ export const Editor: React.FC = () => {
     setDocxLetterSpacingPx(0)
     console.log('[docx] imported compatibility metadata cleared after style mutation')
   }, [docxLetterSpacingPx])
+
+  const updateLayoutSnapshot = useCallback((doc: EditorState['doc']) => {
+    const layout = paginate(doc, pageConfigRef.current)
+    setLayoutResult(layout)
+    setPageCount(prev => layout.breaks.length + 1 !== prev ? layout.breaks.length + 1 : prev)
+    return layout
+  }, [])
 
   const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
@@ -494,26 +401,15 @@ export const Editor: React.FC = () => {
 
       const cfg = pageConfigRef.current
       const doc = v.state.doc
-      const { breaks } = paginate(doc, cfg)
-      const renderedLineStarts = collectRenderedLineStartPositions(v)
-      const calibratedBreaks = calibrateBreaksToRenderedLines(
-        v,
-        [...renderedLineStarts, ...breaks.map((item) => item.pos)],
-        cfg
-      )
-      const effectiveBreaks = calibratedBreaks.length > 0
-        ? calibratedBreaks
-        : breaks.map((item) => ({
-            pos: snapBreakPosToRenderedLineStart(v, item.pos),
-            used: item.prevPageUsed,
-          }))
+      const layout = paginate(doc, cfg)
+      const { breaks } = layout
+      setLayoutResult(layout)
+      setPageCount(prev => breaks.length + 1 !== prev ? breaks.length + 1 : prev)
 
-      setPageCount(prev => effectiveBreaks.length + 1 !== prev ? effectiveBreaks.length + 1 : prev)
-
-      const pageBreakDecos = effectiveBreaks.map((item, index) => {
-          const height = breakWidgetHeight(item.used, cfg)
+      const pageBreakDecos = breaks.map((item, index) => {
+          const height = breakWidgetHeight(item.prevPageUsed, cfg)
           console.log(
-            `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.used.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
+            `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
           )
           return { pos: item.pos, height }
         })
@@ -533,10 +429,23 @@ export const Editor: React.FC = () => {
     const state = initState()
     const editorView = new EditorView(mountRef.current, {
       state,
+      handleDOMEvents: {
+        focus: () => {
+          setEditorFocused(true)
+          return false
+        },
+        blur: () => {
+          setEditorFocused(false)
+          return false
+        },
+      },
       dispatchTransaction(tx) {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
         setEditorState(next)
+        if (tx.docChanged && document.fonts?.status === 'loaded') {
+          updateLayoutSnapshot(next.doc)
+        }
         if (tx.docChanged && !applyingImportedDocxRef.current && transactionHasStyleMutation(tx)) {
           clearImportedDocxCompatibility()
         }
@@ -554,7 +463,7 @@ export const Editor: React.FC = () => {
       editorView.destroy()
       document.head.removeChild(styleEl)
     }
-  }, [repaginate])
+  }, [clearImportedDocxCompatibility, repaginate, updateLayoutSnapshot])
 
   useEffect(() => {
     if (viewRef.current) repaginate()
@@ -609,6 +518,17 @@ export const Editor: React.FC = () => {
       const message = error instanceof Error ? error.message : String(error)
       window.alert(`DOCX 导出失败：${message}`)
     }
+  }, [])
+
+  const handleRequestCaretPos = useCallback((pos: number) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const clampedPos = Math.max(0, Math.min(pos, editorView.state.doc.content.size))
+    const selection = TextSelection.create(editorView.state.doc, clampedPos)
+    const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
+    editorView.dispatch(tr)
+    editorView.focus()
   }, [])
 
   // Canvas height = all A4 cards stacked with gaps
@@ -679,16 +599,29 @@ export const Editor: React.FC = () => {
             </div>
           ))}
 
-          {/* ── Layer 2: ProseMirror editor ── */}
+          {/* ── Layer 2: Pretext page renderer ── */}
+          {layoutResult && (
+            <PretextPageRenderer
+              pages={layoutResult.renderedPages}
+              pageConfig={cfg}
+              pageGap={PAGE_GAP}
+              caretPos={editorState?.selection.head ?? null}
+              showCaret={editorFocused && Boolean(editorState?.selection.empty)}
+              onRequestCaretPos={handleRequestCaretPos}
+            />
+          )}
+
+          {/* ── Layer 3: ProseMirror editor ── */}
           <div
             ref={mountRef}
+            className={layoutResult ? 'pretext-driving-editor' : undefined}
             style={{
               position: 'absolute',
               top: cfg.marginTop,
               left: cfg.marginLeft,
               right: cfg.marginRight,
               ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
-              zIndex: 1,
+              zIndex: 2,
             }}
           />
         </div>
