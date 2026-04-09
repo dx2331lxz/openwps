@@ -74,7 +74,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_document_content",
-            "description": "读取文档完整内容，返回每个段落的文字内容和当前样式",
+            "description": "读取文档完整内容，返回每个段落的文字内容、段落样式，以及 textRuns 形式的分段文字样式",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -82,7 +82,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_paragraph",
-            "description": "读取指定段落的内容和样式",
+            "description": "读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -264,6 +264,8 @@ SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文
 必须调用 get_document_content 重新读取文档，验证修改结果是否符合用户要求。
 规则：
 - 验证时对比预期值与实际读取值，如果不符合则继续修正，直到结果正确
+- get_document_content 返回的每个段落除了 style，还会包含 textRuns、representativeTextStyle、hasMixedTextStyles
+- 如果是“只改选中的几个字”这类部分文字样式请求，必须优先检查对应段落的 textRuns；不要只看 paragraph.style 或 representativeTextStyle
 - 只有在 get_document_content 返回的内容确认修改已生效后，才能将对应 todo 标记为 completed
 - 如果连续 2 次修正后仍不符合预期，将该 todo 标记为 failed，并在回复中告知用户具体的差异
 

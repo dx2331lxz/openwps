@@ -273,32 +273,86 @@ function getRepresentativeTextStyle(node: PMNode) {
   return attrs
 }
 
+function normalizeTextStyle(markAttrs: Record<string, unknown> = {}) {
+  return {
+    fontFamily: describeFontFamily(String(markAttrs.fontFamily ?? '宋体')),
+    fontSize: Number(markAttrs.fontSize ?? 12),
+    color: String(markAttrs.color ?? '#000000'),
+    backgroundColor: String(markAttrs.backgroundColor ?? ''),
+    bold: Boolean(markAttrs.bold ?? false),
+    italic: Boolean(markAttrs.italic ?? false),
+    underline: Boolean(markAttrs.underline ?? false),
+    strikethrough: Boolean(markAttrs.strikethrough ?? false),
+    superscript: Boolean(markAttrs.superscript ?? false),
+    subscript: Boolean(markAttrs.subscript ?? false),
+    letterSpacing: Number(markAttrs.letterSpacing ?? 0),
+  }
+}
+
+function buildParagraphTextRuns(node: PMNode) {
+  const textRuns: Array<{
+    text: string
+    startOffset: number
+    endOffset: number
+    style: ReturnType<typeof normalizeTextStyle>
+  }> = []
+  let offset = 0
+
+  node.forEach(child => {
+    if (!child.isText) {
+      offset += child.nodeSize
+      return
+    }
+
+    const text = child.text ?? ''
+    const startOffset = offset
+    const endOffset = offset + text.length
+    offset = endOffset
+
+    const mark = child.marks.find(item => item.type.name === 'textStyle')
+    textRuns.push({
+      text,
+      startOffset,
+      endOffset,
+      style: normalizeTextStyle((mark?.attrs as Record<string, unknown> | undefined) ?? {}),
+    })
+  })
+
+  return textRuns
+}
+
+function hasMixedTextStyles(textRuns: ReturnType<typeof buildParagraphTextRuns>) {
+  if (textRuns.length <= 1) return false
+  const first = JSON.stringify(textRuns[0]?.style ?? {})
+  return textRuns.some(run => JSON.stringify(run.style) !== first)
+}
+
 function buildParagraphSnapshot(paragraph: ParagraphRef) {
   const textStyle = getRepresentativeTextStyle(paragraph.node)
+  const paragraphStyle = {
+    align: String(paragraph.node.attrs.align ?? 'left'),
+    firstLineIndent: Number(paragraph.node.attrs.firstLineIndent ?? 0),
+    indent: Number(paragraph.node.attrs.indent ?? 0),
+    lineHeight: Number(paragraph.node.attrs.lineHeight ?? 1.5),
+    spaceBefore: Number(paragraph.node.attrs.spaceBefore ?? 0),
+    spaceAfter: Number(paragraph.node.attrs.spaceAfter ?? 0),
+    listType: paragraph.node.attrs.listType ?? 'none',
+  }
+  const representativeTextStyle = normalizeTextStyle(textStyle)
+  const textRuns = buildParagraphTextRuns(paragraph.node)
+
   return {
     index: paragraph.index,
     text: paragraph.node.textContent,
     charCount: paragraph.node.textContent.length,
     style: {
-      fontFamily: describeFontFamily(String(textStyle.fontFamily ?? '宋体')),
-      fontSize: Number(textStyle.fontSize ?? 12),
-      color: String(textStyle.color ?? '#000000'),
-      backgroundColor: String(textStyle.backgroundColor ?? ''),
-      bold: Boolean(textStyle.bold ?? false),
-      italic: Boolean(textStyle.italic ?? false),
-      underline: Boolean(textStyle.underline ?? false),
-      strikethrough: Boolean(textStyle.strikethrough ?? false),
-      superscript: Boolean(textStyle.superscript ?? false),
-      subscript: Boolean(textStyle.subscript ?? false),
-      letterSpacing: Number(textStyle.letterSpacing ?? 0),
-      align: String(paragraph.node.attrs.align ?? 'left'),
-      firstLineIndent: Number(paragraph.node.attrs.firstLineIndent ?? 0),
-      indent: Number(paragraph.node.attrs.indent ?? 0),
-      lineHeight: Number(paragraph.node.attrs.lineHeight ?? 1.5),
-      spaceBefore: Number(paragraph.node.attrs.spaceBefore ?? 0),
-      spaceAfter: Number(paragraph.node.attrs.spaceAfter ?? 0),
-      listType: paragraph.node.attrs.listType ?? 'none',
+      ...representativeTextStyle,
+      ...paragraphStyle,
     },
+    paragraphStyle,
+    representativeTextStyle,
+    hasMixedTextStyles: hasMixedTextStyles(textRuns),
+    textRuns,
   }
 }
 

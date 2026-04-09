@@ -145,12 +145,12 @@ export const layoutTools = [
   },
   {
     name: 'get_document_content',
-    description: '读取文档完整内容，返回每个段落的文字内容和当前样式',
+    description: '读取文档完整内容，返回每个段落的文字内容、段落样式，以及 textRuns 形式的分段文字样式',
     parameters: { type: 'object', properties: {} },
   },
   {
     name: 'get_paragraph',
-    description: '读取指定段落的内容和样式',
+    description: '读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式',
     parameters: {
       type: 'object',
       properties: {
