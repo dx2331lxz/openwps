@@ -27,6 +27,11 @@ export interface ExecuteOptions {
   pageConfig?: PageConfig
   onPageConfigChange?: (cfg: PageConfig) => void
   onDocumentStyleMutation?: () => void
+  selectionContext?: {
+    from: number
+    to: number
+    paragraphIndex?: number
+  } | null
 }
 
 type RangeType =
@@ -46,6 +51,8 @@ interface RangeSpec {
   from?: number
   to?: number
   text?: string
+  selectionFrom?: number
+  selectionTo?: number
 }
 
 interface ParagraphRef {
@@ -96,10 +103,14 @@ function getParagraphAtIndex(state: EditorState, index: number): ParagraphRef | 
   return getParagraphs(state).find(paragraph => paragraph.index === index)
 }
 
-function resolveRange(state: EditorState, range?: RangeSpec): ParagraphRef[] {
+function resolveRange(
+  state: EditorState,
+  range?: RangeSpec,
+  selectionContext?: ExecuteOptions['selectionContext'],
+): ParagraphRef[] {
   const results: ParagraphRef[] = []
   const paragraphs = getParagraphs(state)
-  const { from, to } = state.selection
+  const selectionBounds = getSelectionBounds(state, range, selectionContext)
 
   for (const paragraph of paragraphs) {
     const text = paragraph.node.textContent
@@ -131,7 +142,11 @@ function resolveRange(state: EditorState, range?: RangeSpec): ParagraphRef[] {
         if (paragraph.index % 2 === 1) results.push(paragraph)
         break
       case 'selection':
-        if (paragraph.pos >= from - 1 && paragraph.pos <= to) results.push(paragraph)
+        if (selectionBounds) {
+          const { from, to } = paragraphTextBounds(paragraph)
+          const overlaps = from < selectionBounds.to && to > selectionBounds.from
+          if (overlaps) results.push(paragraph)
+        }
         break
       default:
         results.push(paragraph)
@@ -154,6 +169,21 @@ function paragraphTextBounds(paragraph: ParagraphRef) {
   }
 }
 
+function getSelectionBounds(
+  state: EditorState,
+  range?: RangeSpec,
+  selectionContext?: ExecuteOptions['selectionContext'],
+) {
+  const candidateFrom = range?.selectionFrom ?? selectionContext?.from
+  const candidateTo = range?.selectionTo ?? selectionContext?.to
+  const rawFrom = Number.isFinite(candidateFrom) ? Number(candidateFrom) : state.selection.from
+  const rawTo = Number.isFinite(candidateTo) ? Number(candidateTo) : state.selection.to
+  const from = Math.max(1, Math.min(rawFrom, rawTo))
+  const to = Math.min(state.doc.nodeSize - 1, Math.max(rawFrom, rawTo))
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) return null
+  return { from, to }
+}
+
 function addTextMark(
   tr: Transaction,
   state: EditorState,
@@ -173,12 +203,17 @@ function addTextMark(
   return tr.addMark(from, to, schema.marks.textStyle.create({ ...existing, ...attrs }))
 }
 
-function applyTextStyle(state: EditorState, tr: Transaction, range: RangeSpec | undefined, attrs: Record<string, unknown>) {
+function applyTextStyle(
+  state: EditorState,
+  tr: Transaction,
+  range: RangeSpec | undefined,
+  attrs: Record<string, unknown>,
+  selectionContext?: ExecuteOptions['selectionContext'],
+) {
   if (range?.type === 'selection') {
-    const { from, to } = state.selection
-    const resolvedFrom = Math.max(1, from)
-    const resolvedTo = Math.min(state.doc.nodeSize - 1, to)
-    return addTextMark(tr, state, resolvedFrom, resolvedTo, attrs)
+    const bounds = getSelectionBounds(state, range, selectionContext)
+    if (!bounds) return tr
+    return addTextMark(tr, state, bounds.from, bounds.to, attrs)
   }
 
   for (const paragraph of resolveRange(state, range)) {
@@ -189,8 +224,14 @@ function applyTextStyle(state: EditorState, tr: Transaction, range: RangeSpec | 
   return tr
 }
 
-function applyParagraphStyle(state: EditorState, tr: Transaction, range: RangeSpec | undefined, attrs: Record<string, unknown>) {
-  for (const paragraph of resolveRange(state, range)) {
+function applyParagraphStyle(
+  state: EditorState,
+  tr: Transaction,
+  range: RangeSpec | undefined,
+  attrs: Record<string, unknown>,
+  selectionContext?: ExecuteOptions['selectionContext'],
+) {
+  for (const paragraph of resolveRange(state, range, selectionContext)) {
     tr.setNodeMarkup(paragraph.pos, undefined, { ...paragraph.node.attrs, ...attrs })
   }
   return tr
@@ -341,7 +382,10 @@ export function executeTool(
       case 'set_text_style': {
         const range = params.range as RangeSpec | undefined
         if (!range) return { success: false, message: 'set_text_style 缺少 range 参数' }
-        if (range.type !== 'selection' && resolveRange(state, range).length === 0) {
+        if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
+          return { success: false, message: '当前没有可用的选区，无法按 selection 修改文字样式' }
+        }
+        if (range.type !== 'selection' && resolveRange(state, range, options?.selectionContext).length === 0) {
           return { success: false, message: `未找到可设置文字样式的范围：${describeRange(range)}` }
         }
         const { range: _range, ...rawStyleAttrs } = params
@@ -351,7 +395,7 @@ export function executeTool(
         if (typeof styleAttrs.fontFamily === 'string') {
           styleAttrs.fontFamily = mapFontFamily(styleAttrs.fontFamily)
         }
-        tr = applyTextStyle(state, tr, range, styleAttrs)
+        tr = applyTextStyle(state, tr, range, styleAttrs, options?.selectionContext)
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()
@@ -361,7 +405,10 @@ export function executeTool(
       case 'set_paragraph_style': {
         const range = params.range as RangeSpec | undefined
         if (!range) return { success: false, message: 'set_paragraph_style 缺少 range 参数' }
-        if (range.type !== 'selection' && resolveRange(state, range).length === 0) {
+        if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
+          return { success: false, message: '当前没有可用的选区，无法按 selection 修改段落格式' }
+        }
+        if (resolveRange(state, range, options?.selectionContext).length === 0) {
           return { success: false, message: `未找到可设置段落格式的范围：${describeRange(range)}` }
         }
         const { range: _range, ...rawParaAttrs } = params
@@ -369,7 +416,7 @@ export function executeTool(
           Object.entries(rawParaAttrs).filter(([, value]) => value !== undefined)
         )
         if (paraAttrs.listType === 'none') paraAttrs.listType = null
-        tr = applyParagraphStyle(state, tr, range, paraAttrs)
+        tr = applyParagraphStyle(state, tr, range, paraAttrs, options?.selectionContext)
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()

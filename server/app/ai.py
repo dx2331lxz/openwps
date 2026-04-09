@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, AsyncGenerator, TypedDict
 
 from fastapi import HTTPException
@@ -12,6 +13,8 @@ from langchain_openai import ChatOpenAI
 from .config import read_config
 from .models import ChatMessage, ChatRequest
 from .tooling import SYSTEM_PROMPT, TOOLS
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class AgentState(TypedDict):
@@ -84,16 +87,83 @@ def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
     return HumanMessage(content=content)
 
 
+def _build_context_block(context: dict) -> str:
+    """Serialize context dict into a text block the LLM can read."""
+    if not context:
+        return ""
+    parts: list[str] = []
+    parts.append("[当前文档上下文]")
+    document_context = {
+        "paragraphCount": context.get("paragraphCount"),
+        "wordCount": context.get("wordCount"),
+        "pageCount": context.get("pageCount"),
+    }
+    parts.append(f"context.document = {json.dumps(document_context, ensure_ascii=False)}")
+
+    selection = context.get("selection")
+    if selection and isinstance(selection, dict):
+        parts.append("")
+        parts.append("context.selection = " + json.dumps(selection, ensure_ascii=False, indent=2))
+        parts.append("以上是 context.selection 的序列化结果，请按这些字段名理解选区信息。")
+
+    return "\n".join(parts)
+
+
+def _already_has_context_block(content: str) -> bool:
+    return "[当前文档上下文]" in content and "[用户请求]" in content
+
+
+def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> None:
+    last_user = next(
+        (
+            msg for msg in reversed(messages)
+            if isinstance(msg, HumanMessage)
+        ),
+        None,
+    )
+    if not last_user:
+        return
+
+    logger.info(
+        "[openwps.ai] final user prompt conversationId=%s\n%s",
+        body.conversationId or "-",
+        _stringify_content(last_user.content),
+    )
+
+
 def build_messages(body: ChatRequest) -> list[BaseMessage]:
     messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+    context_block = _build_context_block(body.context)
+
     if body.reactMessages:
-        messages.extend(_to_langchain_message(item) for item in body.reactMessages)
+        last_user_idx = -1
+        if context_block:
+            for i in range(len(body.reactMessages) - 1, -1, -1):
+                if dict(body.reactMessages[i]).get("role") == "user":
+                    last_user_idx = i
+                    break
+
+        for i, item in enumerate(body.reactMessages):
+            if i == last_user_idx:
+                raw = dict(item)
+                original = _stringify_content(raw.get("content"))
+                if context_block and not _already_has_context_block(original):
+                    messages.append(HumanMessage(content=context_block + "\n\n" + original))
+                else:
+                    messages.append(HumanMessage(content=original))
+            else:
+                messages.append(_to_langchain_message(item))
+        _log_final_user_message(body, messages)
         return messages
 
     for item in body.history[-10:]:
         messages.append(_to_langchain_message(item))
 
-    messages.append(HumanMessage(content=body.message))
+    user_text = body.message
+    if context_block and not _already_has_context_block(user_text):
+        user_text = context_block + "\n\n" + user_text
+    messages.append(HumanMessage(content=user_text))
+    _log_final_user_message(body, messages)
     return messages
 
 

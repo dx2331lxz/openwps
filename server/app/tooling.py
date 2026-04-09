@@ -24,6 +24,8 @@ RANGE_SPEC = {
         "from": {"type": "integer", "description": "起始段落索引（range.type=paragraphs 时使用）"},
         "to": {"type": "integer", "description": "结束段落索引（range.type=paragraphs 时使用，包含）"},
         "text": {"type": "string", "description": "匹配的文字（range.type=contains_text 时使用）"},
+        "selectionFrom": {"type": "integer", "description": "选区起始文档位置（range.type=selection 时使用）"},
+        "selectionTo": {"type": "integer", "description": "选区结束文档位置（range.type=selection 时使用）"},
     },
 }
 
@@ -265,6 +267,28 @@ SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文
 - 只有在 get_document_content 返回的内容确认修改已生效后，才能将对应 todo 标记为 completed
 - 如果连续 2 次修正后仍不符合预期，将该 todo 标记为 failed，并在回复中告知用户具体的差异
 
+## 选中内容（context.selection）
+当存在选区时，用户消息中会出现一个由后端注入的文本块，形如：
+- context.selection = {...}
+
+这就是 context.selection 的序列化结果。你在运行时看到的不是原始 HTTP JSON，而是这段文本；请按其中相同的字段名来理解选区信息。
+context.selection 表示用户在文档中选中的文字范围，关键字段包括：
+- selection.selectedText：选中的文字内容
+- selection.paragraphIndex：选中起点所在的段落索引（从 0 开始）
+- selection.charOffset：选中起点在该段落内的字符偏移
+- selection.from / selection.to：编辑器内的选区位置
+- selection.paragraphAttrs：该段落的段落样式属性（align / firstLineIndent / lineHeight 等）
+- selection.textRuns：选中范围内的文字片段列表，每项包含 text、startOffset、endOffset、marks（字体/字号/粗体等样式）
+
+当 context.selection 存在时：
+- 它只能帮助你理解“用户大致指的是哪一段、选中了什么文字、这段文字当前样式如何”
+- 它不是工具返回值，不代表你已经读取了完整文档，也不能替代 get_document_content / get_paragraph
+- 当你调用工具操作当前选区时，必须把选区位置显式序列化进参数：range={"type":"selection","selectionFrom":context.selection.from,"selectionTo":context.selection.to}
+- 不要依赖运行时当前光标位置；用户在你思考或执行期间可能已经点击到别处
+- 如果用户明确要求“修改我选中的内容”，优先使用带 selectionFrom / selectionTo 的 range.type="selection"；不要把它偷换成整段 paragraph，除非用户明确说要改整段
+- 如果用户要确认选区内容、判断选区所在段落的上下文、或操作依赖整篇文档结构，仍然应调用 get_document_content 或 get_paragraph
+- 可以把 selection.paragraphIndex 当作定位线索，但不要把它当作已经完成验证
+
 ## 工具使用原则
 1. 用户消息不会附带文档正文；开始排版前必须先用 get_document_content 读取文档结构，了解段落数量和内容
 2. 用 range 精确指定操作哪些段落，不要用 all，除非用户明确要求全部
@@ -275,6 +299,7 @@ SYSTEM_PROMPT = """你是 openwps 的 AI 排版助手，专门帮助用户对文
 7. 插入类工具必须带位置：insert_page_break / insert_table / insert_horizontal_rule 需要 afterParagraph，insert_text 需要 paragraphIndex
 8. 涉及字体时，只能使用这 4 种字体：宋体、黑体、楷体、仿宋。不要调用其他字体名
 9. 如果还没读取过文档，就不要猜段落索引，也不要直接调用 set_text_style / set_paragraph_style
+10. 当 context.selection 存在时，可以更快定位用户关注的位置，但不要把它误当成完整文档读取结果
 
 ## 回复要求
 - 如果已经完成操作，就简短说明做了什么

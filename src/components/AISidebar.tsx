@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent } from 'react'
 import { EditorView } from 'prosemirror-view'
+import type { EditorState } from 'prosemirror-state'
+import type { Node as ProseMirrorNode } from 'prosemirror-model'
 import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
@@ -47,6 +49,7 @@ interface Message {
   streaming: boolean
   prepared?: PreparedTextWithSegments
   tightWidth: number
+  selectionTag?: { text: string; paragraphIndex: number } | null
 }
 
 interface AskContinueState {
@@ -61,8 +64,92 @@ interface TodoItem {
   status: 'pending' | 'in_progress' | 'completed' | 'failed'
 }
 
+// ─── Selection context ───────────────────────────────────────────────────────
+
+interface TextRun {
+  text: string
+  startOffset: number
+  endOffset: number
+  marks: Record<string, unknown>
+}
+
+interface SelectionContext {
+  from: number
+  to: number
+  selectedText: string
+  paragraphIndex: number
+  charOffset: number
+  paragraphAttrs: Record<string, unknown>
+  textRuns: TextRun[]
+}
+
+function serializeSelection(editorState: EditorState): SelectionContext | null {
+  const { from, to } = editorState.selection
+  if (from === to) return null
+
+  const doc = editorState.doc
+  let paraIndex = 0
+  let targetParaIndex = -1
+  let targetParaStart = -1
+  let targetParaNode: ProseMirrorNode | null = null
+
+  doc.forEach((node, pos) => {
+    if (node.type.name !== 'paragraph') return
+    const paraFrom = pos + 1
+    const paraTo = pos + node.nodeSize - 1
+    if (targetParaIndex === -1 && from >= paraFrom && from <= paraTo) {
+      targetParaIndex = paraIndex
+      targetParaStart = paraFrom
+      targetParaNode = node
+    }
+    paraIndex += 1
+  })
+
+  const selectedText = doc.textBetween(from, to, '\n')
+
+  if (!targetParaNode || targetParaStart === -1) {
+    return {
+      from, to, selectedText,
+      paragraphIndex: -1, charOffset: 0,
+      paragraphAttrs: {}, textRuns: [],
+    }
+  }
+
+  const paraNode = targetParaNode as ProseMirrorNode
+  const charOffset = from - targetParaStart
+  const paragraphAttrs = { ...(paraNode.attrs as Record<string, unknown>) }
+
+  // Build textRuns for the selected range inside this paragraph
+  const selStartInPara = charOffset
+  const selEndInPara = Math.min(paraNode.textContent.length, to - targetParaStart)
+  const textRuns: TextRun[] = []
+  let runningOffset = 0
+
+  paraNode.forEach((child: ProseMirrorNode) => {
+    if (!child.isText) { runningOffset += child.nodeSize; return }
+    const text = child.text ?? ''
+    const runStart = runningOffset
+    const runEnd = runningOffset + text.length
+    runningOffset = runEnd
+
+    if (runEnd <= selStartInPara || runStart >= selEndInPara) return
+
+    const sliceStart = Math.max(runStart, selStartInPara)
+    const sliceEnd = Math.min(runEnd, selEndInPara)
+    const slicedText = text.slice(sliceStart - runStart, sliceEnd - runStart)
+
+    const tm = child.marks.find((m: { type: { name: string } }) => m.type.name === 'textStyle')
+    const marks: Record<string, unknown> = tm ? { ...(tm.attrs as Record<string, unknown>) } : {}
+
+    textRuns.push({ text: slicedText, startOffset: sliceStart, endOffset: sliceEnd, marks })
+  })
+
+  return { from, to, selectedText, paragraphIndex: targetParaIndex, charOffset, paragraphAttrs, textRuns }
+}
+
 interface Props {
   view: EditorView | null
+  editorState?: EditorState | null
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
   onDocumentStyleMutation?: () => void
@@ -140,6 +227,41 @@ function fmtToolCall(tc: ToolCallResult): string {
     })
     .join(', ')
   return `${tc.name}(${short})`
+}
+
+function formatToolParams(params: Record<string, unknown>) {
+  try {
+    return JSON.stringify(params, null, 2)
+  } catch {
+    return String(params)
+  }
+}
+
+function extractSelectionContext(context: Record<string, unknown>) {
+  const selection = context.selection
+  if (!selection || typeof selection !== 'object' || Array.isArray(selection)) return null
+  const from = Number((selection as Record<string, unknown>).from)
+  const to = Number((selection as Record<string, unknown>).to)
+  const paragraphIndex = Number((selection as Record<string, unknown>).paragraphIndex)
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return null
+  return {
+    from,
+    to,
+    paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : undefined,
+  }
+}
+
+function serializeToolParamsWithSelection(
+  params: Record<string, unknown>,
+  selectionContext: { from: number; to: number; paragraphIndex?: number } | null,
+) {
+  const range = params.range
+  if (!selectionContext || !range || typeof range !== 'object' || Array.isArray(range)) return params
+  const nextRange = { ...(range as Record<string, unknown>) }
+  if (nextRange.type !== 'selection') return params
+  if (!Number.isFinite(Number(nextRange.selectionFrom))) nextRange.selectionFrom = selectionContext.from
+  if (!Number.isFinite(Number(nextRange.selectionTo))) nextRange.selectionTo = selectionContext.to
+  return { ...params, range: nextRange }
 }
 
 function toHtml(markdown: string) {
@@ -362,7 +484,7 @@ function makeConversationTitle(text: string) {
   return text.trim().slice(0, 30) || '新会话'
 }
 
-export default function AISidebar({ view: editorView, pageConfig, onPageConfigChange, onDocumentStyleMutation, onClose }: Props) {
+export default function AISidebar({ view: editorView, editorState, pageConfig, onPageConfigChange, onDocumentStyleMutation, onClose }: Props) {
   const [viewMode, setViewMode] = useState<View>('history')
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
@@ -375,6 +497,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
   const [todos, setTodos] = useState<TodoItem[]>([])
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(true)
+  const [includeSelection, setIncludeSelection] = useState(true)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -410,8 +533,13 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
         wordCount += text.length
       }
     })
-    return { paragraphCount, wordCount, pageCount: 1, paragraphs }
-  }, [editorView])
+    const ctx: Record<string, unknown> = { paragraphCount, wordCount, pageCount: 1, paragraphs }
+    if (includeSelection && editorState) {
+      const sel = serializeSelection(editorState)
+      if (sel) ctx.selection = sel
+    }
+    return ctx
+  }, [editorView, editorState, includeSelection])
 
   const loadConversations = useCallback(async () => {
     setHistoryLoading(true)
@@ -522,12 +650,23 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
     const nextTitle = makeConversationTitle(text)
     const previousConversationMessages = shouldStartNewConversation ? [] : conversationMessagesRef.current
     const userMessage = makeUserMessage(text, sidebarWidth)
+
+    // Capture selection tag for this message, then clear it from input area
+    const currentSel = (includeSelection && editorState) ? serializeSelection(editorState) : null
+    if (currentSel) {
+      userMessage.selectionTag = {
+        text: currentSel.selectedText,
+        paragraphIndex: currentSel.paragraphIndex,
+      }
+    }
+
     const aiMessage = makeAiMessage('', true)
 
     setAskContinue({ visible: false, rounds: 0, message: '' })
     setTodos([])
     setIsTodoPanelExpanded(true)
     setInput('')
+    setIncludeSelection(true)
     resetTextareaHeight()
 
     if (shouldStartNewConversation) {
@@ -686,8 +825,15 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                   setIsTodoPanelExpanded(hasActive)
                   result = { success: true, message: 'todo list updated' }
                 } else {
+                  const selectionContext = extractSelectionContext(context)
+                  toolCall.params = serializeToolParamsWithSelection(toolCall.params, selectionContext)
                   result = editorView
-                    ? executeTool(editorView, toolCall.name, toolCall.params, { pageConfig, onPageConfigChange, onDocumentStyleMutation })
+                    ? executeTool(editorView, toolCall.name, toolCall.params, {
+                        pageConfig,
+                        onPageConfigChange,
+                        onDocumentStyleMutation,
+                        selectionContext,
+                      })
                     : { success: false, message: '编辑器尚未就绪' }
                 }
 
@@ -835,7 +981,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [editorView, getContext, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
+  }, [editorState, editorView, getContext, includeSelection, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -986,18 +1132,31 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
             {messages.map(message => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {message.role === 'user' ? (
-                  <div
-                    className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
-                    style={{
-                      width: message.tightWidth > 0 ? message.tightWidth : undefined,
-                      maxWidth: message.tightWidth > 0 ? undefined : '85%',
-                      wordBreak: 'break-word',
-                      whiteSpace: 'pre-wrap',
-                      paddingTop: PADDING_V,
-                      paddingBottom: PADDING_V,
-                    }}
-                  >
-                    {message.text}
+                  <div className="flex flex-col items-end gap-1">
+                    <div
+                      className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
+                      style={{
+                        width: message.tightWidth > 0 ? message.tightWidth : undefined,
+                        maxWidth: message.tightWidth > 0 ? undefined : '85%',
+                        wordBreak: 'break-word',
+                        whiteSpace: 'pre-wrap',
+                        paddingTop: PADDING_V,
+                        paddingBottom: PADDING_V,
+                      }}
+                    >
+                      {message.text}
+                    </div>
+                    {message.selectionTag && (
+                      <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] bg-blue-50 border border-blue-200 text-blue-500">
+                        <span>📎</span>
+                        <span className="max-w-[120px] truncate">
+                          {message.selectionTag.text.length > 15
+                            ? `${message.selectionTag.text.slice(0, 15)}…`
+                            : message.selectionTag.text}
+                        </span>
+                        <span className="opacity-50">P{message.selectionTag.paragraphIndex + 1}</span>
+                      </span>
+                    )}
                   </div>
                 ) : (
                   <div className="w-full min-w-0 space-y-1.5">
@@ -1069,7 +1228,12 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
                               <span className="flex-shrink-0">
                                 {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
                               </span>
-                              <span className="break-all">{fmtToolCall(toolCall)}</span>
+                              <div className="min-w-0 flex-1">
+                                <div className="break-all">{fmtToolCall(toolCall)}</div>
+                                <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white/70 border border-gray-200 rounded-md px-2 py-1">
+                                  {formatToolParams(toolCall.params)}
+                                </pre>
+                              </div>
                             </div>
                             {toolCall.message && (
                               <div className="pl-5 mt-0.5 break-all opacity-80">{toolCall.message}</div>
@@ -1127,7 +1291,35 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
         )}
       </div>
 
-      <div className="border-t border-gray-200 p-2 flex gap-1.5 items-end flex-shrink-0">
+      <div className="border-t border-gray-200 p-2 flex flex-col gap-1.5 flex-shrink-0">
+        {/* Selection tag chip */}
+        {(() => {
+          const sel = editorState ? serializeSelection(editorState) : null
+          if (!sel) return null
+          return (
+            <div className="flex items-center gap-1.5 px-1">
+              <button
+                type="button"
+                onMouseDown={e => { e.preventDefault(); setIncludeSelection(prev => !prev) }}
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border transition-colors select-none ${
+                  includeSelection
+                    ? 'bg-blue-50 border-blue-300 text-blue-700 hover:bg-blue-100'
+                    : 'bg-gray-100 border-gray-300 text-gray-400 hover:bg-gray-200 line-through'
+                }`}
+                title={includeSelection ? '点击取消携带选中内容' : '点击携带选中内容'}
+              >
+                <span>📎</span>
+                <span>
+                  {sel.selectedText.length > 20
+                    ? `"${sel.selectedText.slice(0, 20)}…"`
+                    : `"${sel.selectedText}"`}
+                </span>
+                <span className="opacity-60">P{sel.paragraphIndex + 1}</span>
+              </button>
+            </div>
+          )
+        })()}
+        <div className="flex gap-1.5 items-end">
         <textarea
           ref={textareaRef}
           className="flex-1 text-sm border border-gray-300 rounded-xl px-2.5 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
@@ -1165,6 +1357,7 @@ export default function AISidebar({ view: editorView, pageConfig, onPageConfigCh
             ↵
           </button>
         )}
+        </div>
       </div>
 
       <style>{'@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }'}</style>

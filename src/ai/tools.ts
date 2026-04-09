@@ -19,6 +19,8 @@ const rangeProperties = {
   from: { type: 'integer', description: '起始段落索引（range.type=paragraphs 时使用）' },
   to: { type: 'integer', description: '结束段落索引（range.type=paragraphs 时使用，包含）' },
   text: { type: 'string', description: '要匹配的文字（range.type=contains_text 时使用）' },
+  selectionFrom: { type: 'integer', description: '选区起始文档位置（range.type=selection 时使用）' },
+  selectionTo: { type: 'integer', description: '选区结束文档位置（range.type=selection 时使用）' },
 } as const
 
 export const layoutTools = [

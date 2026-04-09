@@ -660,6 +660,7 @@ export const Editor: React.FC = () => {
       {sidebarOpen && (
         <AISidebar
           view={view}
+          editorState={editorState}
           pageConfig={pageConfig}
           onPageConfigChange={(newCfg) => {
             setPageConfig(newCfg)
