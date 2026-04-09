@@ -12,7 +12,8 @@ interface ToolbarProps {
   editorState: EditorState | null
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
-  onOpenSettings?: (tab?: 'page' | 'ai') => void
+  onOpenServerFile?: () => void | Promise<void>
+  onSaveServerFile?: () => void | Promise<void>
   onImportDocx?: (file: File) => void | Promise<void>
   onExportDocx?: () => void | Promise<void>
 }
@@ -308,7 +309,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   editorState,
   onToggleSidebar,
   sidebarOpen,
-  onOpenSettings,
+  onOpenServerFile,
+  onSaveServerFile,
   onImportDocx,
   onExportDocx,
 }) => {
@@ -399,14 +401,24 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         {/* 导入/导出 */}
         <button
           className={btn(false)}
+          title="打开服务器文件"
+          onMouseDown={e => { e.preventDefault(); void onOpenServerFile?.() }}
+        >📁 打开</button>
+        <button
+          className={btn(false)}
+          title="保存到服务器文件"
+          onMouseDown={e => { e.preventDefault(); void onSaveServerFile?.() }}
+        >💾 保存</button>
+        <button
+          className={btn(false)}
           title="导入 .docx"
           onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
-        >📂 导入</button>
+        >📥 导入</button>
         <button
           className={btn(false)}
           title="导出 .docx"
           onMouseDown={e => { e.preventDefault(); void onExportDocx?.() }}
-        >💾 导出</button>
+        >📤 导出</button>
 
         {sep}
 
@@ -567,11 +579,6 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         {/* Insert page break */}
         <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞</button>
-
-        {/* Page settings */}
-        <button className={btn(false)} title="页面设置" onMouseDown={e => { e.preventDefault(); onOpenSettings?.('page') }}>⚙</button>
-
-        {sep}
 
         {/* AI Sidebar toggle */}
         <button

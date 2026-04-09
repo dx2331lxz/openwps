@@ -14,15 +14,43 @@ import {
 } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
+import FileManagerModal from './FileManagerModal'
 import SettingsModal from './SettingsModal'
-import { importDocx } from '../docx/importer'
-import { exportDocx, type DocxExportOptions } from '../docx/exporter'
+import { importDocx, type PMNodeJSON } from '../docx/importer'
+import { buildDocxBlob, exportDocx, type DocxExportOptions } from '../docx/exporter'
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 import { PretextPageRenderer } from './PretextPageRenderer'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
 const DOCX_PUNCTUATION_COMPRESSION_PX = -0.34
+const DEFAULT_SERVER_DOCUMENT_NAME = 'document.docx'
+
+interface ServerDocumentSummary {
+  name: string
+  size: number
+  updatedAt: string
+}
+
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const raw = await response.text()
+  const contentType = response.headers.get('content-type') ?? ''
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+
+  if (!contentType.includes('application/json')) {
+    const preview = raw.slice(0, 80).replace(/\s+/g, ' ').trim()
+    throw new Error(`接口返回了非 JSON 内容，可能后端还没重启或路由未生效：${preview}`)
+  }
+
+  try {
+    return JSON.parse(raw) as T
+  } catch (error) {
+    throw new Error(`JSON 解析失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
 
 // Widget height for a break after a page that used `usedH` px of content:
 //   = (remaining space on that page) + BREAK_BASE
@@ -356,7 +384,7 @@ export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [settingsTab, setSettingsTab] = useState<0 | 1>(0)
+  const [fileModalMode, setFileModalMode] = useState<'open' | 'save' | null>(null)
   const viewRef = useRef<EditorView | null>(null)
   const applyingImportedDocxRef = useRef(false)
   const [view, setView] = useState<EditorView | null>(null)
@@ -369,6 +397,10 @@ export const Editor: React.FC = () => {
   const [editorFocused, setEditorFocused] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const docxLetterSpacingRef = useRef(0)
+  const [serverDocuments, setServerDocuments] = useState<ServerDocumentSummary[]>([])
+  const [serverDocumentsLoading, setServerDocumentsLoading] = useState(false)
+  const [serverDocumentsError, setServerDocumentsError] = useState<string | null>(null)
+  const [currentDocumentName, setCurrentDocumentName] = useState(DEFAULT_SERVER_DOCUMENT_NAME)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
@@ -380,6 +412,45 @@ export const Editor: React.FC = () => {
     docxLetterSpacingRef.current = 0
     setDocxLetterSpacingPx(0)
     console.log('[docx] imported compatibility metadata cleared after style mutation')
+  }, [])
+
+  const applyDocumentState = useCallback((
+    docJson: PMNodeJSON,
+    nextPageConfig: PageConfig,
+    nextDocxExportOptions: DocxExportOptions = {},
+    nextDocxLetterSpacingPx = 0,
+  ) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const docNode = schema.nodeFromJSON(docJson)
+    const transaction = editorView.state.tr.replaceWith(
+      0,
+      editorView.state.doc.nodeSize - 2,
+      docNode.content,
+    )
+    editorView.dispatch(transaction)
+    setPageConfig(nextPageConfig)
+    pageConfigRef.current = nextPageConfig
+    docxExportOptionsRef.current = nextDocxExportOptions
+    docxLetterSpacingRef.current = nextDocxLetterSpacingPx
+    setDocxLetterSpacingPx(nextDocxLetterSpacingPx)
+  }, [])
+
+  const loadServerDocuments = useCallback(async () => {
+    setServerDocumentsLoading(true)
+    setServerDocumentsError(null)
+    try {
+      const response = await fetch('/api/documents')
+      const data = await readJsonResponse<ServerDocumentSummary[]>(response)
+      setServerDocuments(data)
+    } catch (error) {
+      console.error('[Editor] load server documents failed', error)
+      setServerDocuments([])
+      setServerDocumentsError(`读取文件列表失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setServerDocumentsLoading(false)
+    }
   }, [])
 
   const updateLayoutSnapshot = useCallback((doc: EditorState['doc']) => {
@@ -484,22 +555,12 @@ export const Editor: React.FC = () => {
 
     try {
       const parsed = await importDocx(file)
-      const docNode = schema.nodeFromJSON(parsed.doc)
       applyingImportedDocxRef.current = true
-      const transaction = editorView.state.tr.replaceWith(
-        0,
-        editorView.state.doc.nodeSize - 2,
-        docNode.content,
-      )
-      editorView.dispatch(transaction)
-      setPageConfig(parsed.pageConfig)
-      pageConfigRef.current = parsed.pageConfig
-      docxExportOptionsRef.current = {
+      applyDocumentState(parsed.doc, parsed.pageConfig, {
         docGridLinePitchPt: parsed.docGridLinePitchPt,
         typography: parsed.typography,
-      }
-      docxLetterSpacingRef.current = parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0
-      setDocxLetterSpacingPx(docxLetterSpacingRef.current)
+      }, parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0)
+      setCurrentDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME)
       console.log(
         `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
           `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
@@ -514,7 +575,77 @@ export const Editor: React.FC = () => {
     } finally {
       applyingImportedDocxRef.current = false
     }
-  }, [repaginate])
+  }, [applyDocumentState, repaginate])
+
+  const handleOpenServerDocument = useCallback(async (name: string) => {
+    try {
+      const response = await fetch(`/api/documents/${encodeURIComponent(name)}`)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const blob = await response.blob()
+      const file = new File([blob], name, {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      })
+      await handleImportDocx(file)
+      setCurrentDocumentName(name)
+      setFileModalMode(null)
+      await loadServerDocuments()
+      window.alert('服务器文档打开成功')
+    } catch (error) {
+      console.error('[Editor] open server document failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`服务器文档打开失败：${message}`)
+    }
+  }, [handleImportDocx, loadServerDocuments])
+
+  const handleSaveServerDocument = useCallback(async (name?: string) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const targetName = (name ?? currentDocumentName).trim() || DEFAULT_SERVER_DOCUMENT_NAME
+    try {
+      const blob = await buildDocxBlob(editorView.state.doc, pageConfigRef.current, docxExportOptionsRef.current)
+      const response = await fetch(`/api/documents/${encodeURIComponent(targetName)}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        },
+        body: blob,
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      setCurrentDocumentName(targetName.toLowerCase().endsWith('.docx') ? targetName : `${targetName}.docx`)
+      setFileModalMode(null)
+      await loadServerDocuments()
+      window.alert('服务器文档保存成功')
+    } catch (error) {
+      console.error('[Editor] save server document failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`服务器文档保存失败：${message}`)
+    }
+  }, [currentDocumentName, loadServerDocuments])
+
+  const handleDeleteServerDocument = useCallback(async (name: string) => {
+    try {
+      const response = await fetch(`/api/documents/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      if (currentDocumentName === name) {
+        setCurrentDocumentName(DEFAULT_SERVER_DOCUMENT_NAME)
+      }
+      await loadServerDocuments()
+    } catch (error) {
+      console.error('[Editor] delete server document failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`删除服务器文档失败：${message}`)
+    }
+  }, [currentDocumentName, loadServerDocuments])
+
+  const openServerFileModal = useCallback(async () => {
+    setFileModalMode('open')
+    await loadServerDocuments()
+  }, [loadServerDocuments])
+
+  const openSaveFileModal = useCallback(async () => {
+    setFileModalMode('save')
+    await loadServerDocuments()
+  }, [loadServerDocuments])
 
   const handleExportDocx = useCallback(async () => {
     const editorView = viewRef.current
@@ -567,7 +698,8 @@ export const Editor: React.FC = () => {
           editorState={editorState}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
-          onOpenSettings={(tab = 'page') => { setSettingsTab(tab === 'ai' ? 1 : 0); setSettingsOpen(true) }}
+          onOpenServerFile={openServerFileModal}
+          onSaveServerFile={openSaveFileModal}
           onImportDocx={handleImportDocx}
           onExportDocx={handleExportDocx}
         />
@@ -678,15 +810,28 @@ export const Editor: React.FC = () => {
       <button
         onClick={() => setSettingsOpen(true)}
         className="fixed bottom-4 left-4 z-20 w-9 h-9 flex items-center justify-center bg-white border border-gray-300 rounded-full shadow hover:bg-gray-50 text-lg"
-        title="设置"
+        title={`设置${currentDocumentName ? ` · 当前文件：${currentDocumentName}` : ''}`}
       >
         ⚙️
       </button>
 
+      {fileModalMode && (
+        <FileManagerModal
+          mode={fileModalMode}
+          files={serverDocuments}
+          loading={serverDocumentsLoading}
+          error={serverDocumentsError}
+          initialName={currentDocumentName || DEFAULT_SERVER_DOCUMENT_NAME}
+          onClose={() => setFileModalMode(null)}
+          onOpen={handleOpenServerDocument}
+          onSave={handleSaveServerDocument}
+          onDelete={handleDeleteServerDocument}
+        />
+      )}
+
       {/* Settings modal */}
       {settingsOpen && (
         <SettingsModal
-          defaultTab={settingsTab}
           pageConfig={pageConfig}
           onPageConfigChange={(newCfg) => { setPageConfig(newCfg); pageConfigRef.current = newCfg; repaginate() }}
           onClose={() => setSettingsOpen(false)}

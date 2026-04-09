@@ -6,10 +6,12 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "config" / "ai.json"
 CONVERSATIONS_DIR = BASE_DIR / "data" / "conversations"
+DOCUMENTS_DIR = BASE_DIR / "data" / "documents"
 DIST_DIR = BASE_DIR.parent / "dist"
 
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CONFIG = {
     "endpoint": "https://api.siliconflow.cn/v1",

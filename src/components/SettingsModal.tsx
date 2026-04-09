@@ -67,6 +67,15 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
       .catch(() => setAiError('无法连接到后端，请确认服务已启动（端口 5174）'))
   }, [])
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
+
   // ── Handlers ─────────────────────────────────────────────────────────────
 
   function handlePageSave() {
@@ -102,10 +111,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
   const TAB_LABELS = ['📄 页面设置', '🤖 AI 配置']
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
-    >
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
       <div
         className="bg-white rounded-xl shadow-2xl w-[440px] max-w-[96vw] mx-4 flex flex-col"
         style={{ maxHeight: '90vh' }}

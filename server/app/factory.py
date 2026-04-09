@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +17,7 @@ from .conversations import (
     list_conversations,
     read_conversation,
 )
+from .documents import delete_document, list_documents, read_document_path, save_document
 from .models import AppendMessagesRequest, ChatRequest, SettingsUpdate
 
 
@@ -78,6 +79,29 @@ def create_api_router() -> APIRouter:
     @router.delete("/conversations/{conv_id}")
     def remove_conversation(conv_id: str):
         delete_conversation(conv_id)
+        return {"success": True}
+
+    @router.get("/documents")
+    def get_documents():
+        return list_documents()
+
+    @router.put("/documents/{name:path}")
+    async def put_document(name: str, request: Request):
+        content = await request.body()
+        return save_document(name, content)
+
+    @router.get("/documents/{name:path}")
+    def get_document(name: str):
+        path = read_document_path(name)
+        return FileResponse(
+            path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=path.name,
+        )
+
+    @router.delete("/documents/{name:path}")
+    def remove_document(name: str):
+        delete_document(name)
         return {"success": True}
 
     @router.post("/ai/chat")
