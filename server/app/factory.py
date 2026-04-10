@@ -8,8 +8,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
-from .ai import run_chat, stream_react_round
-from .config import DIST_DIR, read_config, write_config
+from .ai import list_models, run_chat, stream_react_round
+from .config import DIST_DIR, get_provider, public_config, read_config, write_config
 from .conversations import (
     append_messages,
     create_conversation,
@@ -18,7 +18,7 @@ from .conversations import (
     read_conversation,
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
-from .models import AppendMessagesRequest, ChatRequest, SettingsUpdate
+from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, SettingsUpdate
 
 
 def sse(event_type: str, data: dict) -> str:
@@ -35,24 +35,52 @@ def create_api_router() -> APIRouter:
 
     @router.get("/ai/settings")
     def get_settings():
-        cfg = read_config()
-        return {
-            "endpoint": cfg.get("endpoint", ""),
-            "model": cfg.get("model", ""),
-            "hasApiKey": bool(cfg.get("apiKey", "")),
-        }
+        return public_config()
 
     @router.put("/ai/settings")
     def update_settings(body: SettingsUpdate):
-        cfg = read_config()
-        if body.endpoint is not None:
-            cfg["endpoint"] = body.endpoint
-        if body.apiKey is not None:
-            cfg["apiKey"] = body.apiKey
-        if body.model is not None:
-            cfg["model"] = body.model
+        current = read_config()
+        existing_by_id = {
+            str(provider.get("id")): provider
+            for provider in current.get("providers", [])
+            if isinstance(provider, dict)
+        }
+        cfg = {
+            "version": 2,
+            "activeProviderId": body.activeProviderId,
+            "providers": [],
+        }
+        for provider in body.providers:
+            item = provider.model_dump(exclude_none=True)
+            if "apiKey" not in item and item.get("id") in existing_by_id:
+                item["apiKey"] = existing_by_id[item["id"]].get("apiKey", "")
+            cfg["providers"].append(item)
         write_config(cfg)
-        return {"success": True}
+        return public_config(cfg)
+
+    @router.get("/ai/models")
+    async def get_models(providerId: str | None = None):
+        cfg = read_config()
+        provider = get_provider(cfg, providerId)
+        models = await list_models(provider.get("endpoint", ""), str(provider.get("apiKey", "") or ""))
+        return {
+            "providerId": provider["id"],
+            "models": models,
+            "defaultModel": provider.get("defaultModel", ""),
+        }
+
+    @router.post("/ai/models/discover")
+    async def discover_models(body: ModelDiscoveryRequest):
+        if body.providerId:
+            provider = get_provider(read_config(), body.providerId)
+            endpoint = body.endpoint or provider.get("endpoint", "")
+            api_key = body.apiKey if body.apiKey is not None else str(provider.get("apiKey", "") or "")
+        else:
+            endpoint = body.endpoint or ""
+            api_key = body.apiKey or ""
+
+        models = await list_models(endpoint, api_key)
+        return {"models": models}
 
     @router.get("/conversations")
     def get_conversations():

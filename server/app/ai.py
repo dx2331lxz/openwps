@@ -4,13 +4,15 @@ import json
 import logging
 from typing import Any, AsyncGenerator, TypedDict
 
+import httpx
 from fastapi import HTTPException
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableLambda
 from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
 
-from .config import read_config
+from .config import get_provider, read_config
 from .models import ChatMessage, ChatRequest
 from .tooling import get_system_prompt, get_tools
 
@@ -186,21 +188,18 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
     return messages
 
 
-def build_llm(streaming: bool, body: ChatRequest) -> ChatOpenAI:
+def build_llm(streaming: bool, body: ChatRequest) -> Runnable:
     cfg = read_config()
-    api_key = cfg.get("apiKey", "")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="API Key 未配置，请在设置中填写")
-
-    endpoint = str(cfg.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
-    model = str(cfg.get("model", "Qwen/Qwen2.5-72B-Instruct"))
+    provider = get_provider(cfg, body.providerId)
+    api_key = str(provider.get("apiKey", "") or "")
+    endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
+    model = str(body.model or provider.get("defaultModel") or "Qwen/Qwen2.5-72B-Instruct")
 
     return ChatOpenAI(
         model=model,
-        api_key=api_key,
+        api_key=api_key or "not-needed",
         base_url=endpoint,
         temperature=0.3,
-        max_tokens=2048 if streaming else 1024,
         streaming=streaming,
     ).bind_tools(get_tools(body.mode))
 
@@ -231,10 +230,11 @@ async def run_chat(body: ChatRequest) -> dict[str, Any]:
             reply = f"好的，我来帮你执行：{', '.join(call['name'] for call in tool_calls)}"
 
         cfg = read_config()
+        provider = get_provider(cfg, body.providerId)
         return {
             "reply": reply,
             "toolCalls": tool_calls,
-            "model": cfg.get("model", ""),
+            "model": body.model or provider.get("defaultModel", ""),
         }
     except HTTPException:
         raise
@@ -292,3 +292,41 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
                 "name": item["name"],
                 "params": params,
             }
+
+
+async def list_models(endpoint: str, api_key: str = "") -> list[dict[str, str]]:
+    base_url = str(endpoint or "").strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="端点地址不能为空")
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{base_url}/models", headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip() or str(exc)
+        raise HTTPException(status_code=502, detail=f"获取模型列表失败: {detail}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc
+
+    raw_models = payload.get("data", []) if isinstance(payload, dict) else []
+    models: list[dict[str, str]] = []
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        models.append(
+            {
+                "id": model_id,
+                "label": str(item.get("name") or model_id),
+            }
+        )
+
+    return sorted(models, key=lambda item: item["id"].lower())

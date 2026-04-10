@@ -7,6 +7,8 @@ import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
 import { executeTool, type ExecuteResult } from '../ai/executor'
+import { editTools, layoutTools } from '../ai/tools'
+import type { AISettingsData, ModelOption } from '../ai/providers'
 import type { PageConfig } from '../layout/paginator'
 
 type View = 'history' | 'chat'
@@ -39,6 +41,7 @@ interface ToolCallResult {
   status: 'pending' | 'ok' | 'err'
   message?: string
   data?: unknown
+  isExpanded?: boolean
 }
 
 interface ImageAttachment {
@@ -72,12 +75,6 @@ interface TodoItem {
   id: string
   title: string
   status: 'pending' | 'in_progress' | 'completed' | 'failed'
-}
-
-interface AISettingsData {
-  endpoint: string
-  model: string
-  hasApiKey: boolean
 }
 
 // ─── Selection context ───────────────────────────────────────────────────────
@@ -183,6 +180,9 @@ const BUBBLE_MAX_RATIO = 0.85
 const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
 const MAX_TOOL_ROUNDS = 50
+const TOOL_DESCRIPTIONS = Object.fromEntries(
+  [...layoutTools, ...editTools].map(tool => [tool.name, tool.description]),
+)
 
 let msgIdCounter = 0
 
@@ -235,14 +235,60 @@ function formatConversationTime(value: string) {
   return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
-function fmtToolCall(tc: ToolCallResult): string {
-  const short = Object.entries(tc.params)
-    .map(([k, v]) => {
-      const vs = typeof v === 'string' ? v : JSON.stringify(v)
-      return `${k}=${vs}`
-    })
-    .join(', ')
-  return `${tc.name}(${short})`
+function truncateText(value: string, maxLength = 48) {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value
+}
+
+function describeToolTarget(params: Record<string, unknown>) {
+  const range = params.range
+  if (range && typeof range === 'object' && !Array.isArray(range)) {
+    const type = String((range as Record<string, unknown>).type ?? '')
+    if (type === 'selection') return '当前选区'
+    if (type === 'all') return '全文'
+    if (type === 'paragraph') {
+      const paragraphIndex = Number((range as Record<string, unknown>).paragraphIndex)
+      if (Number.isFinite(paragraphIndex)) return `第 ${paragraphIndex + 1} 段`
+    }
+    if (type === 'paragraphs') {
+      const from = Number((range as Record<string, unknown>).from)
+      const to = Number((range as Record<string, unknown>).to)
+      if (Number.isFinite(from) && Number.isFinite(to)) return `第 ${from + 1}-${to + 1} 段`
+    }
+  }
+
+  if (Number.isFinite(Number(params.paragraphIndex))) return `第 ${Number(params.paragraphIndex) + 1} 段`
+  if (Number.isFinite(Number(params.afterParagraph))) return `第 ${Number(params.afterParagraph) + 1} 段后`
+  if (Number.isFinite(Number(params.index))) return `第 ${Number(params.index) + 1} 段`
+  return ''
+}
+
+function summarizeToolPurpose(toolCall: ToolCallResult) {
+  const textKeys = ['purpose', 'goal', 'reason', 'instruction', 'query', 'message', 'text']
+  for (const key of textKeys) {
+    const value = toolCall.params[key]
+    if (typeof value === 'string' && value.trim()) return truncateText(value.trim())
+  }
+
+  const target = describeToolTarget(toolCall.params)
+  const description = TOOL_DESCRIPTIONS[toolCall.name]
+
+  if (toolCall.name === 'get_document_info') return '读取当前文档的统计信息'
+  if (toolCall.name === 'get_document_content') return '读取全文内容和样式，辅助后续判断'
+  if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
+  if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
+  if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
+  if (toolCall.name === 'set_paragraph_style') return target ? `调整${target}的段落格式` : '调整段落格式'
+  if (toolCall.name === 'insert_text') return target ? `向${target}补充文字` : '插入新的文字内容'
+  if (toolCall.name === 'insert_paragraph_after') return target ? `在${target}后新增段落` : '插入一个新段落'
+  if (toolCall.name === 'replace_paragraph_text') return target ? `整体改写${target}` : '整体替换段落内容'
+  if (toolCall.name === 'replace_selection_text') return '替换当前选中的文本'
+  if (toolCall.name === 'delete_selection_text') return '删除当前选中的文本'
+  if (toolCall.name === 'delete_paragraph') return target ? `删除${target}` : '删除指定段落'
+  if (toolCall.name === 'insert_page_break') return target ? `在${target}插入分页符` : '插入分页符'
+  if (toolCall.name === 'insert_horizontal_rule') return target ? `在${target}插入分割线` : '插入分割线'
+  if (toolCall.name === 'insert_table') return target ? `在${target}插入表格` : '插入表格'
+
+  return description || '执行工具调用'
 }
 
 function formatToolParams(params: Record<string, unknown>) {
@@ -401,6 +447,7 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
       status: toolCall.status,
       message: toolCall.message,
       data: toolCall.data,
+      isExpanded: false,
     }))
   }
 
@@ -420,6 +467,7 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
         name: String(call.function?.name ?? ''),
         params,
         status: 'pending' as const,
+        isExpanded: false,
       }
     })
   }
@@ -531,6 +579,10 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(true)
   const [includeSelection, setIncludeSelection] = useState(true)
   const [modelName, setModelName] = useState('')
+  const [selectedModel, setSelectedModel] = useState('')
+  const [activeProviderId, setActiveProviderId] = useState('')
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([])
 
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -560,7 +612,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     let paragraphCount = 0
     let wordCount = 0
     const paragraphs: Array<{index: number, text: string, charCount: number}> = []
-    editorView.state.doc.forEach((node, _pos, _index) => {
+    editorView.state.doc.forEach((node) => {
       if (node.type.name === 'paragraph') {
         const text = node.textContent
         paragraphs.push({ index: paragraphCount, text: text.slice(0, 100), charCount: text.length })
@@ -604,18 +656,56 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       })
       .then(data => {
         if (!active) return
+        setActiveProviderId(data.activeProviderId)
         setModelName(data.model || '')
+        setSelectedModel(data.model || '')
       })
       .catch(error => {
         console.error('[AISidebar] load ai settings failed', error)
         if (!active) return
         setModelName('')
+        setSelectedModel('')
       })
 
     return () => {
       active = false
     }
   }, [])
+
+  useEffect(() => {
+    if (!activeProviderId) return
+
+    let active = true
+    setModelsLoading(true)
+    fetch(`/api/ai/models?providerId=${encodeURIComponent(activeProviderId)}`)
+      .then(async response => {
+        const data = await response.json() as { models?: ModelOption[]; defaultModel?: string; detail?: string }
+        if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+        return data
+      })
+      .then(data => {
+        if (!active) return
+        const models = Array.isArray(data.models) ? data.models : []
+        setAvailableModels(models)
+        const fallbackModel = data.defaultModel || ''
+        setSelectedModel(prev => {
+          if (prev && models.some(model => model.id === prev)) return prev
+          return fallbackModel || models[0]?.id || prev
+        })
+      })
+      .catch(error => {
+        console.error('[AISidebar] load models failed', error)
+        if (!active) return
+        setAvailableModels([])
+      })
+      .finally(() => {
+        if (active) setModelsLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [activeProviderId])
 
   useEffect(() => {
     if (viewMode !== 'chat') return
@@ -848,6 +938,8 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             conversationId,
             reactMessages,
             mode: assistantMode,
+            model: selectedModel || modelName || undefined,
+            providerId: activeProviderId || undefined,
             images: imagesForRequest.map(image => ({
               name: image.name,
               type: image.type,
@@ -904,6 +996,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   name: String(event.name ?? ''),
                   params: normalizeToolParams(event.params),
                   status: 'pending',
+                  isExpanded: false,
                 }
 
                 // Intercept update_todo_list: update UI state locally instead of running on editor
@@ -1081,7 +1174,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [assistantMode, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, sidebarWidth, viewMode])
+  }, [activeProviderId, assistantMode, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -1311,44 +1404,84 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                       )
                     )}
 
-                    {message.toolCalls.filter(tc => tc.name !== 'update_todo_list').length > 0 && (
+                    {message.toolCalls.some(tc => tc.name !== 'update_todo_list') && (
                       <div className="bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 space-y-1">
-                        {message.toolCalls.filter(tc => tc.name !== 'update_todo_list').map((toolCall, index) => (
-                          <div
-                            key={`${toolCall.id ?? toolCall.name}-${index}`}
-                            className={`text-xs font-mono ${
-                              toolCall.status === 'ok'
-                                ? 'text-green-700'
-                                : toolCall.status === 'err'
-                                  ? 'text-red-600'
-                                  : 'text-gray-400'
-                            }`}
-                          >
-                            <div className="flex items-start gap-1.5">
-                              <span className="flex-shrink-0">
-                                {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
-                              </span>
-                              <div className="min-w-0 flex-1">
-                                <div className="break-all">{fmtToolCall(toolCall)}</div>
-                                <div className="mt-1 text-[10px] uppercase tracking-wide opacity-60">params</div>
-                                <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white/70 border border-gray-200 rounded-md px-2 py-1">
-                                  {formatToolParams(toolCall.params)}
-                                </pre>
-                                {toolCall.data != null && (
-                                  <>
-                                    <div className="mt-2 text-[10px] uppercase tracking-wide opacity-60">data</div>
-                                    <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
-                                      {formatToolData(toolCall.data)}
-                                    </pre>
-                                  </>
-                                )}
-                              </div>
+                        {message.toolCalls.map((toolCall, index) => {
+                          if (toolCall.name === 'update_todo_list') return null
+                          return (
+                            <div
+                              key={`${toolCall.id ?? toolCall.name}-${index}`}
+                              className={`text-xs ${
+                                toolCall.status === 'ok'
+                                  ? 'text-green-700'
+                                  : toolCall.status === 'err'
+                                    ? 'text-red-600'
+                                    : 'text-gray-400'
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                className="w-full rounded-lg border border-gray-200 bg-white/80 px-2.5 py-2 text-left"
+                                onClick={() => {
+                                  setMessages(prev =>
+                                    prev.map(item => {
+                                      if (item.id !== message.id) return item
+                                      return {
+                                        ...item,
+                                        toolCalls: item.toolCalls.map((currentToolCall, currentIndex) => (
+                                          currentIndex === index
+                                            ? { ...currentToolCall, isExpanded: !currentToolCall.isExpanded }
+                                            : currentToolCall
+                                        )),
+                                      }
+                                    }),
+                                  )
+                                }}
+                              >
+                                <div className="flex items-start gap-2">
+                                  <span className="flex-shrink-0 mt-0.5">
+                                    {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
+                                  </span>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <div className="font-mono text-[11px] text-gray-700 break-all">{toolCall.name}</div>
+                                        <div className="mt-1 text-[12px] leading-5 text-gray-600 break-words">
+                                          {summarizeToolPurpose(toolCall)}
+                                        </div>
+                                      </div>
+                                      <span className="text-[11px] text-gray-400 flex-shrink-0">
+                                        {toolCall.isExpanded ? '收起' : '展开'}
+                                      </span>
+                                    </div>
+
+                                    {toolCall.isExpanded && (
+                                      <div className="mt-2 space-y-2">
+                                        <div>
+                                          <div className="text-[10px] uppercase tracking-wide text-gray-400">params</div>
+                                          <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white border border-gray-200 rounded-md px-2 py-1 text-gray-700">
+                                            {formatToolParams(toolCall.params)}
+                                          </pre>
+                                        </div>
+                                        {toolCall.data != null && (
+                                          <div>
+                                            <div className="text-[10px] uppercase tracking-wide text-gray-400">data</div>
+                                            <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
+                                              {formatToolData(toolCall.data)}
+                                            </pre>
+                                          </div>
+                                        )}
+                                        {toolCall.message && (
+                                          <div className="text-[11px] leading-4 text-gray-500 break-all">{toolCall.message}</div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </button>
                             </div>
-                            {toolCall.message && (
-                              <div className="pl-5 mt-0.5 break-all opacity-80">{toolCall.message}</div>
-                            )}
-                          </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     )}
                   </div>
@@ -1512,9 +1645,31 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               </div>
 
               <div className="flex items-center gap-2 border-t border-slate-100 bg-slate-50 px-3 py-2">
-                <span className="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] text-slate-500 border border-slate-200">
-                  {modelName || '未配置模型'}
-                </span>
+                <label className="flex items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1 text-[11px] text-slate-500 max-w-[210px]">
+                  <span className="shrink-0">模型</span>
+                  <select
+                    value={selectedModel || modelName}
+                    onChange={event => setSelectedModel(event.target.value)}
+                    disabled={loading || modelsLoading || (availableModels.length === 0 && !modelName)}
+                    className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
+                    title={selectedModel || modelName || '未配置模型'}
+                  >
+                    {selectedModel && !availableModels.some(model => model.id === selectedModel) && (
+                      <option value={selectedModel}>{selectedModel}</option>
+                    )}
+                    {!selectedModel && modelName && !availableModels.some(model => model.id === modelName) && (
+                      <option value={modelName}>{modelName}</option>
+                    )}
+                    {availableModels.map(model => (
+                      <option key={model.id} value={model.id}>{model.id}</option>
+                    ))}
+                    {availableModels.length === 0 && (
+                      <option value={selectedModel || modelName || ''}>
+                        {modelsLoading ? '模型加载中...' : (selectedModel || modelName || '未配置模型')}
+                      </option>
+                    )}
+                  </select>
+                </label>
 
                 <div className="inline-flex rounded-full border border-slate-200 bg-white p-0.5">
                   <button

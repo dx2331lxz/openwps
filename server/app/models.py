@@ -23,12 +23,28 @@ class ChatRequest(BaseModel):
     reactMessages: list[dict[str, Any]] = Field(default_factory=list)
     mode: str = "layout"
     images: list[dict[str, Any]] = Field(default_factory=list)
+    model: Optional[str] = None
+    providerId: Optional[str] = None
+
+
+class ProviderSettings(BaseModel):
+    id: str
+    label: str
+    endpoint: str
+    defaultModel: str = ""
+    apiKey: Optional[str] = None
+    isPreset: bool = False
 
 
 class SettingsUpdate(BaseModel):
+    activeProviderId: str
+    providers: list[ProviderSettings] = Field(default_factory=list)
+
+
+class ModelDiscoveryRequest(BaseModel):
     endpoint: Optional[str] = None
     apiKey: Optional[str] = None
-    model: Optional[str] = None
+    providerId: Optional[str] = None
 
 
 class AppendMessagesRequest(BaseModel):
