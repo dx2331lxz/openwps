@@ -256,6 +256,12 @@ function insertBlockAfterParagraph(state: EditorState, paragraphIndex: number, n
   }
 }
 
+function buildParagraphNodeFromText(paragraph: ParagraphRef | null, text: string) {
+  const attrs = paragraph?.node.attrs ?? undefined
+  const content = text ? schema.text(text) : undefined
+  return schema.nodes.paragraph.create(attrs, content)
+}
+
 function describeFontFamily(fontFamily: string | undefined) {
   return fontNameFromFamily(fontFamily) ?? fontFamily ?? '宋体'
 }
@@ -552,6 +558,58 @@ export function executeTool(
         dispatch(tr)
         view.focus()
         return { success: true, message: `已在第 ${paragraphIndex + 1} 段末尾插入文字` }
+      }
+
+      case 'insert_paragraph_after': {
+        const afterParagraph = Number(params.afterParagraph)
+        const text = String(params.text ?? '')
+        const paragraph = getParagraphAtIndex(state, afterParagraph)
+        if (!paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+        const inserted = insertBlockAfterParagraph(state, afterParagraph, buildParagraphNodeFromText(paragraph, text))
+        if (!inserted.success || !inserted.tr) return inserted
+        dispatch(inserted.tr)
+        view.focus()
+        return { success: true, message: `已在第 ${afterParagraph + 1} 段后插入新段落` }
+      }
+
+      case 'replace_paragraph_text': {
+        const paragraphIndex = Number(params.paragraphIndex)
+        const text = String(params.text ?? '')
+        const paragraph = getParagraphAtIndex(state, paragraphIndex)
+        if (!paragraph) return { success: false, message: `未找到第 ${paragraphIndex + 1} 段` }
+        tr.replaceWith(
+          paragraph.pos,
+          paragraph.pos + paragraph.node.nodeSize,
+          buildParagraphNodeFromText(paragraph, text),
+        )
+        dispatch(tr)
+        view.focus()
+        return { success: true, message: `已替换第 ${paragraphIndex + 1} 段文字` }
+      }
+
+      case 'replace_selection_text': {
+        const range = params.range as RangeSpec | undefined
+        const text = String(params.text ?? '')
+        const bounds = getSelectionBounds(state, range, options?.selectionContext)
+        if (!range || range.type !== 'selection' || !bounds) {
+          return { success: false, message: 'replace_selection_text 需要有效的 selection 范围' }
+        }
+        tr.insertText(text, bounds.from, bounds.to)
+        dispatch(tr)
+        view.focus()
+        return { success: true, message: '已替换选区文字' }
+      }
+
+      case 'delete_selection_text': {
+        const range = params.range as RangeSpec | undefined
+        const bounds = getSelectionBounds(state, range, options?.selectionContext)
+        if (!range || range.type !== 'selection' || !bounds) {
+          return { success: false, message: 'delete_selection_text 需要有效的 selection 范围' }
+        }
+        tr.delete(bounds.from, bounds.to)
+        dispatch(tr)
+        view.focus()
+        return { success: true, message: '已删除选区文字' }
       }
 
       case 'delete_paragraph': {

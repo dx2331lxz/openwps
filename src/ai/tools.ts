@@ -23,6 +23,30 @@ const rangeProperties = {
   selectionTo: { type: 'integer', description: '选区结束文档位置（range.type=selection 时使用）' },
 } as const
 
+const commonTools = [
+  {
+    name: 'get_document_info',
+    description: '获取文档信息（字数、段落数、页数）',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_document_content',
+    description: '读取文档完整内容，返回每个段落的文字内容、段落样式，以及 textRuns 形式的分段文字样式',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_paragraph',
+    description: '读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式',
+    parameters: {
+      type: 'object',
+      properties: {
+        index: { type: 'integer', description: '段落索引（从 0 开始）' },
+      },
+      required: ['index'],
+    },
+  },
+]
+
 export const layoutTools = [
   {
     name: 'set_page_config',
@@ -116,29 +140,6 @@ export const layoutTools = [
     },
   },
   {
-    name: 'insert_text',
-    description: '在指定段落末尾插入文字',
-    parameters: {
-      type: 'object',
-      properties: {
-        paragraphIndex: { type: 'integer' },
-        text: { type: 'string', description: '要插入的文字内容' },
-      },
-      required: ['paragraphIndex', 'text'],
-    },
-  },
-  {
-    name: 'delete_paragraph',
-    description: '删除指定段落',
-    parameters: {
-      type: 'object',
-      properties: {
-        index: { type: 'integer', description: '段落索引' },
-      },
-      required: ['index'],
-    },
-  },
-  {
     name: 'get_document_info',
     description: '获取文档信息（字数、段落数、页数）',
     parameters: { type: 'object', properties: {} },
@@ -159,4 +160,78 @@ export const layoutTools = [
       required: ['index'],
     },
   },
+]
+
+export const editTools = [
+  {
+    name: 'insert_text',
+    description: '在指定段落末尾插入文字',
+    parameters: {
+      type: 'object',
+      properties: {
+        paragraphIndex: { type: 'integer' },
+        text: { type: 'string', description: '要插入的文字内容' },
+      },
+      required: ['paragraphIndex', 'text'],
+    },
+  },
+  {
+    name: 'insert_paragraph_after',
+    description: '在指定段落后插入一个新段落并写入文字',
+    parameters: {
+      type: 'object',
+      properties: {
+        afterParagraph: { type: 'integer', description: '在该段后插入新段落' },
+        text: { type: 'string', description: '新段落文字内容' },
+      },
+      required: ['afterParagraph', 'text'],
+    },
+  },
+  {
+    name: 'replace_paragraph_text',
+    description: '用新文字整体替换指定段落的内容',
+    parameters: {
+      type: 'object',
+      properties: {
+        paragraphIndex: { type: 'integer', description: '要替换的段落索引' },
+        text: { type: 'string', description: '替换后的完整段落内容' },
+      },
+      required: ['paragraphIndex', 'text'],
+    },
+  },
+  {
+    name: 'replace_selection_text',
+    description: '用新文字替换当前选区内容',
+    parameters: {
+      type: 'object',
+      properties: {
+        range: { type: 'object', description: '必须为 selection 范围', properties: rangeProperties },
+        text: { type: 'string', description: '替换后的文字内容' },
+      },
+      required: ['range', 'text'],
+    },
+  },
+  {
+    name: 'delete_selection_text',
+    description: '删除当前选区文字',
+    parameters: {
+      type: 'object',
+      properties: {
+        range: { type: 'object', description: '必须为 selection 范围', properties: rangeProperties },
+      },
+      required: ['range'],
+    },
+  },
+  {
+    name: 'delete_paragraph',
+    description: '删除指定段落',
+    parameters: {
+      type: 'object',
+      properties: {
+        index: { type: 'integer', description: '段落索引' },
+      },
+      required: ['index'],
+    },
+  },
+  ...commonTools,
 ]

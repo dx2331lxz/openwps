@@ -12,7 +12,7 @@ from langchain_openai import ChatOpenAI
 
 from .config import read_config
 from .models import ChatMessage, ChatRequest
-from .tooling import SYSTEM_PROMPT, TOOLS
+from .tooling import get_system_prompt, get_tools
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -113,6 +113,30 @@ def _already_has_context_block(content: str) -> bool:
     return "[当前文档上下文]" in content and "[用户请求]" in content
 
 
+def _normalize_user_text(message: str, context_block: str) -> str:
+    user_text = message
+    if context_block and not _already_has_context_block(user_text):
+        user_text = context_block + "\n\n" + user_text
+    return user_text
+
+
+def _build_human_content(message: str, context_block: str, images: list[dict[str, Any]] | None = None) -> str | list[dict[str, Any]]:
+    user_text = _normalize_user_text(message, context_block)
+    if not images:
+        return user_text
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    for image in images:
+        url = image.get("dataUrl")
+        if not isinstance(url, str) or not url:
+            continue
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
+    return content
+
+
 def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> None:
     last_user = next(
         (
@@ -125,14 +149,15 @@ def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> N
         return
 
     logger.info(
-        "[openwps.ai] final user prompt conversationId=%s\n%s",
+        "[openwps.ai] final user prompt conversationId=%s mode=%s\n%s",
         body.conversationId or "-",
+        body.mode,
         _stringify_content(last_user.content),
     )
 
 
 def build_messages(body: ChatRequest) -> list[BaseMessage]:
-    messages: list[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages: list[BaseMessage] = [SystemMessage(content=get_system_prompt(body.mode))]
     context_block = _build_context_block(body.context)
 
     if body.reactMessages:
@@ -147,10 +172,7 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
             if i == last_user_idx:
                 raw = dict(item)
                 original = _stringify_content(raw.get("content"))
-                if context_block and not _already_has_context_block(original):
-                    messages.append(HumanMessage(content=context_block + "\n\n" + original))
-                else:
-                    messages.append(HumanMessage(content=original))
+                messages.append(HumanMessage(content=_build_human_content(original, context_block, body.images)))
             else:
                 messages.append(_to_langchain_message(item))
         _log_final_user_message(body, messages)
@@ -159,15 +181,12 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
     for item in body.history[-10:]:
         messages.append(_to_langchain_message(item))
 
-    user_text = body.message
-    if context_block and not _already_has_context_block(user_text):
-        user_text = context_block + "\n\n" + user_text
-    messages.append(HumanMessage(content=user_text))
+    messages.append(HumanMessage(content=_build_human_content(body.message, context_block, body.images)))
     _log_final_user_message(body, messages)
     return messages
 
 
-def build_llm(streaming: bool) -> ChatOpenAI:
+def build_llm(streaming: bool, body: ChatRequest) -> ChatOpenAI:
     cfg = read_config()
     api_key = cfg.get("apiKey", "")
     if not api_key:
@@ -183,7 +202,7 @@ def build_llm(streaming: bool) -> ChatOpenAI:
         temperature=0.3,
         max_tokens=2048 if streaming else 1024,
         streaming=streaming,
-    ).bind_tools(TOOLS)
+    ).bind_tools(get_tools(body.mode))
 
 
 def build_graph(llm) -> Any:
@@ -201,7 +220,7 @@ def build_graph(llm) -> Any:
 
 async def run_chat(body: ChatRequest) -> dict[str, Any]:
     try:
-        llm = build_llm(streaming=False)
+        llm = build_llm(streaming=False, body=body)
         graph = build_graph(llm)
         result = await graph.ainvoke({"messages": build_messages(body)})
         response: AIMessage = result["response"]
@@ -224,7 +243,7 @@ async def run_chat(body: ChatRequest) -> dict[str, Any]:
 
 
 async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any], None]:
-    llm = build_llm(streaming=True)
+    llm = build_llm(streaming=True, body=body)
     graph = build_graph(llm)
     tool_call_acc: dict[int, dict[str, Any]] = {}
 

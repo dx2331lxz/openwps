@@ -10,6 +10,7 @@ import { executeTool, type ExecuteResult } from '../ai/executor'
 import type { PageConfig } from '../layout/paginator'
 
 type View = 'history' | 'chat'
+type AssistantMode = 'layout' | 'edit'
 
 interface ConversationSummary {
   id: string
@@ -37,6 +38,15 @@ interface ToolCallResult {
   params: Record<string, unknown>
   status: 'pending' | 'ok' | 'err'
   message?: string
+  data?: unknown
+}
+
+interface ImageAttachment {
+  id: string
+  name: string
+  size: number
+  type: string
+  dataUrl: string
 }
 
 interface Message {
@@ -62,6 +72,12 @@ interface TodoItem {
   id: string
   title: string
   status: 'pending' | 'in_progress' | 'completed' | 'failed'
+}
+
+interface AISettingsData {
+  endpoint: string
+  model: string
+  hasApiKey: boolean
 }
 
 // ─── Selection context ───────────────────────────────────────────────────────
@@ -156,9 +172,9 @@ interface Props {
   onClose: () => void
 }
 
-const SIDEBAR_MIN = 280
-const SIDEBAR_MAX = 600
-const SIDEBAR_DEFAULT = 320
+const SIDEBAR_MIN = 360
+const SIDEBAR_MAX = 760
+const SIDEBAR_DEFAULT = 560
 const FONT = '14px -apple-system, BlinkMacSystemFont, sans-serif'
 const LINE_HEIGHT = 20
 const PADDING_H = 12
@@ -235,6 +251,20 @@ function formatToolParams(params: Record<string, unknown>) {
   } catch {
     return String(params)
   }
+}
+
+function formatToolData(data: unknown) {
+  try {
+    return JSON.stringify(data, null, 2)
+  } catch {
+    return String(data)
+  }
+}
+
+function formatFileSize(size: number) {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
 }
 
 function extractSelectionContext(context: Record<string, unknown>) {
@@ -370,6 +400,7 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
       params: normalizeToolParams(toolCall.params),
       status: toolCall.status,
       message: toolCall.message,
+      data: toolCall.data,
     }))
   }
 
@@ -399,7 +430,7 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
 function applyStoredToolResult(message: Message | undefined, stored: StoredMessage) {
   if (!message || message.role !== 'ai' || stored.role !== 'tool') return
 
-  let parsed: { success?: boolean; message?: string } | null = null
+  let parsed: { success?: boolean; message?: string; data?: unknown } | null = null
   if (typeof stored.content === 'string') {
     try {
       parsed = JSON.parse(stored.content) as { success?: boolean; message?: string }
@@ -419,7 +450,7 @@ function applyStoredToolResult(message: Message | undefined, stored: StoredMessa
       (!matched && !targetId && index === array.length - 1)
     if (!shouldUse) return toolCall
     matched = true
-    return { ...toolCall, status: nextStatus, message: nextMessage }
+    return { ...toolCall, status: nextStatus, message: nextMessage, data: parsed?.data }
   })
 }
 
@@ -494,13 +525,17 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [assistantMode, setAssistantMode] = useState<AssistantMode>('layout')
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
   const [todos, setTodos] = useState<TodoItem[]>([])
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(true)
   const [includeSelection, setIncludeSelection] = useState(true)
+  const [modelName, setModelName] = useState('')
+  const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([])
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const isDragging = useRef(false)
   const currentConversationIdRef = useRef<string | null>(null)
@@ -559,6 +594,28 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   useEffect(() => {
     void loadConversations()
   }, [loadConversations])
+
+  useEffect(() => {
+    let active = true
+    fetch('/api/ai/settings')
+      .then(async response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.json() as Promise<AISettingsData>
+      })
+      .then(data => {
+        if (!active) return
+        setModelName(data.model || '')
+      })
+      .catch(error => {
+        console.error('[AISidebar] load ai settings failed', error)
+        if (!active) return
+        setModelName('')
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
 
   useEffect(() => {
     if (viewMode !== 'chat') return
@@ -642,6 +699,38 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     abortRef.current?.abort()
   }, [])
 
+  const handleImagePick = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return
+
+    const imageFiles = Array.from(files).filter(file => file.type.startsWith('image/'))
+    if (imageFiles.length === 0) return
+
+    const nextImages = await Promise.all(
+      imageFiles.map(
+        file =>
+          new Promise<ImageAttachment>((resolve, reject) => {
+            const reader = new FileReader()
+            reader.onload = () =>
+              resolve({
+                id: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                dataUrl: String(reader.result ?? ''),
+              })
+            reader.onerror = () => reject(reader.error ?? new Error(`读取图片失败：${file.name}`))
+            reader.readAsDataURL(file)
+          }),
+      ),
+    )
+
+    setPendingImages(prev => [...prev, ...nextImages])
+  }, [])
+
+  const removePendingImage = useCallback((id: string) => {
+    setPendingImages(prev => prev.filter(image => image.id !== id))
+  }, [])
+
   const handleSend = useCallback(async (overrideText?: string) => {
     const text = (overrideText ?? input).trim()
     if (!text || loading) return
@@ -650,6 +739,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     const nextTitle = makeConversationTitle(text)
     const previousConversationMessages = shouldStartNewConversation ? [] : conversationMessagesRef.current
     const userMessage = makeUserMessage(text, sidebarWidth)
+    const imagesForRequest = pendingImages
 
     // Capture selection tag for this message, then clear it from input area
     const currentSel = (includeSelection && editorState) ? serializeSelection(editorState) : null
@@ -666,6 +756,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     setTodos([])
     setIsTodoPanelExpanded(true)
     setInput('')
+    setPendingImages([])
     setIncludeSelection(true)
     resetTextareaHeight()
 
@@ -720,6 +811,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               params: tool.params,
               status: tool.result.success ? 'ok' : 'err',
               message: tool.result.message,
+              data: tool.result.data,
             }))
           : undefined,
       })
@@ -755,6 +847,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             context,
             conversationId,
             reactMessages,
+            mode: assistantMode,
+            images: imagesForRequest.map(image => ({
+              name: image.name,
+              type: image.type,
+              size: image.size,
+              dataUrl: image.dataUrl,
+            })),
           }),
         })
 
@@ -839,6 +938,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
                 toolCall.status = result.success ? 'ok' : 'err'
                 toolCall.message = result.message
+                toolCall.data = result.data
                 toolResults.push({
                   id: toolCall.id ?? toolCall.name,
                   name: toolCall.name,
@@ -981,7 +1081,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [editorState, editorView, getContext, includeSelection, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, resetTextareaHeight, sidebarWidth, viewMode])
+  }, [assistantMode, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -1230,9 +1330,18 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                               </span>
                               <div className="min-w-0 flex-1">
                                 <div className="break-all">{fmtToolCall(toolCall)}</div>
+                                <div className="mt-1 text-[10px] uppercase tracking-wide opacity-60">params</div>
                                 <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white/70 border border-gray-200 rounded-md px-2 py-1">
                                   {formatToolParams(toolCall.params)}
                                 </pre>
+                                {toolCall.data != null && (
+                                  <>
+                                    <div className="mt-2 text-[10px] uppercase tracking-wide opacity-60">data</div>
+                                    <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
+                                      {formatToolData(toolCall.data)}
+                                    </pre>
+                                  </>
+                                )}
                               </div>
                             </div>
                             {toolCall.message && (
@@ -1291,73 +1400,183 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         )}
       </div>
 
-      <div className="border-t border-gray-200 p-2 flex flex-col gap-1.5 flex-shrink-0">
-        {/* Selection tag chip */}
+      <div className="border-t border-gray-200 p-2.5 flex-shrink-0">
         {(() => {
           const sel = editorState ? serializeSelection(editorState) : null
-          if (!sel) return null
+          const hasTopContent = Boolean(sel) || pendingImages.length > 0
+
           return (
-            <div className="flex items-center gap-1.5 px-1">
-              <button
-                type="button"
-                onMouseDown={e => { e.preventDefault(); setIncludeSelection(prev => !prev) }}
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border transition-colors select-none ${
-                  includeSelection
-                    ? 'bg-blue-50 border-blue-300 text-blue-700 hover:bg-blue-100'
-                    : 'bg-gray-100 border-gray-300 text-gray-400 hover:bg-gray-200 line-through'
-                }`}
-                title={includeSelection ? '点击取消携带选中内容' : '点击携带选中内容'}
-              >
-                <span>📎</span>
-                <span>
-                  {sel.selectedText.length > 20
-                    ? `"${sel.selectedText.slice(0, 20)}…"`
-                    : `"${sel.selectedText}"`}
+            <div className="rounded-[24px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.06)] overflow-hidden">
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={async event => {
+                  try {
+                    await handleImagePick(event.target.files)
+                  } catch (error) {
+                    console.error('[AISidebar] pick image failed', error)
+                  } finally {
+                    event.target.value = ''
+                  }
+                }}
+              />
+
+              <div className="border-b border-slate-100 bg-slate-50/80 px-3 py-2">
+                {hasTopContent ? (
+                  <div className="flex flex-wrap gap-2">
+                    {pendingImages.map(image => (
+                      <div
+                        key={image.id}
+                        className="group flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-2 py-2 shadow-sm"
+                      >
+                        <img
+                          src={image.dataUrl}
+                          alt={image.name}
+                          className="h-10 w-10 rounded-xl object-cover border border-slate-200 bg-slate-100"
+                        />
+                        <div className="min-w-0">
+                          <div className="max-w-[140px] truncate text-xs font-medium text-slate-700">{image.name}</div>
+                          <div className="text-[11px] text-slate-400">{formatFileSize(image.size)}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => removePendingImage(image.id)}
+                          className="flex h-6 w-6 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+                          title="移除图片"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+
+                    {sel && (
+                      <button
+                        type="button"
+                        onMouseDown={event => {
+                          event.preventDefault()
+                          setIncludeSelection(prev => !prev)
+                        }}
+                        className={`inline-flex max-w-full items-center gap-2 rounded-2xl border px-3 py-2 text-left text-xs transition-colors ${
+                          includeSelection
+                            ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                            : 'border-slate-200 bg-slate-100 text-slate-400 hover:bg-slate-200 line-through'
+                        }`}
+                        title={includeSelection ? '点击取消携带选中内容' : '点击携带选中内容'}
+                      >
+                        <span className="text-sm">“</span>
+                        <span className="max-w-[180px] truncate">
+                          {sel.selectedText.length > 36
+                            ? `${sel.selectedText.slice(0, 36)}…`
+                            : sel.selectedText}
+                        </span>
+                        <span className="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px] text-current">
+                          引用 P{sel.paragraphIndex + 1}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-xs text-slate-400">
+                    上传图片或附带当前选区后，会显示在这里并随本轮请求一起发送。
+                  </div>
+                )}
+              </div>
+
+              <div className="px-3 py-2.5">
+                <textarea
+                  ref={textareaRef}
+                  className="w-full resize-none border-0 bg-transparent text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400"
+                  rows={3}
+                  placeholder={
+                    assistantMode === 'layout'
+                      ? (viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…')
+                      : (viewMode === 'history' ? '输入写作/删改指令，自动新建会话…' : '继续输入写作/删改指令…')
+                  }
+                  value={input}
+                  style={{ minHeight: '72px', maxHeight: '200px', overflowY: 'auto' }}
+                  onChange={event => {
+                    setInput(event.target.value)
+                    autoResize(event.target)
+                  }}
+                  onKeyDown={event => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault()
+                      void handleSend()
+                    }
+                  }}
+                  disabled={loading}
+                />
+              </div>
+
+              <div className="flex items-center gap-2 border-t border-slate-100 bg-slate-50 px-3 py-2">
+                <span className="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] text-slate-500 border border-slate-200">
+                  {modelName || '未配置模型'}
                 </span>
-                <span className="opacity-60">P{sel.paragraphIndex + 1}</span>
-              </button>
+
+                <div className="inline-flex rounded-full border border-slate-200 bg-white p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setAssistantMode('layout')}
+                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${
+                      assistantMode === 'layout'
+                        ? 'bg-blue-500 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                    }`}
+                    title="排版模式：只能排版，不能改写正文"
+                  >
+                    排版
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAssistantMode('edit')}
+                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${
+                      assistantMode === 'edit'
+                        ? 'bg-emerald-500 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                    }`}
+                    title="Edit 模式：可写作、删改正文"
+                  >
+                    Edit
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => imageInputRef.current?.click()}
+                  className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-slate-100"
+                  title="上传图片"
+                >
+                  <span>＋</span>
+                  <span>图片</span>
+                </button>
+
+                <div className="ml-auto">
+                  {loading ? (
+                    <button
+                      onClick={handleCancel}
+                      className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-red-500 px-3 text-sm text-white transition-colors hover:bg-red-600"
+                      title="取消"
+                    >
+                      ⏹
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => void handleSend()}
+                      disabled={!input.trim()}
+                      className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-slate-900 px-3 text-sm text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                      title="发送 (Enter)"
+                    >
+                      ↑
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           )
         })()}
-        <div className="flex gap-1.5 items-end">
-        <textarea
-          ref={textareaRef}
-          className="flex-1 text-sm border border-gray-300 rounded-xl px-2.5 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent"
-          rows={3}
-          placeholder={viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…'}
-          value={input}
-          style={{ minHeight: '72px', maxHeight: '200px', resize: 'none', overflowY: 'auto' }}
-          onChange={event => {
-            setInput(event.target.value)
-            autoResize(event.target)
-          }}
-          onKeyDown={event => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              void handleSend()
-            }
-          }}
-          disabled={loading}
-        />
-        {loading ? (
-          <button
-            onClick={handleCancel}
-            className="px-2.5 py-1.5 bg-red-400 hover:bg-red-500 text-white text-xs rounded-xl flex-shrink-0 whitespace-nowrap"
-            title="取消"
-          >
-            ⏹
-          </button>
-        ) : (
-          <button
-            onClick={() => void handleSend()}
-            disabled={!input.trim()}
-            className="px-2.5 py-1.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm rounded-xl flex-shrink-0 transition-colors"
-            title="发送 (Enter)"
-          >
-            ↵
-          </button>
-        )}
-        </div>
       </div>
 
       <style>{'@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }'}</style>
