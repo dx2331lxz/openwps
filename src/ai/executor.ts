@@ -34,6 +34,19 @@ export interface ExecuteOptions {
   } | null
 }
 
+export interface StreamingWriteSession {
+  id: string
+  action: 'insert_after_paragraph' | 'replace_paragraph'
+  from: number
+  to: number
+  text: string
+  paragraphAttrs?: Record<string, unknown>
+}
+
+interface BeginStreamingWriteResult extends ExecuteResult {
+  session?: StreamingWriteSession
+}
+
 type RangeType =
   | 'all'
   | 'paragraph'
@@ -256,10 +269,19 @@ function insertBlockAfterParagraph(state: EditorState, paragraphIndex: number, n
   }
 }
 
-function buildParagraphNodeFromText(paragraph: ParagraphRef | null, text: string) {
-  const attrs = paragraph?.node.attrs ?? undefined
+function buildParagraphNode(text: string, attrs?: Record<string, unknown>) {
   const content = text ? schema.text(text) : undefined
   return schema.nodes.paragraph.create(attrs, content)
+}
+
+function buildParagraphNodeFromText(paragraph: ParagraphRef | null, text: string) {
+  return buildParagraphNode(text, (paragraph?.node.attrs as Record<string, unknown> | undefined) ?? undefined)
+}
+
+function buildParagraphNodesFromText(text: string, paragraphAttrs?: Record<string, unknown>) {
+  const normalized = text.replace(/\r\n?/g, '\n')
+  const parts = normalized === '' ? [''] : normalized.split('\n')
+  return parts.map(part => buildParagraphNode(part, paragraphAttrs))
 }
 
 function describeFontFamily(fontFamily: string | undefined) {
@@ -428,6 +450,99 @@ function applyPageConfig(params: Record<string, unknown>, options?: ExecuteOptio
   return { success: true, message: '页面配置已更新' }
 }
 
+export function beginStreamingWrite(
+  view: EditorView,
+  params: Record<string, unknown>,
+): BeginStreamingWriteResult {
+  const { state, dispatch } = view
+  const action = String(params.action ?? '')
+
+  if (action === 'insert_after_paragraph') {
+    const afterParagraph = Number(params.afterParagraph)
+    const paragraph = getParagraphAtIndex(state, afterParagraph)
+    if (!paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+
+    const inserted = insertBlockAfterParagraph(state, afterParagraph, buildParagraphNodeFromText(paragraph, ''))
+    if (!inserted.success || !inserted.tr) return inserted
+
+    dispatch(inserted.tr)
+    view.focus()
+
+    const targetParagraph = getParagraphAtIndex(view.state, afterParagraph + 1)
+    if (!targetParagraph) {
+      return { success: false, message: '已创建流式写入占位段落，但无法定位写入位置' }
+    }
+
+    return {
+      success: true,
+      message: `已开始在第 ${afterParagraph + 1} 段后流式写入正文`,
+      session: {
+        id: `stream-${Date.now()}`,
+        action: 'insert_after_paragraph',
+        from: targetParagraph.pos,
+        to: targetParagraph.pos + targetParagraph.node.nodeSize,
+        text: '',
+        paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
+      },
+    }
+  }
+
+  if (action === 'replace_paragraph') {
+    const paragraphIndex = Number(params.paragraphIndex)
+    const paragraph = getParagraphAtIndex(state, paragraphIndex)
+    if (!paragraph) return { success: false, message: `未找到第 ${paragraphIndex + 1} 段` }
+
+    dispatch(
+      state.tr.replaceWith(
+        paragraph.pos,
+        paragraph.pos + paragraph.node.nodeSize,
+        buildParagraphNodeFromText(paragraph, ''),
+      ),
+    )
+    view.focus()
+
+    const targetParagraph = getParagraphAtIndex(view.state, paragraphIndex)
+    if (!targetParagraph) {
+      return { success: false, message: '已创建流式写入占位段落，但无法定位写入位置' }
+    }
+
+    return {
+      success: true,
+      message: `已开始流式改写第 ${paragraphIndex + 1} 段`,
+      session: {
+        id: `stream-${Date.now()}`,
+        action: 'replace_paragraph',
+        from: targetParagraph.pos,
+        to: targetParagraph.pos + targetParagraph.node.nodeSize,
+        text: '',
+        paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
+      },
+    }
+  }
+
+  return { success: false, message: `begin_streaming_write 的 action 无效：${action || '空值'}` }
+}
+
+export function appendStreamingWrite(
+  view: EditorView,
+  session: StreamingWriteSession,
+  chunk: string,
+): ExecuteResult {
+  if (!chunk) return { success: true, message: '本次未追加正文内容' }
+
+  const nextText = session.text + chunk
+  const nodes = buildParagraphNodesFromText(nextText, session.paragraphAttrs)
+  const fragment = Fragment.fromArray(nodes)
+
+  view.dispatch(view.state.tr.replaceWith(session.from, session.to, fragment))
+  view.focus()
+
+  session.text = nextText
+  session.to = session.from + fragment.size
+
+  return { success: true, message: '正文流式写入中' }
+}
+
 export function executeTool(
   view: EditorView,
   toolName: string,
@@ -558,6 +673,11 @@ export function executeTool(
         dispatch(tr)
         view.focus()
         return { success: true, message: `已在第 ${paragraphIndex + 1} 段末尾插入文字` }
+      }
+
+      case 'begin_streaming_write': {
+        const result = beginStreamingWrite(view, params)
+        return { success: result.success, message: result.message }
       }
 
       case 'insert_paragraph_after': {

@@ -164,6 +164,23 @@ export const layoutTools = [
 
 export const editTools = [
   {
+    name: 'begin_streaming_write',
+    description: '开始一次流式正文写入。先声明写入位置，然后把真正要写入文档的正文内容作为后续 assistant 文本直接输出，这些文本会实时写入文档。适合新增长段落或整体改写整段。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['insert_after_paragraph', 'replace_paragraph'],
+          description: 'insert_after_paragraph=在指定段落后新增正文；replace_paragraph=整体改写指定段落',
+        },
+        afterParagraph: { type: 'integer', description: 'action=insert_after_paragraph 时，在该段后开始流式写入' },
+        paragraphIndex: { type: 'integer', description: 'action=replace_paragraph 时，整体改写该段' },
+      },
+      required: ['action'],
+    },
+  },
+  {
     name: 'insert_text',
     description: '在指定段落末尾插入文字',
     parameters: {

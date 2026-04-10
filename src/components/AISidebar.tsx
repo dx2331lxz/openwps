@@ -6,7 +6,13 @@ import type { Node as ProseMirrorNode } from 'prosemirror-model'
 import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
-import { executeTool, type ExecuteResult } from '../ai/executor'
+import {
+  appendStreamingWrite,
+  beginStreamingWrite,
+  executeTool,
+  type ExecuteResult,
+  type StreamingWriteSession,
+} from '../ai/executor'
 import { editTools, layoutTools } from '../ai/tools'
 import type { AISettingsData, ModelOption } from '../ai/providers'
 import type { PageConfig } from '../layout/paginator'
@@ -44,6 +50,11 @@ interface ToolCallResult {
   isExpanded?: boolean
 }
 
+type MessageSegment =
+  | { id: string; type: 'content'; text: string }
+  | { id: string; type: 'thinking'; text: string }
+  | { id: string; type: 'tool'; toolCall: ToolCallResult }
+
 interface ImageAttachment {
   id: string
   name: string
@@ -56,10 +67,12 @@ interface Message {
   id: string
   role: 'user' | 'ai'
   text: string
+  segments: MessageSegment[]
   thinking: string
   isThinkingExpanded: boolean
   toolCalls: ToolCallResult[]
   streaming: boolean
+  activityLabel: string
   prepared?: PreparedTextWithSegments
   tightWidth: number
   selectionTag?: { text: string; paragraphIndex: number } | null
@@ -278,6 +291,7 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
   if (toolCall.name === 'set_paragraph_style') return target ? `调整${target}的段落格式` : '调整段落格式'
+  if (toolCall.name === 'begin_streaming_write') return target ? `开始向${target}流式写正文` : '开始流式写正文'
   if (toolCall.name === 'insert_text') return target ? `向${target}补充文字` : '插入新的文字内容'
   if (toolCall.name === 'insert_paragraph_after') return target ? `在${target}后新增段落` : '插入一个新段落'
   if (toolCall.name === 'replace_paragraph_text') return target ? `整体改写${target}` : '整体替换段落内容'
@@ -289,6 +303,16 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'insert_table') return target ? `在${target}插入表格` : '插入表格'
 
   return description || '执行工具调用'
+}
+
+function buildToolActionLabel(toolCall: ToolCallResult) {
+  return summarizeToolPurpose(toolCall)
+}
+
+function toolStatusTone(toolCall: ToolCallResult) {
+  if (toolCall.status === 'ok') return 'text-emerald-600'
+  if (toolCall.status === 'err') return 'text-red-500'
+  return 'text-blue-500'
 }
 
 function formatToolParams(params: Record<string, unknown>) {
@@ -356,10 +380,12 @@ function makeUserMessage(text: string, sidebarWidth: number): Message {
     id: newId(),
     role: 'user',
     text,
+    segments: [{ id: newId(), type: 'content', text }],
     thinking: '',
     isThinkingExpanded: false,
     toolCalls: [],
     streaming: false,
+    activityLabel: '',
     tightWidth: 0,
   }
 
@@ -379,12 +405,80 @@ function makeAiMessage(text = '', streaming = false): Message {
     id: newId(),
     role: 'ai',
     text,
+    segments: text ? [{ id: newId(), type: 'content', text }] : [],
     thinking: '',
     isThinkingExpanded: false,
     toolCalls: [],
     streaming,
+    activityLabel: streaming ? '正在准备响应...' : '',
     tightWidth: 0,
   }
+}
+
+function appendThinkingChunk(message: Message, chunk: string): Message {
+  const nextThinking = message.thinking + chunk
+  const nextSegments = [...message.segments]
+  const lastSegment = nextSegments.at(-1)
+
+  if (lastSegment?.type === 'thinking') {
+    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + chunk }
+  } else {
+    nextSegments.push({ id: newId(), type: 'thinking', text: chunk })
+  }
+
+  return { ...message, thinking: nextThinking, segments: nextSegments }
+}
+
+function appendContentChunk(message: Message, chunk: string, replace = false): Message {
+  const nextText = replace ? chunk : message.text + chunk
+  const nextToolCalls = message.toolCalls.map(toolCall => (
+    toolCall.status === 'pending' ? toolCall : { ...toolCall, isExpanded: false }
+  ))
+  let toolIndex = -1
+  const nextSegments = message.segments.map(segment => {
+    if (segment.type !== 'tool') return segment
+    toolIndex += 1
+    const nextToolCall = nextToolCalls[toolIndex]
+    return nextToolCall ? { ...segment, toolCall: nextToolCall } : segment
+  })
+  const content = replace ? chunk : chunk
+  const lastSegment = nextSegments.at(-1)
+
+  if (lastSegment?.type === 'content' && !replace) {
+    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + content }
+  } else if (nextText) {
+    nextSegments.push({ id: newId(), type: 'content', text: replace ? nextText : content })
+  }
+
+  return { ...message, text: nextText, toolCalls: nextToolCalls, segments: nextSegments }
+}
+
+function appendToolSegment(message: Message, toolCall: ToolCallResult): Message {
+  return {
+    ...message,
+    toolCalls: [...message.toolCalls, toolCall],
+    segments: [...message.segments, { id: newId(), type: 'tool', toolCall }],
+  }
+}
+
+function updateToolCallInMessage(
+  message: Message,
+  matcher: (toolCall: ToolCallResult, index: number, array: ToolCallResult[]) => boolean,
+  updater: (toolCall: ToolCallResult) => ToolCallResult,
+): Message {
+  const nextToolCalls = message.toolCalls.map((toolCall, index, array) => (
+    matcher(toolCall, index, array) ? updater(toolCall) : toolCall
+  ))
+
+  let toolIndex = -1
+  const nextSegments = message.segments.map(segment => {
+    if (segment.type !== 'tool') return segment
+    toolIndex += 1
+    const nextToolCall = nextToolCalls[toolIndex]
+    return nextToolCall ? { ...segment, toolCall: nextToolCall } : segment
+  })
+
+  return { ...message, toolCalls: nextToolCalls, segments: nextSegments }
 }
 
 interface ToolCallRecord {
@@ -492,14 +586,20 @@ function applyStoredToolResult(message: Message | undefined, stored: StoredMessa
   const targetId = stored.tool_call_id
   let matched = false
 
-  message.toolCalls = message.toolCalls.map((toolCall, index, array) => {
-    const shouldUse =
-      (!matched && targetId && toolCall.id === targetId) ||
-      (!matched && !targetId && index === array.length - 1)
-    if (!shouldUse) return toolCall
-    matched = true
-    return { ...toolCall, status: nextStatus, message: nextMessage, data: parsed?.data }
-  })
+  const nextMessageState = updateToolCallInMessage(
+    message,
+    (toolCall, index, array) => {
+      const shouldUse =
+        (!matched && targetId && toolCall.id === targetId) ||
+        (!matched && !targetId && index === array.length - 1)
+      if (shouldUse) matched = true
+      return shouldUse
+    },
+    toolCall => ({ ...toolCall, status: nextStatus, message: nextMessage, data: parsed?.data }),
+  )
+
+  message.toolCalls = nextMessageState.toolCalls
+  message.segments = nextMessageState.segments
 }
 
 function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Message[] {
@@ -515,6 +615,11 @@ function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Me
       const aiMessage = makeAiMessage(stored.content ?? '', false)
       aiMessage.thinking = stored.thinking ?? ''
       aiMessage.toolCalls = normalizeStoredToolCalls(stored)
+      aiMessage.segments = [
+        ...(stored.thinking ? [{ id: newId(), type: 'thinking' as const, text: stored.thinking }] : []),
+        ...(stored.content ? [{ id: newId(), type: 'content' as const, text: stored.content }] : []),
+        ...aiMessage.toolCalls.map(toolCall => ({ id: newId(), type: 'tool' as const, toolCall })),
+      ]
       restored.push(aiMessage)
       continue
     }
@@ -576,7 +681,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [assistantMode, setAssistantMode] = useState<AssistantMode>('layout')
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
   const [todos, setTodos] = useState<TodoItem[]>([])
-  const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(true)
+  const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
   const [modelName, setModelName] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
@@ -586,12 +691,16 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([])
 
   const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollAreaRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const isDragging = useRef(false)
+  const isComposingRef = useRef(false)
+  const shouldAutoScrollRef = useRef(true)
   const currentConversationIdRef = useRef<string | null>(null)
   const conversationMessagesRef = useRef<StoredMessage[]>([])
+  const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
@@ -600,6 +709,12 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const autoResize = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = 'auto'
     el.style.height = `${Math.min(Math.max(el.scrollHeight, TEXTAREA_MIN_HEIGHT), TEXTAREA_MAX_HEIGHT)}px`
+  }, [])
+
+  const scrollToBottomIfNeeded = useCallback(() => {
+    const scrollArea = scrollAreaRef.current
+    if (!scrollArea || !shouldAutoScrollRef.current) return
+    scrollArea.scrollTop = scrollArea.scrollHeight
   }, [])
 
   const resetTextareaHeight = useCallback(() => {
@@ -709,8 +824,8 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
   useEffect(() => {
     if (viewMode !== 'chat') return
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, loading, askContinue, viewMode])
+    scrollToBottomIfNeeded()
+  }, [messages, loading, askContinue, scrollToBottomIfNeeded, viewMode])
 
   useEffect(() => {
     setMessages(prev =>
@@ -754,6 +869,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const openConversation = useCallback(async (conversationId: string) => {
     if (loading) return
     setAskContinue({ visible: false, rounds: 0, message: '' })
+    shouldAutoScrollRef.current = true
     try {
       const response = await fetch(`/api/conversations/${conversationId}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -844,11 +960,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
     setAskContinue({ visible: false, rounds: 0, message: '' })
     setTodos([])
-    setIsTodoPanelExpanded(true)
+    setIsTodoPanelExpanded(false)
     setInput('')
     setPendingImages([])
     setIncludeSelection(true)
     resetTextareaHeight()
+    shouldAutoScrollRef.current = true
+    activeStreamingWriteRef.current = null
 
     if (shouldStartNewConversation) {
       setCurrentConversationId(null)
@@ -979,25 +1097,45 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             switch (event.type) {
               case 'thinking':
                 roundThinkingText += String(event.content ?? '')
-                updateMessage(message => ({ ...message, thinking: message.thinking + String(event.content ?? '') }))
+                updateMessage(message => ({
+                  ...appendThinkingChunk(message, String(event.content ?? '')),
+                  activityLabel: '正在思考下一步...',
+                }))
                 break
 
               case 'content': {
                 const chunk = String(event.content ?? '')
                 roundAssistantText += chunk
                 persistedAssistantText += chunk
-                updateMessage(message => ({ ...message, text: message.text + chunk }))
+                if (activeStreamingWriteRef.current && editorView) {
+                  const streamResult = appendStreamingWrite(editorView, activeStreamingWriteRef.current, chunk)
+                  if (!streamResult.success) {
+                    console.error('[AISidebar] append streaming write failed', streamResult.message)
+                    activeStreamingWriteRef.current = null
+                  }
+                }
+                updateMessage(message => ({
+                  ...appendContentChunk(message, chunk),
+                  activityLabel: activeStreamingWriteRef.current ? '正在写入正文...' : '正在生成回复...',
+                }))
                 break
               }
 
               case 'tool_call': {
+                activeStreamingWriteRef.current = null
                 const toolCall: ToolCallResult = {
                   id: typeof event.id === 'string' ? event.id : undefined,
                   name: String(event.name ?? ''),
                   params: normalizeToolParams(event.params),
                   status: 'pending',
-                  isExpanded: false,
+                  isExpanded: true,
                 }
+
+                updateMessage(message => ({
+                  ...appendToolSegment(message, toolCall),
+                  activityLabel: `正在调用 ${toolCall.name}...`,
+                }))
+                await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
 
                 // Intercept update_todo_list: update UI state locally instead of running on editor
                 let result: { success: boolean; message: string; data?: unknown }
@@ -1013,9 +1151,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                         : 'pending') as TodoItem['status'],
                     }))
                   setTodos(nextTodos)
-                  const hasActive = nextTodos.some(t => t.status !== 'completed' && t.status !== 'failed')
-                  setIsTodoPanelExpanded(hasActive)
                   result = { success: true, message: 'todo list updated' }
+                } else if (toolCall.name === 'begin_streaming_write') {
+                  const beginResult = editorView
+                    ? beginStreamingWrite(editorView, toolCall.params)
+                    : { success: false, message: '编辑器尚未就绪' }
+                  result = beginResult
+                  if ('session' in beginResult && beginResult.session) {
+                    activeStreamingWriteRef.current = beginResult.session
+                  }
                 } else {
                   const selectionContext = extractSelectionContext(context)
                   toolCall.params = serializeToolParamsWithSelection(toolCall.params, selectionContext)
@@ -1041,7 +1185,27 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                 if (!result.success) {
                   console.error('[AISidebar] tool call failed', toolCall.name, toolCall.params, result.message)
                 }
-                updateMessage(message => ({ ...message, toolCalls: [...message.toolCalls, toolCall] }))
+                updateMessage(message => {
+                  let matched = false
+                  const nextMessage = updateToolCallInMessage(
+                    message,
+                    (currentToolCall, index, array) => {
+                      const shouldUse =
+                        (!matched && toolCall.id && currentToolCall.id === toolCall.id) ||
+                        (!matched && !toolCall.id && index === array.length - 1)
+                      if (shouldUse) matched = true
+                      return shouldUse
+                    },
+                    () => ({ ...toolCall, isExpanded: false }),
+                  )
+                  const activityLabel =
+                    toolCall.status === 'err'
+                      ? '正在调整执行方案...'
+                      : toolCall.name === 'begin_streaming_write'
+                        ? '正在写入正文...'
+                        : '正在整理工具结果...'
+                  return { ...nextMessage, activityLabel }
+                })
                 break
               }
 
@@ -1051,7 +1215,8 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
               case 'done':
                 finished = true
-                updateMessage(message => ({ ...message, streaming: false }))
+                activeStreamingWriteRef.current = null
+                updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
                 break
 
               case 'error':
@@ -1065,12 +1230,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         }
 
         if (finished) {
+          activeStreamingWriteRef.current = null
           appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
           break
         }
         if (!awaitingToolResults || toolResults.length === 0) {
           appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
-          updateMessage(message => ({ ...message, streaming: false }))
+          activeStreamingWriteRef.current = null
+          updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
           finished = true
           break
         }
@@ -1106,12 +1273,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         ]
 
         if (round === MAX_TOOL_ROUNDS) {
+          activeStreamingWriteRef.current = null
           setAskContinue({
             visible: true,
             rounds: round,
             message: `已执行 ${round} 轮操作，请重新发起下一步指令。`,
           })
-          updateMessage(message => ({ ...message, streaming: false }))
+          updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
         }
       }
 
@@ -1127,6 +1295,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
       }
     } catch (error) {
+      activeStreamingWriteRef.current = null
       if (error instanceof Error && error.name === 'AbortError') {
         persistedAssistantText = '（已取消）'
         if (!persistedRecords.some(message => message.role === 'assistant')) {
@@ -1135,7 +1304,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
-              ? { ...message, text: message.text || '（已取消）', streaming: false }
+              ? { ...appendContentChunk(message, message.text ? '' : '（已取消）'), streaming: false, activityLabel: '' }
               : message,
           ),
         )
@@ -1148,7 +1317,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         setMessages(prev =>
           prev.map(message =>
             message.id === aiMessage.id
-              ? { ...message, text: errorText, streaming: false }
+              ? { ...appendContentChunk(message, errorText, true), streaming: false, activityLabel: '' }
               : message,
           ),
         )
@@ -1169,6 +1338,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         }
       }
     } finally {
+      activeStreamingWriteRef.current = null
       setLoading(false)
       abortRef.current = null
       void loadConversations()
@@ -1225,7 +1395,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto min-h-0 p-3">
+      <div
+        ref={scrollAreaRef}
+        onScroll={event => {
+          const element = event.currentTarget
+          const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+          shouldAutoScrollRef.current = distanceToBottom < 48
+        }}
+        className="flex-1 overflow-y-auto min-h-0 p-3"
+      >
         {viewMode === 'history' ? (
           historyEmpty ? (
             <div className="h-full flex items-center justify-center text-sm text-gray-400">
@@ -1269,13 +1447,29 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
             {/* Todo Panel */}
             {todos.length > 0 && (
-              <div className="border border-blue-200 rounded-xl overflow-hidden bg-blue-50 flex-shrink-0">
+              <div className="sticky top-0 z-20 -mx-1 px-1 pb-1">
+                <div className="border border-blue-200 rounded-xl overflow-hidden bg-blue-50/95 backdrop-blur-sm shadow-sm flex-shrink-0">
+                {(() => {
+                  const activeTodo = todos.find(todo => todo.status === 'in_progress')
+                    ?? todos.find(todo => todo.status === 'pending')
+                    ?? todos.at(-1)
+                  return (
+                    <>
                 <button
                   type="button"
                   onClick={() => setIsTodoPanelExpanded(prev => !prev)}
                   className="w-full flex items-center justify-between px-3 py-2 bg-blue-100 hover:bg-blue-200 transition-colors text-left select-none"
                 >
-                  <span className="text-xs font-semibold text-blue-700 tracking-wide">📋 任务计划</span>
+                  <span className="min-w-0">
+                    <span className="text-xs font-semibold text-blue-700 tracking-wide">📋 任务计划</span>
+                    {!isTodoPanelExpanded && activeTodo && (
+                      <span className="mt-0.5 block truncate text-[11px] text-blue-600">
+                        {activeTodo.status === 'completed' ? '已完成' :
+                         activeTodo.status === 'failed' ? '失败' :
+                         activeTodo.status === 'in_progress' ? '进行中' : '待处理'}：{activeTodo.title}
+                      </span>
+                    )}
+                  </span>
                   <span className="text-xs text-blue-500 flex items-center gap-1.5">
                     <span>
                       {todos.filter(t => t.status === 'completed').length}/{todos.length}
@@ -1318,6 +1512,10 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     ))}
                   </ul>
                 )}
+                    </>
+                  )
+                })()}
+                </div>
               </div>
             )}
             {/* End Todo Panel */}
@@ -1353,135 +1551,185 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   </div>
                 ) : (
                   <div className="w-full min-w-0 space-y-1.5">
-                    {message.thinking && (
-                      <div className="border border-gray-200 rounded-lg overflow-hidden text-xs">
-                        <button
-                          className="w-full flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-50 hover:bg-gray-100 text-gray-500 text-left"
-                          onClick={() => {
-                            setMessages(prev =>
-                              prev.map(item =>
-                                item.id === message.id
-                                  ? { ...item, isThinkingExpanded: !item.isThinkingExpanded }
-                                  : item,
-                              ),
-                            )
-                          }}
-                        >
-                          <span className="flex-shrink-0">{message.isThinkingExpanded ? '▼' : '▶'}</span>
-                          <span>思考过程</span>
-                          {message.streaming && (
-                            <span className="ml-auto animate-pulse text-blue-400">思考中…</span>
-                          )}
-                        </button>
-                        {message.isThinkingExpanded && (
-                          <div
-                            className="px-3 py-2 text-gray-600 bg-white border-t border-gray-100 max-h-48 overflow-y-auto"
-                            style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5 }}
-                          >
-                            {message.thinking}
-                          </div>
-                        )}
-                      </div>
-                    )}
+                    {message.segments.length > 0 ? (
+                      <div className="relative space-y-2 pl-4 before:absolute before:left-[7px] before:top-1 before:bottom-1 before:w-px before:bg-gradient-to-b before:from-slate-200 before:via-slate-200 before:to-transparent">
+                        {(() => {
+                          let toolSegmentIndex = -1
+                          return message.segments.map((segment, segmentIndex) => {
+                            if (segment.type === 'content') {
+                              const isStreamingSegment = message.streaming && segmentIndex === message.segments.length - 1
+                              return isStreamingSegment ? (
+                                <div
+                                  key={segment.id}
+                                  className="relative w-full text-sm text-gray-800 leading-6 before:absolute before:-left-4 before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-slate-300"
+                                  style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+                                >
+                                  {segment.text}
+                                  <span
+                                    className="inline-block w-0.5 h-4 bg-gray-600 ml-0.5 align-middle"
+                                    style={{ animation: 'blink 1s step-end infinite' }}
+                                  />
+                                </div>
+                              ) : (
+                                <div
+                                  key={segment.id}
+                                  className="ai-markdown relative w-full text-sm text-gray-800 leading-6 before:absolute before:-left-4 before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-slate-300"
+                                  dangerouslySetInnerHTML={{ __html: toHtml(segment.text) }}
+                                />
+                              )
+                            }
 
-                    {(message.text || message.streaming) && (
-                      message.streaming ? (
-                        <div
-                          className="w-full text-sm text-gray-800 leading-6"
-                          style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
-                        >
-                          {message.text}
-                          <span
-                            className="inline-block w-0.5 h-4 bg-gray-600 ml-0.5 align-middle"
-                            style={{ animation: 'blink 1s step-end infinite' }}
-                          />
-                        </div>
-                      ) : (
-                        <div
-                          className="ai-markdown w-full text-sm text-gray-800 leading-6"
-                          dangerouslySetInnerHTML={{ __html: toHtml(message.text) }}
-                        />
-                      )
-                    )}
+                            if (segment.type === 'thinking') {
+                              return (
+                                <div
+                                  key={segment.id}
+                                  className="relative border-l-2 border-dashed border-slate-200 pl-3 text-[13px] leading-6 text-slate-500 before:absolute before:-left-[18px] before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-sky-300"
+                                  style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+                                >
+                                  <div className="mb-1 text-[10px] font-medium uppercase tracking-[0.18em] text-sky-500/80">
+                                    Thinking
+                                  </div>
+                                  <div>{segment.text}</div>
+                                </div>
+                              )
+                            }
 
-                    {message.toolCalls.some(tc => tc.name !== 'update_todo_list') && (
-                      <div className="bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 space-y-1">
-                        {message.toolCalls.map((toolCall, index) => {
-                          if (toolCall.name === 'update_todo_list') return null
-                          return (
-                            <div
-                              key={`${toolCall.id ?? toolCall.name}-${index}`}
-                              className={`text-xs ${
-                                toolCall.status === 'ok'
-                                  ? 'text-green-700'
-                                  : toolCall.status === 'err'
-                                    ? 'text-red-600'
-                                    : 'text-gray-400'
-                              }`}
-                            >
-                              <button
-                                type="button"
-                                className="w-full rounded-lg border border-gray-200 bg-white/80 px-2.5 py-2 text-left"
-                                onClick={() => {
-                                  setMessages(prev =>
-                                    prev.map(item => {
-                                      if (item.id !== message.id) return item
-                                      return {
-                                        ...item,
-                                        toolCalls: item.toolCalls.map((currentToolCall, currentIndex) => (
-                                          currentIndex === index
-                                            ? { ...currentToolCall, isExpanded: !currentToolCall.isExpanded }
-                                            : currentToolCall
-                                        )),
-                                      }
-                                    }),
-                                  )
-                                }}
-                              >
-                                <div className="flex items-start gap-2">
-                                  <span className="flex-shrink-0 mt-0.5">
-                                    {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
-                                  </span>
-                                  <div className="min-w-0 flex-1">
-                                    <div className="flex items-start justify-between gap-2">
-                                      <div className="min-w-0">
-                                        <div className="font-mono text-[11px] text-gray-700 break-all">{toolCall.name}</div>
-                                        <div className="mt-1 text-[12px] leading-5 text-gray-600 break-words">
-                                          {summarizeToolPurpose(toolCall)}
-                                        </div>
-                                      </div>
-                                      <span className="text-[11px] text-gray-400 flex-shrink-0">
-                                        {toolCall.isExpanded ? '收起' : '展开'}
+                            toolSegmentIndex += 1
+                            const toolIndex = toolSegmentIndex
+                            const toolCall = segment.toolCall
+                            if (toolCall.name === 'update_todo_list') return null
+                            const isCollapsed = toolCall.status !== 'pending' && !toolCall.isExpanded
+
+                            return (
+                              <div key={segment.id} className="relative space-y-1 before:absolute before:-left-4 before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-slate-300">
+                                {!isCollapsed && (
+                                  <div className="text-[12px] leading-5 text-gray-500">
+                                    准备调用工具：{summarizeToolPurpose(toolCall)}
+                                  </div>
+                                )}
+                                {isCollapsed ? (
+                                  <button
+                                    type="button"
+                                    className={`group flex w-full items-center gap-2 text-left text-[12px] leading-5 text-slate-400 transition-colors hover:text-slate-700 ${toolStatusTone(toolCall)}`}
+                                    onClick={() => {
+                                      shouldAutoScrollRef.current = false
+                                      setMessages(prev =>
+                                        prev.map(item => {
+                                          if (item.id !== message.id) return item
+                                          const nextToolCalls = item.toolCalls.map((currentToolCall, currentIndex) => (
+                                            currentIndex === toolIndex
+                                              ? { ...currentToolCall, isExpanded: true }
+                                              : currentToolCall
+                                          ))
+                                          let currentToolIdx = -1
+                                          const nextSegments = item.segments.map(currentSegment => {
+                                            if (currentSegment.type !== 'tool') return currentSegment
+                                            currentToolIdx += 1
+                                            return currentToolIdx === toolIndex
+                                              ? { ...currentSegment, toolCall: { ...currentSegment.toolCall, isExpanded: true } }
+                                              : currentSegment
+                                          })
+                                          return { ...item, toolCalls: nextToolCalls, segments: nextSegments }
+                                        }),
+                                      )
+                                    }}
+                                  >
+                                    <span className="font-mono text-[12px] text-slate-400 transition-colors group-hover:text-slate-700">
+                                      {toolCall.name}
+                                    </span>
+                                    <span className="text-[11px] text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
+                                      ▸
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className={`group w-full text-left text-xs ${
+                                      toolCall.status === 'ok'
+                                        ? 'text-green-700'
+                                        : toolCall.status === 'err'
+                                          ? 'text-red-600'
+                                          : 'text-gray-400'
+                                    }`}
+                                    onClick={() => {
+                                      shouldAutoScrollRef.current = false
+                                      setMessages(prev =>
+                                        prev.map(item => {
+                                          if (item.id !== message.id) return item
+                                          const isExpanded = !toolCall.isExpanded
+                                          const nextToolCalls = item.toolCalls.map((currentToolCall, currentIndex) => (
+                                            currentIndex === toolIndex
+                                              ? { ...currentToolCall, isExpanded }
+                                              : currentToolCall
+                                          ))
+                                          let currentToolIdx = -1
+                                          const nextSegments = item.segments.map(currentSegment => {
+                                            if (currentSegment.type !== 'tool') return currentSegment
+                                            currentToolIdx += 1
+                                            return currentToolIdx === toolIndex
+                                              ? { ...currentSegment, toolCall: { ...currentSegment.toolCall, isExpanded } }
+                                              : currentSegment
+                                          })
+                                          return { ...item, toolCalls: nextToolCalls, segments: nextSegments }
+                                        }),
+                                      )
+                                    }}
+                                  >
+                                    <div className="flex items-start gap-2">
+                                      <span className="mt-0.5 flex-shrink-0">
+                                        {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
                                       </span>
-                                    </div>
-
-                                    {toolCall.isExpanded && (
-                                      <div className="mt-2 space-y-2">
-                                        <div>
-                                          <div className="text-[10px] uppercase tracking-wide text-gray-400">params</div>
-                                          <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white border border-gray-200 rounded-md px-2 py-1 text-gray-700">
-                                            {formatToolParams(toolCall.params)}
-                                          </pre>
+                                      <div className="min-w-0 flex-1">
+                                        <div className="flex items-start justify-between gap-2">
+                                          <div className="font-mono break-all text-[11px] text-gray-700">
+                                            {toolCall.name}
+                                          </div>
+                                          <span className="flex-shrink-0 text-[11px] text-gray-400">
+                                            {toolCall.isExpanded ? '▾' : '▸'}
+                                          </span>
                                         </div>
-                                        {toolCall.data != null && (
-                                          <div>
-                                            <div className="text-[10px] uppercase tracking-wide text-gray-400">data</div>
-                                            <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
-                                              {formatToolData(toolCall.data)}
-                                            </pre>
+
+                                        {toolCall.isExpanded && (
+                                          <div className="mt-2 space-y-2">
+                                            <div className="text-[12px] leading-5 text-gray-600">
+                                              目的：{buildToolActionLabel(toolCall)}
+                                            </div>
+                                            <div>
+                                              <div className="text-[10px] uppercase tracking-wide text-gray-400">params</div>
+                                              <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white border border-gray-200 rounded-md px-2 py-1 text-gray-700">
+                                                {formatToolParams(toolCall.params)}
+                                              </pre>
+                                            </div>
+                                            {toolCall.data != null && (
+                                              <div>
+                                                <div className="text-[10px] uppercase tracking-wide text-gray-400">data</div>
+                                                <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
+                                                  {formatToolData(toolCall.data)}
+                                                </pre>
+                                              </div>
+                                            )}
+                                            {toolCall.message && (
+                                              <div className="text-[11px] leading-4 text-gray-500 break-all">{toolCall.message}</div>
+                                            )}
                                           </div>
                                         )}
-                                        {toolCall.message && (
-                                          <div className="text-[11px] leading-4 text-gray-500 break-all">{toolCall.message}</div>
-                                        )}
                                       </div>
-                                    )}
-                                  </div>
-                                </div>
-                              </button>
-                            </div>
-                          )
-                        })}
+                                    </div>
+                                  </button>
+                                )}
+                              </div>
+                            )
+                          })
+                        })()}
+                      </div>
+                    ) : message.streaming ? (
+                      <div className="text-sm text-gray-400 leading-6">等待模型开始输出...</div>
+                    ) : null}
+
+                    {message.streaming && message.activityLabel && (
+                      <div className="inline-flex items-center gap-2 rounded-full border border-blue-100 bg-blue-50/80 px-3 py-1 text-[11px] text-blue-600">
+                        <span className="inline-flex h-2 w-2 rounded-full bg-blue-400 ai-status-pulse" />
+                        <span className="ai-status-glow">{message.activityLabel}</span>
                       </div>
                     )}
                   </div>
@@ -1634,8 +1882,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     setInput(event.target.value)
                     autoResize(event.target)
                   }}
+                  onCompositionStart={() => {
+                    isComposingRef.current = true
+                  }}
+                  onCompositionEnd={() => {
+                    isComposingRef.current = false
+                  }}
                   onKeyDown={event => {
-                    if (event.key === 'Enter' && !event.shiftKey) {
+                    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !isComposingRef.current) {
                       event.preventDefault()
                       void handleSend()
                     }
@@ -1734,7 +1988,22 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         })()}
       </div>
 
-      <style>{'@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }'}</style>
+      <style>{`
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        @keyframes pulse-soft { 0%,100%{transform:scale(1);opacity:.8} 50%{transform:scale(1.18);opacity:1} }
+        .ai-status-glow {
+          background-image: linear-gradient(90deg, #64748b 0%, #3b82f6 35%, #0f172a 50%, #3b82f6 65%, #64748b 100%);
+          background-size: 200% 100%;
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
+          animation: shimmer 2s linear infinite;
+        }
+        .ai-status-pulse {
+          animation: pulse-soft 1.1s ease-in-out infinite;
+        }
+      `}</style>
     </div>
   )
 }
