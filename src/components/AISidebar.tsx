@@ -105,6 +105,9 @@ interface SelectionContext {
   selectedText: string
   paragraphIndex: number
   charOffset: number
+  prefixText: string
+  suffixText: string
+  paragraphText: string
   paragraphAttrs: Record<string, unknown>
   textRuns: TextRun[]
 }
@@ -142,17 +145,23 @@ function serializeSelection(editorState: EditorState): SelectionContext | null {
     return {
       from, to, selectedText,
       paragraphIndex: -1, charOffset: 0,
+      prefixText: '',
+      suffixText: '',
+      paragraphText: '',
       paragraphAttrs: {}, textRuns: [],
     }
   }
 
   const paraNode = targetParaNode as ProseMirrorNode
   const charOffset = from - targetParaStart
+  const paragraphText = paraNode.textContent
   const paragraphAttrs = { ...(paraNode.attrs as Record<string, unknown>) }
 
   // Build textRuns for the selected range inside this paragraph
   const selStartInPara = charOffset
   const selEndInPara = Math.min(paraNode.textContent.length, to - targetParaStart)
+  const prefixText = paragraphText.slice(Math.max(0, charOffset - 12), charOffset)
+  const suffixText = paragraphText.slice(selEndInPara, Math.min(paragraphText.length, selEndInPara + 12))
   const textRuns: TextRun[] = []
   let runningOffset = 0
 
@@ -175,7 +184,18 @@ function serializeSelection(editorState: EditorState): SelectionContext | null {
     textRuns.push({ text: slicedText, startOffset: sliceStart, endOffset: sliceEnd, marks })
   })
 
-  return { from, to, selectedText, paragraphIndex: targetParaIndex, charOffset, paragraphAttrs, textRuns }
+  return {
+    from,
+    to,
+    selectedText,
+    paragraphIndex: targetParaIndex,
+    charOffset,
+    prefixText,
+    suffixText,
+    paragraphText,
+    paragraphAttrs,
+    textRuns,
+  }
 }
 
 function buildContextPreview(editorState: EditorState, pageConfig: PageConfig) {
@@ -246,6 +266,8 @@ const BUBBLE_MAX_RATIO = 0.85
 const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
 const MAX_TOOL_ROUNDS = 50
+const MAX_SAME_TOOL_FAILURES = 2
+const MAX_SAME_TOOL_STREAK = 4
 const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, tool.description]))
 
 let msgIdCounter = 0
@@ -403,15 +425,61 @@ function extractSelectionContext(context: Record<string, unknown>) {
     from,
     to,
     paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : undefined,
+    charOffset: Number((selection as Record<string, unknown>).charOffset ?? 0),
+    selectedText: String((selection as Record<string, unknown>).selectedText ?? ''),
+    prefixText: String((selection as Record<string, unknown>).prefixText ?? ''),
+    suffixText: String((selection as Record<string, unknown>).suffixText ?? ''),
+    paragraphText: String((selection as Record<string, unknown>).paragraphText ?? ''),
   }
 }
 
+function hasUsableRange(params: Record<string, unknown>) {
+  const range = params.range
+  if (!range || typeof range !== 'object' || Array.isArray(range)) return false
+  const candidate = range as Record<string, unknown>
+  return (
+    typeof candidate.type === 'string'
+    || Number.isFinite(Number(candidate.paragraphIndex))
+    || Number.isFinite(Number(candidate.from))
+    || Number.isFinite(Number(candidate.to))
+    || Number.isFinite(Number(candidate.selectionFrom))
+    || Number.isFinite(Number(candidate.selectionTo))
+    || typeof candidate.text === 'string'
+  )
+}
+
 function serializeToolParamsWithSelection(
+  toolName: string,
   params: Record<string, unknown>,
-  selectionContext: { from: number; to: number; paragraphIndex?: number } | null,
+  selectionContext: {
+    from: number
+    to: number
+    paragraphIndex?: number
+    charOffset?: number
+    selectedText?: string
+    prefixText?: string
+    suffixText?: string
+    paragraphText?: string
+  } | null,
 ) {
   const range = params.range
-  if (!selectionContext || !range || typeof range !== 'object' || Array.isArray(range)) return params
+  if (!selectionContext) return params
+
+  if (
+    (toolName === 'set_text_style' || toolName === 'set_paragraph_style' || toolName === 'clear_formatting')
+    && !hasUsableRange(params)
+  ) {
+    return {
+      ...params,
+      range: {
+        type: 'selection',
+        selectionFrom: selectionContext.from,
+        selectionTo: selectionContext.to,
+      },
+    }
+  }
+
+  if (!range || typeof range !== 'object' || Array.isArray(range)) return params
   const nextRange = { ...(range as Record<string, unknown>) }
   if (nextRange.type !== 'selection') return params
   if (!Number.isFinite(Number(nextRange.selectionFrom))) nextRange.selectionFrom = selectionContext.from
@@ -585,6 +653,26 @@ function serializeToolResult(result: ExecuteResult) {
     message: result.message,
     data: result.data ?? null,
   })
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(',')}]`
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`)
+    return `{${entries.join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function getToolCallSignature(name: string, params: Record<string, unknown>) {
+  return `${name}:${stableStringify(params)}`
+}
+
+function summarizeLoopStop(tool: ToolCallRecord) {
+  const errorMessage = tool.result.message || '工具执行失败'
+  return `检测到工具重复失败，已停止自动重试：\`${tool.name}\`，原因是“${errorMessage}”。请调整系统提示词或改为先读取文档再提供完整参数后重试。`
 }
 
 function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
@@ -1101,6 +1189,9 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
       let reactMessages = buildReactMessages(previousConversationMessages, text)
       let finished = false
+      const failedToolCounts = new Map<string, number>()
+      let lastToolSignature = ''
+      let lastToolStreak = 0
 
       for (let round = 1; round <= MAX_TOOL_ROUNDS && !finished; round += 1) {
         const response = await fetch('/api/ai/react/stream', {
@@ -1220,7 +1311,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   }
                 } else {
                   const selectionContext = extractSelectionContext(context)
-                  toolCall.params = serializeToolParamsWithSelection(toolCall.params, selectionContext)
+                  toolCall.params = serializeToolParamsWithSelection(toolCall.name, toolCall.params, selectionContext)
                   result = editorView
                     ? executeTool(editorView, toolCall.name, toolCall.params, {
                         pageConfig,
@@ -1301,6 +1392,49 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         }
 
         appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+
+        let stopReason = ''
+        for (const tool of toolResults) {
+          const signature = getToolCallSignature(tool.name, tool.params)
+
+          if (signature === lastToolSignature) lastToolStreak += 1
+          else {
+            lastToolSignature = signature
+            lastToolStreak = 1
+          }
+
+          if (tool.result.success) {
+            failedToolCounts.delete(signature)
+            continue
+          }
+
+          const nextFailureCount = (failedToolCounts.get(signature) ?? 0) + 1
+          failedToolCounts.set(signature, nextFailureCount)
+
+          if (nextFailureCount >= MAX_SAME_TOOL_FAILURES || lastToolStreak >= MAX_SAME_TOOL_STREAK) {
+            stopReason = summarizeLoopStop(tool)
+            break
+          }
+        }
+
+        if (stopReason) {
+          persistedAssistantText += (persistedAssistantText ? '\n\n' : '') + stopReason
+          persistedRecords.push({ role: 'assistant', content: stopReason })
+          activeStreamingWriteRef.current = null
+          updateMessage(message => ({
+            ...appendContentChunk(message, `${message.text ? '\n\n' : ''}${stopReason}`),
+            streaming: false,
+            activityLabel: '',
+          }))
+          setAskContinue({
+            visible: true,
+            rounds: round,
+            message: stopReason,
+          })
+          finished = true
+          break
+        }
+
         persistedRecords.push(
           ...toolResults.map(tool => ({
             role: 'tool' as const,

@@ -23,6 +23,7 @@ export const DEFAULT_PAGE_CONFIG: PageConfig = {
 export interface LineInfo {
   text: string
   blockIndex: number
+  blockType: string
   lineIndex: number
   lineHeight: number
   startPos: number | null
@@ -627,6 +628,7 @@ function measureParagraph(
       lines: [{
         text: '',
         blockIndex,
+        blockType: 'paragraph',
         lineIndex: 0,
         lineHeight,
         startPos: paraPos + 1,
@@ -689,6 +691,7 @@ function measureParagraph(
       lines.push({
         text: line.text,
         blockIndex,
+        blockType: 'paragraph',
         lineIndex,
         lineHeight,
         startPos,
@@ -760,12 +763,13 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
     canSplit: false,
     spaceBefore: 0,
     spaceAfter: 0,
-    lines: [{
-      text: '',
-      blockIndex: 0,
-      lineIndex: 0,
-      lineHeight: totalHeight,
-      startPos: null,
+      lines: [{
+        text: '',
+        blockIndex: 0,
+        blockType: 'table',
+        lineIndex: 0,
+        lineHeight: totalHeight,
+        startPos: null,
       units: [],
       align: 'left',
       availableWidth: contentWidth,
@@ -800,6 +804,7 @@ function measureBlock(
         lines: [{
           text: '',
           blockIndex,
+          blockType: 'horizontal_rule',
           lineIndex: 0,
           lineHeight: 20,
           startPos: nodePos + 1,
@@ -821,6 +826,7 @@ function measureBlock(
         lines: [{
           text: '',
           blockIndex,
+          blockType: node.type.name,
           lineIndex: 0,
           lineHeight: 24,
           startPos: nodePos + 1,

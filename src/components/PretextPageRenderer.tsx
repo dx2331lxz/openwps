@@ -369,6 +369,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
       {pages.map((page, pageIndex) => {
         return page.lines.map((line) => {
           const metrics = getLineLayoutMetrics(line, pageIndex, pageConfig, pageGap)
+          const isHorizontalRule = line.blockType === 'horizontal_rule'
 
           return (
             <div
@@ -385,7 +386,16 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                 overflow: 'visible',
               }}
             >
-              {line.units.length > 0 ? (
+              {isHorizontalRule ? (
+                <div
+                  style={{
+                    alignSelf: 'center',
+                    width: Math.max(40, line.availableWidth),
+                    borderTop: '1px solid #cbd5e1',
+                    opacity: 0.95,
+                  }}
+                />
+              ) : line.units.length > 0 ? (
                 line.units.map((unit, index) => {
                   const isLastUnit = index === line.units.length - 1
                   const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)

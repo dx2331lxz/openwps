@@ -31,6 +31,11 @@ export interface ExecuteOptions {
     from: number
     to: number
     paragraphIndex?: number
+    charOffset?: number
+    selectedText?: string
+    prefixText?: string
+    suffixText?: string
+    paragraphText?: string
   } | null
 }
 
@@ -219,6 +224,88 @@ function paragraphTextBounds(paragraph: ParagraphRef) {
   }
 }
 
+function paragraphOffsetToDocPos(paragraph: ParagraphRef, offset: number) {
+  const normalizedOffset = Math.max(0, offset)
+  let consumed = 0
+  let resolvedPos = paragraph.pos + 1
+
+  paragraph.node.forEach((child, childOffset) => {
+    if (!child.isText) return
+    const text = child.text ?? ''
+    const nextConsumed = consumed + text.length
+    if (normalizedOffset <= nextConsumed) {
+      resolvedPos = paragraph.pos + 1 + childOffset + (normalizedOffset - consumed)
+    }
+    consumed = nextConsumed
+  })
+
+  return Math.min(paragraph.pos + paragraph.node.nodeSize - 1, resolvedPos)
+}
+
+function tryResolveSelectionInParagraph(
+  paragraph: ParagraphRef,
+  selectionContext?: ExecuteOptions['selectionContext'],
+) {
+  const selectedText = selectionContext?.selectedText ?? ''
+  if (!selectedText) return null
+
+  const paragraphText = paragraph.node.textContent
+  const prefixText = selectionContext?.prefixText ?? ''
+  const suffixText = selectionContext?.suffixText ?? ''
+  const preferredOffsets: number[] = []
+
+  if (Number.isFinite(selectionContext?.charOffset)) preferredOffsets.push(Number(selectionContext?.charOffset))
+
+  let matchOffset = -1
+  for (const preferredOffset of preferredOffsets) {
+    if (paragraphText.slice(preferredOffset, preferredOffset + selectedText.length) === selectedText) {
+      matchOffset = preferredOffset
+      break
+    }
+  }
+
+  if (matchOffset === -1) {
+    let searchFrom = 0
+    while (searchFrom <= paragraphText.length) {
+      const found = paragraphText.indexOf(selectedText, searchFrom)
+      if (found === -1) break
+      const prefixMatches = !prefixText || paragraphText.slice(Math.max(0, found - prefixText.length), found) === prefixText
+      const suffixMatches = !suffixText || paragraphText.slice(found + selectedText.length, found + selectedText.length + suffixText.length) === suffixText
+      if (prefixMatches || suffixMatches) {
+        matchOffset = found
+        break
+      }
+      searchFrom = found + 1
+    }
+  }
+
+  if (matchOffset === -1) return null
+
+  return {
+    from: paragraphOffsetToDocPos(paragraph, matchOffset),
+    to: paragraphOffsetToDocPos(paragraph, matchOffset + selectedText.length),
+  }
+}
+
+function resolveSelectionByAnchor(state: EditorState, selectionContext?: ExecuteOptions['selectionContext']) {
+  if (!selectionContext?.selectedText) return null
+
+  if (Number.isFinite(selectionContext.paragraphIndex)) {
+    const paragraph = getParagraphAtIndex(state, Number(selectionContext.paragraphIndex))
+    if (paragraph) {
+      const match = tryResolveSelectionInParagraph(paragraph, selectionContext)
+      if (match) return match
+    }
+  }
+
+  for (const paragraph of getParagraphs(state)) {
+    const match = tryResolveSelectionInParagraph(paragraph, selectionContext)
+    if (match) return match
+  }
+
+  return null
+}
+
 function getSelectionBounds(
   state: EditorState,
   range?: RangeSpec,
@@ -226,11 +313,20 @@ function getSelectionBounds(
 ) {
   const candidateFrom = range?.selectionFrom ?? selectionContext?.from
   const candidateTo = range?.selectionTo ?? selectionContext?.to
-  const rawFrom = Number.isFinite(candidateFrom) ? Number(candidateFrom) : state.selection.from
-  const rawTo = Number.isFinite(candidateTo) ? Number(candidateTo) : state.selection.to
+  const hasExplicitBounds = Number.isFinite(candidateFrom) && Number.isFinite(candidateTo)
+  const rawFrom = hasExplicitBounds ? Number(candidateFrom) : state.selection.from
+  const rawTo = hasExplicitBounds ? Number(candidateTo) : state.selection.to
   const from = Math.max(1, Math.min(rawFrom, rawTo))
   const to = Math.min(state.doc.nodeSize - 1, Math.max(rawFrom, rawTo))
-  if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) return null
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) {
+    return resolveSelectionByAnchor(state, selectionContext)
+  }
+  if (selectionContext?.selectedText) {
+    const currentText = state.doc.textBetween(from, to, '\n')
+    if (currentText !== selectionContext.selectedText) {
+      return resolveSelectionByAnchor(state, selectionContext)
+    }
+  }
   return { from, to }
 }
 
@@ -342,14 +438,27 @@ function buildParagraphNode(text: string, attrs?: Record<string, unknown>) {
   return schema.nodes.paragraph.create(attrs, content)
 }
 
+function normalizeToolText(raw: string) {
+  return raw
+    .replace(/\r\n?/g, '\n')
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t')
+}
+
 function buildParagraphNodeFromText(paragraph: ParagraphRef | null, text: string) {
-  return buildParagraphNode(text, (paragraph?.node.attrs as Record<string, unknown> | undefined) ?? undefined)
+  return buildParagraphNode(normalizeToolText(text), (paragraph?.node.attrs as Record<string, unknown> | undefined) ?? undefined)
 }
 
 function buildParagraphNodesFromText(text: string, paragraphAttrs?: Record<string, unknown>) {
-  const normalized = text.replace(/\r\n?/g, '\n')
+  const normalized = normalizeToolText(text)
   const parts = normalized === '' ? [''] : normalized.split('\n')
   return parts.map(part => buildParagraphNode(part, paragraphAttrs))
+}
+
+function isFullParagraphSelection(range: { from: number; to: number }, paragraph: ParagraphRef) {
+  const bounds = paragraphTextBounds(paragraph)
+  return range.from <= bounds.from && range.to >= bounds.to
 }
 
 function describeFontFamily(fontFamily: string | undefined) {
@@ -946,7 +1055,7 @@ export function executeTool(
 
       case 'insert_text': {
         const paragraphIndex = Number(params.paragraphIndex)
-        const text = String(params.text ?? '')
+        const text = normalizeToolText(String(params.text ?? ''))
         const paragraph = getParagraphAtIndex(state, paragraphIndex)
         if (!paragraph) return { success: false, message: `未找到第 ${paragraphIndex + 1} 段` }
         const insertPos = paragraph.pos + paragraph.node.nodeSize - 1
@@ -963,25 +1072,28 @@ export function executeTool(
 
       case 'insert_paragraph_after': {
         const afterParagraph = Number(params.afterParagraph)
-        const text = String(params.text ?? '')
+        const text = normalizeToolText(String(params.text ?? ''))
         const paragraph = getParagraphAtIndex(state, afterParagraph)
         if (!paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
-        const inserted = insertBlockAfterParagraph(state, afterParagraph, buildParagraphNodeFromText(paragraph, text))
-        if (!inserted.success || !inserted.tr) return inserted
-        dispatch(inserted.tr)
+        const insertPos = getInsertPosAfterParagraph(state, afterParagraph)
+        if (insertPos == null) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+        const fragment = Fragment.fromArray(
+          buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined),
+        )
+        dispatch(state.tr.insert(insertPos, fragment))
         view.focus()
         return { success: true, message: `已在第 ${afterParagraph + 1} 段后插入新段落` }
       }
 
       case 'replace_paragraph_text': {
         const paragraphIndex = Number(params.paragraphIndex)
-        const text = String(params.text ?? '')
+        const text = normalizeToolText(String(params.text ?? ''))
         const paragraph = getParagraphAtIndex(state, paragraphIndex)
         if (!paragraph) return { success: false, message: `未找到第 ${paragraphIndex + 1} 段` }
         tr.replaceWith(
           paragraph.pos,
           paragraph.pos + paragraph.node.nodeSize,
-          buildParagraphNodeFromText(paragraph, text),
+          Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined)),
         )
         dispatch(tr)
         view.focus()
@@ -990,10 +1102,24 @@ export function executeTool(
 
       case 'replace_selection_text': {
         const range = params.range as RangeSpec | undefined
-        const text = String(params.text ?? '')
+        const text = normalizeToolText(String(params.text ?? ''))
         const bounds = getSelectionBounds(state, range, options?.selectionContext)
         if (!range || range.type !== 'selection' || !bounds) {
           return { success: false, message: 'replace_selection_text 需要有效的 selection 范围' }
+        }
+        if (text.includes('\n')) {
+          const selectedParagraphs = resolveRange(state, range, options?.selectionContext)
+          if (selectedParagraphs.length === 1 && isFullParagraphSelection(bounds, selectedParagraphs[0]!)) {
+            const paragraph = selectedParagraphs[0]!
+            tr.replaceWith(
+              paragraph.pos,
+              paragraph.pos + paragraph.node.nodeSize,
+              Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined)),
+            )
+            dispatch(tr)
+            view.focus()
+            return { success: true, message: '已按多行内容替换当前段落' }
+          }
         }
         tr.insertText(text, bounds.from, bounds.to)
         dispatch(tr)

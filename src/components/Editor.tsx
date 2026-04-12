@@ -155,7 +155,6 @@ const PM_STYLES = `
   color: transparent;
   -webkit-text-fill-color: transparent;
   caret-color: transparent;
-  opacity: 0;
   text-rendering: geometricPrecision;
 }
 .pretext-driving-editor .ProseMirror * {
@@ -170,9 +169,12 @@ const PM_STYLES = `
   -webkit-text-fill-color: transparent !important;
 }
 .pretext-driving-editor .ProseMirror img,
-.pretext-driving-editor .ProseMirror hr,
 .pretext-driving-editor .ProseMirror table {
   opacity: 0;
+}
+.pretext-driving-editor .ProseMirror hr {
+  opacity: 1;
+  border-top-color: #cbd5e1;
 }
 @keyframes openwps-caret-blink {
   0%, 49% { opacity: 1; }
