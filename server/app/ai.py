@@ -102,6 +102,12 @@ def _build_context_block(context: dict) -> str:
     }
     parts.append(f"context.document = {json.dumps(document_context, ensure_ascii=False)}")
 
+    preview = context.get("preview")
+    if preview and isinstance(preview, dict):
+        parts.append("")
+        parts.append("context.preview = " + json.dumps(preview, ensure_ascii=False, indent=2))
+        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content。")
+
     selection = context.get("selection")
     if selection and isinstance(selection, dict):
         parts.append("")

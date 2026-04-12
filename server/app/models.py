@@ -21,7 +21,7 @@ class ChatRequest(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     conversationId: Optional[str] = None
     reactMessages: list[dict[str, Any]] = Field(default_factory=list)
-    mode: str = "layout"
+    mode: str = "agent"
     images: list[dict[str, Any]] = Field(default_factory=list)
     model: Optional[str] = None
     providerId: Optional[str] = None

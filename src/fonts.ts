@@ -10,7 +10,7 @@ export const FONT_STACKS = {
 
 export const DEFAULT_EDITOR_FONT_STACK = FONT_STACKS.song
 
-export const SUPPORTED_AI_FONT_NAMES = ['宋体', '黑体', '楷体', '仿宋'] as const
+export const SUPPORTED_AI_FONT_NAMES = ['宋体', '黑体', '楷体', '仿宋', 'Arial', 'Times New Roman'] as const
 
 export type SupportedAiFontName = (typeof SUPPORTED_AI_FONT_NAMES)[number]
 
@@ -19,6 +19,8 @@ const FONT_NAME_TO_STACK: Record<SupportedAiFontName, string> = {
   黑体: FONT_STACKS.hei,
   楷体: FONT_STACKS.kai,
   仿宋: FONT_STACKS.fang,
+  Arial: FONT_STACKS.arial,
+  'Times New Roman': FONT_STACKS.timesNewRoman,
 }
 
 export function isSupportedAiFontName(value: string): value is SupportedAiFontName {

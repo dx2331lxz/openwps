@@ -155,6 +155,7 @@ const PM_STYLES = `
   color: transparent;
   -webkit-text-fill-color: transparent;
   caret-color: transparent;
+  opacity: 0;
   text-rendering: geometricPrecision;
 }
 .pretext-driving-editor .ProseMirror * {

@@ -2,7 +2,7 @@ import React from 'react'
 import type { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import { TextSelection } from 'prosemirror-state'
-import type { Mark } from 'prosemirror-model'
+import { Fragment, type Mark } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
 import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
@@ -169,28 +169,76 @@ function toggleList(view: EditorView, listType: 'bullet' | 'ordered') {
   view.focus()
 }
 
+function getParagraphRefs(state: EditorState) {
+  const paragraphs: Array<{ node: typeof state.doc; pos: number; index: number }> = []
+  let paragraphIndex = 0
+
+  state.doc.forEach((node, pos) => {
+    if (node.type.name !== 'paragraph') return
+    paragraphs.push({ node, pos, index: paragraphIndex })
+    paragraphIndex += 1
+  })
+
+  return paragraphs
+}
+
+function getCurrentParagraphRef(state: EditorState) {
+  const resolvePos = state.selection.from === 0 ? 1 : state.selection.from
+  const $from = state.doc.resolve(resolvePos)
+  const paragraphs = getParagraphRefs(state)
+
+  for (let depth = $from.depth; depth >= 0; depth -= 1) {
+    const node = $from.node(depth)
+    if (node.type.name !== 'paragraph') continue
+    const pos = $from.before(depth)
+    return paragraphs.find(paragraph => paragraph.pos === pos) ?? null
+  }
+
+  return paragraphs[0] ?? null
+}
+
 function insertHR(view: EditorView) {
   const { state, dispatch } = view
-  const tr = state.tr.replaceSelectionWith(schema.nodes.horizontal_rule.create())
+  const paragraph = getCurrentParagraphRef(state)
+  if (!paragraph) return
+
+  const paragraphs = getParagraphRefs(state)
+  const nextParagraph = paragraphs[paragraph.index + 1]
+  const insertPos = paragraph.pos + paragraph.node.nodeSize
+  const hrNode = schema.nodes.horizontal_rule.create()
+  const tr = nextParagraph
+    ? state.tr.insert(insertPos, hrNode)
+    : state.tr.insert(insertPos, Fragment.fromArray([hrNode, schema.nodes.paragraph.create()]))
+
+  const selectionPos = nextParagraph ? nextParagraph.pos + hrNode.nodeSize + 1 : insertPos + hrNode.nodeSize + 1
+  tr.setSelection(TextSelection.create(tr.doc, selectionPos))
+
   dispatch(tr)
   view.focus()
 }
 
 function insertPageBreak(view: EditorView) {
   const { state, dispatch } = view
-  const { selection, tr } = state
-  // AllSelection ($from.pos=0, depth=0) means entire doc is selected.
-  // Resolve to pos=1 so we land inside the first paragraph.
-  const resolvePos = selection.from === 0 ? 1 : selection.from
-  const $from = state.doc.resolve(resolvePos)
-  for (let d = $from.depth; d >= 0; d--) {
-    const n = $from.node(d)
-    if (n.type.name === 'paragraph') {
-      const pos = $from.before(d)
-      tr.setNodeMarkup(pos, undefined, { ...n.attrs, pageBreakBefore: !n.attrs.pageBreakBefore })
-      break
-    }
+  const paragraph = getCurrentParagraphRef(state)
+  if (!paragraph) return
+
+  const paragraphs = getParagraphRefs(state)
+  const nextParagraph = paragraphs[paragraph.index + 1]
+  const tr = state.tr
+
+  if (nextParagraph) {
+    tr.setNodeMarkup(nextParagraph.pos, undefined, {
+      ...nextParagraph.node.attrs,
+      pageBreakBefore: true,
+    })
+    tr.setSelection(TextSelection.create(tr.doc, nextParagraph.pos + 1))
+  } else {
+    const insertPos = paragraph.pos + paragraph.node.nodeSize
+    const newParagraph = schema.nodes.paragraph.create({ pageBreakBefore: true })
+    tr.insert(insertPos, newParagraph)
+    tr.setSelection(TextSelection.create(tr.doc, insertPos + 1))
   }
+
   dispatch(tr)
   view.focus()
 }

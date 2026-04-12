@@ -13,12 +13,12 @@ import {
   type ExecuteResult,
   type StreamingWriteSession,
 } from '../ai/executor'
-import { editTools, layoutTools } from '../ai/tools'
+import { agentTools } from '../ai/tools'
 import type { AISettingsData, ModelOption } from '../ai/providers'
-import type { PageConfig } from '../layout/paginator'
+import { paginate, type PageConfig } from '../layout/paginator'
 
 type View = 'history' | 'chat'
-type AssistantMode = 'layout' | 'edit'
+type AssistantMode = 'agent' | 'layout' | 'edit'
 
 interface ConversationSummary {
   id: string
@@ -109,6 +109,11 @@ interface SelectionContext {
   textRuns: TextRun[]
 }
 
+function truncatePreviewText(text: string, maxLength = 120) {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized
+}
+
 function serializeSelection(editorState: EditorState): SelectionContext | null {
   const { from, to } = editorState.selection
   if (from === to) return null
@@ -173,6 +178,54 @@ function serializeSelection(editorState: EditorState): SelectionContext | null {
   return { from, to, selectedText, paragraphIndex: targetParaIndex, charOffset, paragraphAttrs, textRuns }
 }
 
+function buildContextPreview(editorState: EditorState, pageConfig: PageConfig) {
+  const paragraphPreviews: Array<{ index: number; text: string; charCount: number }> = []
+  const blockParagraphIndexes: Array<number | null> = []
+  let paragraphIndex = 0
+
+  editorState.doc.forEach((node) => {
+    if (node.type.name === 'paragraph') {
+      paragraphPreviews.push({
+        index: paragraphIndex,
+        text: truncatePreviewText(node.textContent, 100),
+        charCount: node.textContent.length,
+      })
+      blockParagraphIndexes.push(paragraphIndex)
+      paragraphIndex += 1
+      return
+    }
+
+    blockParagraphIndexes.push(null)
+  })
+
+  const pagination = paginate(editorState.doc, pageConfig)
+  const totalPages = pagination.renderedPages.length
+  const pageIndexes = totalPages <= 4 ? [...pagination.renderedPages.keys()] : [0, 1, totalPages - 1]
+  const pages = pageIndexes.map(pageIndex => {
+    const page = pagination.renderedPages[pageIndex]
+    const paragraphIndexes = [...new Set(
+      page.lines
+        .map(line => blockParagraphIndexes[line.blockIndex] ?? null)
+        .filter((value): value is number => typeof value === 'number')
+    )]
+
+    return {
+      page: pageIndex + 1,
+      paragraphRange: paragraphIndexes.length > 0
+        ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
+        : null,
+      previewText: truncatePreviewText(page.lines.map(line => line.text).join(' '), 160),
+    }
+  })
+
+  return {
+    firstParagraphs: paragraphPreviews.slice(0, 4),
+    lastParagraphs: paragraphPreviews.length > 4 ? paragraphPreviews.slice(-2) : [],
+    pages,
+    omittedPageCount: Math.max(0, totalPages - pages.length),
+  }
+}
+
 interface Props {
   view: EditorView | null
   editorState?: EditorState | null
@@ -193,9 +246,7 @@ const BUBBLE_MAX_RATIO = 0.85
 const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
 const MAX_TOOL_ROUNDS = 50
-const TOOL_DESCRIPTIONS = Object.fromEntries(
-  [...layoutTools, ...editTools].map(tool => [tool.name, tool.description]),
-)
+const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, tool.description]))
 
 let msgIdCounter = 0
 
@@ -272,6 +323,7 @@ function describeToolTarget(params: Record<string, unknown>) {
   if (Number.isFinite(Number(params.paragraphIndex))) return `第 ${Number(params.paragraphIndex) + 1} 段`
   if (Number.isFinite(Number(params.afterParagraph))) return `第 ${Number(params.afterParagraph) + 1} 段后`
   if (Number.isFinite(Number(params.index))) return `第 ${Number(params.index) + 1} 段`
+  if (Number.isFinite(Number(params.page))) return `第 ${Number(params.page)} 页`
   return ''
 }
 
@@ -286,11 +338,14 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   const description = TOOL_DESCRIPTIONS[toolCall.name]
 
   if (toolCall.name === 'get_document_info') return '读取当前文档的统计信息'
-  if (toolCall.name === 'get_document_content') return '读取全文内容和样式，辅助后续判断'
+  if (toolCall.name === 'get_document_outline') return '读取整篇文档的分页概览和样式概览'
+  if (toolCall.name === 'get_document_content') return target ? `读取${target}的内容和样式` : '读取全文内容和样式，辅助后续判断'
+  if (toolCall.name === 'get_page_content') return target ? `查看${target}的分页快照` : '查看指定页面的排版快照'
   if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
   if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
   if (toolCall.name === 'set_paragraph_style') return target ? `调整${target}的段落格式` : '调整段落格式'
+  if (toolCall.name === 'clear_formatting') return target ? `清除${target}的排版格式` : '清除排版格式'
   if (toolCall.name === 'begin_streaming_write') return target ? `开始向${target}流式写正文` : '开始流式写正文'
   if (toolCall.name === 'insert_text') return target ? `向${target}补充文字` : '插入新的文字内容'
   if (toolCall.name === 'insert_paragraph_after') return target ? `在${target}后新增段落` : '插入一个新段落'
@@ -678,7 +733,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [assistantMode, setAssistantMode] = useState<AssistantMode>('layout')
+  const [assistantMode, setAssistantMode] = useState<AssistantMode>('agent')
   const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
   const [todos, setTodos] = useState<TodoItem[]>([])
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(false)
@@ -726,22 +781,25 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     if (!editorView) return {}
     let paragraphCount = 0
     let wordCount = 0
-    const paragraphs: Array<{index: number, text: string, charCount: number}> = []
     editorView.state.doc.forEach((node) => {
       if (node.type.name === 'paragraph') {
-        const text = node.textContent
-        paragraphs.push({ index: paragraphCount, text: text.slice(0, 100), charCount: text.length })
         paragraphCount += 1
-        wordCount += text.length
+        wordCount += node.textContent.length
       }
     })
-    const ctx: Record<string, unknown> = { paragraphCount, wordCount, pageCount: 1, paragraphs }
+    const preview = buildContextPreview(editorView.state, pageConfig)
+    const ctx: Record<string, unknown> = {
+      paragraphCount,
+      wordCount,
+      pageCount: preview.pages.length + preview.omittedPageCount,
+      preview,
+    }
     if (includeSelection && editorState) {
       const sel = serializeSelection(editorState)
       if (sel) ctx.selection = sel
     }
     return ctx
-  }, [editorView, editorState, includeSelection])
+  }, [editorView, editorState, includeSelection, pageConfig])
 
   const loadConversations = useCallback(async () => {
     setHistoryLoading(true)
@@ -1872,9 +1930,11 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   className="w-full resize-none border-0 bg-transparent text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400"
                   rows={3}
                   placeholder={
-                    assistantMode === 'layout'
-                      ? (viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…')
-                      : (viewMode === 'history' ? '输入写作/删改指令，自动新建会话…' : '继续输入写作/删改指令…')
+                    assistantMode === 'agent'
+                      ? (viewMode === 'history' ? '输入写作或排版需求，Agent 会边写边排…' : '继续让 Agent 写内容、调样式或处理分页…')
+                      : assistantMode === 'layout'
+                        ? (viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…')
+                        : (viewMode === 'history' ? '输入写作/删改指令，自动新建会话…' : '继续输入写作/删改指令…')
                   }
                   value={input}
                   style={{ minHeight: '72px', maxHeight: '200px', overflowY: 'auto' }}
@@ -1926,6 +1986,18 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                 </label>
 
                 <div className="inline-flex rounded-full border border-slate-200 bg-white p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setAssistantMode('agent')}
+                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${
+                      assistantMode === 'agent'
+                        ? 'bg-violet-600 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                    }`}
+                    title="Agent 模式：可同时写正文和排版，是主推荐模式"
+                  >
+                    Agent
+                  </button>
                   <button
                     type="button"
                     onClick={() => setAssistantMode('layout')}

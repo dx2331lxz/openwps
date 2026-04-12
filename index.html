@@ -8,6 +8,40 @@
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module">
+      const RETRY_KEY = 'openwps:boot-retry'
+      const RETRY_WINDOW_MS = 15000
+
+      function canRetryBoot() {
+        try {
+          const raw = sessionStorage.getItem(RETRY_KEY)
+          if (!raw) return true
+          const lastTime = Number(raw)
+          return !Number.isFinite(lastTime) || Date.now() - lastTime > RETRY_WINDOW_MS
+        } catch {
+          return true
+        }
+      }
+
+      function reloadWithCacheBust() {
+        try {
+          sessionStorage.setItem(RETRY_KEY, String(Date.now()))
+        } catch {
+          // ignore storage failures and still try to recover
+        }
+        const nextUrl = new URL(window.location.href)
+        nextUrl.searchParams.set('__openwps_reload__', String(Date.now()))
+        window.location.replace(nextUrl.toString())
+      }
+
+      window.__OPENWPS_RELOAD_ON_ASSET_ERROR__ = reloadWithCacheBust
+
+      import('/src/main.tsx').catch(error => {
+        console.error('[boot] failed to load main entry', error)
+        if (canRetryBoot()) {
+          reloadWithCacheBust()
+        }
+      })
+    </script>
   </body>
 </html>

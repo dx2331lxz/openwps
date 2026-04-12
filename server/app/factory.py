@@ -4,7 +4,7 @@ import json
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
@@ -24,6 +24,31 @@ from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, S
 def sse(event_type: str, data: dict) -> str:
     payload = {"type": event_type, **data}
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def apply_no_store_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    for header_name in ("ETag", "Last-Modified"):
+        if header_name in response.headers:
+            del response.headers[header_name]
+    return response
+
+
+class AppStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        path = ""
+        if len(args) >= 3 and isinstance(args[2], dict):
+            path = str(args[2].get("path", "") or "")
+
+        if path.endswith(".js") or path.endswith(".css"):
+            return apply_no_store_headers(response)
+        else:
+            response.headers["Cache-Control"] = "public, max-age=86400"
+
+        return response
 
 
 def create_api_router() -> APIRouter:
@@ -176,24 +201,37 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def prevent_stale_frontend_assets(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if (
+            path == "/"
+            or path.endswith(".html")
+            or path.endswith(".js")
+            or path.endswith(".css")
+        ):
+            apply_no_store_headers(response)
+        return response
+
     app.include_router(create_api_router())
 
     if DIST_DIR.exists():
-        app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
+        app.mount("/assets", AppStaticFiles(directory=DIST_DIR / "assets"), name="assets")
 
         @app.get("/favicon.svg")
         async def favicon():
-            return FileResponse(DIST_DIR / "favicon.svg")
+            return FileResponse(DIST_DIR / "favicon.svg", headers={"Cache-Control": "public, max-age=86400"})
 
         @app.get("/icons.svg")
         async def icons():
-            return FileResponse(DIST_DIR / "icons.svg")
+            return FileResponse(DIST_DIR / "icons.svg", headers={"Cache-Control": "public, max-age=86400"})
 
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str):
             index = DIST_DIR / "index.html"
             if index.exists():
-                return FileResponse(index)
+                return Response(index.read_bytes(), media_type="text/html; charset=utf-8")
             return {"error": "dist 目录不存在，请先执行 npm run build"}
 
     else:

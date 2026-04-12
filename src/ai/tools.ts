@@ -26,13 +26,37 @@ const rangeProperties = {
 const commonTools = [
   {
     name: 'get_document_info',
-    description: '获取文档信息（字数、段落数、页数）',
+    description: '获取文档统计信息、分页信息和常见样式概览，适合先快速了解整篇文档结构',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_document_outline',
+    description: '获取文档概览，返回每页涉及的段落范围、页面文字预览、常见样式签名。长文档时优先用它做导航，不要一开始就读取全文。',
     parameters: { type: 'object', properties: {} },
   },
   {
     name: 'get_document_content',
-    description: '读取文档完整内容，返回每个段落的文字内容、段落样式，以及 textRuns 形式的分段文字样式',
-    parameters: { type: 'object', properties: {} },
+    description: '读取文档内容，可按段落范围分块返回；默认返回段落内容、段落样式和 textRuns。',
+    parameters: {
+      type: 'object',
+      properties: {
+        fromParagraph: { type: 'integer', description: '起始段落索引（包含），不传则从 0 开始' },
+        toParagraph: { type: 'integer', description: '结束段落索引（包含），不传则到最后一段' },
+        includeTextRuns: { type: 'boolean', description: '是否返回 textRuns，默认 true' },
+      },
+    },
+  },
+  {
+    name: 'get_page_content',
+    description: '读取指定页面的排版快照，返回该页涉及的段落、块级元素和逐行预览。长文档或需要按页判断版式时优先使用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        page: { type: 'integer', description: '页码，从 1 开始' },
+        includeTextRuns: { type: 'boolean', description: '是否返回该页相关段落的 textRuns，默认 false' },
+      },
+      required: ['page'],
+    },
   },
   {
     name: 'get_paragraph',
@@ -48,6 +72,7 @@ const commonTools = [
 ]
 
 export const layoutTools = [
+  ...commonTools,
   {
     name: 'set_page_config',
     description: '设置页面配置（纸张大小、页边距、方向）',
@@ -70,7 +95,7 @@ export const layoutTools = [
       type: 'object',
       properties: {
         range: { type: 'object', description: '操作范围', properties: rangeProperties },
-        fontFamily: { type: 'string', enum: [...SUPPORTED_AI_FONT_NAMES], description: '字体名，仅支持 宋体/黑体/楷体/仿宋' },
+        fontFamily: { type: 'string', enum: [...SUPPORTED_AI_FONT_NAMES], description: '字体名，支持宋体/黑体/楷体/仿宋/Arial/Times New Roman' },
         fontSize: { type: 'number', description: '字号（磅），如 12/16/22' },
         color: { type: 'string', description: '文字颜色 hex，如 #FF0000' },
         backgroundColor: { type: 'string', description: '文字背景色 hex' },
@@ -99,6 +124,20 @@ export const layoutTools = [
         spaceBefore: { type: 'number', description: '段前间距（磅）' },
         spaceAfter: { type: 'number', description: '段后间距（磅）' },
         listType: { type: 'string', enum: ['none', 'bullet', 'ordered'], description: '列表类型' },
+        pageBreakBefore: { type: 'boolean', description: '是否在该段前分页，对应工具栏里的分页符开关' },
+      },
+      required: ['range'],
+    },
+  },
+  {
+    name: 'clear_formatting',
+    description: '清除指定范围内的排版格式，对应工具栏“清除格式”。默认同时清除文字样式和段落格式。',
+    parameters: {
+      type: 'object',
+      properties: {
+        range: { type: 'object', description: '操作范围', properties: rangeProperties },
+        clearTextStyles: { type: 'boolean', description: '是否清除字体、字号、颜色、粗斜体等文字样式，默认 true' },
+        clearParagraphStyles: { type: 'boolean', description: '是否清除对齐、缩进、行距、段前段后、列表、分页等段落格式，默认 true' },
       },
       required: ['range'],
     },
@@ -137,27 +176,6 @@ export const layoutTools = [
         headerRow: { type: 'boolean', description: '是否有表头行' },
       },
       required: ['afterParagraph', 'rows', 'cols'],
-    },
-  },
-  {
-    name: 'get_document_info',
-    description: '获取文档信息（字数、段落数、页数）',
-    parameters: { type: 'object', properties: {} },
-  },
-  {
-    name: 'get_document_content',
-    description: '读取文档完整内容，返回每个段落的文字内容、段落样式，以及 textRuns 形式的分段文字样式',
-    parameters: { type: 'object', properties: {} },
-  },
-  {
-    name: 'get_paragraph',
-    description: '读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式',
-    parameters: {
-      type: 'object',
-      properties: {
-        index: { type: 'integer', description: '段落索引（从 0 开始）' },
-      },
-      required: ['index'],
     },
   },
 ]
@@ -252,3 +270,7 @@ export const editTools = [
   },
   ...commonTools,
 ]
+
+export const agentTools = [...layoutTools, ...editTools].filter(
+  (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
+)
