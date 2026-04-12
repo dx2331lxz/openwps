@@ -5,6 +5,7 @@ import { schema } from '../editor/schema'
 import { paginate, type PageConfig } from '../layout/paginator'
 import { mapFontFamily } from './presets'
 import { fontNameFromFamily } from '../fonts'
+import { markdownToFragment } from '../markdown/importer'
 
 const PAPER_SIZES: Record<string, { pageWidth: number; pageHeight: number }> = {
   A4: { pageWidth: 794, pageHeight: 1123 },
@@ -45,7 +46,9 @@ export interface StreamingWriteSession {
   from: number
   to: number
   text: string
+  format: 'markdown'
   paragraphAttrs?: Record<string, unknown>
+  rollbackFragment: Fragment
 }
 
 interface BeginStreamingWriteResult extends ExecuteResult {
@@ -56,6 +59,7 @@ type RangeType =
   | 'all'
   | 'paragraph'
   | 'paragraphs'
+  | 'paragraph_indexes'
   | 'selection'
   | 'contains_text'
   | 'first_paragraph'
@@ -68,6 +72,7 @@ interface RangeSpec {
   paragraphIndex?: number
   from?: number
   to?: number
+  paragraphIndexes?: number[]
   text?: string
   selectionFrom?: number
   selectionTo?: number
@@ -84,6 +89,7 @@ interface BlockRef {
   pos: number
   blockIndex: number
   paragraphIndex: number | null
+  afterParagraphIndex: number | null
 }
 
 const DEFAULT_PARAGRAPH_ATTRS = {
@@ -105,6 +111,10 @@ function describeRange(range?: RangeSpec) {
       return typeof range.paragraphIndex === 'number' ? `第 ${range.paragraphIndex + 1} 段` : '单段范围'
     case 'paragraphs':
       return `第 ${(range.from ?? 0) + 1} 到第 ${(range.to ?? range.from ?? 0) + 1} 段`
+    case 'paragraph_indexes':
+      return Array.isArray(range.paragraphIndexes) && range.paragraphIndexes.length > 0
+        ? `第 ${range.paragraphIndexes.map(index => index + 1).join('、')} 段`
+        : '多段范围'
     case 'selection':
       return '当前选区'
     case 'contains_text':
@@ -124,6 +134,15 @@ function describeRange(range?: RangeSpec) {
   }
 }
 
+function formatToolParamsForError(params: Record<string, unknown>) {
+  try {
+    const serialized = JSON.stringify(params)
+    return serialized.length > 240 ? `${serialized.slice(0, 240)}...` : serialized
+  } catch {
+    return '[unserializable params]'
+  }
+}
+
 function getParagraphs(state: EditorState): ParagraphRef[] {
   const paragraphs: ParagraphRef[] = []
   let paraIndex = 0
@@ -136,6 +155,14 @@ function getParagraphs(state: EditorState): ParagraphRef[] {
   return paragraphs
 }
 
+function normalizeParagraphIndexes(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  const indexes = value
+    .map(item => Number(item))
+    .filter(index => Number.isInteger(index) && index >= 0)
+  return [...new Set(indexes)].sort((a, b) => a - b)
+}
+
 function getParagraphAtIndex(state: EditorState, index: number): ParagraphRef | undefined {
   return getParagraphs(state).find(paragraph => paragraph.index === index)
 }
@@ -144,14 +171,17 @@ function getBlocks(state: EditorState): BlockRef[] {
   const blocks: BlockRef[] = []
   let blockIndex = 0
   let paragraphIndex = 0
+  let lastParagraphIndex: number | null = null
 
   state.doc.forEach((node, pos) => {
     const currentParagraphIndex = node.type.name === 'paragraph' ? paragraphIndex++ : null
+    if (currentParagraphIndex != null) lastParagraphIndex = currentParagraphIndex
     blocks.push({
       node,
       pos,
       blockIndex: blockIndex++,
       paragraphIndex: currentParagraphIndex,
+      afterParagraphIndex: currentParagraphIndex ?? lastParagraphIndex,
     })
   })
 
@@ -181,6 +211,9 @@ function resolveRange(
         if (paragraph.index >= (range.from ?? 0) && paragraph.index <= (range.to ?? Number.POSITIVE_INFINITY)) {
           results.push(paragraph)
         }
+        break
+      case 'paragraph_indexes':
+        if (normalizeParagraphIndexes(range.paragraphIndexes).includes(paragraph.index)) results.push(paragraph)
         break
       case 'first_paragraph':
         if (paragraph.index === 0) results.push(paragraph)
@@ -532,25 +565,25 @@ function hasMixedTextStyles(textRuns: ReturnType<typeof buildParagraphTextRuns>)
   return textRuns.some(run => JSON.stringify(run.style) !== first)
 }
 
-function buildParagraphSnapshot(paragraph: ParagraphRef, includeTextRuns = true) {
-  const textStyle = getRepresentativeTextStyle(paragraph.node)
+function buildParagraphNodeSnapshot(node: PMNode, index: number | null, includeTextRuns = true) {
+  const textStyle = getRepresentativeTextStyle(node)
   const paragraphStyle = {
-    align: String(paragraph.node.attrs.align ?? 'left'),
-    firstLineIndent: Number(paragraph.node.attrs.firstLineIndent ?? 0),
-    indent: Number(paragraph.node.attrs.indent ?? 0),
-    lineHeight: Number(paragraph.node.attrs.lineHeight ?? 1.5),
-    spaceBefore: Number(paragraph.node.attrs.spaceBefore ?? 0),
-    spaceAfter: Number(paragraph.node.attrs.spaceAfter ?? 0),
-    listType: paragraph.node.attrs.listType ?? 'none',
-    pageBreakBefore: Boolean(paragraph.node.attrs.pageBreakBefore ?? false),
+    align: String(node.attrs.align ?? 'left'),
+    firstLineIndent: Number(node.attrs.firstLineIndent ?? 0),
+    indent: Number(node.attrs.indent ?? 0),
+    lineHeight: Number(node.attrs.lineHeight ?? 1.5),
+    spaceBefore: Number(node.attrs.spaceBefore ?? 0),
+    spaceAfter: Number(node.attrs.spaceAfter ?? 0),
+    listType: node.attrs.listType ?? 'none',
+    pageBreakBefore: Boolean(node.attrs.pageBreakBefore ?? false),
   }
   const representativeTextStyle = normalizeTextStyle(textStyle)
-  const textRuns = includeTextRuns ? buildParagraphTextRuns(paragraph.node) : []
+  const textRuns = includeTextRuns ? buildParagraphTextRuns(node) : []
 
   return {
-    index: paragraph.index,
-    text: paragraph.node.textContent,
-    charCount: paragraph.node.textContent.length,
+    index,
+    text: node.textContent,
+    charCount: node.textContent.length,
     style: {
       ...representativeTextStyle,
       ...paragraphStyle,
@@ -559,6 +592,78 @@ function buildParagraphSnapshot(paragraph: ParagraphRef, includeTextRuns = true)
     representativeTextStyle,
     hasMixedTextStyles: includeTextRuns ? hasMixedTextStyles(textRuns) : false,
     textRuns: includeTextRuns ? textRuns : undefined,
+  }
+}
+
+function buildParagraphSnapshot(paragraph: ParagraphRef, includeTextRuns = true) {
+  return buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns)
+}
+
+function buildTableSnapshot(tableNode: PMNode, includeTextRuns = true) {
+  const rows = tableNode.content.content.map((rowNode, rowIndex) => {
+    const cells = rowNode.content.content.map((cellNode) => {
+      const paragraphs = cellNode.content.content
+        .filter(child => child.type.name === 'paragraph')
+        .map(child => buildParagraphNodeSnapshot(child, null, includeTextRuns))
+      const text = paragraphs.map(paragraph => paragraph.text).join('\n')
+      return {
+        header: Boolean(cellNode.attrs.header ?? false),
+        colspan: Number(cellNode.attrs.colspan ?? 1),
+        rowspan: Number(cellNode.attrs.rowspan ?? 1),
+        width: cellNode.attrs.width ?? null,
+        text,
+        paragraphs,
+      }
+    })
+    return { rowIndex, cells }
+  })
+
+  return {
+    rowCount: rows.length,
+    colCount: rows.reduce((max, row) => Math.max(max, row.cells.length), 0),
+    headerRow: rows[0]?.cells.some(cell => cell.header) ?? false,
+    text: rows
+      .flatMap(row => row.cells.map(cell => cell.text))
+      .filter(Boolean)
+      .join(' | '),
+    rows,
+  }
+}
+
+function buildBlockSnapshot(block: BlockRef, includeTextRuns = true) {
+  switch (block.node.type.name) {
+    case 'paragraph':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'paragraph',
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        ...buildParagraphNodeSnapshot(block.node, block.paragraphIndex, includeTextRuns),
+      }
+    case 'table':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'table',
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        ...buildTableSnapshot(block.node, includeTextRuns),
+      }
+    case 'horizontal_rule':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'horizontal_rule',
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        text: '',
+      }
+    default:
+      return {
+        blockIndex: block.blockIndex,
+        type: block.node.type.name,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        text: block.node.textContent,
+      }
   }
 }
 
@@ -583,7 +688,7 @@ function buildCommonStyleSummary(paragraphs: ReturnType<typeof buildParagraphSna
     const key = buildStyleSignature(paragraph)
     const current = counter.get(key) ?? { count: 0, sampleParagraphs: [] }
     current.count += 1
-    if (current.sampleParagraphs.length < 3) current.sampleParagraphs.push(paragraph.index)
+    if (current.sampleParagraphs.length < 3 && typeof paragraph.index === 'number') current.sampleParagraphs.push(paragraph.index)
     counter.set(key, current)
   }
 
@@ -614,7 +719,7 @@ function buildPaginationSummary(state: EditorState, pageConfig?: PageConfig) {
 function getDocumentInfo(state: EditorState, options?: ExecuteOptions): ExecuteResult {
   const paragraphs = getParagraphs(state)
   const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
-  const wordCount = paragraphs.reduce((sum, paragraph) => sum + paragraph.node.textContent.length, 0)
+  const wordCount = state.doc.textContent.length
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
   const blockCounts = blocks.reduce<Record<string, number>>((counts, block) => {
@@ -696,6 +801,10 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
   const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
+  const blocksInRange = blocks.filter(block => (
+    (block.paragraphIndex != null && block.paragraphIndex >= firstParagraphIndex && block.paragraphIndex <= lastParagraphIndex)
+    || (block.afterParagraphIndex != null && block.afterParagraphIndex >= firstParagraphIndex && block.afterParagraphIndex <= lastParagraphIndex)
+  ))
   const pageRanges = pagination.renderedPages.map((page, pageIndex) => {
     const pageParagraphIndexes = [...new Set(
       page.lines
@@ -720,6 +829,7 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
       paragraphCount: paragraphs.length,
       totalChars,
       paragraphs,
+      blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns)),
       pageRanges,
     },
   }
@@ -760,12 +870,7 @@ function getPageContent(state: EditorState, pageNumber: number, includeTextRuns:
         ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
         : null,
       previewText: buildPageTextPreview(page.lines),
-      blocks: pageBlocks.map(block => ({
-        blockIndex: block.blockIndex,
-        type: block.node.type.name,
-        paragraphIndex: block.paragraphIndex,
-        text: block.node.type.name === 'paragraph' ? block.node.textContent : '',
-      })),
+      blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns)),
       lines: page.lines.map(line => ({
         blockIndex: line.blockIndex,
         lineIndex: line.lineIndex,
@@ -774,6 +879,64 @@ function getPageContent(state: EditorState, pageNumber: number, includeTextRuns:
         startPos: line.startPos,
       })),
       paragraphs: pageParagraphs,
+    },
+  }
+}
+
+function getPageStyleSummary(state: EditorState, pageNumber: number, options?: ExecuteOptions): ExecuteResult {
+  if (!Number.isInteger(pageNumber) || pageNumber < 1) {
+    return { success: false, message: 'page 必须是从 1 开始的整数' }
+  }
+
+  const blocks = getBlocks(state)
+  const paragraphs = getParagraphs(state)
+  const pagination = buildPaginationSummary(state, options?.pageConfig)
+  const page = pagination.renderedPages[pageNumber - 1]
+
+  if (!page) {
+    return { success: false, message: `未找到第 ${pageNumber} 页` }
+  }
+
+  const blockIndexes = [...new Set(page.lines.map(line => line.blockIndex))]
+  const pageBlocks = blockIndexes
+    .map(index => blocks[index])
+    .filter((block): block is BlockRef => Boolean(block))
+  const paragraphIndexes = [...new Set(pageBlocks.flatMap(block => (block.paragraphIndex == null ? [] : [block.paragraphIndex])))]
+  const pageParagraphs = paragraphIndexes
+    .map(index => paragraphs[index])
+    .filter((paragraph): paragraph is ParagraphRef => Boolean(paragraph))
+    .map(paragraph => buildParagraphSnapshot(paragraph, true))
+
+  const paragraphStyles = pageParagraphs.map(paragraph => ({
+    index: paragraph.index,
+    textPreview: paragraph.text.length > 60 ? `${paragraph.text.slice(0, 60)}...` : paragraph.text,
+    styleSignature: buildStyleSignature(paragraph),
+    paragraphStyle: paragraph.paragraphStyle,
+    representativeTextStyle: paragraph.representativeTextStyle,
+    hasMixedTextStyles: paragraph.hasMixedTextStyles,
+    likelyHeading:
+      paragraph.text.length > 0
+      && paragraph.text.length <= 40
+      && (
+        paragraph.representativeTextStyle.bold
+        || paragraph.representativeTextStyle.fontSize >= 14
+        || paragraph.paragraphStyle.align === 'center'
+      ),
+  }))
+
+  return {
+    success: true,
+    message: `已读取第 ${pageNumber} 页样式摘要`,
+    data: {
+      page: pageNumber,
+      pageCount: pagination.renderedPages.length,
+      paragraphIndexes,
+      paragraphRange: paragraphIndexes.length > 0
+        ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
+        : null,
+      previewText: buildPageTextPreview(page.lines),
+      commonStyles: buildCommonStyleSummary(pageParagraphs),
+      paragraphs: paragraphStyles,
     },
   }
 }
@@ -854,7 +1017,9 @@ export function beginStreamingWrite(
         from: targetParagraph.pos,
         to: targetParagraph.pos + targetParagraph.node.nodeSize,
         text: '',
+        format: 'markdown',
         paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
+        rollbackFragment: Fragment.empty,
       },
     }
   }
@@ -887,7 +1052,9 @@ export function beginStreamingWrite(
         from: targetParagraph.pos,
         to: targetParagraph.pos + targetParagraph.node.nodeSize,
         text: '',
+        format: 'markdown',
         paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
+        rollbackFragment: Fragment.from(paragraph.node),
       },
     }
   }
@@ -899,20 +1066,33 @@ export function appendStreamingWrite(
   view: EditorView,
   session: StreamingWriteSession,
   chunk: string,
+  options?: { final?: boolean },
 ): ExecuteResult {
   if (!chunk) return { success: true, message: '本次未追加正文内容' }
 
   const nextText = session.text + chunk
-  const nodes = buildParagraphNodesFromText(nextText, session.paragraphAttrs)
-  const fragment = Fragment.fromArray(nodes)
+  const fragment = markdownToFragment(nextText, { baseParagraphAttrs: session.paragraphAttrs })
 
-  view.dispatch(view.state.tr.replaceWith(session.from, session.to, fragment))
-  view.focus()
+  const tr = view.state.tr.replaceWith(session.from, session.to, fragment)
+  if (!options?.final) tr.setMeta('addToHistory', false)
+  view.dispatch(tr)
 
   session.text = nextText
   session.to = session.from + fragment.size
 
   return { success: true, message: '正文流式写入中' }
+}
+
+export function abortStreamingWrite(
+  view: EditorView,
+  session: StreamingWriteSession,
+): ExecuteResult {
+  if (session.text.trim()) {
+    return { success: true, message: '流式写入已有正文，无需回滚' }
+  }
+
+  view.dispatch(view.state.tr.replaceWith(session.from, session.to, session.rollbackFragment).setMeta('addToHistory', false))
+  return { success: true, message: '已回滚空的流式写入占位内容' }
 }
 
 export function executeTool(
@@ -928,7 +1108,7 @@ export function executeTool(
     switch (toolName) {
       case 'set_text_style': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: 'set_text_style 缺少 range 参数' }
+        if (!range) return { success: false, message: `set_text_style 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
         if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法按 selection 修改文字样式' }
         }
@@ -951,7 +1131,7 @@ export function executeTool(
 
       case 'set_paragraph_style': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: 'set_paragraph_style 缺少 range 参数' }
+        if (!range) return { success: false, message: `set_paragraph_style 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
         if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法按 selection 修改段落格式' }
         }
@@ -972,7 +1152,7 @@ export function executeTool(
 
       case 'clear_formatting': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: 'clear_formatting 缺少 range 参数' }
+        if (!range) return { success: false, message: `clear_formatting 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
         if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法清除 selection 范围的格式' }
         }
@@ -1026,9 +1206,18 @@ export function executeTool(
       }
 
       case 'insert_table': {
-        const rows = Math.min(20, Math.max(1, Number(params.rows) || 1))
-        const cols = Math.min(10, Math.max(1, Number(params.cols) || 1))
-        const headerRow = Boolean(params.headerRow)
+        const tableData = Array.isArray(params.data)
+          ? params.data.map(row => (
+              Array.isArray(row)
+                ? row.map(cell => normalizeToolText(String(cell ?? '')))
+                : []
+            ))
+          : []
+        const dataRows = tableData.length
+        const dataCols = tableData.reduce((max, row) => Math.max(max, row.length), 0)
+        const rows = Math.min(20, Math.max(1, dataRows || Number(params.rows) || 1))
+        const cols = Math.min(10, Math.max(1, dataCols || Number(params.cols) || 1))
+        const headerRow = Boolean(params.headerRow ?? (dataRows > 0))
         const afterParagraph = Number(params.afterParagraph)
 
         const tableNode = schema.nodes.table.create(
@@ -1036,10 +1225,10 @@ export function executeTool(
           Array.from({ length: rows }, (_, rowIndex) =>
             schema.nodes.table_row.create(
               null,
-              Array.from({ length: cols }, () =>
+              Array.from({ length: cols }, (_, colIndex) =>
                 schema.nodes.table_cell.create(
                   { header: headerRow && rowIndex === 0 },
-                  schema.nodes.paragraph.create()
+                  buildParagraphNodesFromText(tableData[rowIndex]?.[colIndex] ?? '')
                 )
               )
             )
@@ -1050,7 +1239,7 @@ export function executeTool(
         if (!inserted.success || !inserted.tr) return inserted
         dispatch(inserted.tr)
         view.focus()
-        return { success: true, message: `已插入 ${rows} 行 ${cols} 列表格` }
+        return { success: true, message: `已插入 ${rows} 行 ${cols} 列表格${dataRows > 0 ? '，并填充内容' : ''}` }
       }
 
       case 'insert_text': {
@@ -1140,19 +1329,32 @@ export function executeTool(
       }
 
       case 'delete_paragraph': {
-        const index = Number(params.index)
-        const paragraph = getParagraphAtIndex(state, index)
-        if (!paragraph) return { success: false, message: `未找到第 ${index + 1} 段` }
+        const indices = normalizeParagraphIndexes(params.indices)
+        const targetIndexes = indices.length > 0
+          ? [...indices].sort((a, b) => b - a)
+          : (Number.isInteger(params.index) ? [Number(params.index)] : [])
+        if (targetIndexes.length === 0) return { success: false, message: 'delete_paragraph 需要 index 或 indices 参数' }
 
-        if (state.doc.childCount === 1) {
-          tr.replaceWith(paragraph.pos, paragraph.pos + paragraph.node.nodeSize, schema.nodes.paragraph.create())
-        } else {
-          tr.delete(paragraph.pos, paragraph.pos + paragraph.node.nodeSize)
+        const paragraphs = getParagraphs(state)
+        for (const index of targetIndexes) {
+          const paragraph = paragraphs.find(item => item.index === index)
+          if (!paragraph) return { success: false, message: `未找到第 ${index + 1} 段` }
+
+          if (state.doc.childCount === 1 && targetIndexes.length === 1) {
+            tr.replaceWith(paragraph.pos, paragraph.pos + paragraph.node.nodeSize, schema.nodes.paragraph.create())
+          } else {
+            tr.delete(paragraph.pos, paragraph.pos + paragraph.node.nodeSize)
+          }
         }
 
         dispatch(tr)
         view.focus()
-        return { success: true, message: `已删除第 ${index + 1} 段` }
+        return {
+          success: true,
+          message: targetIndexes.length === 1
+            ? `已删除第 ${targetIndexes[0]! + 1} 段`
+            : `已批量删除 ${targetIndexes.length} 个段落`,
+        }
       }
 
       case 'get_document_info':
@@ -1166,6 +1368,9 @@ export function executeTool(
 
       case 'get_page_content':
         return getPageContent(state, Number(params.page), params.includeTextRuns === true, options)
+
+      case 'get_page_style_summary':
+        return getPageStyleSummary(state, Number(params.page), options)
 
       case 'get_paragraph':
         return getParagraph(state, Number(params.index))

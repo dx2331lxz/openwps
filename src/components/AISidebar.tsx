@@ -7,6 +7,7 @@ import { marked } from 'marked'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
 import {
+  abortStreamingWrite,
   appendStreamingWrite,
   beginStreamingWrite,
   executeTool,
@@ -44,6 +45,7 @@ interface ToolCallResult {
   id?: string
   name: string
   params: Record<string, unknown>
+  originalParams?: Record<string, unknown>
   status: 'pending' | 'ok' | 'err'
   message?: string
   data?: unknown
@@ -76,12 +78,6 @@ interface Message {
   prepared?: PreparedTextWithSegments
   tightWidth: number
   selectionTag?: { text: string; paragraphIndex: number } | null
-}
-
-interface AskContinueState {
-  visible: boolean
-  rounds: number
-  message: string
 }
 
 interface TodoItem {
@@ -268,6 +264,8 @@ const TEXTAREA_MAX_HEIGHT = 200
 const MAX_TOOL_ROUNDS = 50
 const MAX_SAME_TOOL_FAILURES = 2
 const MAX_SAME_TOOL_STREAK = 4
+const STREAMING_WRITE_FLUSH_MS = 80
+const STREAMING_WRITE_MAX_BUFFER = 1200
 const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, tool.description]))
 
 let msgIdCounter = 0
@@ -359,10 +357,12 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   const target = describeToolTarget(toolCall.params)
   const description = TOOL_DESCRIPTIONS[toolCall.name]
 
+  if (toolCall.name === 'get_todo_list') return '读取当前任务计划状态'
   if (toolCall.name === 'get_document_info') return '读取当前文档的统计信息'
   if (toolCall.name === 'get_document_outline') return '读取整篇文档的分页概览和样式概览'
   if (toolCall.name === 'get_document_content') return target ? `读取${target}的内容和样式` : '读取全文内容和样式，辅助后续判断'
   if (toolCall.name === 'get_page_content') return target ? `查看${target}的分页快照` : '查看指定页面的排版快照'
+  if (toolCall.name === 'get_page_style_summary') return target ? `查看${target}的样式摘要` : '查看指定页面的样式摘要'
   if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
   if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
@@ -412,6 +412,18 @@ function formatFileSize(size: number) {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function downloadJsonFile(filename: string, payload: unknown) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
 }
 
 function extractSelectionContext(context: Record<string, unknown>) {
@@ -496,6 +508,14 @@ function normalizeToolParams(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? Object.fromEntries(Object.entries(value))
     : {}
+}
+
+function hasToolParams(params: Record<string, unknown> | undefined) {
+  return Boolean(params && Object.keys(params).length > 0)
+}
+
+function getReplayToolParams(tool: Pick<ToolCallResult, 'params' | 'originalParams'>) {
+  return hasToolParams(tool.originalParams) ? normalizeToolParams(tool.originalParams) : normalizeToolParams(tool.params)
 }
 
 function makeUserMessage(text: string, sidebarWidth: number): Message {
@@ -608,6 +628,7 @@ interface ToolCallRecord {
   id: string
   name: string
   params: Record<string, unknown>
+  originalParams?: Record<string, unknown>
   result: ExecuteResult
 }
 
@@ -626,7 +647,7 @@ function normalizeReactToolCalls(
       type: 'function',
       function: {
         name: tool.name,
-        arguments: JSON.stringify(tool.params),
+        arguments: JSON.stringify(getReplayToolParams(tool)),
       },
     }))
   }
@@ -647,12 +668,23 @@ function normalizeReactToolCalls(
     .filter((call): call is { id: string; type: 'function'; function: { name: string; arguments: string } } => Boolean(call))
 }
 
-function serializeToolResult(result: ExecuteResult) {
-  return JSON.stringify({
-    success: result.success,
-    message: result.message,
-    data: result.data ?? null,
-  })
+function serializeToolResult(tool: ToolCallRecord) {
+  const payload: Record<string, unknown> = {
+    success: tool.result.success,
+    message: tool.result.message,
+    data: tool.result.data ?? null,
+    toolName: tool.name,
+    originalParams: hasToolParams(tool.originalParams) ? tool.originalParams : null,
+    executedParams: tool.params,
+    paramsRepaired: stableStringify(getReplayToolParams(tool)) !== stableStringify(tool.params),
+  }
+
+  if (tool.name === 'begin_streaming_write' && tool.result.success) {
+    payload.nextAction = 'immediately_stream_markdown_content'
+    payload.instruction = '现在必须立刻输出要写入文档的 Markdown 正文内容，不要结束，不要解释，不要再次调用 begin_streaming_write。'
+  }
+
+  return JSON.stringify(payload)
 }
 
 function stableStringify(value: unknown): string {
@@ -670,9 +702,195 @@ function getToolCallSignature(name: string, params: Record<string, unknown>) {
   return `${name}:${stableStringify(params)}`
 }
 
+function normalizeParagraphIndexList(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(
+    value
+      .map(item => Number(item))
+      .filter(index => Number.isInteger(index) && index >= 0)
+  )].sort((a, b) => a - b)
+}
+
+function extractParagraphIndexesForMerge(rangeValue: unknown): number[] | null {
+  if (!rangeValue || typeof rangeValue !== 'object' || Array.isArray(rangeValue)) return null
+  const range = rangeValue as Record<string, unknown>
+  switch (String(range.type ?? '')) {
+    case 'paragraph':
+      return Number.isInteger(range.paragraphIndex) ? [Number(range.paragraphIndex)] : null
+    case 'paragraphs': {
+      const from = Number(range.from)
+      const to = Number(range.to)
+      if (!Number.isInteger(from) || !Number.isInteger(to) || to < from) return null
+      return Array.from({ length: to - from + 1 }, (_, index) => from + index)
+    }
+    case 'paragraph_indexes':
+      return normalizeParagraphIndexList(range.paragraphIndexes)
+    default:
+      return null
+  }
+}
+
+function buildRangeFromParagraphIndexes(indexes: number[]) {
+  const normalized = [...new Set(indexes.filter(index => Number.isInteger(index) && index >= 0))].sort((a, b) => a - b)
+  if (normalized.length === 0) return null
+  if (normalized.length === 1) return { type: 'paragraph' as const, paragraphIndex: normalized[0] }
+  const contiguous = normalized.every((index, position) => position === 0 || index === normalized[position - 1]! + 1)
+  if (contiguous) return { type: 'paragraphs' as const, from: normalized[0], to: normalized[normalized.length - 1] }
+  return { type: 'paragraph_indexes' as const, paragraphIndexes: normalized }
+}
+
+function getMergeableToolAttrs(params: Record<string, unknown>) {
+  const { range: _range, ...attrs } = params
+  return normalizeToolParams(attrs)
+}
+
+function extractDeleteParagraphIndexes(params: Record<string, unknown>) {
+  const indices = normalizeParagraphIndexList(params.indices)
+  if (indices.length > 0) return indices
+  return Number.isInteger(params.index) ? [Number(params.index)] : null
+}
+
+interface OptimizedToolCallGroup {
+  leader: ToolCallResult
+  members: ToolCallResult[]
+  params: Record<string, unknown>
+}
+
+function optimizeToolCallGroups(toolCalls: ToolCallResult[]): OptimizedToolCallGroup[] {
+  const groups: OptimizedToolCallGroup[] = []
+  const mergeableStyleTools = new Set(['set_text_style', 'set_paragraph_style', 'clear_formatting'])
+
+  for (let index = 0; index < toolCalls.length;) {
+    const current = toolCalls[index]!
+
+    if (mergeableStyleTools.has(current.name)) {
+      const currentIndexes = extractParagraphIndexesForMerge(current.params.range)
+      const currentAttrs = getMergeableToolAttrs(current.params)
+      if (currentIndexes && currentIndexes.length > 0) {
+        const members = [current]
+        const mergedIndexes = [...currentIndexes]
+        let nextIndex = index + 1
+
+        while (nextIndex < toolCalls.length) {
+          const next = toolCalls[nextIndex]!
+          const nextIndexes = extractParagraphIndexesForMerge(next.params.range)
+          if (
+            next.name !== current.name
+            || !nextIndexes
+            || nextIndexes.length === 0
+            || stableStringify(getMergeableToolAttrs(next.params)) !== stableStringify(currentAttrs)
+          ) {
+            break
+          }
+          members.push(next)
+          mergedIndexes.push(...nextIndexes)
+          nextIndex += 1
+        }
+
+        const mergedRange = buildRangeFromParagraphIndexes(mergedIndexes)
+        groups.push({
+          leader: current,
+          members,
+          params: mergedRange ? { ...currentAttrs, range: mergedRange } : current.params,
+        })
+        index = nextIndex
+        continue
+      }
+    }
+
+    if (current.name === 'delete_paragraph') {
+      const currentIndexes = extractDeleteParagraphIndexes(current.params)
+      if (currentIndexes && currentIndexes.length > 0) {
+        const members = [current]
+        const mergedIndexes = [...currentIndexes]
+        let nextIndex = index + 1
+
+        while (nextIndex < toolCalls.length) {
+          const next = toolCalls[nextIndex]!
+          const nextIndexes = extractDeleteParagraphIndexes(next.params)
+          if (next.name !== 'delete_paragraph' || !nextIndexes || nextIndexes.length === 0) break
+          members.push(next)
+          mergedIndexes.push(...nextIndexes)
+          nextIndex += 1
+        }
+
+        const normalized = [...new Set(mergedIndexes)].sort((a, b) => b - a)
+        groups.push({
+          leader: current,
+          members,
+          params: normalized.length === 1 ? { index: normalized[0] } : { indices: normalized },
+        })
+        index = nextIndex
+        continue
+      }
+    }
+
+    groups.push({
+      leader: current,
+      members: [current],
+      params: current.params,
+    })
+    index += 1
+  }
+
+  return groups
+}
+
 function summarizeLoopStop(tool: ToolCallRecord) {
   const errorMessage = tool.result.message || '工具执行失败'
   return `检测到工具重复失败，已停止自动重试：\`${tool.name}\`，原因是“${errorMessage}”。请调整系统提示词或改为先读取文档再提供完整参数后重试。`
+}
+
+function repairToolArgsJson(raw: string): string | null {
+  const text = raw.trim()
+  if (!text) return null
+
+  const stack: string[] = []
+  let inString = false
+  let escaped = false
+
+  for (const char of text) {
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+
+    if (char === '"') inString = true
+    else if (char === '{') stack.push('}')
+    else if (char === '[') stack.push(']')
+    else if (char === '}' || char === ']') {
+      if (stack.at(-1) !== char) return null
+      stack.pop()
+    }
+  }
+
+  let repaired = text
+  if (inString) repaired += '"'
+  if (escaped) repaired += '"'
+  if (stack.length > 0) repaired += stack.slice().reverse().join('')
+  repaired = repaired.replace(/,\s*}/g, '}').replace(/,\s*]/g, ']')
+  return repaired === text ? null : repaired
+}
+
+function parseToolArguments(rawArguments: unknown): Record<string, unknown> {
+  if (rawArguments && typeof rawArguments === 'object' && !Array.isArray(rawArguments)) {
+    return normalizeToolParams(rawArguments)
+  }
+  if (typeof rawArguments !== 'string') return {}
+
+  try {
+    return normalizeToolParams(JSON.parse(rawArguments))
+  } catch {
+    const repaired = repairToolArgsJson(rawArguments)
+    if (!repaired) return {}
+    try {
+      return normalizeToolParams(JSON.parse(repaired))
+    } catch {
+      return {}
+    }
+  }
 }
 
 function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
@@ -681,6 +899,7 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
       id: toolCall.id,
       name: toolCall.name,
       params: normalizeToolParams(toolCall.params),
+      originalParams: normalizeToolParams(toolCall.originalParams),
       status: toolCall.status,
       message: toolCall.message,
       data: toolCall.data,
@@ -690,19 +909,12 @@ function normalizeStoredToolCalls(message: StoredMessage): ToolCallResult[] {
 
   if (Array.isArray(message.tool_calls)) {
     return message.tool_calls.map(call => {
-      let params: Record<string, unknown> = {}
-      const rawArguments = call.function?.arguments
-      if (typeof rawArguments === 'string') {
-        try {
-          params = normalizeToolParams(JSON.parse(rawArguments))
-        } catch {
-          params = {}
-        }
-      }
+      const params = parseToolArguments(call.function?.arguments)
       return {
         id: call.id,
         name: String(call.function?.name ?? ''),
         params,
+        originalParams: params,
         status: 'pending' as const,
         isExpanded: false,
       }
@@ -788,7 +1000,7 @@ function buildReactMessages(messages: StoredMessage[], userText: string): ReactM
         return {
           role: 'assistant' as const,
           content: typeof message.content === 'string' ? message.content : null,
-          tool_calls: normalizeReactToolCalls(message.tool_calls ?? message.toolCalls),
+          tool_calls: normalizeReactToolCalls(message.toolCalls ?? message.tool_calls),
         }
       }
 
@@ -822,7 +1034,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [assistantMode, setAssistantMode] = useState<AssistantMode>('agent')
-  const [askContinue, setAskContinue] = useState<AskContinueState>({ visible: false, rounds: 0, message: '' })
   const [todos, setTodos] = useState<TodoItem[]>([])
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
@@ -844,10 +1055,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const currentConversationIdRef = useRef<string | null>(null)
   const conversationMessagesRef = useRef<StoredMessage[]>([])
   const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
+  const todosRef = useRef<TodoItem[]>([])
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
   }, [currentConversationId])
+
+  useEffect(() => {
+    todosRef.current = todos
+  }, [todos])
 
   const autoResize = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = 'auto'
@@ -971,7 +1187,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   useEffect(() => {
     if (viewMode !== 'chat') return
     scrollToBottomIfNeeded()
-  }, [messages, loading, askContinue, scrollToBottomIfNeeded, viewMode])
+  }, [messages, loading, scrollToBottomIfNeeded, viewMode])
 
   useEffect(() => {
     setMessages(prev =>
@@ -1014,7 +1230,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
   const openConversation = useCallback(async (conversationId: string) => {
     if (loading) return
-    setAskContinue({ visible: false, rounds: 0, message: '' })
     shouldAutoScrollRef.current = true
     try {
       const response = await fetch(`/api/conversations/${conversationId}`)
@@ -1040,12 +1255,40 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         setCurrentConversationTitle('')
         conversationMessagesRef.current = []
         setMessages([])
-        setAskContinue({ visible: false, rounds: 0, message: '' })
       }
     } catch (error) {
       console.error('[AISidebar] delete conversation failed', error)
     }
   }, [])
+
+  const exportConversation = useCallback(async (conversationId?: string | null) => {
+    const targetConversationId = conversationId ?? currentConversationIdRef.current
+    const title = currentConversationTitle || 'conversation'
+
+    let detail: ConversationDetail | null = null
+    if (targetConversationId) {
+      const response = await fetch(`/api/conversations/${targetConversationId}`)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      detail = await response.json() as ConversationDetail
+    }
+
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      conversationId: targetConversationId,
+      title: detail?.title || title,
+      mode: assistantMode,
+      providerId: activeProviderId || null,
+      model: selectedModel || modelName || null,
+      includeSelection,
+      currentContext: getContext(),
+      storedMessages: detail?.messages ?? conversationMessagesRef.current,
+      uiMessages: messages,
+      reactHistory: buildReactMessages(detail?.messages ?? conversationMessagesRef.current, '').slice(0, -1),
+    }
+
+    const safeTitle = String(payload.title || 'conversation').replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 40) || 'conversation'
+    downloadJsonFile(`${safeTitle}-${targetConversationId ?? 'draft'}.json`, payload)
+  }, [activeProviderId, assistantMode, currentConversationTitle, getContext, includeSelection, messages, modelName, selectedModel])
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort()
@@ -1104,8 +1347,8 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
     const aiMessage = makeAiMessage('', true)
 
-    setAskContinue({ visible: false, rounds: 0, message: '' })
     setTodos([])
+    todosRef.current = []
     setIsTodoPanelExpanded(false)
     setInput('')
     setPendingImages([])
@@ -1137,6 +1380,8 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     let persistedAssistantText = ''
     let conversationPersisted = false
     const persistedRecords: StoredMessage[] = [{ role: 'user', content: text }]
+    let pendingStreamingChunk = ''
+    let streamingFlushTimer: number | null = null
 
     const appendAssistantRound = (
       assistantText: string,
@@ -1154,7 +1399,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               type: 'function' as const,
               function: {
                 name: tool.name,
-                arguments: JSON.stringify(tool.params),
+                arguments: JSON.stringify(getReplayToolParams(tool)),
               },
             }))
           : undefined,
@@ -1163,12 +1408,72 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               id: tool.id,
               name: tool.name,
               params: tool.params,
+              originalParams: tool.originalParams,
               status: tool.result.success ? 'ok' : 'err',
               message: tool.result.message,
               data: tool.result.data,
             }))
           : undefined,
       })
+    }
+
+    const flushStreamingWrite = (final = false) => {
+      if (!pendingStreamingChunk) return
+      if (streamingFlushTimer != null) {
+        window.clearTimeout(streamingFlushTimer)
+        streamingFlushTimer = null
+      }
+      if (!activeStreamingWriteRef.current || !editorView) {
+        pendingStreamingChunk = ''
+        return
+      }
+
+      const streamResult = appendStreamingWrite(
+        editorView,
+        activeStreamingWriteRef.current,
+        pendingStreamingChunk,
+        { final },
+      )
+      pendingStreamingChunk = ''
+
+      if (!streamResult.success) {
+        console.error('[AISidebar] append streaming write failed', streamResult.message)
+        activeStreamingWriteRef.current = null
+      }
+    }
+
+    const queueStreamingWrite = (chunk: string) => {
+      if (!chunk) return
+      pendingStreamingChunk += chunk
+
+      if (pendingStreamingChunk.length >= STREAMING_WRITE_MAX_BUFFER) {
+        flushStreamingWrite(false)
+        return
+      }
+
+      if (streamingFlushTimer != null) return
+      streamingFlushTimer = window.setTimeout(() => {
+        streamingFlushTimer = null
+        flushStreamingWrite(false)
+      }, STREAMING_WRITE_FLUSH_MS)
+    }
+
+    const closeStreamingWriteSession = (reason: 'done' | 'tool_call' | 'awaiting_tool_results' | 'finish' | 'error') => {
+      const session = activeStreamingWriteRef.current
+      if (!session || !editorView) {
+        activeStreamingWriteRef.current = null
+        return null
+      }
+
+      if (!session.text.trim()) {
+        const rollbackResult = abortStreamingWrite(editorView, session)
+        console.warn('[AISidebar] begin_streaming_write finished without streamed content', { reason, rollbackResult })
+        activeStreamingWriteRef.current = null
+        return '检测到 `begin_streaming_write` 后没有实际输出正文，已自动撤销这次空写入。'
+      }
+
+      activeStreamingWriteRef.current = null
+      return null
     }
 
     try {
@@ -1192,7 +1497,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       const failedToolCounts = new Map<string, number>()
       let lastToolSignature = ''
       let lastToolStreak = 0
-
       for (let round = 1; round <= MAX_TOOL_ROUNDS && !finished; round += 1) {
         const response = await fetch('/api/ai/react/stream', {
           method: 'POST',
@@ -1225,6 +1529,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         let roundAssistantText = ''
         let roundThinkingText = ''
         const toolResults: ToolCallRecord[] = []
+        const pendingToolCalls: ToolCallResult[] = []
 
         while (true) {
           const { done, value } = await reader.read()
@@ -1257,11 +1562,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                 roundAssistantText += chunk
                 persistedAssistantText += chunk
                 if (activeStreamingWriteRef.current && editorView) {
-                  const streamResult = appendStreamingWrite(editorView, activeStreamingWriteRef.current, chunk)
-                  if (!streamResult.success) {
-                    console.error('[AISidebar] append streaming write failed', streamResult.message)
-                    activeStreamingWriteRef.current = null
-                  }
+                  queueStreamingWrite(chunk)
                 }
                 updateMessage(message => ({
                   ...appendContentChunk(message, chunk),
@@ -1271,101 +1572,68 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               }
 
               case 'tool_call': {
-                activeStreamingWriteRef.current = null
+                flushStreamingWrite(true)
+                const emptyStreamingWarning = closeStreamingWriteSession('tool_call')
                 const toolCall: ToolCallResult = {
                   id: typeof event.id === 'string' ? event.id : undefined,
                   name: String(event.name ?? ''),
                   params: normalizeToolParams(event.params),
+                  originalParams: normalizeToolParams(event.params),
                   status: 'pending',
                   isExpanded: true,
                 }
 
-                updateMessage(message => ({
-                  ...appendToolSegment(message, toolCall),
-                  activityLabel: `正在调用 ${toolCall.name}...`,
-                }))
-                await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
-
-                // Intercept update_todo_list: update UI state locally instead of running on editor
-                let result: { success: boolean; message: string; data?: unknown }
-                if (toolCall.name === 'update_todo_list') {
-                  const rawTodos = Array.isArray(toolCall.params.todos) ? toolCall.params.todos : []
-                  const nextTodos: TodoItem[] = rawTodos
-                    .filter((t): t is Record<string, unknown> => t !== null && typeof t === 'object')
-                    .map(t => ({
-                      id: String(t.id ?? ''),
-                      title: String(t.title ?? ''),
-                      status: (['pending', 'in_progress', 'completed', 'failed'].includes(String(t.status))
-                        ? t.status
-                        : 'pending') as TodoItem['status'],
-                    }))
-                  setTodos(nextTodos)
-                  result = { success: true, message: 'todo list updated' }
-                } else if (toolCall.name === 'begin_streaming_write') {
-                  const beginResult = editorView
-                    ? beginStreamingWrite(editorView, toolCall.params)
-                    : { success: false, message: '编辑器尚未就绪' }
-                  result = beginResult
-                  if ('session' in beginResult && beginResult.session) {
-                    activeStreamingWriteRef.current = beginResult.session
-                  }
-                } else {
-                  const selectionContext = extractSelectionContext(context)
-                  toolCall.params = serializeToolParamsWithSelection(toolCall.name, toolCall.params, selectionContext)
-                  result = editorView
-                    ? executeTool(editorView, toolCall.name, toolCall.params, {
-                        pageConfig,
-                        onPageConfigChange,
-                        onDocumentStyleMutation,
-                        selectionContext,
-                      })
-                    : { success: false, message: '编辑器尚未就绪' }
+                if (
+                  (toolCall.name === 'set_text_style' || toolCall.name === 'set_paragraph_style' || toolCall.name === 'clear_formatting')
+                  && Object.keys(toolCall.originalParams ?? {}).length === 0
+                ) {
+                  console.warn('[AISidebar] received suspicious empty tool params', {
+                    toolName: toolCall.name,
+                    toolId: toolCall.id,
+                    context,
+                    assistantMode,
+                  })
                 }
 
-                toolCall.status = result.success ? 'ok' : 'err'
-                toolCall.message = result.message
-                toolCall.data = result.data
-                toolResults.push({
-                  id: toolCall.id ?? toolCall.name,
-                  name: toolCall.name,
-                  params: toolCall.params,
-                  result,
-                })
-                if (!result.success) {
-                  console.error('[AISidebar] tool call failed', toolCall.name, toolCall.params, result.message)
-                }
                 updateMessage(message => {
-                  let matched = false
-                  const nextMessage = updateToolCallInMessage(
-                    message,
-                    (currentToolCall, index, array) => {
-                      const shouldUse =
-                        (!matched && toolCall.id && currentToolCall.id === toolCall.id) ||
-                        (!matched && !toolCall.id && index === array.length - 1)
-                      if (shouldUse) matched = true
-                      return shouldUse
-                    },
-                    () => ({ ...toolCall, isExpanded: false }),
-                  )
-                  const activityLabel =
-                    toolCall.status === 'err'
-                      ? '正在调整执行方案...'
-                      : toolCall.name === 'begin_streaming_write'
-                        ? '正在写入正文...'
-                        : '正在整理工具结果...'
-                  return { ...nextMessage, activityLabel }
+                  const withWarning = emptyStreamingWarning
+                    ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
+                    : message
+                  return {
+                    ...appendToolSegment(withWarning, toolCall),
+                    activityLabel: `正在调用 ${toolCall.name}...`,
+                  }
                 })
+                pendingToolCalls.push(toolCall)
                 break
               }
 
               case 'awaiting_tool_results':
+                flushStreamingWrite(true)
+                {
+                  const emptyStreamingWarning = closeStreamingWriteSession('awaiting_tool_results')
+                  if (emptyStreamingWarning) {
+                    updateMessage(message => ({
+                      ...appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`),
+                      activityLabel: '正在整理工具结果...',
+                    }))
+                  }
+                }
                 awaitingToolResults = true
                 break
 
               case 'done':
+                flushStreamingWrite(true)
                 finished = true
-                activeStreamingWriteRef.current = null
-                updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
+                {
+                  const emptyStreamingWarning = closeStreamingWriteSession('done')
+                  updateMessage(message => {
+                    const nextMessage = emptyStreamingWarning
+                      ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
+                      : message
+                    return { ...nextMessage, streaming: false, activityLabel: '' }
+                  })
+                }
                 break
 
               case 'error':
@@ -1378,15 +1646,143 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
           }
         }
 
+        if (pendingToolCalls.length > 0) {
+          const selectionContext = extractSelectionContext(context)
+          const optimizedGroups = optimizeToolCallGroups(pendingToolCalls)
+
+          for (const group of optimizedGroups) {
+            const toolCall = group.leader
+            toolCall.params = serializeToolParamsWithSelection(toolCall.name, group.params, selectionContext)
+
+            await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+
+            let result: { success: boolean; message: string; data?: unknown }
+            if (toolCall.name === 'update_todo_list') {
+              const rawTodos = Array.isArray(toolCall.params.todos) ? toolCall.params.todos : []
+              const nextTodos: TodoItem[] = rawTodos
+                .filter((t): t is Record<string, unknown> => t !== null && typeof t === 'object')
+                .map(t => ({
+                  id: String(t.id ?? ''),
+                  title: String(t.title ?? ''),
+                  status: (['pending', 'in_progress', 'completed', 'failed'].includes(String(t.status))
+                    ? t.status
+                    : 'pending') as TodoItem['status'],
+                }))
+              setTodos(nextTodos)
+              todosRef.current = nextTodos
+              result = { success: true, message: 'todo list updated' }
+            } else if (toolCall.name === 'get_todo_list') {
+              result = {
+                success: true,
+                message: todosRef.current.length > 0 ? `当前有 ${todosRef.current.length} 个任务` : '当前还没有任务计划',
+                data: {
+                  todos: todosRef.current,
+                  total: todosRef.current.length,
+                  completed: todosRef.current.filter(todo => todo.status === 'completed').length,
+                  pending: todosRef.current.filter(todo => todo.status === 'pending').length,
+                  inProgress: todosRef.current.filter(todo => todo.status === 'in_progress').length,
+                  failed: todosRef.current.filter(todo => todo.status === 'failed').length,
+                },
+              }
+            } else if (toolCall.name === 'begin_streaming_write') {
+              const beginResult = editorView
+                ? beginStreamingWrite(editorView, toolCall.params)
+                : { success: false, message: '编辑器尚未就绪' }
+              result = beginResult
+              if ('session' in beginResult && beginResult.session) {
+                activeStreamingWriteRef.current = beginResult.session
+              }
+            } else {
+              result = editorView
+                ? executeTool(editorView, toolCall.name, toolCall.params, {
+                    pageConfig,
+                    onPageConfigChange,
+                    onDocumentStyleMutation,
+                    selectionContext,
+                  })
+                : { success: false, message: '编辑器尚未就绪' }
+            }
+
+            toolCall.status = result.success ? 'ok' : 'err'
+            toolCall.message = result.message
+            toolCall.data = result.data
+
+            toolResults.push({
+              id: toolCall.id ?? toolCall.name,
+              name: toolCall.name,
+              params: toolCall.params,
+              originalParams: toolCall.originalParams,
+              result,
+            })
+
+            if (!result.success) {
+              console.error('[AISidebar] tool call failed', toolCall.name, toolCall.params, result.message)
+            }
+
+            const mergedFollowerMessage = group.members.length > 1
+              ? `${result.success ? '已合并到批量执行' : '批量执行失败'}：${toolCall.name} x${group.members.length}`
+              : result.message
+
+            updateMessage(message => {
+              let nextMessage = updateToolCallInMessage(
+                message,
+                (currentToolCall, index, array) => {
+                  const shouldUse =
+                    (toolCall.id && currentToolCall.id === toolCall.id) ||
+                    (!toolCall.id && currentToolCall.name === toolCall.name && index === array.findIndex(item => item.name === toolCall.name))
+                  return shouldUse
+                },
+                () => ({ ...toolCall, isExpanded: false }),
+              )
+
+              for (const member of group.members.slice(1)) {
+                nextMessage = updateToolCallInMessage(
+                  nextMessage,
+                  currentToolCall => (
+                    (member.id && currentToolCall.id === member.id)
+                    || (!member.id && currentToolCall.name === member.name)
+                  ),
+                  currentToolCall => ({
+                    ...currentToolCall,
+                    status: toolCall.status,
+                    message: mergedFollowerMessage,
+                    data: result.data,
+                    isExpanded: false,
+                  }),
+                )
+              }
+
+              const activityLabel =
+                toolCall.status === 'err'
+                  ? '正在调整执行方案...'
+                  : toolCall.name === 'begin_streaming_write'
+                    ? '正在写入正文...'
+                    : '正在整理工具结果...'
+              return { ...nextMessage, activityLabel }
+            })
+          }
+        }
+
         if (finished) {
-          activeStreamingWriteRef.current = null
+          flushStreamingWrite(true)
+          const emptyStreamingWarning = closeStreamingWriteSession('finish')
           appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+          if (emptyStreamingWarning) {
+            persistedAssistantText += (persistedAssistantText ? '\n\n' : '') + emptyStreamingWarning
+            persistedRecords.push({ role: 'assistant', content: emptyStreamingWarning })
+          }
           break
         }
         if (!awaitingToolResults || toolResults.length === 0) {
+          flushStreamingWrite(true)
           appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
-          activeStreamingWriteRef.current = null
-          updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
+          const emptyStreamingWarning = closeStreamingWriteSession('finish')
+          updateMessage(message => {
+            const nextMessage = emptyStreamingWarning
+              ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
+              : message
+            return { ...nextMessage, streaming: false, activityLabel: '' }
+          })
           finished = true
           break
         }
@@ -1418,6 +1814,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         }
 
         if (stopReason) {
+          flushStreamingWrite(true)
           persistedAssistantText += (persistedAssistantText ? '\n\n' : '') + stopReason
           persistedRecords.push({ role: 'assistant', content: stopReason })
           activeStreamingWriteRef.current = null
@@ -1426,11 +1823,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             streaming: false,
             activityLabel: '',
           }))
-          setAskContinue({
-            visible: true,
-            rounds: round,
-            message: stopReason,
-          })
           finished = true
           break
         }
@@ -1439,7 +1831,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
           ...toolResults.map(tool => ({
             role: 'tool' as const,
             tool_call_id: tool.id,
-            content: serializeToolResult(tool.result),
+            content: serializeToolResult(tool),
           })),
         )
 
@@ -1453,25 +1845,25 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                 type: 'function',
                 function: {
                   name: tool.name,
-                  arguments: JSON.stringify(tool.params),
+                  arguments: JSON.stringify(getReplayToolParams(tool)),
                 },
               })),
           },
           ...toolResults.map(tool => ({
             role: 'tool' as const,
             tool_call_id: tool.id,
-            content: serializeToolResult(tool.result),
+            content: serializeToolResult(tool),
           })),
         ]
 
         if (round === MAX_TOOL_ROUNDS) {
+          flushStreamingWrite(true)
           activeStreamingWriteRef.current = null
-          setAskContinue({
-            visible: true,
-            rounds: round,
-            message: `已执行 ${round} 轮操作，请重新发起下一步指令。`,
-          })
-          updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
+          updateMessage(message => ({
+            ...appendContentChunk(message, `${message.text ? '\n\n' : ''}已执行 ${round} 轮操作，已停止当前自动链路。请根据当前结果继续下达下一步指令。`),
+            streaming: false,
+            activityLabel: '',
+          }))
         }
       }
 
@@ -1487,7 +1879,12 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
       }
     } catch (error) {
-      activeStreamingWriteRef.current = null
+      if (streamingFlushTimer != null) {
+        window.clearTimeout(streamingFlushTimer)
+        streamingFlushTimer = null
+      }
+      flushStreamingWrite(true)
+      closeStreamingWriteSession('error')
       if (error instanceof Error && error.name === 'AbortError') {
         persistedAssistantText = '（已取消）'
         if (!persistedRecords.some(message => message.role === 'assistant')) {
@@ -1530,7 +1927,12 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         }
       }
     } finally {
-      activeStreamingWriteRef.current = null
+      if (streamingFlushTimer != null) {
+        window.clearTimeout(streamingFlushTimer)
+        streamingFlushTimer = null
+      }
+      flushStreamingWrite(true)
+      closeStreamingWriteSession('finish')
       setLoading(false)
       abortRef.current = null
       void loadConversations()
@@ -1569,7 +1971,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
           <button
             onClick={() => {
               setViewMode('history')
-              setAskContinue({ visible: false, rounds: 0, message: '' })
             }}
             className="px-1.5 py-0.5 rounded hover:bg-blue-500 text-sm flex-shrink-0"
             title="返回会话历史"
@@ -1577,6 +1978,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             ←
           </button>
           <div className="min-w-0 flex-1 font-semibold text-sm truncate">{currentConversationTitle || '新会话'}</div>
+          <button
+            onClick={() => void exportConversation()}
+            className="px-1.5 py-0.5 rounded hover:bg-blue-500 text-sm flex-shrink-0"
+            title="导出当前会话调试 JSON"
+          >
+            ⤓
+          </button>
           <button
             onClick={onClose}
             className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
@@ -1618,6 +2026,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   >
                     <div className="text-sm text-gray-800 truncate">{truncateTitle(conversation.title || '新会话')}</div>
                     <div className="text-xs text-gray-400 mt-0.5">{formatConversationTime(conversation.updatedAt || conversation.createdAt)}</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void exportConversation(conversation.id)}
+                    className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-blue-500 text-sm flex-shrink-0"
+                    title="导出会话 JSON"
+                  >
+                    ⤓
                   </button>
                   <button
                     type="button"
@@ -1941,29 +2357,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                       />
                     ))}
                   </span>
-                </div>
-              </div>
-            )}
-
-            {askContinue.visible && (
-              <div className="bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2.5 space-y-2 text-sm">
-                <p className="text-yellow-800 text-xs">{askContinue.message}</p>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => {
-                      setAskContinue(state => ({ ...state, visible: false }))
-                      void handleSend('继续执行刚才的操作')
-                    }}
-                    className="px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white text-xs rounded-lg"
-                  >
-                    ✅ 继续执行
-                  </button>
-                  <button
-                    onClick={() => setAskContinue(state => ({ ...state, visible: false }))}
-                    className="px-3 py-1 bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs rounded-lg"
-                  >
-                    ⏹ 停止
-                  </button>
                 </div>
               </div>
             )}

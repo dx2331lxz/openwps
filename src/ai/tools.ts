@@ -7,6 +7,7 @@ const rangeProperties = {
       'all',
       'paragraph',
       'paragraphs',
+      'paragraph_indexes',
       'selection',
       'contains_text',
       'first_paragraph',
@@ -18,12 +19,22 @@ const rangeProperties = {
   paragraphIndex: { type: 'integer', description: '段落索引（range.type=paragraph 时使用）' },
   from: { type: 'integer', description: '起始段落索引（range.type=paragraphs 时使用）' },
   to: { type: 'integer', description: '结束段落索引（range.type=paragraphs 时使用，包含）' },
+  paragraphIndexes: {
+    type: 'array',
+    description: '非连续段落索引列表（range.type=paragraph_indexes 时使用）',
+    items: { type: 'integer' },
+  },
   text: { type: 'string', description: '要匹配的文字（range.type=contains_text 时使用）' },
   selectionFrom: { type: 'integer', description: '选区起始文档位置（range.type=selection 时使用）' },
   selectionTo: { type: 'integer', description: '选区结束文档位置（range.type=selection 时使用）' },
 } as const
 
 const commonTools = [
+  {
+    name: 'get_todo_list',
+    description: '读取当前任务计划列表和各步骤状态，适合在继续执行前、收尾前或怀疑状态不同步时确认 todo 进度。',
+    parameters: { type: 'object', properties: {} },
+  },
   {
     name: 'get_document_info',
     description: '获取文档统计信息、分页信息和常见样式概览，适合先快速了解整篇文档结构',
@@ -36,7 +47,7 @@ const commonTools = [
   },
   {
     name: 'get_document_content',
-    description: '读取文档内容，可按段落范围分块返回；默认返回段落内容、段落样式和 textRuns。',
+    description: '读取文档内容，可按段落范围分块返回；默认返回段落内容、段落样式、textRuns，以及该范围内的块级元素快照（含表格/分割线）。',
     parameters: {
       type: 'object',
       properties: {
@@ -48,12 +59,23 @@ const commonTools = [
   },
   {
     name: 'get_page_content',
-    description: '读取指定页面的排版快照，返回该页涉及的段落、块级元素和逐行预览。长文档或需要按页判断版式时优先使用。',
+    description: '读取指定页面的排版快照，返回该页涉及的段落、块级元素和逐行预览；表格会附带单元格文本快照。长文档或需要按页判断版式时优先使用。',
     parameters: {
       type: 'object',
       properties: {
         page: { type: 'integer', description: '页码，从 1 开始' },
         includeTextRuns: { type: 'boolean', description: '是否返回该页相关段落的 textRuns，默认 false' },
+      },
+      required: ['page'],
+    },
+  },
+  {
+    name: 'get_page_style_summary',
+    description: '读取指定页面的样式摘要，返回该页每个段落的文字预览、样式签名、标题候选和常见样式统计。长文档排版时优先用它按页判断标题/正文是否混淆。',
+    parameters: {
+      type: 'object',
+      properties: {
+        page: { type: 'integer', description: '页码，从 1 开始' },
       },
       required: ['page'],
     },
@@ -166,7 +188,7 @@ export const layoutTools = [
   },
   {
     name: 'insert_table',
-    description: '在指定位置插入表格',
+    description: '在指定位置插入表格；可直接用 data 二维数组一次写入表头和单元格内容，避免先插空表再逐格补内容。',
     parameters: {
       type: 'object',
       properties: {
@@ -174,8 +196,16 @@ export const layoutTools = [
         rows: { type: 'integer', minimum: 1, maximum: 20 },
         cols: { type: 'integer', minimum: 1, maximum: 10 },
         headerRow: { type: 'boolean', description: '是否有表头行' },
+        data: {
+          type: 'array',
+          description: '表格二维文本数据。若提供，将优先按 data 的尺寸创建并填充表格。',
+          items: {
+            type: 'array',
+            items: { type: 'string' },
+          },
+        },
       },
-      required: ['afterParagraph', 'rows', 'cols'],
+      required: ['afterParagraph'],
     },
   },
 ]
@@ -183,7 +213,7 @@ export const layoutTools = [
 export const editTools = [
   {
     name: 'begin_streaming_write',
-    description: '开始一次流式正文写入。先声明写入位置，然后把真正要写入文档的正文内容作为后续 assistant 文本直接输出，这些文本会实时写入文档。适合新增长段落或整体改写整段。',
+    description: '开始一次流式正文写入。先声明写入位置，然后把真正要写入文档的 Markdown 正文作为后续 assistant 文本直接输出，前端会实时解析并写入文档。适合新增长段落、表格、分割线或整体改写整段。',
     parameters: {
       type: 'object',
       properties: {
@@ -259,13 +289,17 @@ export const editTools = [
   },
   {
     name: 'delete_paragraph',
-    description: '删除指定段落',
+    description: '删除一个或多个整段。删除多段时优先一次传 indices，避免逐段重复调用。',
     parameters: {
       type: 'object',
       properties: {
         index: { type: 'integer', description: '段落索引' },
+        indices: {
+          type: 'array',
+          description: '要删除的多个段落索引，会按从大到小一次删除',
+          items: { type: 'integer' },
+        },
       },
-      required: ['index'],
     },
   },
   ...commonTools,

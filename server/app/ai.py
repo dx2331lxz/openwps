@@ -14,7 +14,8 @@ from langchain_core.runnables import Runnable
 
 from .config import get_provider, read_config
 from .models import ChatMessage, ChatRequest
-from .tooling import get_system_prompt, get_tools
+from .prompts import get_system_prompt
+from .tooling import get_tools
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -50,6 +51,48 @@ def _extract_reasoning(chunk: AIMessageChunk) -> str:
     return "".join(value for value in values if isinstance(value, str))
 
 
+def _repair_tool_args_json(raw_args: str) -> str | None:
+    text = (raw_args or "").strip()
+    if not text:
+        return None
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in {"}", "]"}:
+            if not stack or stack[-1] != char:
+                return None
+            stack.pop()
+
+    repaired = text
+    if in_string:
+        repaired += '"'
+    if escaped:
+        repaired += '"'
+    if stack:
+        repaired += "".join(reversed(stack))
+
+    repaired = repaired.replace(",}", "}").replace(",]", "]")
+    return repaired if repaired != text else None
+
+
 def _tool_calls_from_ai_message(message: AIMessage) -> list[dict[str, Any]]:
     tool_calls: list[dict[str, Any]] = []
     for call in message.tool_calls:
@@ -59,6 +102,26 @@ def _tool_calls_from_ai_message(message: AIMessage) -> list[dict[str, Any]]:
             "params": call.get("args", {}) or {},
         })
     return tool_calls
+
+
+def _parse_tool_args(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str):
+        return {}
+
+    try:
+        parsed = json.loads(arguments)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        repaired_args = _repair_tool_args_json(arguments)
+        if not repaired_args:
+            return {}
+        try:
+            parsed = json.loads(repaired_args)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
 
 
 def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
@@ -72,11 +135,7 @@ def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
         tool_calls = []
         for call in raw.get("tool_calls") or []:
             fn = call.get("function") or {}
-            arguments = fn.get("arguments", "{}")
-            try:
-                args = json.loads(arguments) if isinstance(arguments, str) else arguments
-            except Exception:
-                args = {}
+            args = _parse_tool_args(fn.get("arguments", "{}"))
             tool_calls.append({
                 "id": call.get("id"),
                 "name": fn.get("name", ""),
@@ -143,7 +202,6 @@ def _build_human_content(message: str, context_block: str, images: list[dict[str
             "image_url": {"url": url},
         })
     return content
-
 
 def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> None:
     last_user = next(
@@ -252,6 +310,7 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
     llm = build_llm(streaming=True, body=body)
     graph = build_graph(llm)
     tool_call_acc: dict[int, dict[str, Any]] = {}
+    range_required_tools = {"set_text_style", "set_paragraph_style", "clear_formatting"}
 
     try:
         async for event in graph.astream_events({"messages": build_messages(body)}, version="v2"):
@@ -288,10 +347,60 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
     if tool_call_acc:
         for index in sorted(tool_call_acc.keys()):
             item = tool_call_acc[index]
+            raw_args = item["args_str"]
             try:
-                params = json.loads(item["args_str"]) if item["args_str"] else {}
-            except Exception:
-                params = {}
+                params = json.loads(raw_args) if raw_args else {}
+            except Exception as exc:
+                repaired_args = _repair_tool_args_json(raw_args)
+                if repaired_args:
+                    try:
+                        params = json.loads(repaired_args)
+                        logger.warning(
+                            "[openwps.ai] tool args repaired conversationId=%s mode=%s index=%s tool=%s id=%s raw_args=%r repaired_args=%r",
+                            body.conversationId or "-",
+                            body.mode,
+                            index,
+                            item["name"] or "-",
+                            item["id"] or "-",
+                            raw_args,
+                            repaired_args,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[openwps.ai] tool args parse failed conversationId=%s mode=%s index=%s tool=%s id=%s raw_args=%r repaired_args=%r error=%s",
+                            body.conversationId or "-",
+                            body.mode,
+                            index,
+                            item["name"] or "-",
+                            item["id"] or "-",
+                            raw_args,
+                            repaired_args,
+                            exc,
+                        )
+                        params = {}
+                else:
+                    logger.warning(
+                        "[openwps.ai] tool args parse failed conversationId=%s mode=%s index=%s tool=%s id=%s raw_args=%r error=%s",
+                        body.conversationId or "-",
+                        body.mode,
+                        index,
+                        item["name"] or "-",
+                        item["id"] or "-",
+                        raw_args,
+                        exc,
+                    )
+                    params = {}
+
+            if item["name"] in range_required_tools and not params:
+                logger.warning(
+                    "[openwps.ai] suspicious empty tool args conversationId=%s mode=%s index=%s tool=%s id=%s raw_args=%r",
+                    body.conversationId or "-",
+                    body.mode,
+                    index,
+                    item["name"] or "-",
+                    item["id"] or "-",
+                    raw_args,
+                )
             yield {
                 "type": "tool_call",
                 "id": item["id"],

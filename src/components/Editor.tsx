@@ -19,6 +19,7 @@ import SettingsModal from './SettingsModal'
 import { importDocx, type PMNodeJSON } from '../docx/importer'
 import { buildDocxBlob, exportDocx, type DocxExportOptions } from '../docx/exporter'
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
+import { markdownToDocument } from '../markdown/importer'
 import { PretextPageRenderer } from './PretextPageRenderer'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
@@ -50,6 +51,12 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   } catch (error) {
     throw new Error(`JSON 解析失败：${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+function buildImportedDocumentName(filename: string) {
+  const trimmed = filename.trim()
+  if (!trimmed) return DEFAULT_SERVER_DOCUMENT_NAME
+  return trimmed.replace(/\.(md|markdown)$/i, '.docx')
 }
 
 // Widget height for a break after a page that used `usedH` px of content:
@@ -148,8 +155,6 @@ const PM_STYLES = `
   vertical-align: bottom;
 }
 .ProseMirror p.page-break-before {
-  border-top: 2px dashed #0066cc;
-  padding-top: 4px;
 }
 .pretext-driving-editor .ProseMirror {
   color: transparent;
@@ -171,6 +176,18 @@ const PM_STYLES = `
 .pretext-driving-editor .ProseMirror img,
 .pretext-driving-editor .ProseMirror table {
   opacity: 0;
+}
+.pretext-driving-editor .ProseMirror table {
+  opacity: 1;
+}
+.pretext-driving-editor .ProseMirror table,
+.pretext-driving-editor .ProseMirror table * {
+  color: #111827 !important;
+  -webkit-text-fill-color: #111827 !important;
+}
+.pretext-driving-editor .ProseMirror table p,
+.pretext-driving-editor .ProseMirror table span {
+  text-shadow: none !important;
 }
 .pretext-driving-editor .ProseMirror hr {
   opacity: 1;
@@ -580,6 +597,30 @@ export const Editor: React.FC = () => {
     }
   }, [applyDocumentState, repaginate])
 
+  const handleImportMarkdown = useCallback(async (file: File) => {
+    try {
+      const markdown = await file.text()
+      const doc = markdownToDocument(markdown)
+      applyDocumentState(doc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
+      setCurrentDocumentName(buildImportedDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME))
+      repaginate()
+      window.alert('Markdown 导入成功')
+    } catch (error) {
+      console.error('[Editor] Markdown import failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      window.alert(`Markdown 导入失败：${message}`)
+    }
+  }, [applyDocumentState, repaginate])
+
+  const handleImportFile = useCallback(async (file: File) => {
+    const name = file.name.toLowerCase()
+    if (name.endsWith('.md') || name.endsWith('.markdown') || file.type === 'text/markdown') {
+      await handleImportMarkdown(file)
+      return
+    }
+    await handleImportDocx(file)
+  }, [handleImportDocx, handleImportMarkdown])
+
   const handleOpenServerDocument = useCallback(async (name: string) => {
     try {
       const response = await fetch(`/api/documents/${encodeURIComponent(name)}`)
@@ -703,7 +744,7 @@ export const Editor: React.FC = () => {
           sidebarOpen={sidebarOpen}
           onOpenServerFile={openServerFileModal}
           onSaveServerFile={openSaveFileModal}
-          onImportDocx={handleImportDocx}
+          onImportDocx={handleImportFile}
           onExportDocx={handleExportDocx}
         />
       </div>

@@ -742,6 +742,12 @@ function countRowColumns(rowNode: PMNode): number {
   return Math.max(count, 1)
 }
 
+function buildTablePreviewText(tableNode: PMNode) {
+  const text = tableNode.textContent.replace(/\s+/g, ' ').trim()
+  if (!text) return '[表格]'
+  return text.length > 180 ? `${text.slice(0, 180)}...` : text
+}
+
 function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
   let maxColumns = 1
   tableNode.forEach((rowNode) => {
@@ -764,7 +770,7 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
     spaceBefore: 0,
     spaceAfter: 0,
       lines: [{
-        text: '',
+        text: buildTablePreviewText(tableNode),
         blockIndex: 0,
         blockType: 'table',
         lineIndex: 0,

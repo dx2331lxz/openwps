@@ -459,7 +459,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         >💾 保存</button>
         <button
           className={btn(false)}
-          title="导入 .docx"
+          title="导入 .docx / .md"
           onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
         >📥 导入</button>
         <button
@@ -644,7 +644,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         <input
           type="file"
-          accept=".docx"
+          accept=".docx,.md,.markdown,text/markdown"
           ref={fileInputRef}
           onChange={(event) => {
             const file = event.target.files?.[0]
