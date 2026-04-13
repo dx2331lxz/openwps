@@ -49,3 +49,16 @@ class ModelDiscoveryRequest(BaseModel):
 
 class AppendMessagesRequest(BaseModel):
     messages: list[ChatMessage]
+
+
+class ToolResultItem(BaseModel):
+    execution_id: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    content: str
+
+
+class ToolResultsRequest(BaseModel):
+    plan_id: Optional[str] = None
+    round: Optional[int] = None
+    results: list[ToolResultItem] = Field(default_factory=list)
+    stop: bool = False

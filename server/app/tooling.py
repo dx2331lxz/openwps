@@ -404,6 +404,92 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_style_batch",
+            "description": (
+                "批量应用样式规则。一次调用可同时设置多个段落范围的文字样式和段落格式，"
+                "适合全文排版、按角色（标题/正文/副标题）分别设置样式。"
+                "每条规则可同时包含 textStyle 和 paragraphStyle，也可只包含其一。"
+                "返回值包含受影响段落的快照，无需额外调用 get_document_content 验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rules": {
+                        "type": "array",
+                        "description": "样式规则列表，按顺序执行",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "range": RANGE_SPEC,
+                                "textStyle": {
+                                    "type": "object",
+                                    "description": "文字样式",
+                                    "properties": {
+                                        "fontFamily": {"type": "string", "enum": SUPPORTED_AI_FONTS},
+                                        "fontSize": {"type": "number"},
+                                        "color": {"type": "string"},
+                                        "backgroundColor": {"type": "string"},
+                                        "bold": {"type": "boolean"},
+                                        "italic": {"type": "boolean"},
+                                        "underline": {"type": "boolean"},
+                                        "strikethrough": {"type": "boolean"},
+                                        "superscript": {"type": "boolean"},
+                                        "subscript": {"type": "boolean"},
+                                        "letterSpacing": {"type": "number"},
+                                    },
+                                },
+                                "paragraphStyle": {
+                                    "type": "object",
+                                    "description": "段落格式",
+                                    "properties": {
+                                        "align": {"type": "string", "enum": ["left", "center", "right", "justify"]},
+                                        "firstLineIndent": {"type": "number"},
+                                        "indent": {"type": "number"},
+                                        "lineHeight": {"type": "number"},
+                                        "spaceBefore": {"type": "number"},
+                                        "spaceAfter": {"type": "number"},
+                                        "listType": {"type": "string", "enum": ["none", "bullet", "ordered"]},
+                                        "pageBreakBefore": {"type": "boolean"},
+                                    },
+                                },
+                            },
+                            "required": ["range"],
+                        },
+                    },
+                },
+                "required": ["rules"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_document_preset",
+            "description": (
+                "应用文档预设模板（公文/论文/合同/报告/信函），一次性设置页面配置和全文样式。"
+                "会自动识别标题段落（短文本+居中/加粗/大字号）和正文段落，分别应用对应样式。"
+                "返回值包含受影响段落的快照，无需额外验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "enum": ["公文", "论文", "合同", "报告", "信函"],
+                        "description": "预设名称",
+                    },
+                    "applyPageConfig": {
+                        "type": "boolean",
+                        "description": "是否同时应用页面配置（纸张/边距），默认 true",
+                    },
+                },
+                "required": ["preset"],
+            },
+        },
+    },
 ]
 
 LAYOUT_TOOL_NAMES = {
@@ -422,6 +508,8 @@ LAYOUT_TOOL_NAMES = {
     "insert_page_break",
     "insert_horizontal_rule",
     "insert_table",
+    "apply_style_batch",
+    "apply_document_preset",
 }
 
 EDIT_TOOL_NAMES = {

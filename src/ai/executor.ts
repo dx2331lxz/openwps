@@ -3,7 +3,7 @@ import type { EditorState, Transaction } from 'prosemirror-state'
 import type { EditorView } from 'prosemirror-view'
 import { schema } from '../editor/schema'
 import { paginate, type PageConfig } from '../layout/paginator'
-import { mapFontFamily } from './presets'
+import { mapFontFamily, presetStyles } from './presets'
 import { fontNameFromFamily } from '../fonts'
 import { markdownToFragment } from '../markdown/importer'
 
@@ -131,15 +131,6 @@ function describeRange(range?: RangeSpec) {
       return '整个文档'
     default:
       return '指定范围'
-  }
-}
-
-function formatToolParamsForError(params: Record<string, unknown>) {
-  try {
-    const serialized = JSON.stringify(params)
-    return serialized.length > 240 ? `${serialized.slice(0, 240)}...` : serialized
-  } catch {
-    return '[unserializable params]'
   }
 }
 
@@ -496,6 +487,57 @@ function isFullParagraphSelection(range: { from: number; to: number }, paragraph
 
 function describeFontFamily(fontFamily: string | undefined) {
   return fontNameFromFamily(fontFamily) ?? fontFamily ?? '宋体'
+}
+
+// ─── Compact snapshot for tool return values ────────────────────────────────
+
+function buildCompactParagraphSnapshot(state: EditorState, paragraphIndexes: number[]) {
+  const paragraphs = getParagraphs(state)
+  return paragraphIndexes
+    .map(index => paragraphs.find(p => p.index === index))
+    .filter((p): p is ParagraphRef => Boolean(p))
+    .map(p => {
+      const textStyle = getRepresentativeTextStyle(p.node)
+      const normalized = normalizeTextStyle(textStyle)
+      const paraStyle = p.node.attrs as Record<string, unknown>
+      return {
+        index: p.index,
+        text: p.node.textContent.length > 60 ? `${p.node.textContent.slice(0, 60)}...` : p.node.textContent,
+        style: {
+          fontFamily: normalized.fontFamily,
+          fontSize: normalized.fontSize,
+          bold: normalized.bold,
+          italic: normalized.italic,
+          color: normalized.color,
+          align: String(paraStyle.align ?? 'left'),
+          firstLineIndent: Number(paraStyle.firstLineIndent ?? 0),
+          lineHeight: Number(paraStyle.lineHeight ?? 1.5),
+          spaceBefore: Number(paraStyle.spaceBefore ?? 0),
+          spaceAfter: Number(paraStyle.spaceAfter ?? 0),
+        },
+      }
+    })
+}
+
+// ─── Range validation helper ────────────────────────────────────────────────
+
+const VALID_RANGE_TYPES = new Set<string>([
+  'all', 'paragraph', 'paragraphs', 'paragraph_indexes', 'selection',
+  'contains_text', 'first_paragraph', 'last_paragraph', 'odd_paragraphs', 'even_paragraphs',
+])
+
+function validateRange(toolName: string, range: unknown): { valid: true } | { valid: false; error: string } {
+  if (!range || typeof range !== 'object' || Array.isArray(range)) {
+    return { valid: false, error: `${toolName} 缺少 range 参数，必须提供有效的操作范围` }
+  }
+  const rangeObj = range as Record<string, unknown>
+  if (!rangeObj.type && Object.keys(rangeObj).length === 0) {
+    return { valid: false, error: `${toolName} 的 range 为空对象 {}，必须指定 range.type` }
+  }
+  if (rangeObj.type && !VALID_RANGE_TYPES.has(String(rangeObj.type))) {
+    return { valid: false, error: `${toolName} 的 range.type="${rangeObj.type}" 无效，支持的类型: ${[...VALID_RANGE_TYPES].join(', ')}` }
+  }
+  return { valid: true }
 }
 
 function getRepresentativeTextStyle(node: PMNode) {
@@ -965,7 +1007,7 @@ function applyPageConfig(params: Record<string, unknown>, options?: ExecuteOptio
 
   let { pageWidth, pageHeight } = base
   if (paperSize && PAPER_SIZES[paperSize]) {
-    ;({ pageWidth, pageHeight } = PAPER_SIZES[paperSize])
+    ; ({ pageWidth, pageHeight } = PAPER_SIZES[paperSize])
   }
   if (orientation === 'landscape' && pageWidth < pageHeight) {
     ;[pageWidth, pageHeight] = [pageHeight, pageWidth]
@@ -1108,11 +1150,13 @@ export function executeTool(
     switch (toolName) {
       case 'set_text_style': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: `set_text_style 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
-        if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
+        const rangeCheck = validateRange('set_text_style', range)
+        if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
+        if (range!.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法按 selection 修改文字样式' }
         }
-        if (range.type !== 'selection' && resolveRange(state, range, options?.selectionContext).length === 0) {
+        const resolved = resolveRange(state, range, options?.selectionContext)
+        if (range!.type !== 'selection' && resolved.length === 0) {
           return { success: false, message: `未找到可设置文字样式的范围：${describeRange(range)}` }
         }
         const { range: _range, ...rawStyleAttrs } = params
@@ -1126,16 +1170,23 @@ export function executeTool(
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()
-        return { success: true, message: '文字样式已更新' }
+        const affectedIndexes = resolved.map(p => p.index)
+        return {
+          success: true,
+          message: `文字样式已更新（${describeRange(range)}）`,
+          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedIndexes) },
+        }
       }
 
       case 'set_paragraph_style': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: `set_paragraph_style 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
-        if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
+        const rangeCheck = validateRange('set_paragraph_style', range)
+        if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
+        if (range!.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法按 selection 修改段落格式' }
         }
-        if (resolveRange(state, range, options?.selectionContext).length === 0) {
+        const resolved = resolveRange(state, range, options?.selectionContext)
+        if (resolved.length === 0) {
           return { success: false, message: `未找到可设置段落格式的范围：${describeRange(range)}` }
         }
         const { range: _range, ...rawParaAttrs } = params
@@ -1147,16 +1198,23 @@ export function executeTool(
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()
-        return { success: true, message: '段落格式已更新' }
+        const affectedIndexes = resolved.map(p => p.index)
+        return {
+          success: true,
+          message: `段落格式已更新（${describeRange(range)}）`,
+          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedIndexes) },
+        }
       }
 
       case 'clear_formatting': {
         const range = params.range as RangeSpec | undefined
-        if (!range) return { success: false, message: `clear_formatting 缺少 range 参数；收到 params=${formatToolParamsForError(params)}` }
-        if (range.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
+        const rangeCheck = validateRange('clear_formatting', range)
+        if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
+        if (range!.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
           return { success: false, message: '当前没有可用的选区，无法清除 selection 范围的格式' }
         }
-        if (range.type !== 'selection' && resolveRange(state, range, options?.selectionContext).length === 0) {
+        const resolved = resolveRange(state, range, options?.selectionContext)
+        if (range!.type !== 'selection' && resolved.length === 0) {
           return { success: false, message: `未找到可清除格式的范围：${describeRange(range)}` }
         }
         const clearTextStyles = params.clearTextStyles !== false
@@ -1165,7 +1223,12 @@ export function executeTool(
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()
-        return { success: true, message: '已清除指定范围的格式' }
+        const affectedIndexes = resolved.map(p => p.index)
+        return {
+          success: true,
+          message: `已清除指定范围的格式（${describeRange(range)}）`,
+          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedIndexes) },
+        }
       }
 
       case 'set_page_config':
@@ -1208,10 +1271,10 @@ export function executeTool(
       case 'insert_table': {
         const tableData = Array.isArray(params.data)
           ? params.data.map(row => (
-              Array.isArray(row)
-                ? row.map(cell => normalizeToolText(String(cell ?? '')))
-                : []
-            ))
+            Array.isArray(row)
+              ? row.map(cell => normalizeToolText(String(cell ?? '')))
+              : []
+          ))
           : []
         const dataRows = tableData.length
         const dataCols = tableData.reduce((max, row) => Math.max(max, row.length), 0)
@@ -1374,6 +1437,149 @@ export function executeTool(
 
       case 'get_paragraph':
         return getParagraph(state, Number(params.index))
+
+      case 'apply_style_batch': {
+        const rules = Array.isArray(params.rules) ? params.rules : []
+        if (rules.length === 0) return { success: false, message: 'apply_style_batch 需要至少一条规则' }
+
+        const allAffectedIndexes = new Set<number>()
+        let currentTr = state.tr
+
+        for (let i = 0; i < rules.length; i++) {
+          const rule = rules[i] as Record<string, unknown>
+          const range = rule.range as RangeSpec | undefined
+          const rangeCheck = validateRange(`apply_style_batch.rules[${i}]`, range)
+          if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
+
+          const resolved = resolveRange(state, range, options?.selectionContext)
+          for (const p of resolved) allAffectedIndexes.add(p.index)
+
+          const textStyle = rule.textStyle as Record<string, unknown> | undefined
+          if (textStyle && typeof textStyle === 'object') {
+            const styleAttrs = Object.fromEntries(
+              Object.entries(textStyle).filter(([, v]) => v !== undefined)
+            )
+            if (typeof styleAttrs.fontFamily === 'string') {
+              styleAttrs.fontFamily = mapFontFamily(styleAttrs.fontFamily)
+            }
+            currentTr = applyTextStyle(state, currentTr, range, styleAttrs, options?.selectionContext)
+          }
+
+          const paragraphStyle = rule.paragraphStyle as Record<string, unknown> | undefined
+          if (paragraphStyle && typeof paragraphStyle === 'object') {
+            const paraAttrs = Object.fromEntries(
+              Object.entries(paragraphStyle).filter(([, v]) => v !== undefined)
+            )
+            if (paraAttrs.listType === 'none') paraAttrs.listType = null
+            currentTr = applyParagraphStyle(state, currentTr, range, paraAttrs, options?.selectionContext)
+          }
+        }
+
+        dispatch(currentTr)
+        options?.onDocumentStyleMutation?.()
+        view.focus()
+
+        const affectedArr = [...allAffectedIndexes].sort((a, b) => a - b)
+        return {
+          success: true,
+          message: `已批量应用 ${rules.length} 条样式规则，影响 ${affectedArr.length} 个段落`,
+          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedArr) },
+        }
+      }
+
+      case 'apply_document_preset': {
+        const presetName = String(params.preset ?? '')
+        const preset = presetStyles[presetName]
+        if (!preset) {
+          return { success: false, message: `未知预设: "${presetName}"，支持: ${Object.keys(presetStyles).join(', ')}` }
+        }
+
+        const applyPage = params.applyPageConfig !== false
+        if (applyPage && preset.page && options?.pageConfig && options.onPageConfigChange) {
+          applyPageConfig({
+            paperSize: preset.page.paperSize,
+            orientation: preset.page.orientation,
+            marginTop: preset.page.marginTop,
+            marginBottom: preset.page.marginBottom,
+            marginLeft: preset.page.marginLeft,
+            marginRight: preset.page.marginRight,
+          }, options)
+        }
+
+        const paragraphs = getParagraphs(state)
+        let currentTr = state.tr
+        const allIndexes: number[] = []
+
+        for (const p of paragraphs) {
+          allIndexes.push(p.index)
+          const text = p.node.textContent
+          const textLen = text.length
+          const repStyle = getRepresentativeTextStyle(p.node)
+          const pAttrs = p.node.attrs as Record<string, unknown>
+
+          // Heuristic: heading detection
+          const isLikelyHeading = textLen > 0 && textLen <= 50 && (
+            Boolean(repStyle.bold) ||
+            Number(repStyle.fontSize ?? 12) >= 14 ||
+            String(pAttrs.align ?? 'left') === 'center'
+          )
+
+          // Determine heading level based on font size / position
+          let headingLevel = 0
+          if (isLikelyHeading) {
+            const fontSize = Number(repStyle.fontSize ?? 12)
+            if (fontSize >= 18 || String(pAttrs.align ?? 'left') === 'center') headingLevel = 1
+            else if (fontSize >= 14) headingLevel = 2
+            else headingLevel = 3
+          }
+
+          // Apply styles based on role
+          const headingStyle = headingLevel === 1 ? preset.heading1
+            : headingLevel === 2 ? preset.heading2
+              : headingLevel === 3 ? preset.heading3
+                : null
+
+          if (headingStyle) {
+            const textAttrs: Record<string, unknown> = {}
+            if (headingStyle.fontFamily) textAttrs.fontFamily = mapFontFamily(headingStyle.fontFamily)
+            if (headingStyle.fontSize) textAttrs.fontSize = headingStyle.fontSize
+            if (headingStyle.bold !== undefined) textAttrs.bold = headingStyle.bold
+            const { from, to } = paragraphTextBounds(p)
+            currentTr = addTextMark(currentTr, state, from, to, textAttrs)
+
+            const paraAttrs: Record<string, unknown> = {}
+            if (headingStyle.align) paraAttrs.align = headingStyle.align
+            if (headingStyle.spaceBefore !== undefined) paraAttrs.spaceBefore = headingStyle.spaceBefore
+            if (headingStyle.spaceAfter !== undefined) paraAttrs.spaceAfter = headingStyle.spaceAfter
+            currentTr.setNodeMarkup(p.pos, undefined, { ...p.node.attrs, ...paraAttrs })
+          } else if (preset.body && textLen > 0) {
+            const body = preset.body
+            const textAttrs: Record<string, unknown> = {}
+            if (body.fontFamily) textAttrs.fontFamily = mapFontFamily(body.fontFamily)
+            if (body.fontSize) textAttrs.fontSize = body.fontSize
+            const { from, to } = paragraphTextBounds(p)
+            currentTr = addTextMark(currentTr, state, from, to, textAttrs)
+
+            const paraAttrs: Record<string, unknown> = {}
+            if (body.align) paraAttrs.align = body.align
+            if (body.firstLineIndent !== undefined) paraAttrs.firstLineIndent = body.firstLineIndent
+            if (body.lineHeight !== undefined) paraAttrs.lineHeight = body.lineHeight
+            if (body.spaceBefore !== undefined) paraAttrs.spaceBefore = body.spaceBefore
+            if (body.spaceAfter !== undefined) paraAttrs.spaceAfter = body.spaceAfter
+            currentTr.setNodeMarkup(p.pos, undefined, { ...p.node.attrs, ...paraAttrs })
+          }
+        }
+
+        dispatch(currentTr)
+        options?.onDocumentStyleMutation?.()
+        view.focus()
+
+        return {
+          success: true,
+          message: `已应用"${presetName}"预设，影响 ${allIndexes.length} 个段落${applyPage && preset.page ? '，并更新页面配置' : ''}`,
+          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, allIndexes) },
+        }
+      }
 
       default:
         return { success: false, message: `未知工具: ${toolName}` }

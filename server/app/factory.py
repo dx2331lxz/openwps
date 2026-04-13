@@ -8,7 +8,16 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
-from .ai import list_models, run_chat, stream_react_round
+from .ai import (
+    create_react_session,
+    get_react_session,
+    get_react_session_trace,
+    list_conversation_react_traces,
+    list_models,
+    run_chat,
+    stream_react_session,
+    submit_react_tool_results,
+)
 from .config import DIST_DIR, get_provider, public_config, read_config, write_config
 from .conversations import (
     append_messages,
@@ -18,7 +27,7 @@ from .conversations import (
     read_conversation,
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
-from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, SettingsUpdate
+from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, SettingsUpdate, ToolResultsRequest
 
 
 def sse(event_type: str, data: dict) -> str:
@@ -121,6 +130,10 @@ def create_api_router() -> APIRouter:
     def get_conversation(conv_id: str):
         return read_conversation(conv_id)
 
+    @router.get("/conversations/{conv_id}/react-traces")
+    def get_conversation_react_traces(conv_id: str):
+        return {"traces": list_conversation_react_traces(conv_id)}
+
     @router.post("/conversations/{conv_id}/messages")
     def post_messages(conv_id: str, body: AppendMessagesRequest):
         append_messages(
@@ -163,18 +176,12 @@ def create_api_router() -> APIRouter:
 
     @router.post("/ai/react/stream")
     async def react_stream(body: ChatRequest):
+        session = create_react_session(body)
+
         async def generate():
             try:
-                tool_call_count = 0
-                async for event in stream_react_round(body):
-                    if event["type"] == "tool_call":
-                        tool_call_count += 1
+                async for event in stream_react_session(session):
                     yield sse(str(event["type"]), event)
-
-                if tool_call_count > 0:
-                    yield sse("awaiting_tool_results", {"count": tool_call_count})
-                else:
-                    yield sse("done", {"reason": "completed"})
             except HTTPException as exc:
                 yield sse("error", {"message": exc.detail})
             except Exception as exc:
@@ -188,6 +195,22 @@ def create_api_router() -> APIRouter:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @router.post("/ai/react/{session_id}/tool-results")
+    async def post_tool_results(session_id: str, body: ToolResultsRequest):
+        session = get_react_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found or expired")
+
+        submit_react_tool_results(session, body)
+        return {"success": True}
+
+    @router.get("/ai/react/{session_id}/trace")
+    async def get_react_trace(session_id: str):
+        trace = get_react_session_trace(session_id)
+        if not trace:
+            raise HTTPException(status_code=404, detail="React trace not found")
+        return trace
 
     return router
 
