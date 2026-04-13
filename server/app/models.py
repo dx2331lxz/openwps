@@ -15,6 +15,17 @@ class ChatMessage(BaseModel):
     thinking: Optional[str] = None
 
 
+class OCRConfig(BaseModel):
+    enabled: bool = True
+    providerId: str = "siliconflow"
+    endpoint: str = ""
+    model: str = "PaddlePaddle/PaddleOCR-VL-1.5"
+    apiKey: Optional[str] = None
+    hasApiKey: bool = False
+    timeoutSeconds: int = 60
+    maxImages: int = 5
+
+
 class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = Field(default_factory=list)
@@ -25,6 +36,9 @@ class ChatRequest(BaseModel):
     images: list[dict[str, Any]] = Field(default_factory=list)
     model: Optional[str] = None
     providerId: Optional[str] = None
+    imageProcessingMode: str = "direct_multimodal"
+    ocrConfig: Optional[OCRConfig] = None
+    ocrResults: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ProviderSettings(BaseModel):
@@ -34,10 +48,13 @@ class ProviderSettings(BaseModel):
     defaultModel: str = ""
     apiKey: Optional[str] = None
     isPreset: bool = False
+    supportsVision: bool = False
 
 
 class SettingsUpdate(BaseModel):
     activeProviderId: str
+    imageProcessingMode: str = "direct_multimodal"
+    ocrConfig: OCRConfig = Field(default_factory=OCRConfig)
     providers: list[ProviderSettings] = Field(default_factory=list)
 
 

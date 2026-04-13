@@ -89,6 +89,10 @@ export interface PaginateResult {
 
 const PRETEXT_LAYOUT_SAFETY_PX = 2
 const COMPRESSIBLE_PUNCT_RE = /^[，。、；：！？,.!?:;、（）()〈〉《》「」『』【】〔〕〖〗〘〙〚〛‘’“”…]+$/
+const TABLE_BLOCK_MARGIN_PX = 8
+const TABLE_CELL_HORIZONTAL_PADDING_PX = 16
+const TABLE_CELL_VERTICAL_CHROME_PX = 10
+const TABLE_MIN_ROW_HEIGHT_PX = 34
 
 interface MeasuredBlock {
   lines: RenderedLine[]
@@ -720,18 +724,18 @@ function measureParagraph(
   }
 }
 
-function measureTableCell(cellNode: PMNode, cellWidth: number): number {
+function measureTableCell(cellNode: PMNode, cellContentWidth: number): number {
   let totalHeight = 0
   cellNode.forEach((child) => {
     if (child.type.name === 'paragraph') {
-      totalHeight += measureParagraph(child, 0, 0, Math.max(cellWidth - 16, 40)).totalHeight
+      totalHeight += measureParagraph(child, 0, 0, Math.max(cellContentWidth, 40)).totalHeight
     } else if (child.type.name === 'table') {
-      totalHeight += measureTable(child, Math.max(cellWidth - 16, 40)).totalHeight
+      totalHeight += measureTable(child, Math.max(cellContentWidth, 40)).totalHeight
     } else {
       totalHeight += 24
     }
   })
-  return Math.max(totalHeight, 28)
+  return Math.max(totalHeight, 24)
 }
 
 function countRowColumns(rowNode: PMNode): number {
@@ -755,27 +759,31 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
   })
 
   const cellWidth = Math.max(Math.floor(contentWidth / maxColumns), 48)
-  let totalHeight = 16
+  const cellContentWidth = Math.max(cellWidth - TABLE_CELL_HORIZONTAL_PADDING_PX - 2, 40)
+  let contentHeight = 0
 
   tableNode.forEach((rowNode) => {
-    let rowHeight = 28
+    let rowHeight = TABLE_MIN_ROW_HEIGHT_PX
     rowNode.forEach((cellNode) => {
-      rowHeight = Math.max(rowHeight, measureTableCell(cellNode, cellWidth))
+      rowHeight = Math.max(
+        rowHeight,
+        measureTableCell(cellNode, cellContentWidth) + TABLE_CELL_VERTICAL_CHROME_PX,
+      )
     })
-    totalHeight += rowHeight
+    contentHeight += rowHeight
   })
 
   return {
     canSplit: false,
-    spaceBefore: 0,
-    spaceAfter: 0,
-      lines: [{
-        text: buildTablePreviewText(tableNode),
-        blockIndex: 0,
-        blockType: 'table',
-        lineIndex: 0,
-        lineHeight: totalHeight,
-        startPos: null,
+    spaceBefore: TABLE_BLOCK_MARGIN_PX,
+    spaceAfter: TABLE_BLOCK_MARGIN_PX,
+    lines: [{
+      text: buildTablePreviewText(tableNode),
+      blockIndex: 0,
+      blockType: 'table',
+      lineIndex: 0,
+      lineHeight: contentHeight,
+      startPos: null,
       units: [],
       align: 'left',
       availableWidth: contentWidth,
@@ -784,7 +792,7 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
       renderedWidth: 0,
       isLastLineOfParagraph: true,
     }],
-    totalHeight,
+    totalHeight: contentHeight + TABLE_BLOCK_MARGIN_PX * 2,
   }
 }
 
@@ -799,7 +807,7 @@ function measureBlock(
       return measureParagraph(node, nodePos, blockIndex, contentWidth)
     case 'table': {
       const measured = measureTable(node, contentWidth)
-      measured.lines[0] = { ...measured.lines[0]!, blockIndex }
+      measured.lines[0] = { ...measured.lines[0]!, blockIndex, startPos: nodePos + 1 }
       return measured
     }
     case 'horizontal_rule':
@@ -1006,7 +1014,7 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
   console.log(
     `[paginator] ${pages.length} page(s), contentHeight=${contentHeight}px, ` +
-      pages.map((page, index) => `p${index + 1}=${page.totalHeight.toFixed(0)}px`).join(' ')
+    pages.map((page, index) => `p${index + 1}=${page.totalHeight.toFixed(0)}px`).join(' ')
   )
 
   return {

@@ -41,15 +41,15 @@ function deriveFormats(state: EditorState) {
   const marks: readonly Mark[] = empty
     ? (state.storedMarks ?? doc.resolve(from).marks())
     : (() => {
-        const found: Mark[] = []
-        doc.nodesBetween(selection.from, selection.to, (node) => {
-          if (node.isText && node.marks.length) {
-            node.marks.forEach(m => found.push(m))
-            return false
-          }
-        })
-        return found
-      })()
+      const found: Mark[] = []
+      doc.nodesBetween(selection.from, selection.to, (node) => {
+        if (node.isText && node.marks.length) {
+          node.marks.forEach(m => found.push(m))
+          return false
+        }
+      })
+      return found
+    })()
 
   const tm = marks.find(m => m.type.name === 'textStyle')
   if (tm) Object.assign(text, tm.attrs)
@@ -630,7 +630,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         {/* AI Sidebar toggle */}
         <button
-          title="AI 排版助手"
+          title="openwps AI 助手"
           onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
           style={{
             padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',

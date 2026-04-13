@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ClipboardEvent as ReactClipboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import type { Node as ProseMirrorNode } from 'prosemirror-model'
@@ -15,7 +15,13 @@ import {
   type StreamingWriteSession,
 } from '../ai/executor'
 import { agentTools } from '../ai/tools'
-import type { AISettingsData, ModelOption } from '../ai/providers'
+import type {
+  AIProviderSettings,
+  AISettingsData,
+  ImageProcessingMode,
+  ModelOption,
+  OcrConfigData,
+} from '../ai/providers'
 import { paginate, type PageConfig } from '../layout/paginator'
 
 type View = 'history' | 'chat'
@@ -263,6 +269,9 @@ const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
 const STREAMING_WRITE_FLUSH_MS = 80
 const STREAMING_WRITE_MAX_BUFFER = 1200
+const MAX_IMAGE_ATTACHMENT_COUNT = 5
+const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, tool.description]))
 
 let msgIdCounter = 0
@@ -965,11 +974,54 @@ function buildReactMessages(messages: StoredMessage[], userText: string): ReactM
 
 function buildErrorText(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
+
+  if (message.includes('未接受图片输入') || message.includes('不兼容 image_url 图片格式')) {
+    return `❌ 当前模型未接受图片输入：${message}\n\n你可以切换到明确支持视觉的模型，或改用 OCR 路径。`
+  }
+
+  if (message.includes('OCR API Key 未配置') || message.includes('OCR 端点未配置') || message.includes('OCR 模型未配置')) {
+    return `❌ OCR 配置不完整：${message}\n\n请在设置中检查 OCR 端点、模型 ID 和 API Key。`
+  }
+
+  if (message.includes('OCR 模型请求失败')) {
+    return `❌ OCR 接口调用失败：${message}\n\n请检查 OCR 服务端点、API Key、模型 ID，以及当前服务是否可达。`
+  }
+
+  if (message.includes('OCR 结果解析失败')) {
+    return `❌ OCR 已返回响应，但结果格式不可解析：${message}\n\n这通常表示 OCR 模型返回了非预期格式，或输出被截断。建议先换一张更清晰的图片，或检查当前 OCR 模型是否支持该接口格式。`
+  }
+
   return `❌ 请求失败：${message}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
 }
 
 function makeConversationTitle(text: string) {
   return text.trim().slice(0, 30) || '新会话'
+}
+
+function buildDefaultImagePrompt(mode: AssistantMode) {
+  if (mode === 'layout') return '请根据上传的图片内容复现版式到当前文档中。'
+  if (mode === 'edit') return '请根据上传的图片内容复现正文到当前文档中。'
+  return '请根据上传的图片内容复现到当前文档中。'
+}
+
+function createDefaultOcrConfig(): OcrConfigData {
+  return {
+    enabled: true,
+    providerId: 'siliconflow',
+    endpoint: 'https://api.siliconflow.cn/v1',
+    model: 'PaddlePaddle/PaddleOCR-VL-1.5',
+    hasApiKey: false,
+    timeoutSeconds: 60,
+    maxImages: 5,
+  }
+}
+
+function extractClipboardImageFiles(event: ReactClipboardEvent<HTMLTextAreaElement>): File[] {
+  const items = Array.from(event.clipboardData?.items || [])
+  return items
+    .filter(item => item.type.startsWith('image/'))
+    .map(item => item.getAsFile())
+    .filter((file): file is File => file !== null)
 }
 
 export default function AISidebar({ view: editorView, editorState, pageConfig, onPageConfigChange, onDocumentStyleMutation, onClose }: Props) {
@@ -986,12 +1038,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [todos, setTodos] = useState<TodoItem[]>([])
   const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
+  const [providers, setProviders] = useState<AIProviderSettings[]>([])
   const [modelName, setModelName] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
   const [activeProviderId, setActiveProviderId] = useState('')
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
   const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([])
+  const [imageProcessingMode, setImageProcessingMode] = useState<ImageProcessingMode>('direct_multimodal')
+  const [ocrConfig, setOcrConfig] = useState<OcrConfigData>(createDefaultOcrConfig())
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollAreaRef = useRef<HTMLDivElement>(null)
@@ -1005,6 +1060,31 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const conversationMessagesRef = useRef<StoredMessage[]>([])
   const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
   const todosRef = useRef<TodoItem[]>([])
+
+  const activeProvider = useMemo(
+    () => providers.find(provider => provider.id === activeProviderId) ?? null,
+    [providers, activeProviderId],
+  )
+  const activeOcrProvider = useMemo(
+    () => providers.find(provider => provider.id === ocrConfig.providerId) ?? null,
+    [ocrConfig.providerId, providers],
+  )
+  const activeProviderSupportsVision = Boolean(activeProvider?.supportsVision)
+  const currentModelId = selectedModel || modelName
+  const currentModelSupportsVision = useMemo(() => {
+    const matched = availableModels.find(model => model.id === currentModelId)
+    return matched?.supportsVision ?? activeProviderSupportsVision
+  }, [activeProviderSupportsVision, availableModels, currentModelId])
+  const effectiveOcrEndpoint = ocrConfig.endpoint || activeOcrProvider?.endpoint || ''
+  const effectiveOcrHasApiKey = ocrConfig.hasApiKey || Boolean(activeOcrProvider?.hasApiKey)
+  const isOcrReady = Boolean(
+    ocrConfig.enabled
+    && ocrConfig.model.trim()
+    && effectiveOcrEndpoint
+    && effectiveOcrHasApiKey,
+  )
+  const canUploadImages = imageProcessingMode === 'ocr_text' ? isOcrReady : true
+  const canSendMessage = Boolean(input.trim() || pendingImages.length > 0)
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
@@ -1082,7 +1162,10 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       })
       .then(data => {
         if (!active) return
+        setProviders(data.providers)
         setActiveProviderId(data.activeProviderId)
+        setImageProcessingMode(data.imageProcessingMode || 'direct_multimodal')
+        setOcrConfig(data.ocrConfig || createDefaultOcrConfig())
         setModelName(data.model || '')
         setSelectedModel(data.model || '')
       })
@@ -1235,6 +1318,12 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       mode: assistantMode,
       providerId: activeProviderId || null,
       model: selectedModel || modelName || null,
+      imageProcessingMode,
+      ocrConfig: {
+        providerId: ocrConfig.providerId,
+        endpoint: effectiveOcrEndpoint || null,
+        model: ocrConfig.model || null,
+      },
       includeSelection,
       currentContext: getContext(),
       storedMessages: detail?.messages ?? conversationMessagesRef.current,
@@ -1245,20 +1334,61 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
     const safeTitle = String(payload.title || 'conversation').replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 40) || 'conversation'
     downloadJsonFile(`${safeTitle}-${targetConversationId ?? 'draft'}.json`, payload)
-  }, [activeProviderId, assistantMode, currentConversationTitle, getContext, includeSelection, messages, modelName, selectedModel])
+  }, [activeProviderId, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, imageProcessingMode, includeSelection, messages, modelName, ocrConfig.model, ocrConfig.providerId, selectedModel])
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort()
   }, [])
 
-  const handleImagePick = useCallback(async (files: FileList | null) => {
-    if (!files || files.length === 0) return
+  const appendPendingImages = useCallback(async (incomingFiles: File[]) => {
+    if (incomingFiles.length === 0) return
 
-    const imageFiles = Array.from(files).filter(file => file.type.startsWith('image/'))
+    if (imageProcessingMode === 'ocr_text' && !canUploadImages) {
+      window.alert(
+        imageProcessingMode === 'ocr_text'
+          ? '当前已切换到 OCR 模式，但 OCR 配置未就绪。请先在设置中配置 OCR 模型、端点和 API Key。'
+          : '当前模型未标记为支持图片输入。请先切换到多模态模型，再上传图片。',
+      )
+      return
+    }
+
+    const imageFiles = incomingFiles.filter(file => file.type.startsWith('image/'))
     if (imageFiles.length === 0) return
 
+    const errors: string[] = []
+    const existingTotalSize = pendingImages.reduce((sum, image) => sum + image.size, 0)
+    const remainingSlots = Math.max(MAX_IMAGE_ATTACHMENT_COUNT - pendingImages.length, 0)
+    if (remainingSlots <= 0) {
+      window.alert(`最多只能附带 ${MAX_IMAGE_ATTACHMENT_COUNT} 张图片。`)
+      return
+    }
+
+    let nextTotalSize = existingTotalSize
+    const acceptedFiles: File[] = []
+    for (const file of imageFiles.slice(0, remainingSlots)) {
+      if (file.size > MAX_IMAGE_SIZE_BYTES) {
+        errors.push(`${file.name} 超过 ${Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024))}MB 限制`)
+        continue
+      }
+      if (nextTotalSize + file.size > MAX_TOTAL_IMAGE_BYTES) {
+        errors.push(`图片总大小不能超过 ${Math.floor(MAX_TOTAL_IMAGE_BYTES / (1024 * 1024))}MB`)
+        break
+      }
+      acceptedFiles.push(file)
+      nextTotalSize += file.size
+    }
+
+    if (imageFiles.length > remainingSlots) {
+      errors.push(`最多只能附带 ${MAX_IMAGE_ATTACHMENT_COUNT} 张图片，超出的图片已忽略`)
+    }
+
+    if (acceptedFiles.length === 0) {
+      if (errors.length > 0) window.alert(errors.join('\n'))
+      return
+    }
+
     const nextImages = await Promise.all(
-      imageFiles.map(
+      acceptedFiles.map(
         file =>
           new Promise<ImageAttachment>((resolve, reject) => {
             const reader = new FileReader()
@@ -1277,15 +1407,30 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     )
 
     setPendingImages(prev => [...prev, ...nextImages])
-  }, [])
+    if (errors.length > 0) window.alert(errors.join('\n'))
+  }, [canUploadImages, imageProcessingMode, pendingImages])
+
+  const handleImagePick = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return
+    await appendPendingImages(Array.from(files))
+  }, [appendPendingImages])
 
   const removePendingImage = useCallback((id: string) => {
     setPendingImages(prev => prev.filter(image => image.id !== id))
   }, [])
 
   const handleSend = useCallback(async (overrideText?: string) => {
-    const text = (overrideText ?? input).trim()
+    const rawText = (overrideText ?? input).trim()
+    const text = rawText || (pendingImages.length > 0 ? buildDefaultImagePrompt(assistantMode) : '')
     if (!text || loading) return
+    if (pendingImages.length > 0 && imageProcessingMode === 'ocr_text' && !canUploadImages) {
+      window.alert(
+        imageProcessingMode === 'ocr_text'
+          ? 'OCR 配置未就绪，请先在设置中补充 OCR 模型、端点和 API Key。'
+          : '当前模型未标记为支持图片输入。请切换到多模态模型后再发送。',
+      )
+      return
+    }
 
     const shouldStartNewConversation = viewMode === 'history'
     const nextTitle = makeConversationTitle(text)
@@ -1468,6 +1613,17 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
           mode: assistantMode,
           model: selectedModel || modelName || undefined,
           providerId: activeProviderId || undefined,
+          imageProcessingMode,
+          ocrConfig: imageProcessingMode === 'ocr_text'
+            ? {
+              enabled: ocrConfig.enabled,
+              providerId: ocrConfig.providerId,
+              endpoint: effectiveOcrEndpoint || undefined,
+              model: ocrConfig.model || undefined,
+              timeoutSeconds: ocrConfig.timeoutSeconds,
+              maxImages: ocrConfig.maxImages,
+            }
+            : undefined,
           images: imagesForRequest.map(image => ({
             name: image.name,
             type: image.type,
@@ -1944,7 +2100,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [activeProviderId, assistantMode, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
+  }, [activeProviderId, assistantMode, canUploadImages, currentModelSupportsVision, editorState, editorView, effectiveOcrEndpoint, getContext, imageProcessingMode, includeSelection, input, loadConversations, loading, modelName, ocrConfig.enabled, ocrConfig.maxImages, ocrConfig.model, ocrConfig.providerId, ocrConfig.timeoutSeconds, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -1962,7 +2118,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       {viewMode === 'history' ? (
         <div className="flex items-center justify-between px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
           <div className="min-w-0">
-            <span className="font-semibold text-sm truncate">🤖 AI 排版助手</span>
+            <span className="font-semibold text-sm truncate">🤖 openwps</span>
           </div>
           <button
             onClick={onClose}
@@ -2450,7 +2606,20 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   </div>
                 ) : (
                   <div className="text-xs text-slate-400">
-                    上传图片或附带当前选区后，会显示在这里并随本轮请求一起发送。
+                    {imageProcessingMode === 'ocr_text'
+                      ? (isOcrReady
+                        ? '当前使用 OCR + 文本模型 路径。上传图片后会先提取内容和样式线索，再交给主模型继续处理。'
+                        : '当前已切换到 OCR 模式，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。')
+                      : (currentModelSupportsVision
+                        ? '上传图片或附带当前选区后，会显示在这里并随本轮请求一起发送。'
+                        : '当前模型未明确标记为多模态，仍会尝试发送图片；若上游拒绝，请切换到支持视觉的模型或改用 OCR 路径。')}
+                  </div>
+                )}
+                {pendingImages.length > 0 && imageProcessingMode === 'ocr_text' && !canUploadImages && (
+                  <div className="mt-2 text-[11px] text-amber-600">
+                    {imageProcessingMode === 'ocr_text'
+                      ? '当前 OCR 配置未就绪，请先在设置中补充 OCR 模型、端点和 API Key。'
+                      : '当前模型未标记为支持图片输入，请先切换到多模态模型再发送。'}
                   </div>
                 )}
               </div>
@@ -2473,6 +2642,12 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     setInput(event.target.value)
                     autoResize(event.target)
                   }}
+                  onPaste={event => {
+                    const pastedImageFiles = extractClipboardImageFiles(event)
+                    if (pastedImageFiles.length === 0) return
+                    event.preventDefault()
+                    void appendPendingImages(pastedImageFiles)
+                  }}
                   onCompositionStart={() => {
                     isComposingRef.current = true
                   }}
@@ -2489,98 +2664,113 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                 />
               </div>
 
-              <div className="flex items-center gap-2 border-t border-slate-100 bg-slate-50 px-3 py-2">
-                <label className="flex items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1 text-[11px] text-slate-500 max-w-[210px]">
-                  <span className="shrink-0">模型</span>
-                  <select
-                    value={selectedModel || modelName}
-                    onChange={event => setSelectedModel(event.target.value)}
-                    disabled={loading || modelsLoading || (availableModels.length === 0 && !modelName)}
-                    className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
-                    title={selectedModel || modelName || '未配置模型'}
-                  >
-                    {selectedModel && !availableModels.some(model => model.id === selectedModel) && (
-                      <option value={selectedModel}>{selectedModel}</option>
-                    )}
-                    {!selectedModel && modelName && !availableModels.some(model => model.id === modelName) && (
-                      <option value={modelName}>{modelName}</option>
-                    )}
-                    {availableModels.map(model => (
-                      <option key={model.id} value={model.id}>{model.id}</option>
-                    ))}
-                    {availableModels.length === 0 && (
-                      <option value={selectedModel || modelName || ''}>
-                        {modelsLoading ? '模型加载中...' : (selectedModel || modelName || '未配置模型')}
-                      </option>
-                    )}
-                  </select>
-                </label>
+              <div className="border-t border-slate-100 bg-slate-50/90 px-3 py-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="flex min-w-[180px] flex-1 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
+                    <span className="shrink-0">模型</span>
+                    <select
+                      value={selectedModel || modelName}
+                      onChange={event => setSelectedModel(event.target.value)}
+                      disabled={loading || modelsLoading || (availableModels.length === 0 && !modelName)}
+                      className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
+                      title={selectedModel || modelName || '未配置模型'}
+                    >
+                      {selectedModel && !availableModels.some(model => model.id === selectedModel) && (
+                        <option value={selectedModel}>{selectedModel}</option>
+                      )}
+                      {!selectedModel && modelName && !availableModels.some(model => model.id === modelName) && (
+                        <option value={modelName}>{modelName}</option>
+                      )}
+                      {availableModels.map(model => (
+                        <option key={model.id} value={model.id}>{model.supportsVision ? `${model.id} · 多模态` : model.id}</option>
+                      ))}
+                      {availableModels.length === 0 && (
+                        <option value={selectedModel || modelName || ''}>
+                          {modelsLoading ? '模型加载中...' : (selectedModel || modelName || '未配置模型')}
+                        </option>
+                      )}
+                    </select>
+                  </label>
 
-                <div className="inline-flex rounded-full border border-slate-200 bg-white p-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setAssistantMode('agent')}
-                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${assistantMode === 'agent'
-                      ? 'bg-violet-600 text-white'
-                      : 'text-slate-500 hover:bg-slate-100'
-                      }`}
-                    title="Agent 模式：可同时写正文和排版，是主推荐模式"
-                  >
-                    Agent
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAssistantMode('layout')}
-                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${assistantMode === 'layout'
-                      ? 'bg-blue-500 text-white'
-                      : 'text-slate-500 hover:bg-slate-100'
-                      }`}
-                    title="排版模式：只能排版，不能改写正文"
-                  >
-                    排版
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAssistantMode('edit')}
-                    className={`rounded-full px-2.5 py-1 text-[11px] transition-colors ${assistantMode === 'edit'
-                      ? 'bg-emerald-500 text-white'
-                      : 'text-slate-500 hover:bg-slate-100'
-                      }`}
-                    title="Edit 模式：可写作、删改正文"
-                  >
-                    Edit
-                  </button>
+                  <div className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] ${currentModelSupportsVision ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
+                    {currentModelSupportsVision ? '多模态' : '视觉待确认'}
+                  </div>
+
+                  <div className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] ${imageProcessingMode === 'ocr_text' ? (isOcrReady ? 'border-violet-200 bg-violet-50 text-violet-700' : 'border-amber-200 bg-amber-50 text-amber-700') : 'border-slate-200 bg-white text-slate-500'}`}>
+                    {imageProcessingMode === 'ocr_text'
+                      ? (isOcrReady ? 'OCR 模式' : 'OCR 未就绪')
+                      : '直连模式'}
+                  </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => imageInputRef.current?.click()}
-                  className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-600 transition-colors hover:bg-slate-100"
-                  title="上传图片"
-                >
-                  <span>＋</span>
-                  <span>图片</span>
-                </button>
+                <div className="mt-2 flex items-center gap-2">
+                  <div className="inline-flex min-w-0 flex-1 rounded-full border border-slate-200 bg-white p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setAssistantMode('agent')}
+                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'agent'
+                        ? 'bg-violet-600 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                        }`}
+                      title="Agent 模式：可同时写正文和排版，是主推荐模式"
+                    >
+                      Agent
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAssistantMode('layout')}
+                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'layout'
+                        ? 'bg-blue-500 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                        }`}
+                      title="排版模式：只能排版，不能改写正文"
+                    >
+                      排版
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAssistantMode('edit')}
+                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'edit'
+                        ? 'bg-emerald-500 text-white'
+                        : 'text-slate-500 hover:bg-slate-100'
+                        }`}
+                      title="Edit 模式：可写作、删改正文"
+                    >
+                      Edit
+                    </button>
+                  </div>
 
-                <div className="ml-auto">
-                  {loading ? (
-                    <button
-                      onClick={handleCancel}
-                      className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-red-500 px-3 text-sm text-white transition-colors hover:bg-red-600"
-                      title="取消"
-                    >
-                      ⏹
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => void handleSend()}
-                      disabled={!input.trim()}
-                      className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-slate-900 px-3 text-sm text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
-                      title="发送 (Enter)"
-                    >
-                      ↑
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={loading || !canUploadImages}
+                    className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1.5 text-[11px] transition-colors ${loading || !canUploadImages ? 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'}`}
+                    title={imageProcessingMode === 'ocr_text' ? (isOcrReady ? '上传图片并走 OCR 预处理' : 'OCR 配置未就绪') : (currentModelSupportsVision ? '上传图片' : '上传图片并尝试直连多模态；若模型不支持会在发送时提示')}
+                  >
+                    <span>＋</span>
+                    <span>图片</span>
+                  </button>
+
+                  <div className="ml-auto shrink-0">
+                    {loading ? (
+                      <button
+                        onClick={handleCancel}
+                        className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-red-500 px-3 text-sm text-white transition-colors hover:bg-red-600"
+                        title="取消"
+                      >
+                        ⏹
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => void handleSend()}
+                        disabled={!canSendMessage}
+                        className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-slate-900 px-3 text-sm text-white transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+                        title="发送 (Enter)"
+                      >
+                        ↑
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>

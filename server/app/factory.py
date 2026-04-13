@@ -14,6 +14,7 @@ from .ai import (
     get_react_session_trace,
     list_conversation_react_traces,
     list_models,
+    prepare_chat_request,
     run_chat,
     stream_react_session,
     submit_react_tool_results,
@@ -79,9 +80,12 @@ def create_api_router() -> APIRouter:
             for provider in current.get("providers", [])
             if isinstance(provider, dict)
         }
+        existing_ocr = dict(current.get("ocrConfig") or {})
         cfg = {
             "version": 2,
             "activeProviderId": body.activeProviderId,
+            "imageProcessingMode": body.imageProcessingMode,
+            "ocrConfig": {},
             "providers": [],
         }
         for provider in body.providers:
@@ -89,6 +93,12 @@ def create_api_router() -> APIRouter:
             if "apiKey" not in item and item.get("id") in existing_by_id:
                 item["apiKey"] = existing_by_id[item["id"]].get("apiKey", "")
             cfg["providers"].append(item)
+
+        ocr_item = body.ocrConfig.model_dump(exclude_none=True)
+        ocr_item.pop("hasApiKey", None)
+        if "apiKey" not in ocr_item:
+            ocr_item["apiKey"] = existing_ocr.get("apiKey", "")
+        cfg["ocrConfig"] = ocr_item
         write_config(cfg)
         return public_config(cfg)
 
@@ -96,7 +106,7 @@ def create_api_router() -> APIRouter:
     async def get_models(providerId: str | None = None):
         cfg = read_config()
         provider = get_provider(cfg, providerId)
-        models = await list_models(provider.get("endpoint", ""), str(provider.get("apiKey", "") or ""))
+        models = await list_models(provider.get("endpoint", ""), str(provider.get("apiKey", "") or ""), provider.get("id"))
         return {
             "providerId": provider["id"],
             "models": models,
@@ -113,7 +123,7 @@ def create_api_router() -> APIRouter:
             endpoint = body.endpoint or ""
             api_key = body.apiKey or ""
 
-        models = await list_models(endpoint, api_key)
+        models = await list_models(endpoint, api_key, body.providerId)
         return {"models": models}
 
     @router.get("/conversations")
@@ -176,7 +186,8 @@ def create_api_router() -> APIRouter:
 
     @router.post("/ai/react/stream")
     async def react_stream(body: ChatRequest):
-        session = create_react_session(body)
+        prepared_body = await prepare_chat_request(body)
+        session = create_react_session(prepared_body)
 
         async def generate():
             try:

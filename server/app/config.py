@@ -23,6 +23,7 @@ PRESET_PROVIDERS = [
         "defaultModel": "Qwen/Qwen2.5-72B-Instruct",
         "apiKey": "",
         "isPreset": True,
+        "supportsVision": True,
     },
     {
         "id": "openai",
@@ -31,6 +32,7 @@ PRESET_PROVIDERS = [
         "defaultModel": "gpt-4o",
         "apiKey": "",
         "isPreset": True,
+        "supportsVision": True,
     },
     {
         "id": "openrouter",
@@ -39,6 +41,7 @@ PRESET_PROVIDERS = [
         "defaultModel": "openai/gpt-4o-mini",
         "apiKey": "",
         "isPreset": True,
+        "supportsVision": True,
     },
     {
         "id": "groq",
@@ -47,6 +50,7 @@ PRESET_PROVIDERS = [
         "defaultModel": "llama-3.3-70b-versatile",
         "apiKey": "",
         "isPreset": True,
+        "supportsVision": True,
     },
     {
         "id": "ollama",
@@ -55,18 +59,47 @@ PRESET_PROVIDERS = [
         "defaultModel": "llama3.2",
         "apiKey": "",
         "isPreset": True,
+        "supportsVision": True,
     },
 ]
+
+DEFAULT_IMAGE_PROCESSING_MODE = "direct_multimodal"
+DEFAULT_OCR_CONFIG = {
+    "enabled": True,
+    "providerId": "siliconflow",
+    "endpoint": "https://api.siliconflow.cn/v1",
+    "model": "PaddlePaddle/PaddleOCR-VL-1.5",
+    "apiKey": "",
+    "timeoutSeconds": 60,
+    "maxImages": 5,
+}
 
 DEFAULT_CONFIG = {
     "version": 2,
     "activeProviderId": "siliconflow",
+    "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
+    "ocrConfig": deepcopy(DEFAULT_OCR_CONFIG),
     "providers": deepcopy(PRESET_PROVIDERS),
 }
 
 
 def _normalize_endpoint(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
+
+
+def _normalize_image_processing_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"ocr", "ocr_text"}:
+        return "ocr_text"
+    return DEFAULT_IMAGE_PROCESSING_MODE
+
+
+def _normalize_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 600) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(min(parsed, maximum), minimum)
 
 
 def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -> dict[str, Any]:
@@ -80,6 +113,36 @@ def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -
         "defaultModel": default_model,
         "apiKey": str(raw.get("apiKey") or "").strip(),
         "isPreset": bool(raw.get("isPreset", is_preset)),
+        "supportsVision": bool(raw.get("supportsVision", False)),
+    }
+
+
+def _sanitize_ocr_config(raw: dict[str, Any] | None, providers: list[dict[str, Any]]) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    provider_id = str(source.get("providerId") or DEFAULT_OCR_CONFIG["providerId"]).strip() or DEFAULT_OCR_CONFIG["providerId"]
+    provider = next((item for item in providers if item["id"] == provider_id), None)
+    endpoint = _normalize_endpoint(source.get("endpoint")) or _normalize_endpoint(
+        provider.get("endpoint") if provider else DEFAULT_OCR_CONFIG["endpoint"]
+    )
+    model = str(source.get("model") or source.get("modelId") or DEFAULT_OCR_CONFIG["model"]).strip() or DEFAULT_OCR_CONFIG["model"]
+    return {
+        "enabled": bool(source.get("enabled", DEFAULT_OCR_CONFIG["enabled"])),
+        "providerId": provider["id"] if provider else provider_id,
+        "endpoint": endpoint,
+        "model": model,
+        "apiKey": str(source.get("apiKey") or "").strip(),
+        "timeoutSeconds": _normalize_positive_int(
+            source.get("timeoutSeconds"),
+            DEFAULT_OCR_CONFIG["timeoutSeconds"],
+            minimum=5,
+            maximum=600,
+        ),
+        "maxImages": _normalize_positive_int(
+            source.get("maxImages"),
+            DEFAULT_OCR_CONFIG["maxImages"],
+            minimum=1,
+            maximum=20,
+        ),
     }
 
 
@@ -115,6 +178,7 @@ def _merge_providers(saved: list[dict[str, Any]] | None) -> list[dict[str, Any]]
                 "id": provider_id,
                 "label": item["label"] or f"自定义服务商 {custom_index}",
                 "isPreset": False,
+                "supportsVision": bool(item.get("supportsVision", False)),
             }
         )
 
@@ -143,6 +207,7 @@ def _migrate_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
                 "defaultModel": model,
                 "apiKey": api_key,
                 "isPreset": False,
+                "supportsVision": False,
             }
         )
         active_provider_id = "custom-1"
@@ -150,6 +215,8 @@ def _migrate_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "version": 2,
         "activeProviderId": active_provider_id,
+        "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
+        "ocrConfig": _sanitize_ocr_config(None, providers),
         "providers": providers,
     }
 
@@ -166,6 +233,8 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         return {
             "version": 2,
             "activeProviderId": active_provider_id,
+            "imageProcessingMode": _normalize_image_processing_mode(raw.get("imageProcessingMode")),
+            "ocrConfig": _sanitize_ocr_config(raw.get("ocrConfig"), providers),
             "providers": providers,
         }
 
@@ -201,8 +270,11 @@ def get_provider(cfg: dict | None = None, provider_id: str | None = None) -> dic
 def public_config(cfg: dict | None = None) -> dict[str, Any]:
     normalized = normalize_config(cfg if cfg is not None else read_config())
     active_provider = get_provider(normalized)
+    ocr_config = _sanitize_ocr_config(normalized.get("ocrConfig"), normalized["providers"])
+    ocr_provider = get_provider(normalized, ocr_config.get("providerId"))
     return {
         "activeProviderId": normalized["activeProviderId"],
+        "imageProcessingMode": normalized.get("imageProcessingMode", DEFAULT_IMAGE_PROCESSING_MODE),
         "providers": [
             {
                 "id": provider["id"],
@@ -211,10 +283,21 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
                 "defaultModel": provider["defaultModel"],
                 "hasApiKey": bool(provider.get("apiKey")),
                 "isPreset": bool(provider.get("isPreset")),
+                "supportsVision": bool(provider.get("supportsVision")),
             }
             for provider in normalized["providers"]
         ],
+        "ocrConfig": {
+            "enabled": bool(ocr_config.get("enabled", True)),
+            "providerId": ocr_provider["id"],
+            "endpoint": _normalize_endpoint(ocr_config.get("endpoint")) or ocr_provider["endpoint"],
+            "model": str(ocr_config.get("model") or DEFAULT_OCR_CONFIG["model"]),
+            "hasApiKey": bool(ocr_config.get("apiKey") or ocr_provider.get("apiKey")),
+            "timeoutSeconds": int(ocr_config.get("timeoutSeconds") or DEFAULT_OCR_CONFIG["timeoutSeconds"]),
+            "maxImages": int(ocr_config.get("maxImages") or DEFAULT_OCR_CONFIG["maxImages"]),
+        },
         "endpoint": active_provider["endpoint"],
         "model": active_provider["defaultModel"],
         "hasApiKey": bool(active_provider.get("apiKey")),
+        "supportsVision": bool(active_provider.get("supportsVision")),
     }

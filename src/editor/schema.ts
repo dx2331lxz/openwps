@@ -51,7 +51,7 @@ export const schema = new Schema({
       group: 'block',
       parseDOM: [{ tag: 'table' }],
       toDOM() {
-        return ['table', { style: 'border-collapse:collapse;width:100%;margin:8px 0' }, ['tbody', 0]]
+        return ['table', { style: 'border-collapse:collapse;width:100%;margin:8px 0;box-sizing:border-box;table-layout:fixed' }, ['tbody', 0]]
       },
     },
     table_row: {
@@ -100,6 +100,7 @@ export const schema = new Schema({
             'padding:4px 8px',
             'min-width:40px',
             'vertical-align:top',
+            'box-sizing:border-box',
             node.attrs.width ? `width:${node.attrs.width}` : '',
           ].filter(Boolean).join(';'),
         }, 0]

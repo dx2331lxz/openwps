@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,12 +18,51 @@ from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import Runnable
 
-from .config import get_provider, read_config
-from .models import ChatMessage, ChatRequest, ToolResultsRequest
+from .config import DEFAULT_IMAGE_PROCESSING_MODE, DEFAULT_OCR_CONFIG, get_provider, read_config
+from .models import ChatMessage, ChatRequest, OCRConfig, ToolResultsRequest
 from .prompts import get_system_prompt
 from .tooling import get_tools
 
 logger = logging.getLogger("uvicorn.error")
+
+
+OCR_ANALYSIS_SYSTEM_PROMPT = """你是 openwps 的 OCR 与样式分析器。你的任务不是聊天，而是把图片里的文档内容和样式线索提取成稳定 JSON。
+
+返回严格 JSON，对象字段必须包含：
+- plainText: 字符串，尽量完整的正文文本
+- markdown: 字符串，按标题、列表、表格尽量转成 Markdown；若无法稳定转 Markdown，可留空字符串
+- styleSummary: 对象，尽量包含 documentType、dominantAlignment、overallTone、layoutNotes；如果样式判断不确定，可填 null，但不要因此省略正文
+- blocks: 数组，每项包含 kind、text、styleHints
+- tables: 数组，每项包含 title、markdown、rowCount、columnCount
+- warnings: 数组，写识别不确定、缺失、遮挡、样式判断不确定等
+
+styleHints 尽量包含以下字段：titleLevel、alignment、fontWeightGuess、fontSizeTier、listType、indentLevel、tableStructure、emphasis。
+如果无法判断，就填 null 或省略，不要编造。
+即使样式无法识别，也必须尽量返回 plainText、markdown、blocks、tables，不要只返回空结构。只返回 JSON，不要输出解释。"""
+
+OCR_STYLE_ANALYSIS_SYSTEM_PROMPT = """你是 openwps 的 OCR 第二阶段样式分析器。你的任务不是重新抄正文，而是根据图片视觉布局和已提取的文本块，为每个 block 补充适合文档排版的样式线索。
+
+返回严格 JSON，对象字段必须包含：
+- styleSummary: 对象，尽量包含 documentType、dominantAlignment、layoutNotes
+- blockStyles: 数组，每项包含 blockIndex、styleHints
+- warnings: 数组，写视觉判断不确定、块级文本可能不完整等
+
+styleHints 尽量包含以下字段：
+- titleLevel: 1-6 的整数
+- alignment: left/center/right/justify/unknown
+- fontWeightGuess: bold/regular
+- fontSizeTier: xlarge/large/medium/small
+- listType: bullet/ordered/none
+- indentLevel: 整数
+- sectionRole: cover_title/cover_field/body_heading/body_text/date/signature/footer/form_field
+- underlinePlaceholder: 布尔值
+- labelValuePattern: 布尔值
+- emphasis: 数组，可包含 bold/italic/underline
+- confidence: high/medium/low
+- notes: 简短说明
+
+优先识别：封面标题、表单字段+下划线占位、日期/签名、居中标题、列表、缩进。
+若无法确认，请保守返回 null，不要编造。不要重新输出全文，只分析 blockIndex 对应的样式。只返回 JSON。"""
 
 
 class AgentState(TypedDict):
@@ -233,10 +273,1129 @@ def _normalize_user_text(message: str, context_block: str) -> str:
     return user_text
 
 
-def _build_human_content(message: str, context_block: str, images: list[dict[str, Any]] | None = None) -> str | list[dict[str, Any]]:
+def _normalize_image_processing_mode(mode: str | None) -> str:
+    normalized = str(mode or "").strip().lower().replace("-", "_")
+    if normalized in {"ocr", "ocr_text"}:
+        return "ocr_text"
+    return DEFAULT_IMAGE_PROCESSING_MODE
+
+
+def _normalize_ocr_config(body: ChatRequest) -> OCRConfig:
+    cfg = read_config()
+    saved = dict(cfg.get("ocrConfig") or DEFAULT_OCR_CONFIG)
+    request_config = body.ocrConfig.model_dump(exclude_none=True) if body.ocrConfig else {}
+
+    merged: dict[str, Any] = dict(saved)
+    for key, value in request_config.items():
+        if key == "hasApiKey":
+            continue
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                merged[key] = normalized.rstrip("/") if key == "endpoint" else normalized
+            continue
+        merged[key] = value
+
+    provider_id = str(merged.get("providerId") or DEFAULT_OCR_CONFIG["providerId"]).strip() or DEFAULT_OCR_CONFIG["providerId"]
+    provider = get_provider(cfg, provider_id)
+    endpoint = str(merged.get("endpoint") or provider.get("endpoint") or DEFAULT_OCR_CONFIG["endpoint"]).strip().rstrip("/")
+    api_key = str(merged.get("apiKey") or provider.get("apiKey") or "").strip()
+    model = str(merged.get("model") or DEFAULT_OCR_CONFIG["model"]).strip() or DEFAULT_OCR_CONFIG["model"]
+
+    return OCRConfig(
+        enabled=bool(merged.get("enabled", True)),
+        providerId=provider["id"],
+        endpoint=endpoint,
+        model=model,
+        apiKey=api_key or None,
+        hasApiKey=bool(api_key),
+        timeoutSeconds=max(int(merged.get("timeoutSeconds") or DEFAULT_OCR_CONFIG["timeoutSeconds"]), 5),
+        maxImages=max(int(merged.get("maxImages") or DEFAULT_OCR_CONFIG["maxImages"]), 1),
+    )
+
+
+def _resolve_image_processing_mode(body: ChatRequest) -> str:
+    cfg = read_config()
+    return _normalize_image_processing_mode(body.imageProcessingMode or str(cfg.get("imageProcessingMode") or DEFAULT_IMAGE_PROCESSING_MODE))
+
+
+def _model_name_supports_vision(model_name: str) -> bool:
+    normalized = model_name.strip().lower()
+    if not normalized:
+        return False
+
+    hints = (
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-4-turbo",
+        "vision",
+        "multimodal",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "glm-4v",
+        "glm-4.1v",
+        "glm-4.5v",
+        "internvl",
+        "llava",
+        "pixtral",
+        "gemini",
+        "claude-3",
+        "claude-3.5",
+        "claude-3.7",
+        "llama-3.2-11b-vision",
+        "llama-3.2-90b-vision",
+    )
+    if any(hint in normalized for hint in hints):
+        return True
+
+    return normalized.endswith("-vl") or normalized.endswith("-vision") or normalized.endswith("-omni")
+
+
+def _raw_model_supports_vision(raw_model: dict[str, Any]) -> bool:
+    capability_sources = [
+        raw_model.get("capabilities"),
+        raw_model.get("architecture"),
+    ]
+    for source in capability_sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("vision", "image_input", "supports_vision", "supportsVision", "multimodal"):
+            value = source.get(key)
+            if isinstance(value, bool) and value:
+                return True
+        for key in ("input_modalities", "modalities"):
+            values = source.get(key)
+            if isinstance(values, list) and any(str(item).lower() in {"image", "vision"} for item in values):
+                return True
+
+    for key in ("input_modalities", "modalities"):
+        values = raw_model.get(key)
+        if isinstance(values, list) and any(str(item).lower() in {"image", "vision"} for item in values):
+            return True
+
+    return False
+
+
+def _provider_supports_vision(provider: dict[str, Any]) -> bool:
+    return bool(provider.get("supportsVision"))
+
+
+def _resolve_provider_and_model(body: ChatRequest) -> tuple[dict[str, Any], str]:
+    cfg = read_config()
+    provider = get_provider(cfg, body.providerId)
+    model = str(body.model or provider.get("defaultModel") or "").strip()
+    return provider, model
+
+
+def _selected_model_supports_vision(provider: dict[str, Any], model_name: str) -> bool:
+    if _model_name_supports_vision(model_name):
+        return True
+    if not model_name:
+        return _provider_supports_vision(provider)
+    return False
+
+
+def _parse_data_url_header(data_url: str) -> tuple[str, str] | None:
+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+        return None
+    header, _, payload = data_url.partition(",")
+    if not header or not payload:
+        return None
+    return header, payload
+
+
+def _estimate_data_url_size_bytes(data_url: str) -> int:
+    parsed = _parse_data_url_header(data_url)
+    if not parsed:
+        return 0
+    _, payload = parsed
+    normalized = payload.strip()
+    if not normalized:
+        return 0
+    padding = len(normalized) - len(normalized.rstrip("="))
+    return max(((len(normalized) * 3) // 4) - padding, 0)
+
+
+def _validate_image_batch(images: list[dict[str, Any]], *, max_images: int) -> None:
+    if len(images) > max_images:
+        raise HTTPException(status_code=400, detail=f"最多只能上传 {max_images} 张图片")
+
+    total_size = 0
+    for index, image in enumerate(images, start=1):
+        data_url = str(image.get("dataUrl") or "").strip()
+        parsed = _parse_data_url_header(data_url)
+        if not parsed:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片格式无效")
+
+        header, _ = parsed
+        mime = header[5:].split(";", 1)[0].strip().lower()
+        if not mime.startswith("image/") or ";base64" not in header:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片不是支持的图片格式")
+
+        declared_size = int(image.get("size") or 0)
+        estimated_size = _estimate_data_url_size_bytes(data_url)
+        image_size = max(declared_size, estimated_size)
+        if image_size <= 0:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片内容为空")
+        if image_size > MAX_IMAGE_SIZE_BYTES:
+            raise HTTPException(status_code=400, detail=f"第 {index} 张图片超过 {MAX_IMAGE_SIZE_BYTES // (1024 * 1024)}MB 限制")
+
+        total_size += image_size
+
+    if total_size > MAX_TOTAL_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail=f"图片总大小超过 {MAX_TOTAL_IMAGE_BYTES // (1024 * 1024)}MB 限制")
+
+
+def _validate_multimodal_request(body: ChatRequest) -> None:
+    images = body.images or []
+    if not images:
+        return
+
+    _validate_image_batch(images, max_images=MAX_MULTIMODAL_IMAGES)
+
+
+def _validate_ocr_request(body: ChatRequest, ocr_config: OCRConfig) -> None:
+    images = body.images or []
+    if not images:
+        return
+
+    if not ocr_config.enabled:
+        raise HTTPException(status_code=400, detail="当前已切换到 OCR 模式，但 OCR 功能未启用。")
+    if not ocr_config.endpoint:
+        raise HTTPException(status_code=400, detail="OCR 端点未配置。")
+    if not ocr_config.model:
+        raise HTTPException(status_code=400, detail="OCR 模型未配置。")
+    if not ocr_config.hasApiKey:
+        raise HTTPException(status_code=400, detail="OCR API Key 未配置，请在设置中补充后再使用 OCR 模式。")
+
+    _validate_image_batch(images, max_images=max(int(ocr_config.maxImages), 1))
+
+
+def _looks_like_multimodal_capability_error(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+
+    hints = (
+        "image_url",
+        "image input",
+        "input image",
+        "input_image",
+        "unsupported image",
+        "does not support image",
+        "doesn't support image",
+        "does not support vision",
+        "vision is not supported",
+        "multimodal",
+        "multi-modal",
+        "text-only",
+        "only text",
+        "input modalities",
+        "unsupported content type",
+        "unable to view images",
+        "cannot process images",
+    )
+    return any(hint in normalized for hint in hints)
+
+
+def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
+    text = detail.strip() or "未知错误"
+    images = body.images or []
+    if not images or _resolve_image_processing_mode(body) == "ocr_text":
+        return text
+    if not _looks_like_multimodal_capability_error(text):
+        return text
+
+    provider, model_name = _resolve_provider_and_model(body)
+    provider_name = str(provider.get("label") or provider.get("id") or "当前服务商")
+    model_text = model_name or str(provider.get("defaultModel") or "当前模型")
+    return (
+        f"当前模型 {model_text} 未接受图片输入，或 {provider_name} 接口不兼容 image_url 图片格式。"
+        f"系统已按多模态路径尝试发送图片，但上游返回不支持。"
+        f"请切换到明确支持视觉的模型，或改用 OCR 路径。上游错误：{_compact_text_preview(text, 160)}"
+    )
+
+
+def _raise_ai_api_request_error(body: ChatRequest, exc: Exception) -> None:
+    detail = _normalize_ai_api_error_detail(body, str(exc))
+    raise HTTPException(status_code=502, detail=f"AI API 请求失败: {detail}") from exc
+
+
+def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
+    text = raw_text.strip()
+    if not text:
+        return None
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate: str) -> None:
+        normalized = candidate.strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(normalized)
+
+    add_candidate(text)
+
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+        add_candidate(match.group(1))
+
+    stack = 0
+    start_index: int | None = None
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if stack == 0:
+                start_index = index
+            stack += 1
+            continue
+        if char == "}" and stack > 0:
+            stack -= 1
+            if stack == 0 and start_index is not None:
+                add_candidate(text[start_index:index + 1])
+                start_index = None
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_ocr_style_hints(raw_hints: Any) -> dict[str, Any]:
+    if not isinstance(raw_hints, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key in (
+        "titleLevel",
+        "alignment",
+        "fontWeightGuess",
+        "fontSizeTier",
+        "listType",
+        "indentLevel",
+        "tableStructure",
+        "emphasis",
+        "sectionRole",
+        "underlinePlaceholder",
+        "labelValuePattern",
+        "confidence",
+        "notes",
+        "styleSource",
+    ):
+        value = raw_hints.get(key)
+        if value in (None, "", []):
+            continue
+        normalized[key] = value
+    return normalized
+
+
+def _infer_block_kind_from_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "paragraph"
+    if re.match(r"^\s{0,3}#{1,6}\s", stripped):
+        return "heading"
+    if re.match(r"^\s*(?:[-*]|\d+\.)\s", stripped):
+        return "list_item"
+    return "paragraph"
+
+
+def _should_split_ocr_block(kind: str, text: str, lines: list[str]) -> bool:
+    if kind != "paragraph" or len(lines) < 2 or len(lines) > 16:
+        return False
+    if any(len(line) > 80 for line in lines):
+        return False
+    average_length = sum(len(line) for line in lines) / max(len(lines), 1)
+    has_placeholder = any(re.search(r"[_＿]{2,}|\.{3,}|…{2,}", line) for line in lines)
+    return has_placeholder or "\n\n" in text or average_length <= 24
+
+
+def _expand_ocr_blocks(blocks: list[dict[str, Any]], plain_text: str) -> list[dict[str, Any]]:
+    source_blocks = blocks or ([{"kind": "paragraph", "text": plain_text, "styleHints": {}}] if plain_text else [])
+    expanded: list[dict[str, Any]] = []
+
+    for block in source_blocks:
+        kind = str(block.get("kind") or "paragraph")
+        text = _stringify_content(block.get("text")).strip()
+        if not text:
+            continue
+        hints = dict(block.get("styleHints") or {})
+        lines = [line.strip() for line in re.split(r"\n+", text) if line.strip()]
+        if _should_split_ocr_block(kind, text, lines):
+            for line in lines:
+                expanded.append({
+                    "kind": _infer_block_kind_from_text(line),
+                    "text": line,
+                    "styleHints": dict(hints),
+                })
+            continue
+        expanded.append({
+            "kind": kind,
+            "text": text,
+            "styleHints": dict(hints),
+        })
+
+    return expanded[:24]
+
+
+def _looks_like_markdown(text: str) -> bool:
+    return bool(re.search(r"(^\s{0,3}#{1,6}\s)|(^\s*(?:[-*]|\d+\.)\s)|(^\s*\|.+\|\s*$)", text, flags=re.MULTILINE))
+
+
+def _compact_text_preview(text: str, limit: int = 220) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _has_meaningful_ocr_content(result: dict[str, Any]) -> bool:
+    return bool(
+        _stringify_content(result.get("plainText")).strip()
+        or _stringify_content(result.get("markdown")).strip()
+        or result.get("blocks")
+        or result.get("tables")
+    )
+
+
+def _append_ocr_warning(result: dict[str, Any], warning: str) -> dict[str, Any]:
+    text = warning.strip()
+    if not text:
+        return result
+    warnings = [str(item).strip() for item in (result.get("warnings") or []) if str(item).strip()]
+    if text in warnings:
+        return result
+    result["warnings"] = [*warnings, text][:12]
+    return result
+
+
+def _set_style_source(existing: dict[str, Any], source: str) -> dict[str, Any]:
+    current = _stringify_content(existing.get("styleSource")).strip()
+    if not current:
+        existing["styleSource"] = source
+        return existing
+    parts = [part for part in current.split("+") if part]
+    if source not in parts:
+        existing["styleSource"] = "+".join([*parts, source])
+    return existing
+
+
+def _infer_ocr_style_summary(
+    raw_style_summary: dict[str, Any],
+    plain_text: str,
+    markdown: str,
+    blocks: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    fallback_used = False
+    style_summary = dict(raw_style_summary)
+
+    document_type = _stringify_content(style_summary.get("documentType")).strip()
+    if document_type in {"", "unknown"}:
+        if tables:
+            document_type = "table_document"
+        elif any(block.get("kind") in {"heading", "title"} for block in blocks) or _looks_like_markdown(markdown):
+            document_type = "structured_document"
+        elif plain_text:
+            document_type = "document"
+        else:
+            document_type = "unknown"
+        fallback_used = True
+
+    dominant_alignment = _stringify_content(style_summary.get("dominantAlignment")).strip()
+    if dominant_alignment in {"", "unknown"}:
+        align_counts: dict[str, int] = {}
+        for block in blocks:
+            hints = block.get("styleHints") or {}
+            alignment = _stringify_content(hints.get("alignment")).strip()
+            if alignment and alignment != "unknown":
+                align_counts[alignment] = align_counts.get(alignment, 0) + 1
+        dominant_alignment = max(align_counts, key=align_counts.get) if align_counts else "unknown"
+        fallback_used = True
+
+    overall_tone = _stringify_content(style_summary.get("overallTone")).strip()
+    if overall_tone in {"", "未明确"}:
+        overall_tone = "未明确"
+        fallback_used = True
+
+    layout_notes = _stringify_content(style_summary.get("layoutNotes")).strip()
+    if not layout_notes:
+        notes: list[str] = []
+        if any(block.get("kind") in {"heading", "title"} for block in blocks) or re.search(r"^\s{0,3}#{1,6}\s", markdown, flags=re.MULTILINE):
+            notes.append("检测到标题或分节结构")
+        if re.search(r"^\s*(?:[-*]|\d+\.)\s", markdown, flags=re.MULTILINE):
+            notes.append("检测到列表结构")
+        if tables:
+            notes.append(f"检测到 {len(tables)} 个表格")
+        if not notes and plain_text:
+            notes.append("已提取正文文本，样式线索有限")
+        layout_notes = "；".join(notes) if notes else "样式线索有限，建议结合原图复核"
+        fallback_used = True
+
+    return {
+        "documentType": document_type,
+        "dominantAlignment": dominant_alignment,
+        "overallTone": overall_tone,
+        "layoutNotes": layout_notes,
+    }, fallback_used
+
+
+def _normalize_ocr_style_analysis(raw_result: dict[str, Any] | None, block_count: int) -> dict[str, Any]:
+    payload = raw_result if isinstance(raw_result, dict) else {}
+    raw_summary = payload.get("styleSummary") if isinstance(payload.get("styleSummary"), dict) else {}
+    if not raw_summary and isinstance(payload.get("documentStyleSummary"), dict):
+        raw_summary = payload.get("documentStyleSummary") or {}
+
+    block_styles: list[dict[str, Any]] = []
+    for item in payload.get("blockStyles") or payload.get("styles") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            block_index = int(item.get("blockIndex") or 0)
+        except Exception:
+            continue
+        if block_index < 1 or block_index > block_count:
+            continue
+        raw_hints = item.get("styleHints") if isinstance(item.get("styleHints"), dict) else item
+        hints = _normalize_ocr_style_hints(raw_hints)
+        if not hints:
+            continue
+        hints = _set_style_source(hints, "ocr_style_pass")
+        block_styles.append({
+            "blockIndex": block_index,
+            "styleHints": hints,
+        })
+
+    warnings = [str(item).strip() for item in (payload.get("warnings") or []) if str(item).strip()]
+    return {
+        "styleSummary": {
+            "documentType": _stringify_content(raw_summary.get("documentType")).strip(),
+            "dominantAlignment": _stringify_content(raw_summary.get("dominantAlignment")).strip(),
+            "overallTone": _stringify_content(raw_summary.get("overallTone")).strip(),
+            "layoutNotes": _stringify_content(raw_summary.get("layoutNotes")).strip(),
+        },
+        "blockStyles": block_styles,
+        "warnings": warnings[:12],
+    }
+
+
+def _merge_ocr_style_analysis(base_result: dict[str, Any], style_analysis: dict[str, Any] | None) -> dict[str, Any]:
+    if not style_analysis:
+        return base_result
+
+    result = dict(base_result)
+    blocks = [
+        {
+            "kind": str(block.get("kind") or "paragraph"),
+            "text": _stringify_content(block.get("text")).strip(),
+            "styleHints": dict(block.get("styleHints") or {}),
+        }
+        for block in (base_result.get("blocks") or [])
+        if _stringify_content(block.get("text")).strip()
+    ]
+
+    for item in style_analysis.get("blockStyles") or []:
+        if not isinstance(item, dict):
+            continue
+        block_index = int(item.get("blockIndex") or 0) - 1
+        if block_index < 0 or block_index >= len(blocks):
+            continue
+        block = dict(blocks[block_index])
+        merged_hints = dict(block.get("styleHints") or {})
+        for key, value in (item.get("styleHints") or {}).items():
+            if value in (None, "", []):
+                continue
+            merged_hints[key] = value
+        if merged_hints.get("titleLevel") and block.get("kind") == "paragraph":
+            block["kind"] = "heading"
+        elif merged_hints.get("listType") not in (None, "", "none") and block.get("kind") == "paragraph":
+            block["kind"] = "list_item"
+        elif merged_hints.get("sectionRole") in {"cover_title", "body_heading"} and block.get("kind") == "paragraph":
+            block["kind"] = "heading"
+        block["styleHints"] = merged_hints
+        blocks[block_index] = block
+
+    merged_summary = dict(base_result.get("styleSummary") or {})
+    for key, value in (style_analysis.get("styleSummary") or {}).items():
+        if value in (None, "", "unknown", "未明确"):
+            continue
+        merged_summary[key] = value
+
+    result["blocks"] = blocks[:24]
+    result["styleSummary"] = merged_summary
+    for warning in style_analysis.get("warnings") or []:
+        result = _append_ocr_warning(result, str(warning))
+    return result
+
+
+def _apply_ocr_style_heuristics(result: dict[str, Any]) -> dict[str, Any]:
+    blocks = [
+        {
+            "kind": str(block.get("kind") or "paragraph"),
+            "text": _stringify_content(block.get("text")).strip(),
+            "styleHints": dict(block.get("styleHints") or {}),
+        }
+        for block in (result.get("blocks") or [])
+        if _stringify_content(block.get("text")).strip()
+    ]
+    if not blocks:
+        return result
+
+    total = len(blocks)
+    placeholder_count = 0
+    heading_count = 0
+
+    for index, block in enumerate(blocks):
+        text = block["text"]
+        hints = dict(block.get("styleHints") or {})
+        line_length = len(text)
+        added_by_heuristic = False
+
+        if "underlinePlaceholder" not in hints and bool(re.search(r"[_＿]{2,}", text)):
+            hints["underlinePlaceholder"] = True
+            added_by_heuristic = True
+        if hints.get("underlinePlaceholder"):
+            placeholder_count += 1
+
+        if "labelValuePattern" not in hints and bool(re.search(r"^[\u4e00-\u9fffA-Za-z0-9（）()《》、·\-\s]+[:：]?\s*[_＿]{2,}$", text)):
+            hints["labelValuePattern"] = True
+            added_by_heuristic = True
+
+        if not hints.get("sectionRole"):
+            if hints.get("labelValuePattern") or hints.get("underlinePlaceholder"):
+                hints["sectionRole"] = "cover_field" if total <= 10 else "form_field"
+                added_by_heuristic = True
+            elif index == 0 and line_length <= 24 and not re.search(r"[_＿]{2,}", text):
+                hints["sectionRole"] = "cover_title"
+                added_by_heuristic = True
+            elif index == total - 1 and re.search(r"(?:19|20)\d{2}|20xx", text, flags=re.IGNORECASE):
+                hints["sectionRole"] = "date"
+                added_by_heuristic = True
+
+        if not hints.get("titleLevel"):
+            if hints.get("sectionRole") == "cover_title":
+                hints["titleLevel"] = 1
+                added_by_heuristic = True
+            elif index < 3 and line_length <= 18 and not hints.get("underlinePlaceholder") and not re.search(r"[。；，：:]$", text):
+                hints["titleLevel"] = 2
+                hints.setdefault("sectionRole", "body_heading")
+                added_by_heuristic = True
+
+        if hints.get("titleLevel"):
+            heading_count += 1
+            if block.get("kind") == "paragraph":
+                block["kind"] = "heading"
+            if not hints.get("fontWeightGuess"):
+                hints["fontWeightGuess"] = "bold"
+                added_by_heuristic = True
+            if not hints.get("fontSizeTier"):
+                hints["fontSizeTier"] = "xlarge" if hints.get("titleLevel") == 1 else "large"
+                added_by_heuristic = True
+            if not hints.get("alignment") and hints.get("sectionRole") == "cover_title":
+                hints["alignment"] = "center"
+                added_by_heuristic = True
+
+        if not hints.get("listType") and re.match(r"^\s*(?:[-*]|\d+\.)\s", text):
+            hints["listType"] = "ordered" if re.match(r"^\s*\d+\.\s", text) else "bullet"
+            if block.get("kind") == "paragraph":
+                block["kind"] = "list_item"
+            added_by_heuristic = True
+
+        if hints.get("labelValuePattern"):
+            if not hints.get("fontSizeTier"):
+                hints["fontSizeTier"] = "medium"
+                added_by_heuristic = True
+            if not hints.get("alignment"):
+                hints["alignment"] = "left"
+                added_by_heuristic = True
+
+        if added_by_heuristic:
+            hints = _set_style_source(hints, "heuristic")
+            hints.setdefault("confidence", "low")
+
+        block["styleHints"] = _normalize_ocr_style_hints(hints)
+        blocks[index] = block
+
+    result = dict(result)
+    result["blocks"] = blocks[:24]
+    if placeholder_count >= 3:
+        result["styleSummary"] = {
+            **dict(result.get("styleSummary") or {}),
+            "documentType": "cover_form",
+        }
+        result = _append_ocr_warning(result, "检测到多处下划线占位，已按封面/表单结构补充样式线索。")
+    elif heading_count >= 1 and _stringify_content((result.get("styleSummary") or {}).get("documentType")).strip() in {"", "document", "unknown"}:
+        result["styleSummary"] = {
+            **dict(result.get("styleSummary") or {}),
+            "documentType": "structured_document",
+        }
+    return result
+
+
+def _refresh_ocr_style_summary(result: dict[str, Any]) -> dict[str, Any]:
+    summary, fallback_used = _infer_ocr_style_summary(
+        dict(result.get("styleSummary") or {}),
+        _stringify_content(result.get("plainText")).strip(),
+        _stringify_content(result.get("markdown")).strip(),
+        list(result.get("blocks") or []),
+        list(result.get("tables") or []),
+    )
+    next_result = dict(result)
+    next_result["styleSummary"] = summary
+    if fallback_used and _has_meaningful_ocr_content(next_result):
+        next_result = _append_ocr_warning(next_result, "部分样式摘要仍由结构与启发式规则推断生成，建议结合原图复核。")
+    return next_result
+
+
+def _build_ocr_style_analysis_user_text(result: dict[str, Any]) -> str:
+    blocks_payload = []
+    for index, block in enumerate(result.get("blocks") or [], start=1):
+        blocks_payload.append({
+            "blockIndex": index,
+            "kind": block.get("kind") or "paragraph",
+            "text": _stringify_content(block.get("text")).strip()[:200],
+        })
+
+    summary = result.get("styleSummary") or {}
+    return (
+        "请根据原图和以下已提取文本块，只补充对文档排版真正有用的样式线索。"
+        "重点判断：标题层级、对齐、字体粗细、字号层级、列表、缩进、封面字段、下划线占位。\n\n"
+        f"styleSummary = {json.dumps(summary, ensure_ascii=False)}\n"
+        f"blocks = {json.dumps(blocks_payload, ensure_ascii=False, indent=2)}\n\n"
+        "如果某个 block 像“题目 ____ / 指导老师 ____ / 姓名 ____”，请优先标记 underlinePlaceholder=true 和 labelValuePattern=true。"
+    )
+
+
+async def _call_ocr_style_analysis_for_image(
+    ocr_config: OCRConfig,
+    image: dict[str, Any],
+    index: int,
+    ocr_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    blocks = ocr_result.get("blocks") or []
+    if not blocks:
+        return None
+
+    headers = {"Content-Type": "application/json"}
+    if ocr_config.apiKey:
+        headers["Authorization"] = f"Bearer {ocr_config.apiKey}"
+
+    base_payload = {
+        "model": ocr_config.model,
+        "temperature": 0.1,
+        "max_tokens": 2200,
+        "messages": [
+            {"role": "system", "content": OCR_STYLE_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _build_ocr_style_analysis_user_text(ocr_result),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": str(image.get("dataUrl") or "")},
+                    },
+                ],
+            },
+        ],
+    }
+    attempts = [
+        {**base_payload, "response_format": {"type": "json_object"}},
+        base_payload,
+    ]
+    last_error = ""
+
+    async with httpx.AsyncClient(timeout=float(ocr_config.timeoutSeconds)) as client:
+        for payload in attempts:
+            attempt_label = "style_json_object" if payload.get("response_format") is not None else "style_plain"
+            try:
+                response = await client.post(f"{ocr_config.endpoint}/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text.strip() or str(exc)
+                last_error = detail
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
+                    index,
+                    attempt_label,
+                    exc.response.status_code,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    _compact_text_preview(detail),
+                )
+                if payload.get("response_format") is not None and exc.response.status_code in {400, 404, 422}:
+                    continue
+                return None
+            except Exception as exc:
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s request_error endpoint=%s model=%s error=%s",
+                    index,
+                    attempt_label,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    exc,
+                )
+                return None
+
+            content, finish_reason = _extract_ocr_response_content(body)
+            logger.info(
+                "[openwps.ocr] image=%s attempt=%s finish_reason=%s content_preview=%s",
+                index,
+                attempt_label,
+                finish_reason or "-",
+                _compact_text_preview(content or "<empty>"),
+            )
+
+            parsed = _extract_json_object(content)
+            if parsed is not None:
+                normalized = _normalize_ocr_style_analysis(parsed, len(blocks))
+                if normalized.get("blockStyles") or normalized.get("styleSummary"):
+                    return normalized
+                last_error = "样式分析返回了 JSON，但没有可用的 blockStyles。"
+                continue
+
+            last_error = _compact_text_preview(content or "样式分析返回为空")
+
+    if last_error:
+        logger.warning("[openwps.ocr] image=%s style_analysis_skipped detail=%s", index, last_error)
+    return None
+
+
+def _build_fallback_ocr_payload(raw_text: str, finish_reason: str) -> dict[str, Any] | None:
+    cleaned = raw_text.strip()
+    if not cleaned:
+        return None
+
+    cleaned = re.sub(r"^```(?:json|markdown|md|text)?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("{") or cleaned.startswith("["):
+        return None
+
+    warnings = ["OCR 返回了非 JSON 文本，已按纯文本结果回退；样式信息可能不完整。"]
+    if _is_output_truncated_finish_reason(finish_reason):
+        warnings.append("OCR 输出可能因响应长度限制被截断，请结合原图复核。")
+
+    return {
+        "plainText": cleaned,
+        "markdown": cleaned if _looks_like_markdown(cleaned) else "",
+        "blocks": [{"kind": "paragraph", "text": cleaned, "styleHints": {}}],
+        "tables": [],
+        "warnings": warnings,
+    }
+
+
+def _extract_ocr_response_content(body: Any) -> tuple[str, str]:
+    finish_reason = _extract_finish_reason(body)
+    candidates: list[str] = []
+
+    def add_candidate(value: Any) -> None:
+        text = _stringify_content(value).strip()
+        if text:
+            candidates.append(text)
+
+    if isinstance(body, dict):
+        add_candidate(body.get("output_text"))
+        add_candidate(body.get("text"))
+
+        choices = body.get("choices")
+        if isinstance(choices, list):
+            for choice in choices[:2]:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message")
+                if isinstance(message, dict):
+                    add_candidate(message.get("content"))
+                    add_candidate(message.get("text"))
+                add_candidate(choice.get("content"))
+                add_candidate(choice.get("text"))
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    add_candidate(delta.get("content"))
+
+        output = body.get("output")
+        if isinstance(output, list):
+            for item in output[:2]:
+                if not isinstance(item, dict):
+                    continue
+                add_candidate(item.get("content"))
+                add_candidate(item.get("text"))
+
+    return (candidates[0] if candidates else ""), finish_reason
+
+
+def _normalize_ocr_result(raw_result: dict[str, Any] | None, image: dict[str, Any], index: int) -> dict[str, Any]:
+    payload = raw_result if isinstance(raw_result, dict) else {}
+    blocks: list[dict[str, Any]] = []
+    for block in payload.get("blocks") or []:
+        if not isinstance(block, dict):
+            continue
+        text = _stringify_content(block.get("text")).strip()
+        if not text:
+            continue
+        blocks.append({
+            "kind": str(block.get("kind") or "paragraph"),
+            "text": text,
+            "styleHints": _normalize_ocr_style_hints(block.get("styleHints")),
+        })
+
+    tables: list[dict[str, Any]] = []
+    for table in payload.get("tables") or []:
+        if not isinstance(table, dict):
+            continue
+        title = _stringify_content(table.get("title")).strip()
+        markdown = _stringify_content(table.get("markdown")).strip()
+        if not title and not markdown:
+            continue
+        tables.append({
+            "title": title,
+            "markdown": markdown,
+            "rowCount": int(table.get("rowCount") or 0),
+            "columnCount": int(table.get("columnCount") or 0),
+        })
+
+    style_summary = payload.get("styleSummary") if isinstance(payload.get("styleSummary"), dict) else {}
+    warnings = [str(item).strip() for item in (payload.get("warnings") or []) if str(item).strip()]
+    plain_text = _stringify_content(payload.get("plainText") or payload.get("text")).strip()
+    markdown = _stringify_content(payload.get("markdown")).strip()
+    blocks = _expand_ocr_blocks(blocks, plain_text)
+    resolved_style_summary, fallback_used = _infer_ocr_style_summary(style_summary, plain_text, markdown, blocks, tables)
+    if fallback_used and (plain_text or markdown or blocks or tables):
+        warnings.insert(0, "styleSummary 未完整返回，已根据 OCR 提取到的结构生成默认样式摘要。")
+
+    result = {
+        "imageIndex": index,
+        "name": str(image.get("name") or f"image-{index}"),
+        "plainText": plain_text,
+        "markdown": markdown,
+        "styleSummary": resolved_style_summary,
+        "blocks": blocks[:24],
+        "tables": tables[:12],
+        "warnings": warnings[:12],
+    }
+    result = _apply_ocr_style_heuristics(result)
+    return _refresh_ocr_style_summary(result)
+
+
+async def _call_ocr_model_for_image(ocr_config: OCRConfig, image: dict[str, Any], index: int) -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if ocr_config.apiKey:
+        headers["Authorization"] = f"Bearer {ocr_config.apiKey}"
+
+    base_payload = {
+        "model": ocr_config.model,
+        "temperature": 0.1,
+        "max_tokens": 3200,
+        "messages": [
+            {"role": "system", "content": OCR_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "请提取图片中的正文、标题层级、列表、表格和样式线索，返回严格 JSON。",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": str(image.get("dataUrl") or "")},
+                    },
+                ],
+            },
+        ],
+    }
+    attempts = [
+        {**base_payload, "response_format": {"type": "json_object"}},
+        base_payload,
+    ]
+    last_error = ""
+
+    async with httpx.AsyncClient(timeout=float(ocr_config.timeoutSeconds)) as client:
+        for attempt_index, payload in enumerate(attempts, start=1):
+            attempt_label = "json_object" if payload.get("response_format") is not None else "plain"
+            try:
+                response = await client.post(f"{ocr_config.endpoint}/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text.strip() or str(exc)
+                last_error = detail
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
+                    index,
+                    attempt_label,
+                    exc.response.status_code,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    _compact_text_preview(detail),
+                )
+                if payload.get("response_format") is not None and exc.response.status_code in {400, 404, 422}:
+                    continue
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {detail}") from exc
+            except Exception as exc:
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s request_error endpoint=%s model=%s error=%s",
+                    index,
+                    attempt_label,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    exc,
+                )
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {exc}") from exc
+
+            content, finish_reason = _extract_ocr_response_content(body)
+            logger.info(
+                "[openwps.ocr] image=%s attempt=%s finish_reason=%s content_preview=%s",
+                index,
+                attempt_label,
+                finish_reason or "-",
+                _compact_text_preview(content or "<empty>"),
+            )
+
+            parsed = _extract_json_object(content)
+            if parsed is not None:
+                normalized = _normalize_ocr_result(parsed, image, index)
+                if _is_output_truncated_finish_reason(finish_reason):
+                    normalized = _append_ocr_warning(normalized, "OCR 输出可能因响应长度限制被截断，请结合原图复核。")
+                if _has_meaningful_ocr_content(normalized):
+                    style_analysis = await _call_ocr_style_analysis_for_image(ocr_config, image, index, normalized)
+                    enhanced = _merge_ocr_style_analysis(normalized, style_analysis)
+                    enhanced = _apply_ocr_style_heuristics(enhanced)
+                    enhanced = _refresh_ocr_style_summary(enhanced)
+                    return enhanced
+                last_error = "OCR 返回了 JSON，但未提取到可用正文、表格或结构信息。"
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s parsed_json_without_content preview=%s",
+                    index,
+                    attempt_label,
+                    _compact_text_preview(content or "<empty>"),
+                )
+                continue
+
+            fallback_payload = _build_fallback_ocr_payload(content, finish_reason)
+            if fallback_payload is not None:
+                logger.warning(
+                    "[openwps.ocr] image=%s attempt=%s fallback_to_plain_text preview=%s",
+                    index,
+                    attempt_label,
+                    _compact_text_preview(content),
+                )
+                return _normalize_ocr_result(fallback_payload, image, index)
+
+            last_error = f"OCR 返回不可解析内容（finish_reason={finish_reason or '-' }）: {_compact_text_preview(content or 'OCR 返回为空')}"
+            logger.warning(
+                "[openwps.ocr] image=%s attempt=%s unparseable_response preview=%s",
+                index,
+                attempt_label,
+                _compact_text_preview(content or "<empty>"),
+            )
+
+    raise HTTPException(status_code=502, detail=f"OCR 结果解析失败: {last_error}")
+
+
+async def _process_ocr_images(body: ChatRequest, ocr_config: OCRConfig) -> list[dict[str, Any]]:
+    images = body.images or []
+    if not images:
+        return []
+    tasks = [
+        _call_ocr_model_for_image(ocr_config, image, index)
+        for index, image in enumerate(images, start=1)
+    ]
+    return await asyncio.gather(*tasks)
+
+
+def _format_ocr_results_for_model(ocr_results: list[dict[str, Any]]) -> str:
+    parts = [
+        "[OCR 识别结果]",
+        "以下内容由 OCR 模型从图片中提取，包含正文、表格和样式线索。请优先使用 blocks[*].styleHints 中的标题层级、对齐、字号层级、占位线、表单字段等线索来复现内容和样式；不确定处可说明。",
+    ]
+    for result in ocr_results:
+        parts.append("")
+        parts.append(f"图片 {result.get('imageIndex')}: {result.get('name')}")
+        style_summary = result.get("styleSummary") or {}
+        if style_summary:
+            parts.append("styleSummary = " + json.dumps(style_summary, ensure_ascii=False))
+        markdown = _stringify_content(result.get("markdown")).strip()
+        if markdown:
+            parts.append("markdown:\n" + markdown)
+        plain_text = _stringify_content(result.get("plainText")).strip()
+        if plain_text and plain_text != markdown:
+            parts.append("plainText:\n" + plain_text[:3000])
+        tables = result.get("tables") or []
+        if tables:
+            parts.append("tables = " + json.dumps(tables, ensure_ascii=False, indent=2))
+        blocks = result.get("blocks") or []
+        if blocks:
+            parts.append("blocks = " + json.dumps(blocks, ensure_ascii=False, indent=2))
+        warnings = result.get("warnings") or []
+        if warnings:
+            parts.append("warnings = " + json.dumps(warnings, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+async def prepare_chat_request(body: ChatRequest) -> ChatRequest:
+    mode = _resolve_image_processing_mode(body)
+    prepared = body.model_copy(update={"imageProcessingMode": mode})
+    if not prepared.images:
+        return prepared
+
+    if mode == "ocr_text":
+        ocr_config = _normalize_ocr_config(prepared)
+        _validate_ocr_request(prepared, ocr_config)
+        ocr_results = await _process_ocr_images(prepared, ocr_config)
+        return prepared.model_copy(update={
+            "ocrConfig": ocr_config,
+            "ocrResults": ocr_results,
+        })
+
+    _validate_multimodal_request(prepared)
+    return prepared
+
+
+def _build_human_content(
+    message: str,
+    context_block: str,
+    images: list[dict[str, Any]] | None = None,
+    ocr_results: list[dict[str, Any]] | None = None,
+    image_processing_mode: str = DEFAULT_IMAGE_PROCESSING_MODE,
+) -> str | list[dict[str, Any]]:
     user_text = _normalize_user_text(message, context_block)
+    if ocr_results:
+        return user_text + "\n\n" + _format_ocr_results_for_model(ocr_results)
+
     if not images:
         return user_text
+
+    user_text = (
+        user_text
+        + f"\n\n[图片输入]\n本轮附带了 {len(images)} 张图片。"
+          + (
+              "当前路径是直接多模态模式。请直接根据图片内容和样式线索复现到当前文档中。"
+              if image_processing_mode == DEFAULT_IMAGE_PROCESSING_MODE
+              else "请根据图片内容复现到当前文档中。"
+          )
+    )
 
     content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for image in images:
@@ -276,6 +1435,9 @@ TOOL_RESULT_TIMEOUT = 300  # seconds
 MAX_RETRIES_PER_ROUND = 2
 MAX_FORCED_FOLLOW_UPS = 3
 MAX_OUTPUT_CONTINUATIONS = 3
+MAX_MULTIMODAL_IMAGES = 5
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 RETRY_DELAYS = [1.0, 2.0, 4.0]
 # Token budget: trigger compression when estimated input tokens exceed this
 TOKEN_BUDGET_SOFT = 24_000   # tier-1 compression kicks in
@@ -1785,7 +2947,13 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
             if i == last_user_idx:
                 raw = dict(item)
                 original = _stringify_content(raw.get("content"))
-                messages.append(HumanMessage(content=_build_human_content(original, context_block, body.images)))
+                messages.append(HumanMessage(content=_build_human_content(
+                    original,
+                    context_block,
+                    body.images,
+                    body.ocrResults,
+                    body.imageProcessingMode,
+                )))
             else:
                 messages.append(_to_langchain_message(item))
         _log_final_user_message(body, messages)
@@ -1794,17 +2962,23 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
     for item in body.history[-10:]:
         messages.append(_to_langchain_message(item))
 
-    messages.append(HumanMessage(content=_build_human_content(body.message, context_block, body.images)))
+    messages.append(HumanMessage(content=_build_human_content(
+        body.message,
+        context_block,
+        body.images,
+        body.ocrResults,
+        body.imageProcessingMode,
+    )))
     _log_final_user_message(body, messages)
     return messages
 
 
 def build_llm(streaming: bool, body: ChatRequest) -> Runnable:
-    cfg = read_config()
-    provider = get_provider(cfg, body.providerId)
+    provider, model = _resolve_provider_and_model(body)
     api_key = str(provider.get("apiKey", "") or "")
     endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
-    model = str(body.model or provider.get("defaultModel") or "Qwen/Qwen2.5-72B-Instruct")
+    if not model:
+        model = "Qwen/Qwen2.5-72B-Instruct"
 
     return ChatOpenAI(
         model=model,
@@ -1830,9 +3004,10 @@ def build_graph(llm) -> Any:
 
 async def run_chat(body: ChatRequest) -> dict[str, Any]:
     try:
-        llm = build_llm(streaming=False, body=body)
+        prepared_body = await prepare_chat_request(body)
+        llm = build_llm(streaming=False, body=prepared_body)
         graph = build_graph(llm)
-        result = await graph.ainvoke({"messages": build_messages(body)})
+        result = await graph.ainvoke({"messages": build_messages(prepared_body)})
         response: AIMessage = result["response"]
         reply = _stringify_content(response.content)
         tool_calls = _tool_calls_from_ai_message(response)
@@ -1841,26 +3016,27 @@ async def run_chat(body: ChatRequest) -> dict[str, Any]:
             reply = f"好的，我来帮你执行：{', '.join(call['name'] for call in tool_calls)}"
 
         cfg = read_config()
-        provider = get_provider(cfg, body.providerId)
+        provider = get_provider(cfg, prepared_body.providerId)
         return {
             "reply": reply,
             "toolCalls": tool_calls,
-            "model": body.model or provider.get("defaultModel", ""),
+            "model": prepared_body.model or provider.get("defaultModel", ""),
         }
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI API 请求失败: {exc}") from exc
+        _raise_ai_api_request_error(body, exc)
 
 
 async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any], None]:
-    llm = build_llm(streaming=True, body=body)
+    prepared_body = await prepare_chat_request(body)
+    llm = build_llm(streaming=True, body=prepared_body)
     graph = build_graph(llm)
     tool_call_acc: dict[int, dict[str, Any]] = {}
     range_required_tools = {"set_text_style", "set_paragraph_style", "clear_formatting"}
 
     try:
-        async for event in graph.astream_events({"messages": build_messages(body)}, version="v2"):
+        async for event in graph.astream_events({"messages": build_messages(prepared_body)}, version="v2"):
             if event.get("event") != "on_chat_model_stream":
                 continue
 
@@ -1889,7 +3065,7 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI API 请求失败: {exc}") from exc
+        _raise_ai_api_request_error(prepared_body, exc)
 
     if tool_call_acc:
         for index in sorted(tool_call_acc.keys()):
@@ -2011,7 +3187,7 @@ async def _run_llm_round(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI API 请求失败: {exc}") from exc
+        _raise_ai_api_request_error(body, exc)
 
     parsed_tool_calls: list[dict[str, Any]] = []
     if tool_call_acc:
@@ -2546,8 +3722,9 @@ class QueryCoordinator:
         except Exception as exc:
             self.state.transition = Transition.FATAL_ERROR
             logger.exception("[openwps.ai] session %s fatal error", self.session.session_id)
-            _record_trace_event(self.session, "error", round=self.state.round, message=f"AI 请求失败: {exc}")
-            yield {"type": "error", "message": f"AI 请求失败: {exc}"}
+            error_message = f"AI 请求失败: {_normalize_ai_api_error_detail(self.session.body, str(exc))}"
+            _record_trace_event(self.session, "error", round=self.state.round, message=error_message)
+            yield {"type": "error", "message": error_message}
         finally:
             self.session.trace.final_state = {
                 "transition": self.state.transition.value,
@@ -2572,7 +3749,7 @@ async def stream_react_session(session: ReactSession) -> AsyncGenerator[dict[str
         yield event
 
 
-async def list_models(endpoint: str, api_key: str = "") -> list[dict[str, str]]:
+async def list_models(endpoint: str, api_key: str = "", provider_id: str | None = None) -> list[dict[str, Any]]:
     base_url = str(endpoint or "").strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="端点地址不能为空")
@@ -2593,17 +3770,20 @@ async def list_models(endpoint: str, api_key: str = "") -> list[dict[str, str]]:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc
 
     raw_models = payload.get("data", []) if isinstance(payload, dict) else []
-    models: list[dict[str, str]] = []
+    provider = get_provider(read_config(), provider_id) if provider_id else {"supportsVision": False}
+    models: list[dict[str, Any]] = []
     for item in raw_models:
         if not isinstance(item, dict):
             continue
         model_id = str(item.get("id") or "").strip()
         if not model_id:
             continue
+        supports_vision = _raw_model_supports_vision(item) or _selected_model_supports_vision(provider, model_id)
         models.append(
             {
                 "id": model_id,
                 "label": str(item.get("name") or model_id),
+                "supportsVision": supports_vision,
             }
         )
 

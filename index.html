@@ -1,47 +1,50 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ai-doc-editor</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module">
-      const RETRY_KEY = 'openwps:boot-retry'
-      const RETRY_WINDOW_MS = 15000
 
-      function canRetryBoot() {
-        try {
-          const raw = sessionStorage.getItem(RETRY_KEY)
-          if (!raw) return true
-          const lastTime = Number(raw)
-          return !Number.isFinite(lastTime) || Date.now() - lastTime > RETRY_WINDOW_MS
-        } catch {
-          return true
-        }
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>openwps</title>
+</head>
+
+<body>
+  <div id="root"></div>
+  <script type="module">
+    const RETRY_KEY = 'openwps:boot-retry'
+    const RETRY_WINDOW_MS = 15000
+
+    function canRetryBoot() {
+      try {
+        const raw = sessionStorage.getItem(RETRY_KEY)
+        if (!raw) return true
+        const lastTime = Number(raw)
+        return !Number.isFinite(lastTime) || Date.now() - lastTime > RETRY_WINDOW_MS
+      } catch {
+        return true
       }
+    }
 
-      function reloadWithCacheBust() {
-        try {
-          sessionStorage.setItem(RETRY_KEY, String(Date.now()))
-        } catch {
-          // ignore storage failures and still try to recover
-        }
-        const nextUrl = new URL(window.location.href)
-        nextUrl.searchParams.set('__openwps_reload__', String(Date.now()))
-        window.location.replace(nextUrl.toString())
+    function reloadWithCacheBust() {
+      try {
+        sessionStorage.setItem(RETRY_KEY, String(Date.now()))
+      } catch {
+        // ignore storage failures and still try to recover
       }
+      const nextUrl = new URL(window.location.href)
+      nextUrl.searchParams.set('__openwps_reload__', String(Date.now()))
+      window.location.replace(nextUrl.toString())
+    }
 
-      window.__OPENWPS_RELOAD_ON_ASSET_ERROR__ = reloadWithCacheBust
+    window.__OPENWPS_RELOAD_ON_ASSET_ERROR__ = reloadWithCacheBust
 
-      import('/src/main.tsx').catch(error => {
-        console.error('[boot] failed to load main entry', error)
-        if (canRetryBoot()) {
-          reloadWithCacheBust()
-        }
-      })
-    </script>
-  </body>
+    import('/src/main.tsx').catch(error => {
+      console.error('[boot] failed to load main entry', error)
+      if (canRetryBoot()) {
+        reloadWithCacheBust()
+      }
+    })
+  </script>
+</body>
+
 </html>
