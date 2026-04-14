@@ -18,7 +18,6 @@ import { agentTools } from '../ai/tools'
 import type {
   AIProviderSettings,
   AISettingsData,
-  ImageProcessingMode,
   ModelOption,
   OcrConfigData,
 } from '../ai/providers'
@@ -37,6 +36,7 @@ interface ConversationSummary {
 interface StoredMessage {
   role: 'user' | 'assistant' | 'tool'
   content?: string | null
+  attachments?: ChatAttachment[]
   thinking?: string
   toolCalls?: ToolCallResult[]
   tool_calls?: Array<{ id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }>
@@ -63,12 +63,17 @@ type MessageSegment =
   | { id: string; type: 'thinking'; text: string }
   | { id: string; type: 'tool'; toolCall: ToolCallResult }
 
-interface ImageAttachment {
+type AttachmentKind = 'image' | 'text'
+
+interface ChatAttachment {
   id: string
   name: string
   size: number
   type: string
-  dataUrl: string
+  kind: AttachmentKind
+  dataUrl?: string
+  textContent?: string
+  textFormat?: 'plain' | 'markdown' | 'docx'
 }
 
 interface Message {
@@ -84,12 +89,41 @@ interface Message {
   prepared?: PreparedTextWithSegments
   tightWidth: number
   selectionTag?: { text: string; paragraphIndex: number } | null
+  attachments?: ChatAttachment[]
 }
 
 interface TodoItem {
   id: string
   title: string
   status: 'pending' | 'in_progress' | 'completed' | 'failed'
+}
+
+type OcrTaskType = 'general_parse' | 'document_text' | 'table' | 'chart' | 'handwriting' | 'formula'
+
+interface OcrIntentMatch {
+  taskType: OcrTaskType
+  instruction: string
+  source: 'slash' | 'intent'
+}
+
+interface OcrAnalysisResult {
+  imageIndex: number
+  name: string
+  taskType: OcrTaskType
+  summary: string
+  plainText: string
+  markdown: string
+  tables?: Array<{ title?: string; markdown?: string; rowCount?: number; columnCount?: number }>
+  charts?: Array<{ title?: string; summary?: string }>
+  handwritingText?: string
+  formulas?: Array<{ latex?: string; text?: string }>
+  warnings?: string[]
+}
+
+interface OcrAnalysisResponse {
+  taskType: OcrTaskType
+  imageCount: number
+  results: OcrAnalysisResult[]
 }
 
 // ─── Selection context ───────────────────────────────────────────────────────
@@ -269,9 +303,10 @@ const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
 const STREAMING_WRITE_FLUSH_MS = 80
 const STREAMING_WRITE_MAX_BUFFER = 1200
-const MAX_IMAGE_ATTACHMENT_COUNT = 5
-const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
-const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
+const MAX_ATTACHMENT_COUNT = 8
+const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
+const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
+const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, tool.description]))
 
 let msgIdCounter = 0
@@ -384,6 +419,12 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'insert_page_break') return target ? `在${target}插入分页符` : '插入分页符'
   if (toolCall.name === 'insert_horizontal_rule') return target ? `在${target}插入分割线` : '插入分割线'
   if (toolCall.name === 'insert_table') return target ? `在${target}插入表格` : '插入表格'
+  if (toolCall.name === 'insert_table_row_before') return '在当前表格行上方插入一行'
+  if (toolCall.name === 'insert_table_row_after') return '在当前表格行下方插入一行'
+  if (toolCall.name === 'delete_table_row') return '删除当前表格行'
+  if (toolCall.name === 'insert_table_column_before') return '在当前表格列左侧插入一列'
+  if (toolCall.name === 'insert_table_column_after') return '在当前表格列右侧插入一列'
+  if (toolCall.name === 'delete_table_column') return '删除当前表格列'
   if (toolCall.name === 'apply_style_batch') {
     const ruleCount = Array.isArray(toolCall.params.rules) ? toolCall.params.rules.length : 0
     return ruleCount > 0 ? `批量应用 ${ruleCount} 条样式规则` : '批量应用样式规则'
@@ -426,6 +467,129 @@ function formatFileSize(size: number) {
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
   return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function createAttachmentId(file: File) {
+  return `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function isImageAttachment(attachment: ChatAttachment): attachment is ChatAttachment & { kind: 'image'; dataUrl: string } {
+  return attachment.kind === 'image' && typeof attachment.dataUrl === 'string' && attachment.dataUrl.length > 0
+}
+
+function isTextAttachment(attachment: ChatAttachment): attachment is ChatAttachment & { kind: 'text'; textContent: string } {
+  return attachment.kind === 'text' && typeof attachment.textContent === 'string' && attachment.textContent.trim().length > 0
+}
+
+function normalizeAttachmentText(text: string) {
+  return text.replace(/\r\n/g, '\n').trim()
+}
+
+function getAttachmentTextFormat(file: File): ChatAttachment['textFormat'] | null {
+  const lowerName = file.name.toLowerCase()
+  if (lowerName.endsWith('.md') || lowerName.endsWith('.markdown') || file.type === 'text/markdown') return 'markdown'
+  if (lowerName.endsWith('.txt') || file.type.startsWith('text/')) return 'plain'
+  if (lowerName.endsWith('.docx') || file.type === DOCX_MIME) return 'docx'
+  return null
+}
+
+function getUnsupportedAttachmentReason(file: File): string | null {
+  const lowerName = file.name.toLowerCase()
+  if (lowerName.endsWith('.pdf') || file.type === 'application/pdf') {
+    return '暂不支持直接发送 PDF 附件，请先转换为 TXT、Markdown 或 DOCX。'
+  }
+  return '当前仅支持图片、TXT、Markdown 和 DOCX 附件。'
+}
+
+async function extractTextAttachment(file: File): Promise<ChatAttachment> {
+  const textFormat = getAttachmentTextFormat(file)
+  if (!textFormat) {
+    throw new Error(getUnsupportedAttachmentReason(file) || `暂不支持附件类型：${file.name}`)
+  }
+
+  let textContent = ''
+  if (textFormat === 'docx') {
+    const mammoth = await import('mammoth')
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })
+    textContent = normalizeAttachmentText(result.value || '')
+  } else {
+    textContent = normalizeAttachmentText(await file.text())
+  }
+
+  if (!textContent) {
+    throw new Error(`${file.name} 中未提取到可发送的文本内容`)
+  }
+
+  return {
+    id: createAttachmentId(file),
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    kind: 'text',
+    textContent,
+    textFormat,
+  }
+}
+
+async function extractAttachment(file: File): Promise<ChatAttachment> {
+  if (file.type.startsWith('image/')) {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result ?? ''))
+      reader.onerror = () => reject(reader.error ?? new Error(`读取图片失败：${file.name}`))
+      reader.readAsDataURL(file)
+    })
+
+    return {
+      id: createAttachmentId(file),
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      kind: 'image',
+      dataUrl,
+    }
+  }
+
+  return extractTextAttachment(file)
+}
+
+function getAttachmentBadge(attachment: ChatAttachment) {
+  if (attachment.kind === 'image') return '图片'
+  if (attachment.textFormat === 'markdown') return 'Markdown'
+  if (attachment.textFormat === 'docx') return 'DOCX'
+  return '文本'
+}
+
+function buildAttachmentContextBlock(attachments: ChatAttachment[]) {
+  if (attachments.length === 0) return ''
+
+  const parts = ['[附件内容]']
+  let totalChars = 0
+  const maxTotalChars = 16000
+  attachments.forEach((attachment, index) => {
+    const header = `附件 ${index + 1}: ${attachment.name} (${getAttachmentBadge(attachment)})`
+    if (isImageAttachment(attachment)) {
+      parts.push(`${header}\n该附件为图片，历史上下文仅保留附件名称。`)
+      return
+    }
+    if (isTextAttachment(attachment)) {
+      const label = attachment.textFormat === 'markdown' ? '原始 Markdown' : '提取文本'
+      const remaining = maxTotalChars - totalChars
+      if (remaining <= 0) return
+      const clipped = attachment.textContent.slice(0, remaining)
+      totalChars += clipped.length
+      const suffix = clipped.length < attachment.textContent.length ? '\n[后续内容已截断]' : ''
+      parts.push(`${header}\n${label}:\n${clipped}${suffix}`)
+    }
+  })
+  return parts.join('\n\n')
+}
+
+function buildStoredUserContent(text: string, attachments: ChatAttachment[]) {
+  const attachmentBlock = buildAttachmentContextBlock(attachments)
+  if (!attachmentBlock) return text
+  if (!text.trim()) return attachmentBlock
+  return `${text}\n\n${attachmentBlock}`
 }
 
 function downloadJsonFile(filename: string, payload: unknown) {
@@ -532,7 +696,7 @@ function getReplayToolParams(tool: Pick<ToolCallResult, 'params' | 'originalPara
   return hasToolParams(tool.originalParams) ? normalizeToolParams(tool.originalParams) : normalizeToolParams(tool.params)
 }
 
-function makeUserMessage(text: string, sidebarWidth: number): Message {
+function makeUserMessage(text: string, sidebarWidth: number, attachments: ChatAttachment[] = []): Message {
   const message: Message = {
     id: newId(),
     role: 'user',
@@ -544,6 +708,7 @@ function makeUserMessage(text: string, sidebarWidth: number): Message {
     streaming: false,
     activityLabel: '',
     tightWidth: 0,
+    attachments,
   }
 
   try {
@@ -920,7 +1085,7 @@ function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Me
 
   for (const stored of messages) {
     if (stored.role === 'user') {
-      restored.push(makeUserMessage(stored.content ?? '', sidebarWidth))
+      restored.push(makeUserMessage(stored.content ?? '', sidebarWidth, stored.attachments ?? []))
       continue
     }
 
@@ -964,7 +1129,10 @@ function buildReactMessages(messages: StoredMessage[], userText: string): ReactM
 
       return {
         role: 'user' as const,
-        content: typeof message.content === 'string' ? message.content : '',
+        content: buildStoredUserContent(
+          typeof message.content === 'string' ? message.content : '',
+          message.attachments ?? [],
+        ),
       }
     })
     .slice(-40)
@@ -1004,9 +1172,17 @@ function buildDefaultImagePrompt(mode: AssistantMode) {
   return '请根据上传的图片内容复现到当前文档中。'
 }
 
+function buildDefaultAttachmentPrompt(mode: AssistantMode, attachments: ChatAttachment[]) {
+  if (attachments.some(isImageAttachment)) return buildDefaultImagePrompt(mode)
+  if (mode === 'layout') return '请根据上传的附件内容整理并完成排版。'
+  if (mode === 'edit') return '请根据上传的附件内容整理并写入正文。'
+  return '请根据上传的附件内容处理当前任务。'
+}
+
 function createDefaultOcrConfig(): OcrConfigData {
   return {
     enabled: true,
+    backend: 'compat_chat',
     providerId: 'siliconflow',
     endpoint: 'https://api.siliconflow.cn/v1',
     model: 'PaddlePaddle/PaddleOCR-VL-1.5',
@@ -1014,6 +1190,96 @@ function createDefaultOcrConfig(): OcrConfigData {
     timeoutSeconds: 60,
     maxImages: 5,
   }
+}
+
+function normalizeOcrTaskType(value: string | undefined): OcrTaskType {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
+  if (normalized === 'table' || normalized === 'tables') return 'table'
+  if (normalized === 'chart' || normalized === 'charts' || normalized === 'graph') return 'chart'
+  if (normalized === 'handwriting' || normalized === 'handwritten' || normalized === 'handwrite') return 'handwriting'
+  if (normalized === 'formula' || normalized === 'math') return 'formula'
+  if (normalized === 'document_text' || normalized === 'document' || normalized === 'text' || normalized === 'doc') return 'document_text'
+  return 'general_parse'
+}
+
+function parseOcrCommand(text: string): OcrIntentMatch | null {
+  const match = text.match(/^\/ocr(?:\s+([a-zA-Z_-]+))?(?:\s+([\s\S]+))?$/i)
+  if (!match) return null
+  return {
+    taskType: normalizeOcrTaskType(match[1]),
+    instruction: String(match[2] || '').trim(),
+    source: 'slash',
+  }
+}
+
+function detectOcrIntent(text: string): OcrIntentMatch | null {
+  const normalized = text.trim()
+  if (!normalized) return null
+  if (!/(识别|提取|解析|读取|ocr)/i.test(normalized)) return null
+
+  let taskType: OcrTaskType = 'general_parse'
+  if (/(表格|表单|table)/i.test(normalized)) taskType = 'table'
+  else if (/(图表|柱状图|折线图|饼图|chart|graph)/i.test(normalized)) taskType = 'chart'
+  else if (/(手写|手写字|笔迹|handwriting|handwritten)/i.test(normalized)) taskType = 'handwriting'
+  else if (/(公式|数学|latex|equation)/i.test(normalized)) taskType = 'formula'
+  else if (/(扫描件|文档文字|正文|段落|document|text)/i.test(normalized)) taskType = 'document_text'
+
+  return {
+    taskType,
+    instruction: normalized,
+    source: 'intent',
+  }
+}
+
+function compactOcrDisplayText(text: string, maxLines = 24, maxChars = 1200): string {
+  const lines = text.split(/\r?\n/)
+  let compact = lines.slice(0, maxLines).join('\n').trim()
+  let truncated = lines.length > maxLines
+
+  if (compact.length > maxChars) {
+    compact = `${compact.slice(0, maxChars).trimEnd()}…`
+    truncated = true
+  }
+
+  if (truncated) compact = `${compact}\n[内容已截断]`
+  return compact
+}
+
+function formatOcrResponseForChat(response: OcrAnalysisResponse): string {
+  const parts: string[] = []
+  parts.push(`已完成 OCR 识别，共处理 ${response.imageCount} 张图片，任务类型：${response.taskType}。`)
+
+  response.results.forEach(result => {
+    parts.push('')
+    parts.push(`图片 ${result.imageIndex}：${result.name}`)
+    if (result.summary) parts.push(`摘要：${result.summary}`)
+    if (result.handwritingText) parts.push(`手写识别：\n${compactOcrDisplayText(result.handwritingText)}`)
+    if (result.markdown) parts.push(`Markdown：\n${compactOcrDisplayText(result.markdown)}`)
+    else if (result.plainText) parts.push(`文本：\n${compactOcrDisplayText(result.plainText)}`)
+    if (Array.isArray(result.tables) && result.tables.length > 0) {
+      parts.push(`表格数：${result.tables.length}`)
+      result.tables.forEach((table, index) => {
+        const title = table.title ? `表格 ${index + 1}：${table.title}` : `表格 ${index + 1}`
+        parts.push(title)
+        if (table.markdown) parts.push(compactOcrDisplayText(table.markdown, 32, 1600))
+      })
+    }
+    if (Array.isArray(result.charts) && result.charts.length > 0) {
+      parts.push(`图表数：${result.charts.length}`)
+      result.charts.forEach((chart, index) => {
+        const title = chart.title ? `图表 ${index + 1}：${chart.title}` : `图表 ${index + 1}`
+        parts.push(chart.summary ? `${title}\n${chart.summary}` : title)
+      })
+    }
+    if (Array.isArray(result.formulas) && result.formulas.length > 0) {
+      parts.push(`公式：${result.formulas.map(item => item.latex || item.text).filter(Boolean).join('；')}`)
+    }
+    if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+      parts.push(`提示：${result.warnings.join('；')}`)
+    }
+  })
+
+  return parts.join('\n')
 }
 
 function extractClipboardImageFiles(event: ReactClipboardEvent<HTMLTextAreaElement>): File[] {
@@ -1044,8 +1310,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   const [activeProviderId, setActiveProviderId] = useState('')
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
-  const [pendingImages, setPendingImages] = useState<ImageAttachment[]>([])
-  const [imageProcessingMode, setImageProcessingMode] = useState<ImageProcessingMode>('direct_multimodal')
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([])
   const [ocrConfig, setOcrConfig] = useState<OcrConfigData>(createDefaultOcrConfig())
 
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -1077,14 +1342,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
   }, [activeProviderSupportsVision, availableModels, currentModelId])
   const effectiveOcrEndpoint = ocrConfig.endpoint || activeOcrProvider?.endpoint || ''
   const effectiveOcrHasApiKey = ocrConfig.hasApiKey || Boolean(activeOcrProvider?.hasApiKey)
+  const ocrBackendRequiresModel = ocrConfig.backend === 'compat_chat'
   const isOcrReady = Boolean(
     ocrConfig.enabled
-    && ocrConfig.model.trim()
+    && (!ocrBackendRequiresModel || ocrConfig.model.trim())
     && effectiveOcrEndpoint
     && effectiveOcrHasApiKey,
   )
-  const canUploadImages = imageProcessingMode === 'ocr_text' ? isOcrReady : true
-  const canSendMessage = Boolean(input.trim() || pendingImages.length > 0)
+  const canSendMessage = Boolean(input.trim() || pendingAttachments.length > 0)
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
@@ -1134,6 +1399,45 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     return ctx
   }, [editorView, editorState, includeSelection, pageConfig])
 
+  const requestOcrAnalysis = useCallback(async (
+    request: OcrIntentMatch,
+    images: ChatAttachment[],
+    imageIndices?: number[],
+  ) => {
+    if (!isOcrReady) {
+      throw new Error('OCR 配置未就绪，请先在设置中补充 OCR 模型、端点和 API Key。')
+    }
+
+    const response = await fetch('/api/ai/ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        taskType: request.taskType,
+        instruction: request.instruction || undefined,
+        imageIndices,
+        ocrConfig: {
+          enabled: ocrConfig.enabled,
+          backend: ocrConfig.backend,
+          providerId: ocrConfig.providerId,
+          endpoint: effectiveOcrEndpoint || undefined,
+          model: ocrConfig.model || undefined,
+          timeoutSeconds: ocrConfig.timeoutSeconds,
+          maxImages: ocrConfig.maxImages,
+        },
+        images: images.map(image => ({
+          name: image.name,
+          type: image.type,
+          size: image.size,
+          dataUrl: image.dataUrl,
+        })),
+      }),
+    })
+
+    const data = await response.json() as OcrAnalysisResponse & { detail?: string }
+    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`)
+    return data
+  }, [effectiveOcrEndpoint, isOcrReady, ocrConfig.backend, ocrConfig.enabled, ocrConfig.maxImages, ocrConfig.model, ocrConfig.providerId, ocrConfig.timeoutSeconds])
+
   const loadConversations = useCallback(async () => {
     setHistoryLoading(true)
     try {
@@ -1164,7 +1468,6 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
         if (!active) return
         setProviders(data.providers)
         setActiveProviderId(data.activeProviderId)
-        setImageProcessingMode(data.imageProcessingMode || 'direct_multimodal')
         setOcrConfig(data.ocrConfig || createDefaultOcrConfig())
         setModelName(data.model || '')
         setSelectedModel(data.model || '')
@@ -1318,8 +1621,9 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       mode: assistantMode,
       providerId: activeProviderId || null,
       model: selectedModel || modelName || null,
-      imageProcessingMode,
+      imageProcessingMode: 'direct_multimodal',
       ocrConfig: {
+        backend: ocrConfig.backend,
         providerId: ocrConfig.providerId,
         endpoint: effectiveOcrEndpoint || null,
         model: ocrConfig.model || null,
@@ -1334,52 +1638,40 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
     const safeTitle = String(payload.title || 'conversation').replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 40) || 'conversation'
     downloadJsonFile(`${safeTitle}-${targetConversationId ?? 'draft'}.json`, payload)
-  }, [activeProviderId, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, imageProcessingMode, includeSelection, messages, modelName, ocrConfig.model, ocrConfig.providerId, selectedModel])
+  }, [activeProviderId, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, includeSelection, messages, modelName, ocrConfig.backend, ocrConfig.model, ocrConfig.providerId, selectedModel])
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort()
   }, [])
 
-  const appendPendingImages = useCallback(async (incomingFiles: File[]) => {
+  const appendPendingAttachments = useCallback(async (incomingFiles: File[]) => {
     if (incomingFiles.length === 0) return
 
-    if (imageProcessingMode === 'ocr_text' && !canUploadImages) {
-      window.alert(
-        imageProcessingMode === 'ocr_text'
-          ? '当前已切换到 OCR 模式，但 OCR 配置未就绪。请先在设置中配置 OCR 模型、端点和 API Key。'
-          : '当前模型未标记为支持图片输入。请先切换到多模态模型，再上传图片。',
-      )
-      return
-    }
-
-    const imageFiles = incomingFiles.filter(file => file.type.startsWith('image/'))
-    if (imageFiles.length === 0) return
-
     const errors: string[] = []
-    const existingTotalSize = pendingImages.reduce((sum, image) => sum + image.size, 0)
-    const remainingSlots = Math.max(MAX_IMAGE_ATTACHMENT_COUNT - pendingImages.length, 0)
+    const existingTotalSize = pendingAttachments.reduce((sum, attachment) => sum + attachment.size, 0)
+    const remainingSlots = Math.max(MAX_ATTACHMENT_COUNT - pendingAttachments.length, 0)
     if (remainingSlots <= 0) {
-      window.alert(`最多只能附带 ${MAX_IMAGE_ATTACHMENT_COUNT} 张图片。`)
+      window.alert(`最多只能附带 ${MAX_ATTACHMENT_COUNT} 个附件。`)
       return
     }
 
     let nextTotalSize = existingTotalSize
     const acceptedFiles: File[] = []
-    for (const file of imageFiles.slice(0, remainingSlots)) {
-      if (file.size > MAX_IMAGE_SIZE_BYTES) {
-        errors.push(`${file.name} 超过 ${Math.floor(MAX_IMAGE_SIZE_BYTES / (1024 * 1024))}MB 限制`)
+    for (const file of incomingFiles.slice(0, remainingSlots)) {
+      if (file.size > MAX_ATTACHMENT_SIZE_BYTES) {
+        errors.push(`${file.name} 超过 ${Math.floor(MAX_ATTACHMENT_SIZE_BYTES / (1024 * 1024))}MB 限制`)
         continue
       }
-      if (nextTotalSize + file.size > MAX_TOTAL_IMAGE_BYTES) {
-        errors.push(`图片总大小不能超过 ${Math.floor(MAX_TOTAL_IMAGE_BYTES / (1024 * 1024))}MB`)
+      if (nextTotalSize + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
+        errors.push(`附件总大小不能超过 ${Math.floor(MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024))}MB`)
         break
       }
       acceptedFiles.push(file)
       nextTotalSize += file.size
     }
 
-    if (imageFiles.length > remainingSlots) {
-      errors.push(`最多只能附带 ${MAX_IMAGE_ATTACHMENT_COUNT} 张图片，超出的图片已忽略`)
+    if (incomingFiles.length > remainingSlots) {
+      errors.push(`最多只能附带 ${MAX_ATTACHMENT_COUNT} 个附件，超出的文件已忽略`)
     }
 
     if (acceptedFiles.length === 0) {
@@ -1387,56 +1679,48 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       return
     }
 
-    const nextImages = await Promise.all(
-      acceptedFiles.map(
-        file =>
-          new Promise<ImageAttachment>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = () =>
-              resolve({
-                id: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                name: file.name,
-                size: file.size,
-                type: file.type,
-                dataUrl: String(reader.result ?? ''),
-              })
-            reader.onerror = () => reject(reader.error ?? new Error(`读取图片失败：${file.name}`))
-            reader.readAsDataURL(file)
-          }),
-      ),
-    )
+    const nextAttachments: ChatAttachment[] = []
+    for (const file of acceptedFiles) {
+      try {
+        nextAttachments.push(await extractAttachment(file))
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error))
+      }
+    }
 
-    setPendingImages(prev => [...prev, ...nextImages])
+    if (nextAttachments.length > 0) {
+      setPendingAttachments(prev => [...prev, ...nextAttachments])
+    }
     if (errors.length > 0) window.alert(errors.join('\n'))
-  }, [canUploadImages, imageProcessingMode, pendingImages])
+  }, [pendingAttachments])
 
-  const handleImagePick = useCallback(async (files: FileList | null) => {
+  const handleAttachmentPick = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return
-    await appendPendingImages(Array.from(files))
-  }, [appendPendingImages])
+    await appendPendingAttachments(Array.from(files))
+  }, [appendPendingAttachments])
 
-  const removePendingImage = useCallback((id: string) => {
-    setPendingImages(prev => prev.filter(image => image.id !== id))
+  const removePendingAttachment = useCallback((id: string) => {
+    setPendingAttachments(prev => prev.filter(attachment => attachment.id !== id))
   }, [])
 
   const handleSend = useCallback(async (overrideText?: string) => {
     const rawText = (overrideText ?? input).trim()
-    const text = rawText || (pendingImages.length > 0 ? buildDefaultImagePrompt(assistantMode) : '')
-    if (!text || loading) return
-    if (pendingImages.length > 0 && imageProcessingMode === 'ocr_text' && !canUploadImages) {
-      window.alert(
-        imageProcessingMode === 'ocr_text'
-          ? 'OCR 配置未就绪，请先在设置中补充 OCR 模型、端点和 API Key。'
-          : '当前模型未标记为支持图片输入。请切换到多模态模型后再发送。',
-      )
+    const imageAttachments = pendingAttachments.filter(isImageAttachment)
+    const textAttachments = pendingAttachments.filter(isTextAttachment)
+    if (rawText.startsWith('/ocr') && imageAttachments.length === 0) {
+      window.alert('请先附带至少一张图片，再使用 /ocr 命令。')
       return
     }
+    const ocrIntent = imageAttachments.length > 0 ? (parseOcrCommand(rawText) ?? detectOcrIntent(rawText)) : null
+    const text = rawText || (pendingAttachments.length > 0 ? buildDefaultAttachmentPrompt(assistantMode, pendingAttachments) : '')
+    if (!text || loading) return
 
     const shouldStartNewConversation = viewMode === 'history'
     const nextTitle = makeConversationTitle(text)
     const previousConversationMessages = shouldStartNewConversation ? [] : conversationMessagesRef.current
-    const userMessage = makeUserMessage(text, sidebarWidth)
-    const imagesForRequest = pendingImages
+    const userMessage = makeUserMessage(text, sidebarWidth, pendingAttachments)
+    const imagesForRequest = imageAttachments
+    const textAttachmentsForRequest = textAttachments
 
     // Capture selection tag for this message, then clear it from input area
     const currentSel = (includeSelection && editorState) ? serializeSelection(editorState) : null
@@ -1453,7 +1737,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     todosRef.current = []
     setIsTodoPanelExpanded(false)
     setInput('')
-    setPendingImages([])
+    setPendingAttachments([])
     setIncludeSelection(true)
     resetTextareaHeight()
     shouldAutoScrollRef.current = true
@@ -1481,7 +1765,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     const context = getContext()
     let persistedAssistantText = ''
     let conversationPersisted = false
-    const persistedRecords: StoredMessage[] = [{ role: 'user', content: text }]
+    const persistedRecords: StoredMessage[] = [{ role: 'user', content: text, attachments: pendingAttachments }]
     let pendingStreamingChunk = ''
     let streamingFlushTimer: number | null = null
 
@@ -1599,6 +1883,29 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       let sessionId = ''
       let currentToolPlan: ToolExecutionPlan | null = null
 
+      if (ocrIntent) {
+        const ocrResponse = await requestOcrAnalysis(ocrIntent, imagesForRequest)
+        const ocrText = formatOcrResponseForChat(ocrResponse)
+        persistedAssistantText = ocrText
+        persistedRecords.push({ role: 'assistant', content: ocrText })
+        setMessages(prev => prev.map(message => (
+          message.id === aiMessage.id
+            ? { ...appendContentChunk(message, ocrText, true), streaming: false, activityLabel: '' }
+            : message
+        )))
+
+        if (conversationId) {
+          await fetch(`/api/conversations/${conversationId}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: persistedRecords }),
+          })
+          conversationPersisted = true
+          conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
+        }
+        return
+      }
+
       // ── Single SSE connection for the entire ReAct session ──
       const response = await fetch('/api/ai/react/stream', {
         method: 'POST',
@@ -1613,17 +1920,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
           mode: assistantMode,
           model: selectedModel || modelName || undefined,
           providerId: activeProviderId || undefined,
-          imageProcessingMode,
-          ocrConfig: imageProcessingMode === 'ocr_text'
-            ? {
-              enabled: ocrConfig.enabled,
-              providerId: ocrConfig.providerId,
-              endpoint: effectiveOcrEndpoint || undefined,
-              model: ocrConfig.model || undefined,
-              timeoutSeconds: ocrConfig.timeoutSeconds,
-              maxImages: ocrConfig.maxImages,
-            }
-            : undefined,
+          imageProcessingMode: 'direct_multimodal',
+          attachments: textAttachmentsForRequest.map(attachment => ({
+            name: attachment.name,
+            type: attachment.type,
+            size: attachment.size,
+            textContent: attachment.textContent,
+            textFormat: attachment.textFormat,
+          })),
           images: imagesForRequest.map(image => ({
             name: image.name,
             type: image.type,
@@ -1707,6 +2011,29 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             result = beginResult
             if ('session' in beginResult && beginResult.session) {
               activeStreamingWriteRef.current = beginResult.session
+            }
+          } else if (execution.toolName === 'analyze_image_with_ocr') {
+            if (imagesForRequest.length === 0) {
+              result = { success: false, message: '当前轮没有可供 OCR 分析的图片' }
+            } else {
+              try {
+                const taskType = normalizeOcrTaskType(typeof executedParams.taskType === 'string' ? executedParams.taskType : undefined)
+                const imageIndices = Array.isArray(executedParams.imageIndices)
+                  ? executedParams.imageIndices.map(value => Number(value)).filter(value => Number.isInteger(value) && value > 0)
+                  : undefined
+                const ocrResponse = await requestOcrAnalysis({
+                  taskType,
+                  instruction: typeof executedParams.instruction === 'string' ? executedParams.instruction : '',
+                  source: 'slash',
+                }, imagesForRequest, imageIndices)
+                result = {
+                  success: true,
+                  message: `已完成 OCR 识别（${ocrResponse.taskType}，${ocrResponse.imageCount} 张图片）`,
+                  data: ocrResponse,
+                }
+              } catch (error) {
+                result = { success: false, message: error instanceof Error ? error.message : String(error) }
+              }
             }
           } else {
             result = editorView
@@ -2100,7 +2427,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [activeProviderId, assistantMode, canUploadImages, currentModelSupportsVision, editorState, editorView, effectiveOcrEndpoint, getContext, imageProcessingMode, includeSelection, input, loadConversations, loading, modelName, ocrConfig.enabled, ocrConfig.maxImages, ocrConfig.model, ocrConfig.providerId, ocrConfig.timeoutSeconds, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingImages, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
+  }, [activeProviderId, assistantMode, currentModelSupportsVision, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -2294,6 +2621,32 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 {message.role === 'user' ? (
                   <div className="flex flex-col items-end gap-1">
+                    {message.attachments && message.attachments.length > 0 && (
+                      <div className="flex max-w-[85%] flex-wrap justify-end gap-2">
+                        {message.attachments.map(attachment => (
+                          <div
+                            key={attachment.id}
+                            className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-2.5 py-2 shadow-sm"
+                          >
+                            {isImageAttachment(attachment) ? (
+                              <img
+                                src={attachment.dataUrl}
+                                alt={attachment.name}
+                                className="h-10 w-10 rounded-xl border border-slate-200 bg-slate-100 object-cover"
+                              />
+                            ) : (
+                              <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                                {getAttachmentBadge(attachment)}
+                              </div>
+                            )}
+                            <div className="min-w-0">
+                              <div className="max-w-[180px] truncate text-xs font-medium text-slate-700">{attachment.name}</div>
+                              <div className="text-[11px] text-slate-400">{formatFileSize(attachment.size)}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     <div
                       className="bg-blue-500 text-white rounded-2xl rounded-tr-sm px-3 py-2 text-sm"
                       style={{
@@ -2530,21 +2883,21 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       <div className="border-t border-gray-200 p-2.5 flex-shrink-0">
         {(() => {
           const sel = editorState ? serializeSelection(editorState) : null
-          const hasTopContent = Boolean(sel) || pendingImages.length > 0
+          const hasTopContent = Boolean(sel) || pendingAttachments.length > 0
+          const hasPendingImageAttachment = pendingAttachments.some(isImageAttachment)
 
           return (
             <div className="rounded-[24px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.06)] overflow-hidden">
               <input
                 ref={imageInputRef}
                 type="file"
-                accept="image/*"
                 multiple
                 className="hidden"
                 onChange={async event => {
                   try {
-                    await handleImagePick(event.target.files)
+                    await handleAttachmentPick(event.target.files)
                   } catch (error) {
-                    console.error('[AISidebar] pick image failed', error)
+                    console.error('[AISidebar] pick attachment failed', error)
                   } finally {
                     event.target.value = ''
                   }
@@ -2554,25 +2907,31 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               <div className="border-b border-slate-100 bg-slate-50/80 px-3 py-2">
                 {hasTopContent ? (
                   <div className="flex flex-wrap gap-2">
-                    {pendingImages.map(image => (
+                    {pendingAttachments.map(attachment => (
                       <div
-                        key={image.id}
+                        key={attachment.id}
                         className="group flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-2 py-2 shadow-sm"
                       >
-                        <img
-                          src={image.dataUrl}
-                          alt={image.name}
-                          className="h-10 w-10 rounded-xl object-cover border border-slate-200 bg-slate-100"
-                        />
+                        {isImageAttachment(attachment) ? (
+                          <img
+                            src={attachment.dataUrl}
+                            alt={attachment.name}
+                            className="h-10 w-10 rounded-xl object-cover border border-slate-200 bg-slate-100"
+                          />
+                        ) : (
+                          <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                            {getAttachmentBadge(attachment)}
+                          </div>
+                        )}
                         <div className="min-w-0">
-                          <div className="max-w-[140px] truncate text-xs font-medium text-slate-700">{image.name}</div>
-                          <div className="text-[11px] text-slate-400">{formatFileSize(image.size)}</div>
+                          <div className="max-w-[160px] truncate text-xs font-medium text-slate-700">{attachment.name}</div>
+                          <div className="text-[11px] text-slate-400">{getAttachmentBadge(attachment)} · {formatFileSize(attachment.size)}</div>
                         </div>
                         <button
                           type="button"
-                          onClick={() => removePendingImage(image.id)}
+                          onClick={() => removePendingAttachment(attachment.id)}
                           className="flex h-6 w-6 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
-                          title="移除图片"
+                          title="移除附件"
                         >
                           ×
                         </button>
@@ -2606,20 +2965,14 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                   </div>
                 ) : (
                   <div className="text-xs text-slate-400">
-                    {imageProcessingMode === 'ocr_text'
-                      ? (isOcrReady
-                        ? '当前使用 OCR + 文本模型 路径。上传图片后会先提取内容和样式线索，再交给主模型继续处理。'
-                        : '当前已切换到 OCR 模式，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。')
-                      : (currentModelSupportsVision
-                        ? '上传图片或附带当前选区后，会显示在这里并随本轮请求一起发送。'
-                        : '当前模型未明确标记为多模态，仍会尝试发送图片；若上游拒绝，请切换到支持视觉的模型或改用 OCR 路径。')}
+                    {currentModelSupportsVision
+                      ? '上传图片、文本或 DOCX 附件后会随本轮请求一起发送；表格、图表、手写识别可继续用 /ocr。'
+                      : '当前模型未明确标记为多模态，图片仍会尝试发送；文本和 DOCX 附件会先提取内容再发送。'}
                   </div>
                 )}
-                {pendingImages.length > 0 && imageProcessingMode === 'ocr_text' && !canUploadImages && (
+                {hasPendingImageAttachment && !isOcrReady && /(^\/ocr\b)|(识别|提取|解析|读取).*(表格|图表|手写|公式|扫描件|文档文字)/.test(input.trim()) && (
                   <div className="mt-2 text-[11px] text-amber-600">
-                    {imageProcessingMode === 'ocr_text'
-                      ? '当前 OCR 配置未就绪，请先在设置中补充 OCR 模型、端点和 API Key。'
-                      : '当前模型未标记为支持图片输入，请先切换到多模态模型再发送。'}
+                    当前命中了 OCR 专用识别请求，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。
                   </div>
                 )}
               </div>
@@ -2646,7 +2999,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     const pastedImageFiles = extractClipboardImageFiles(event)
                     if (pastedImageFiles.length === 0) return
                     event.preventDefault()
-                    void appendPendingImages(pastedImageFiles)
+                    void appendPendingAttachments(pastedImageFiles)
                   }}
                   onCompositionStart={() => {
                     isComposingRef.current = true
@@ -2665,8 +3018,18 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
               </div>
 
               <div className="border-t border-slate-100 bg-slate-50/90 px-3 py-2.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <label className="flex min-w-[180px] flex-1 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={loading}
+                    className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border text-base transition-colors ${loading ? 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'}`}
+                    title="添加图片或文件附件"
+                  >
+                    ＋
+                  </button>
+
+                  <label className="flex min-w-0 flex-1 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
                     <span className="shrink-0">模型</span>
                     <select
                       value={selectedModel || modelName}
@@ -2692,64 +3055,20 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     </select>
                   </label>
 
-                  <div className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] ${currentModelSupportsVision ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
-                    {currentModelSupportsVision ? '多模态' : '视觉待确认'}
-                  </div>
-
-                  <div className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] ${imageProcessingMode === 'ocr_text' ? (isOcrReady ? 'border-violet-200 bg-violet-50 text-violet-700' : 'border-amber-200 bg-amber-50 text-amber-700') : 'border-slate-200 bg-white text-slate-500'}`}>
-                    {imageProcessingMode === 'ocr_text'
-                      ? (isOcrReady ? 'OCR 模式' : 'OCR 未就绪')
-                      : '直连模式'}
-                  </div>
-                </div>
-
-                <div className="mt-2 flex items-center gap-2">
-                  <div className="inline-flex min-w-0 flex-1 rounded-full border border-slate-200 bg-white p-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setAssistantMode('agent')}
-                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'agent'
-                        ? 'bg-violet-600 text-white'
-                        : 'text-slate-500 hover:bg-slate-100'
-                        }`}
-                      title="Agent 模式：可同时写正文和排版，是主推荐模式"
+                  <label className="flex shrink-0 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
+                    <span className="shrink-0">模式</span>
+                    <select
+                      value={assistantMode}
+                      onChange={event => setAssistantMode(event.target.value as AssistantMode)}
+                      disabled={loading}
+                      className="bg-transparent pr-1 text-slate-700 outline-none"
+                      title="切换 Agent / 排版 / Edit 模式"
                     >
-                      Agent
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setAssistantMode('layout')}
-                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'layout'
-                        ? 'bg-blue-500 text-white'
-                        : 'text-slate-500 hover:bg-slate-100'
-                        }`}
-                      title="排版模式：只能排版，不能改写正文"
-                    >
-                      排版
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setAssistantMode('edit')}
-                      className={`flex-1 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] transition-colors ${assistantMode === 'edit'
-                        ? 'bg-emerald-500 text-white'
-                        : 'text-slate-500 hover:bg-slate-100'
-                        }`}
-                      title="Edit 模式：可写作、删改正文"
-                    >
-                      Edit
-                    </button>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => imageInputRef.current?.click()}
-                    disabled={loading || !canUploadImages}
-                    className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1.5 text-[11px] transition-colors ${loading || !canUploadImages ? 'cursor-not-allowed border-slate-200 bg-slate-100 text-slate-400' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'}`}
-                    title={imageProcessingMode === 'ocr_text' ? (isOcrReady ? '上传图片并走 OCR 预处理' : 'OCR 配置未就绪') : (currentModelSupportsVision ? '上传图片' : '上传图片并尝试直连多模态；若模型不支持会在发送时提示')}
-                  >
-                    <span>＋</span>
-                    <span>图片</span>
-                  </button>
+                      <option value="agent">Agent</option>
+                      <option value="layout">排版</option>
+                      <option value="edit">Edit</option>
+                    </select>
+                  </label>
 
                   <div className="ml-auto shrink-0">
                     {loading ? (

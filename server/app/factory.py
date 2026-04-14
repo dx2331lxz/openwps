@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
 from .ai import (
+    analyze_images_with_ocr,
     create_react_session,
     get_react_session,
     get_react_session_trace,
@@ -29,6 +30,7 @@ from .conversations import (
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
 from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, SettingsUpdate, ToolResultsRequest
+from .models import OCRCommandRequest
 
 
 def sse(event_type: str, data: dict) -> str:
@@ -183,6 +185,10 @@ def create_api_router() -> APIRouter:
     @router.post("/ai/chat")
     async def chat(body: ChatRequest):
         return await run_chat(body)
+
+    @router.post("/ai/ocr")
+    async def analyze_ocr(body: OCRCommandRequest):
+        return await analyze_images_with_ocr(body)
 
     @router.post("/ai/react/stream")
     async def react_stream(body: ChatRequest):

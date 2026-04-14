@@ -209,6 +209,36 @@ export const layoutTools = [
     },
   },
   {
+    name: 'insert_table_row_before',
+    description: '在当前光标所在表格单元格的上方插入一行。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'insert_table_row_after',
+    description: '在当前光标所在表格单元格的下方插入一行。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'delete_table_row',
+    description: '删除当前光标所在表格单元格对应的整行。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'insert_table_column_before',
+    description: '在当前光标所在表格单元格的左侧插入一列。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'insert_table_column_after',
+    description: '在当前光标所在表格单元格的右侧插入一列。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'delete_table_column',
+    description: '删除当前光标所在表格单元格对应的整列。要求当前光标在表格中。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
     name: 'apply_style_batch',
     description: '批量应用样式规则。一次调用可同时设置多个段落范围的文字样式和段落格式，适合全文排版、按角色（标题/正文/副标题）分别设置样式。返回值包含受影响段落的快照，无需额外调用 get_document_content 验证。',
     parameters: {
@@ -376,6 +406,30 @@ export const editTools = [
   ...commonTools,
 ]
 
-export const agentTools = [...layoutTools, ...editTools].filter(
+const ocrTool = {
+  name: 'analyze_image_with_ocr',
+  description: '对当前轮上传的图片执行 OCR 专项识别。适合表格、图表、手写、公式、扫描件文字提取等任务；返回结构化结果，供 agent 再决定写作、插表或总结。',
+  parameters: {
+    type: 'object',
+    properties: {
+      taskType: {
+        type: 'string',
+        enum: ['general_parse', 'document_text', 'table', 'chart', 'handwriting', 'formula'],
+        description: 'OCR 任务类型。表格识别用 table，图表解析用 chart，手写识别用 handwriting，公式识别用 formula。',
+      },
+      imageIndices: {
+        type: 'array',
+        description: '要识别的图片索引列表，从 1 开始；不传则处理当前轮所有图片。',
+        items: { type: 'integer' },
+      },
+      instruction: {
+        type: 'string',
+        description: '附加说明，例如“只提取表格内容，不要解释图片背景”。',
+      },
+    },
+  },
+} as const
+
+export const agentTools = [...layoutTools, ...editTools, ocrTool].filter(
   (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
 )

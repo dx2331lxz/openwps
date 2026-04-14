@@ -161,6 +161,35 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_image_with_ocr",
+            "description": (
+                "对当前轮上传的图片执行 OCR 专项识别。适合表格、图表、手写、公式、扫描件文字提取等任务；"
+                "返回结构化结果，供 agent 再决定后续写作、插表或总结。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "taskType": {
+                        "type": "string",
+                        "enum": ["general_parse", "document_text", "table", "chart", "handwriting", "formula"],
+                        "description": "OCR 任务类型。表格识别用 table，图表解析用 chart，手写识别用 handwriting，公式识别用 formula。",
+                    },
+                    "imageIndices": {
+                        "type": "array",
+                        "description": "要识别的图片索引列表，从 1 开始；不传则处理当前轮所有图片。",
+                        "items": {"type": "integer"},
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "附加说明，例如“只提取表格内容，不要解释图片背景”。",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_text_style",
             "description": "设置指定范围内文字的样式（字体、字号、颜色、粗体、斜体等）",
             "parameters": {
@@ -530,7 +559,7 @@ EDIT_TOOL_NAMES = {
     "delete_paragraph",
 }
 
-AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES
+AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr"}
 
 def get_tools(mode: str | None) -> list[dict]:
     if mode == "edit":

@@ -1,4 +1,13 @@
 import React from 'react'
+import {
+  addColumnAfter,
+  addColumnBefore,
+  addRowAfter,
+  addRowBefore,
+  deleteColumn,
+  deleteRow,
+  isInTable,
+} from 'prosemirror-tables'
 import type { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import { TextSelection } from 'prosemirror-state'
@@ -243,6 +252,15 @@ function insertPageBreak(view: EditorView) {
   view.focus()
 }
 
+function runTableCommand(
+  view: EditorView,
+  command: (state: EditorState, dispatch?: (tr: EditorState['tr']) => void) => boolean,
+) {
+  const success = command(view.state, view.dispatch)
+  if (!success) return
+  view.focus()
+}
+
 // ─── Color swatch ─────────────────────────────────────────────────────────────
 
 const TEXT_COLORS = ['#000000', '#FF0000', '#E65C00', '#FFB300', '#1B8000', '#0066CC', '#7B00D4', '#FFFFFF']
@@ -377,6 +395,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
+  const selectionInTable = Boolean(editorState && isInTable(editorState))
   const fontSizeOptions = Array.from(new Set([
     8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72,
     Number(fmt.text.fontSize),
@@ -627,6 +646,38 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         {/* Insert page break */}
         <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞</button>
+
+        {selectionInTable && (
+          <>
+            {sep}
+            <select
+              title="表格行列操作"
+              value=""
+              style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+              onChange={e => {
+                const action = e.target.value
+                e.target.value = ''
+                if (!view) return
+                switch (action) {
+                  case 'row-before': runTableCommand(view, addRowBefore); break
+                  case 'row-after': runTableCommand(view, addRowAfter); break
+                  case 'row-delete': runTableCommand(view, deleteRow); break
+                  case 'col-before': runTableCommand(view, addColumnBefore); break
+                  case 'col-after': runTableCommand(view, addColumnAfter); break
+                  case 'col-delete': runTableCommand(view, deleteColumn); break
+                }
+              }}
+            >
+              <option value="" disabled>表格▾</option>
+              <option value="row-before">↑ 在上方插入行</option>
+              <option value="row-after">↓ 在下方插入行</option>
+              <option value="row-delete">✕ 删除当前行</option>
+              <option value="col-before">← 在左侧插入列</option>
+              <option value="col-after">→ 在右侧插入列</option>
+              <option value="col-delete">✕ 删除当前列</option>
+            </select>
+          </>
+        )}
 
         {/* AI Sidebar toggle */}
         <button

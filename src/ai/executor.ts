@@ -1,6 +1,16 @@
 import { Fragment, type Node as PMNode } from 'prosemirror-model'
 import type { EditorState, Transaction } from 'prosemirror-state'
 import type { EditorView } from 'prosemirror-view'
+import {
+  addColumnAfter,
+  addColumnBefore,
+  addRowAfter,
+  addRowBefore,
+  deleteColumn,
+  deleteRow,
+  findTable,
+  isInTable,
+} from 'prosemirror-tables'
 import { schema } from '../editor/schema'
 import { paginate, type PageConfig } from '../layout/paginator'
 import { mapFontFamily, presetStyles } from './presets'
@@ -155,6 +165,7 @@ function normalizeParagraphIndexes(value: unknown): number[] {
 }
 
 function getParagraphAtIndex(state: EditorState, index: number): ParagraphRef | undefined {
+  if (!Number.isInteger(index) || index < 0) return undefined
   return getParagraphs(state).find(paragraph => paragraph.index === index)
 }
 
@@ -439,6 +450,7 @@ function clearFormatting(
 }
 
 function getInsertPosAfterParagraph(state: EditorState, index: number): number | null {
+  if (index === -1) return 0
   const paragraph = getParagraphAtIndex(state, index)
   if (!paragraph) return null
   return paragraph.pos + paragraph.node.nodeSize
@@ -450,10 +462,15 @@ function insertBlockAfterParagraph(state: EditorState, paragraphIndex: number, n
     return { success: false, message: `未找到第 ${paragraphIndex + 1} 段` }
   }
 
+  const shouldAppendTrailingParagraph = insertPos >= state.doc.content.size && node.type !== schema.nodes.paragraph
+  const fragment = shouldAppendTrailingParagraph
+    ? Fragment.fromArray([node, schema.nodes.paragraph.create()])
+    : Fragment.from(node)
+
   return {
     success: true,
     message: '已插入内容',
-    tr: state.tr.insert(insertPos, Fragment.from(node)),
+    tr: state.tr.insert(insertPos, fragment),
   }
 }
 
@@ -669,6 +686,40 @@ function buildTableSnapshot(tableNode: PMNode, includeTextRuns = true) {
       .filter(Boolean)
       .join(' | '),
     rows,
+  }
+}
+
+function getSelectedTable(state: EditorState) {
+  return findTable(state.selection.$from) ?? findTable(state.selection.$anchor)
+}
+
+function executeTableCommand(
+  view: EditorView,
+  command: (state: EditorState, dispatch?: (tr: Transaction) => void) => boolean,
+  successMessage: string,
+): ExecuteResult {
+  const { state } = view
+
+  if (!isInTable(state)) {
+    return { success: false, message: '当前光标不在表格中，无法执行行列编辑' }
+  }
+
+  const success = command(state, view.dispatch)
+  if (!success) {
+    return { success: false, message: '当前表格无法执行该操作，请确认光标位于可编辑单元格中' }
+  }
+
+  view.focus()
+  const selectedTable = getSelectedTable(view.state)
+
+  return {
+    success: true,
+    message: successMessage,
+    data: selectedTable
+      ? {
+        table: buildTableSnapshot(selectedTable.node),
+      }
+      : undefined,
   }
 }
 
@@ -1036,8 +1087,8 @@ export function beginStreamingWrite(
 
   if (action === 'insert_after_paragraph') {
     const afterParagraph = Number(params.afterParagraph)
-    const paragraph = getParagraphAtIndex(state, afterParagraph)
-    if (!paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+    const paragraph = afterParagraph >= 0 ? getParagraphAtIndex(state, afterParagraph) : getParagraphAtIndex(state, 0)
+    if (afterParagraph < -1 || !paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
 
     const inserted = insertBlockAfterParagraph(state, afterParagraph, buildParagraphNodeFromText(paragraph, ''))
     if (!inserted.success || !inserted.tr) return inserted
@@ -1302,8 +1353,30 @@ export function executeTool(
         if (!inserted.success || !inserted.tr) return inserted
         dispatch(inserted.tr)
         view.focus()
-        return { success: true, message: `已插入 ${rows} 行 ${cols} 列表格${dataRows > 0 ? '，并填充内容' : ''}` }
+        return {
+          success: true,
+          message: `已插入 ${rows} 行 ${cols} 列表格${dataRows > 0 ? '，并填充内容' : ''}`,
+          data: { table: buildTableSnapshot(tableNode) },
+        }
       }
+
+      case 'insert_table_row_before':
+        return executeTableCommand(view, addRowBefore, '已在当前行上方插入一行')
+
+      case 'insert_table_row_after':
+        return executeTableCommand(view, addRowAfter, '已在当前行下方插入一行')
+
+      case 'delete_table_row':
+        return executeTableCommand(view, deleteRow, '已删除当前行')
+
+      case 'insert_table_column_before':
+        return executeTableCommand(view, addColumnBefore, '已在当前列左侧插入一列')
+
+      case 'insert_table_column_after':
+        return executeTableCommand(view, addColumnAfter, '已在当前列右侧插入一列')
+
+      case 'delete_table_column':
+        return executeTableCommand(view, deleteColumn, '已删除当前列')
 
       case 'insert_text': {
         const paragraphIndex = Number(params.paragraphIndex)
@@ -1325,7 +1398,7 @@ export function executeTool(
       case 'insert_paragraph_after': {
         const afterParagraph = Number(params.afterParagraph)
         const text = normalizeToolText(String(params.text ?? ''))
-        const paragraph = getParagraphAtIndex(state, afterParagraph)
+        const paragraph = afterParagraph >= 0 ? getParagraphAtIndex(state, afterParagraph) : getParagraphAtIndex(state, 0)
         if (!paragraph) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
         const insertPos = getInsertPosAfterParagraph(state, afterParagraph)
         if (insertPos == null) return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }

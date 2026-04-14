@@ -5,6 +5,7 @@ import { DOMParser as PMDOMParser } from 'prosemirror-model'
 import { keymap } from 'prosemirror-keymap'
 import { baseKeymap } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
+import { goToNextCell, isInTable, tableEditing } from 'prosemirror-tables'
 import { schema } from '../editor/schema'
 import {
   paginate,
@@ -149,6 +150,17 @@ const PM_STYLES = `
   border-top: 1px solid #ccc;
   margin: 8px 0;
 }
+.ProseMirror td,
+.ProseMirror th {
+  position: relative;
+}
+.ProseMirror .selectedCell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(59, 130, 246, 0.14);
+  pointer-events: none;
+}
 .ProseMirror img {
   display: inline-block;
   max-width: 100%;
@@ -184,10 +196,17 @@ const PM_STYLES = `
 .pretext-driving-editor .ProseMirror table * {
   color: #111827 !important;
   -webkit-text-fill-color: #111827 !important;
+  caret-color: #111827 !important;
 }
 .pretext-driving-editor .ProseMirror table p,
 .pretext-driving-editor .ProseMirror table span {
   text-shadow: none !important;
+}
+.pretext-driving-editor .ProseMirror table ::selection,
+.pretext-driving-editor .ProseMirror table *::selection {
+  background: rgba(24, 119, 242, 0.24) !important;
+  color: inherit !important;
+  -webkit-text-fill-color: currentColor !important;
 }
 .pretext-driving-editor .ProseMirror hr {
   opacity: 1;
@@ -360,11 +379,16 @@ function initState(): EditorState {
     plugins: [
       history(),
       keymap({
+        'Tab': goToNextCell(1),
+        'Shift-Tab': goToNextCell(-1),
+      }),
+      keymap({
         'Mod-z': undo, 'Mod-y': redo, 'Mod-Shift-z': redo,
         'Mod-b': (s, d) => toggleMarkAttr(s, d, 'bold'),
         'Mod-i': (s, d) => toggleMarkAttr(s, d, 'italic'),
         'Mod-u': (s, d) => toggleMarkAttr(s, d, 'underline'),
         'Tab': (state, dispatch) => {
+          if (isInTable(state)) return false
           if (!dispatch) return false
           const { selection, tr } = state
           let changed = false
@@ -378,6 +402,7 @@ function initState(): EditorState {
           return false
         },
         'Shift-Tab': (state, dispatch) => {
+          if (isInTable(state)) return false
           if (!dispatch) return false
           const { selection, tr } = state
           let changed = false
@@ -393,6 +418,7 @@ function initState(): EditorState {
         },
       }),
       keymap(baseKeymap),
+      tableEditing(),
       mixedScriptSpacingPlugin,
       pageBreakPlugin,
     ],
@@ -507,12 +533,12 @@ export const Editor: React.FC = () => {
       setPageCount(prev => breaks.length + 1 !== prev ? breaks.length + 1 : prev)
 
       const pageBreakDecos = breaks.map((item, index) => {
-          const height = breakWidgetHeight(item.prevPageUsed, cfg)
-          console.log(
-            `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
-          )
-          return { pos: item.pos, height }
-        })
+        const height = breakWidgetHeight(item.prevPageUsed, cfg)
+        console.log(
+          `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
+        )
+        return { pos: item.pos, height }
+      })
       const decos = buildDecos(doc, pageBreakDecos)
       const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
       v.updateState(v.state.apply(tr))
@@ -583,8 +609,8 @@ export const Editor: React.FC = () => {
       setCurrentDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME)
       console.log(
         `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
-          `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
-          `doNotUseEastAsianBreakRules=${parsed.typography.doNotUseEastAsianBreakRules}`
+        `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
+        `doNotUseEastAsianBreakRules=${parsed.typography.doNotUseEastAsianBreakRules}`
       )
       repaginate()
       window.alert('DOCX 导入成功')
@@ -753,7 +779,7 @@ export const Editor: React.FC = () => {
       <div className="flex flex-1 min-h-0">
         {/* Scrollable editor area */}
         <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
-        {/*
+          {/*
           Canvas: explicit height so absolute page cards create scroll space.
           Width = page width, centered.
 
@@ -762,91 +788,91 @@ export const Editor: React.FC = () => {
             2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
                Inside the editor, transparent widgets push content between cards.
         */}
-        <div
-          className="relative mx-auto"
-          style={{ width: cfg.pageWidth, height: canvasH }}
-        >
-          {/* ── Layer 1: page cards ── */}
-          {Array.from({ length: pageCount }).map((_, i) => (
-            <div
-              key={i}
-              style={{
-                position: 'absolute',
-                top: i * (cfg.pageHeight + PAGE_GAP),
-                left: 0,
-                width: cfg.pageWidth,
-                height: cfg.pageHeight,
-                background: 'white',
-                boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
-                pointerEvents: 'none',
-                zIndex: 0,
-              }}
-            >
+          <div
+            className="relative mx-auto"
+            style={{ width: cfg.pageWidth, height: canvasH }}
+          >
+            {/* ── Layer 1: page cards ── */}
+            {Array.from({ length: pageCount }).map((_, i) => (
               <div
+                key={i}
                 style={{
                   position: 'absolute',
-                  bottom: 12,
-                  width: '100%',
-                  textAlign: 'center',
-                  fontSize: 12,
-                  color: '#aaa',
-                  userSelect: 'none',
+                  top: i * (cfg.pageHeight + PAGE_GAP),
+                  left: 0,
+                  width: cfg.pageWidth,
+                  height: cfg.pageHeight,
+                  background: 'white',
+                  boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
+                  pointerEvents: 'none',
+                  zIndex: 0,
                 }}
               >
-                {i + 1} / {pageCount}
+                <div
+                  style={{
+                    position: 'absolute',
+                    bottom: 12,
+                    width: '100%',
+                    textAlign: 'center',
+                    fontSize: 12,
+                    color: '#aaa',
+                    userSelect: 'none',
+                  }}
+                >
+                  {i + 1} / {pageCount}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
 
-          {/* ── Layer 2: Pretext page renderer ── */}
-          {layoutResult && (
-            <PretextPageRenderer
-              pages={layoutResult.renderedPages}
-              pageConfig={cfg}
-              pageGap={PAGE_GAP}
-              caretPos={editorState?.selection.head ?? null}
-              selectionFrom={editorState?.selection.from ?? null}
-              selectionTo={editorState?.selection.to ?? null}
-              showCaret={editorFocused && Boolean(editorState?.selection.empty)}
-              showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty)}
-              onRequestCaretPos={handleRequestCaretPos}
-              onRequestSelectionRange={handleRequestSelectionRange}
+            {/* ── Layer 2: Pretext page renderer ── */}
+            {layoutResult && (
+              <PretextPageRenderer
+                pages={layoutResult.renderedPages}
+                pageConfig={cfg}
+                pageGap={PAGE_GAP}
+                caretPos={editorState?.selection.head ?? null}
+                selectionFrom={editorState?.selection.from ?? null}
+                selectionTo={editorState?.selection.to ?? null}
+                showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
+                showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
+                onRequestCaretPos={handleRequestCaretPos}
+                onRequestSelectionRange={handleRequestSelectionRange}
+              />
+            )}
+
+            {/* ── Layer 3: ProseMirror editor ── */}
+            <div
+              ref={mountRef}
+              className={layoutResult ? 'pretext-driving-editor' : undefined}
+              style={{
+                position: 'absolute',
+                top: cfg.marginTop,
+                left: cfg.marginLeft,
+                right: cfg.marginRight,
+                ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
+                zIndex: 2,
+              }}
             />
-          )}
-
-          {/* ── Layer 3: ProseMirror editor ── */}
-          <div
-            ref={mountRef}
-            className={layoutResult ? 'pretext-driving-editor' : undefined}
-            style={{
-              position: 'absolute',
-              top: cfg.marginTop,
-              left: cfg.marginLeft,
-              right: cfg.marginRight,
-              ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
-              zIndex: 2,
-            }}
-          />
-        </div>
-        {/* end canvas */}
+          </div>
+          {/* end canvas */}
         </div>
         {/* end scrollable editor area */}
 
-      {/* AI Sidebar */}
-      {sidebarOpen && (
-        <AISidebar
-          view={view}
-          editorState={editorState}
-          pageConfig={pageConfig}
-          onPageConfigChange={(newCfg) => {
-            setPageConfig(newCfg)
-            pageConfigRef.current = newCfg
-            repaginate()
-          }}
-          onDocumentStyleMutation={clearImportedDocxCompatibility}
-          onClose={() => setSidebarOpen(false)}
-        />
-      )}
+        {/* AI Sidebar */}
+        {sidebarOpen && (
+          <AISidebar
+            view={view}
+            editorState={editorState}
+            pageConfig={pageConfig}
+            onPageConfigChange={(newCfg) => {
+              setPageConfig(newCfg)
+              pageConfigRef.current = newCfg
+              repaginate()
+            }}
+            onDocumentStyleMutation={clearImportedDocxCompatibility}
+            onClose={() => setSidebarOpen(false)}
+          />
+        )}
       </div>
       {/* end main content row */}
 

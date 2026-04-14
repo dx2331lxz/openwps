@@ -157,10 +157,10 @@ function getClosestCaretPos(
 ) {
   let bestLine:
     | {
-        line: RenderedLine & { top: number }
-        metrics: LineLayoutMetrics
-        distance: number
-      }
+      line: RenderedLine & { top: number }
+      metrics: LineLayoutMetrics
+      distance: number
+    }
     | null = null
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
@@ -336,7 +336,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
       ref={containerRef}
       aria-hidden="true"
       onMouseDown={(event) => {
-        if (( !onRequestCaretPos && !onRequestSelectionRange) || event.button !== 0) return
+        if ((!onRequestCaretPos && !onRequestSelectionRange) || event.button !== 0) return
         const pos = getPointerCaretPos(event.clientX, event.clientY)
         if (typeof pos !== 'number') return
         event.preventDefault()
@@ -346,8 +346,8 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
       style={{
         position: 'absolute',
         inset: 0,
-        pointerEvents: onRequestCaretPos ? 'auto' : 'none',
-        zIndex: 3,
+        pointerEvents: 'none',
+        zIndex: 1,
       }}
     >
       {selectionRects.map((rect, index) => (

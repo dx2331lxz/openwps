@@ -64,8 +64,10 @@ PRESET_PROVIDERS = [
 ]
 
 DEFAULT_IMAGE_PROCESSING_MODE = "direct_multimodal"
+DEFAULT_OCR_BACKEND = "compat_chat"
 DEFAULT_OCR_CONFIG = {
     "enabled": True,
+    "backend": DEFAULT_OCR_BACKEND,
     "providerId": "siliconflow",
     "endpoint": "https://api.siliconflow.cn/v1",
     "model": "PaddlePaddle/PaddleOCR-VL-1.5",
@@ -92,6 +94,13 @@ def _normalize_image_processing_mode(value: Any) -> str:
     if normalized in {"ocr", "ocr_text"}:
         return "ocr_text"
     return DEFAULT_IMAGE_PROCESSING_MODE
+
+
+def _normalize_ocr_backend(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"paddleocr_service", "official_service", "layout_parsing"}:
+        return "paddleocr_service"
+    return DEFAULT_OCR_BACKEND
 
 
 def _normalize_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 600) -> int:
@@ -124,9 +133,13 @@ def _sanitize_ocr_config(raw: dict[str, Any] | None, providers: list[dict[str, A
     endpoint = _normalize_endpoint(source.get("endpoint")) or _normalize_endpoint(
         provider.get("endpoint") if provider else DEFAULT_OCR_CONFIG["endpoint"]
     )
-    model = str(source.get("model") or source.get("modelId") or DEFAULT_OCR_CONFIG["model"]).strip() or DEFAULT_OCR_CONFIG["model"]
+    backend = _normalize_ocr_backend(source.get("backend"))
+    model = str(source.get("model") or source.get("modelId") or DEFAULT_OCR_CONFIG["model"]).strip()
+    if backend == "compat_chat":
+        model = model or DEFAULT_OCR_CONFIG["model"]
     return {
         "enabled": bool(source.get("enabled", DEFAULT_OCR_CONFIG["enabled"])),
+        "backend": backend,
         "providerId": provider["id"] if provider else provider_id,
         "endpoint": endpoint,
         "model": model,
@@ -289,9 +302,10 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
         ],
         "ocrConfig": {
             "enabled": bool(ocr_config.get("enabled", True)),
+            "backend": _normalize_ocr_backend(ocr_config.get("backend")),
             "providerId": ocr_provider["id"],
             "endpoint": _normalize_endpoint(ocr_config.get("endpoint")) or ocr_provider["endpoint"],
-            "model": str(ocr_config.get("model") or DEFAULT_OCR_CONFIG["model"]),
+            "model": str(ocr_config.get("model") or ""),
             "hasApiKey": bool(ocr_config.get("apiKey") or ocr_provider.get("apiKey")),
             "timeoutSeconds": int(ocr_config.get("timeoutSeconds") or DEFAULT_OCR_CONFIG["timeoutSeconds"]),
             "maxImages": int(ocr_config.get("maxImages") or DEFAULT_OCR_CONFIG["maxImages"]),

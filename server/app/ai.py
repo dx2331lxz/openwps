@@ -18,8 +18,8 @@ from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import Runnable
 
-from .config import DEFAULT_IMAGE_PROCESSING_MODE, DEFAULT_OCR_CONFIG, get_provider, read_config
-from .models import ChatMessage, ChatRequest, OCRConfig, ToolResultsRequest
+from .config import DEFAULT_IMAGE_PROCESSING_MODE, DEFAULT_OCR_BACKEND, DEFAULT_OCR_CONFIG, get_provider, read_config
+from .models import ChatMessage, ChatRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
 from .prompts import get_system_prompt
 from .tooling import get_tools
 
@@ -63,6 +63,37 @@ styleHints 尽量包含以下字段：
 
 优先识别：封面标题、表单字段+下划线占位、日期/签名、居中标题、列表、缩进。
 若无法确认，请保守返回 null，不要编造。不要重新输出全文，只分析 blockIndex 对应的样式。只返回 JSON。"""
+
+
+OCR_TASK_GUIDANCE = {
+    "general_parse": "请面向通用文档解析，尽量提取正文、表格、图表标题、手写批注、公式和必要警告。",
+    "document_text": "请专注提取文档正文与层级结构，适合扫描件、拍照文本和复杂文档段落解析。",
+    "table": "请专注识别表格，优先返回 tables 数组和 markdown 表格；忽略与表格无关的背景描述。",
+    "chart": "请专注识别图表，尽量提取图表标题、图例、坐标轴标签、关键数据系列和摘要。",
+    "handwriting": "请专注识别手写文字，优先返回 handwritingText 和不确定片段说明。",
+    "formula": "请专注识别公式与数学表达，优先返回 formulas 数组，并保留必要上下文。",
+}
+
+OCR_TASK_ALIASES = {
+    "general": "general_parse",
+    "parse": "general_parse",
+    "document": "document_text",
+    "text": "document_text",
+    "doc": "document_text",
+    "table": "table",
+    "tables": "table",
+    "chart": "chart",
+    "charts": "chart",
+    "graph": "chart",
+    "handwriting": "handwriting",
+    "handwritten": "handwriting",
+    "handwrite": "handwriting",
+    "formula": "formula",
+    "math": "formula",
+}
+
+OCR_BACKEND_COMPAT_CHAT = "compat_chat"
+OCR_BACKEND_PADDLEOCR_SERVICE = "paddleocr_service"
 
 
 class AgentState(TypedDict):
@@ -214,6 +245,7 @@ def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
     raw = message.model_dump(exclude_none=True) if isinstance(message, ChatMessage) else dict(message)
     role = raw.get("role", "user")
     content = _stringify_content(raw.get("content"))
+    attachments = raw.get("attachments") if isinstance(raw.get("attachments"), list) else []
 
     if role == "system":
         return SystemMessage(content=content)
@@ -231,6 +263,9 @@ def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
         return AIMessage(content=content, tool_calls=tool_calls)
     if role == "tool":
         return ToolMessage(content=content, tool_call_id=str(raw.get("tool_call_id", "")))
+    attachment_block = _format_text_attachments_for_model(attachments)
+    if attachment_block:
+        content = f"{content}\n\n{attachment_block}" if content else attachment_block
     return HumanMessage(content=content)
 
 
@@ -280,13 +315,28 @@ def _normalize_image_processing_mode(mode: str | None) -> str:
     return DEFAULT_IMAGE_PROCESSING_MODE
 
 
+def _normalize_ocr_backend(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {OCR_BACKEND_PADDLEOCR_SERVICE, "official_service", "layout_parsing"}:
+        return OCR_BACKEND_PADDLEOCR_SERVICE
+    return OCR_BACKEND_COMPAT_CHAT
+
+
+def _ocr_backend_requires_model(backend: str) -> bool:
+    return _normalize_ocr_backend(backend) == OCR_BACKEND_COMPAT_CHAT
+
+
 def _normalize_ocr_config(body: ChatRequest) -> OCRConfig:
+    return _resolve_ocr_config(body.ocrConfig)
+
+
+def _resolve_ocr_config(request_config: OCRConfig | None) -> OCRConfig:
     cfg = read_config()
     saved = dict(cfg.get("ocrConfig") or DEFAULT_OCR_CONFIG)
-    request_config = body.ocrConfig.model_dump(exclude_none=True) if body.ocrConfig else {}
+    request_config_data = request_config.model_dump(exclude_none=True) if request_config else {}
 
     merged: dict[str, Any] = dict(saved)
-    for key, value in request_config.items():
+    for key, value in request_config_data.items():
         if key == "hasApiKey":
             continue
         if isinstance(value, str):
@@ -298,12 +348,16 @@ def _normalize_ocr_config(body: ChatRequest) -> OCRConfig:
 
     provider_id = str(merged.get("providerId") or DEFAULT_OCR_CONFIG["providerId"]).strip() or DEFAULT_OCR_CONFIG["providerId"]
     provider = get_provider(cfg, provider_id)
+    backend = _normalize_ocr_backend(merged.get("backend") or DEFAULT_OCR_BACKEND)
     endpoint = str(merged.get("endpoint") or provider.get("endpoint") or DEFAULT_OCR_CONFIG["endpoint"]).strip().rstrip("/")
     api_key = str(merged.get("apiKey") or provider.get("apiKey") or "").strip()
-    model = str(merged.get("model") or DEFAULT_OCR_CONFIG["model"]).strip() or DEFAULT_OCR_CONFIG["model"]
+    model = str(merged.get("model") or "").strip()
+    if _ocr_backend_requires_model(backend):
+        model = model or DEFAULT_OCR_CONFIG["model"]
 
     return OCRConfig(
         enabled=bool(merged.get("enabled", True)),
+        backend=backend,
         providerId=provider["id"],
         endpoint=endpoint,
         model=model,
@@ -317,6 +371,25 @@ def _normalize_ocr_config(body: ChatRequest) -> OCRConfig:
 def _resolve_image_processing_mode(body: ChatRequest) -> str:
     cfg = read_config()
     return _normalize_image_processing_mode(body.imageProcessingMode or str(cfg.get("imageProcessingMode") or DEFAULT_IMAGE_PROCESSING_MODE))
+
+
+def _normalize_ocr_task_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        return "general_parse"
+    return OCR_TASK_ALIASES.get(normalized, normalized if normalized in OCR_TASK_GUIDANCE else "general_parse")
+
+
+def _build_ocr_user_instruction(task_type: str, instruction: str | None = None) -> str:
+    base = OCR_TASK_GUIDANCE.get(task_type, OCR_TASK_GUIDANCE["general_parse"])
+    shared = (
+        "返回严格 JSON，对象字段必须包含：taskType、summary、plainText、markdown、tables、charts、handwritingText、formulas、blocks、warnings。"
+        "未识别到的字段请返回空字符串、空数组或 null，不要输出解释性前后缀。"
+    )
+    extra = str(instruction or "").strip()
+    if extra:
+        return f"{base}\n{shared}\n额外要求：{extra}"
+    return f"{base}\n{shared}"
 
 
 def _model_name_supports_vision(model_name: str) -> bool:
@@ -464,7 +537,7 @@ def _validate_ocr_request(body: ChatRequest, ocr_config: OCRConfig) -> None:
         raise HTTPException(status_code=400, detail="当前已切换到 OCR 模式，但 OCR 功能未启用。")
     if not ocr_config.endpoint:
         raise HTTPException(status_code=400, detail="OCR 端点未配置。")
-    if not ocr_config.model:
+    if _ocr_backend_requires_model(ocr_config.backend) and not ocr_config.model:
         raise HTTPException(status_code=400, detail="OCR 模型未配置。")
     if not ocr_config.hasApiKey:
         raise HTTPException(status_code=400, detail="OCR API Key 未配置，请在设置中补充后再使用 OCR 模式。")
@@ -502,7 +575,7 @@ def _looks_like_multimodal_capability_error(detail: str) -> bool:
 def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
     text = detail.strip() or "未知错误"
     images = body.images or []
-    if not images or _resolve_image_processing_mode(body) == "ocr_text":
+    if not images:
         return text
     if not _looks_like_multimodal_capability_error(text):
         return text
@@ -513,7 +586,7 @@ def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
     return (
         f"当前模型 {model_text} 未接受图片输入，或 {provider_name} 接口不兼容 image_url 图片格式。"
         f"系统已按多模态路径尝试发送图片，但上游返回不支持。"
-        f"请切换到明确支持视觉的模型，或改用 OCR 路径。上游错误：{_compact_text_preview(text, 160)}"
+        f"请切换到明确支持视觉的模型，或改用 /ocr 命令 / OCR 工具处理识别型任务。上游错误：{_compact_text_preview(text, 160)}"
     )
 
 
@@ -667,13 +740,190 @@ def _compact_text_preview(text: str, limit: int = 220) -> str:
     return normalized[: max(limit - 1, 0)].rstrip() + "…"
 
 
+def _normalize_ocr_fallback_text(raw_text: str, *, max_lines: int = 80, max_chars: int = 4000) -> tuple[str, list[str]]:
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
+    compressed: list[str] = []
+    warnings: list[str] = []
+    repeat_compressed = False
+
+    previous_line: str | None = None
+    repeat_count = 0
+
+    def flush_repeat() -> None:
+        nonlocal previous_line, repeat_count, repeat_compressed
+        if previous_line is None:
+            return
+        keep_count = min(repeat_count, 3)
+        compressed.extend(previous_line for _ in range(keep_count) if previous_line)
+        if repeat_count > 3:
+            compressed.append(f"[上行重复 {repeat_count - 3} 次已省略]")
+            repeat_compressed = True
+        previous_line = None
+        repeat_count = 0
+
+    for line in lines:
+        if not line:
+            flush_repeat()
+            if compressed and compressed[-1] != "":
+                compressed.append("")
+            continue
+        if line == previous_line:
+            repeat_count += 1
+            continue
+        flush_repeat()
+        previous_line = line
+        repeat_count = 1
+
+    flush_repeat()
+
+    while compressed and not compressed[-1]:
+        compressed.pop()
+
+    truncated = False
+    if len(compressed) > max_lines:
+        compressed = compressed[:max_lines]
+        truncated = True
+
+    normalized = "\n".join(compressed).strip()
+    if len(normalized) > max_chars:
+        normalized = normalized[:max_chars].rstrip()
+        truncated = True
+
+    if repeat_compressed:
+        warnings.append("OCR 纯文本回退结果包含大量重复内容，已压缩显示。")
+    if truncated:
+        normalized = normalized.rstrip() + "\n[后续内容已截断]"
+        warnings.append("OCR 纯文本回退结果过长，已截断显示。")
+
+    return normalized.strip(), warnings
+
+
 def _has_meaningful_ocr_content(result: dict[str, Any]) -> bool:
     return bool(
         _stringify_content(result.get("plainText")).strip()
         or _stringify_content(result.get("markdown")).strip()
+        or _stringify_content(result.get("handwritingText")).strip()
         or result.get("blocks")
         or result.get("tables")
+        or result.get("charts")
+        or result.get("formulas")
     )
+
+
+def _normalize_ocr_tables(raw_tables: Any) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    for item in raw_tables or []:
+        if not isinstance(item, dict):
+            continue
+        markdown = _stringify_content(item.get("markdown") or item.get("tableMarkdown")).strip()
+        title = _stringify_content(item.get("title") or item.get("name")).strip()
+        try:
+            row_count = int(item.get("rowCount") or 0)
+        except Exception:
+            row_count = 0
+        try:
+            column_count = int(item.get("columnCount") or 0)
+        except Exception:
+            column_count = 0
+        if not markdown and not title and row_count <= 0 and column_count <= 0:
+            continue
+        tables.append({
+            "title": title,
+            "markdown": markdown,
+            "rowCount": max(row_count, 0),
+            "columnCount": max(column_count, 0),
+        })
+    return tables[:12]
+
+
+def _normalize_ocr_charts(raw_charts: Any) -> list[dict[str, Any]]:
+    charts: list[dict[str, Any]] = []
+    for item in raw_charts or []:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                charts.append({"title": "", "summary": text, "series": []})
+            continue
+        if not isinstance(item, dict):
+            continue
+        title = _stringify_content(item.get("title") or item.get("name")).strip()
+        summary = _stringify_content(item.get("summary") or item.get("description")).strip()
+        series = item.get("series") if isinstance(item.get("series"), list) else []
+        axes = item.get("axes") if isinstance(item.get("axes"), dict) else {}
+        legend = item.get("legend") if isinstance(item.get("legend"), list) else []
+        if not title and not summary and not series and not axes and not legend:
+            continue
+        charts.append({
+            "title": title,
+            "summary": summary,
+            "series": series,
+            "axes": axes,
+            "legend": legend,
+        })
+    return charts[:8]
+
+
+def _normalize_ocr_formulas(raw_formulas: Any) -> list[dict[str, Any]]:
+    formulas: list[dict[str, Any]] = []
+    for item in raw_formulas or []:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                formulas.append({"latex": text, "text": text})
+            continue
+        if not isinstance(item, dict):
+            continue
+        latex = _stringify_content(item.get("latex") or item.get("formula")).strip()
+        text = _stringify_content(item.get("text") or item.get("plainText")).strip()
+        if not latex and not text:
+            continue
+        formulas.append({"latex": latex, "text": text})
+    return formulas[:16]
+
+
+def _normalize_ocr_task_result(raw_payload: dict[str, Any], image: dict[str, Any], index: int, task_type: str) -> dict[str, Any]:
+    warnings = [str(item).strip() for item in (raw_payload.get("warnings") or []) if str(item).strip()]
+    plain_text = _stringify_content(
+        raw_payload.get("plainText")
+        or raw_payload.get("text")
+        or raw_payload.get("handwritingText")
+    ).strip()
+    markdown = _stringify_content(raw_payload.get("markdown")).strip()
+    handwriting_text = _stringify_content(raw_payload.get("handwritingText")).strip()
+    summary = _stringify_content(raw_payload.get("summary") or raw_payload.get("layoutNotes")).strip()
+    blocks = _expand_ocr_blocks(raw_payload.get("blocks") or [], plain_text) if task_type in {"general_parse", "document_text"} else []
+    tables = _normalize_ocr_tables(raw_payload.get("tables"))
+    charts = _normalize_ocr_charts(raw_payload.get("charts"))
+    formulas = _normalize_ocr_formulas(raw_payload.get("formulas"))
+
+    if not summary:
+        if task_type == "table" and tables:
+            summary = f"识别到 {len(tables)} 个表格"
+        elif task_type == "chart" and charts:
+            summary = f"识别到 {len(charts)} 个图表"
+        elif task_type == "handwriting" and handwriting_text:
+            summary = "已提取手写文字"
+        elif task_type == "formula" and formulas:
+            summary = f"识别到 {len(formulas)} 条公式"
+        elif plain_text:
+            summary = "已提取图片中的文字内容"
+        else:
+            summary = "未提取到明确内容"
+
+    return {
+        "imageIndex": index,
+        "name": str(image.get("name") or f"image-{index}"),
+        "taskType": task_type,
+        "summary": summary,
+        "plainText": plain_text,
+        "markdown": markdown,
+        "tables": tables,
+        "charts": charts,
+        "handwritingText": handwriting_text,
+        "formulas": formulas,
+        "blocks": blocks[:24],
+        "warnings": warnings[:12],
+    }
 
 
 def _append_ocr_warning(result: dict[str, Any], warning: str) -> dict[str, Any]:
@@ -1094,7 +1344,12 @@ def _build_fallback_ocr_payload(raw_text: str, finish_reason: str) -> dict[str, 
     if cleaned.startswith("{") or cleaned.startswith("["):
         return None
 
+    cleaned, extra_warnings = _normalize_ocr_fallback_text(cleaned)
+    if not cleaned:
+        return None
+
     warnings = ["OCR 返回了非 JSON 文本，已按纯文本结果回退；样式信息可能不完整。"]
+    warnings.extend(extra_warnings)
     if _is_output_truncated_finish_reason(finish_reason):
         warnings.append("OCR 输出可能因响应长度限制被截断，请结合原图复核。")
 
@@ -1104,6 +1359,21 @@ def _build_fallback_ocr_payload(raw_text: str, finish_reason: str) -> dict[str, 
         "blocks": [{"kind": "paragraph", "text": cleaned, "styleHints": {}}],
         "tables": [],
         "warnings": warnings,
+    }
+
+
+def _build_fallback_task_payload(raw_text: str, finish_reason: str, task_type: str) -> dict[str, Any] | None:
+    fallback = _build_fallback_ocr_payload(raw_text, finish_reason)
+    if fallback is None:
+        return None
+
+    return {
+        "taskType": task_type,
+        "summary": "OCR 返回了纯文本结果",
+        **fallback,
+        "charts": [],
+        "handwritingText": fallback.get("plainText") if task_type == "handwriting" else "",
+        "formulas": [],
     }
 
 
@@ -1199,7 +1469,269 @@ def _normalize_ocr_result(raw_result: dict[str, Any] | None, image: dict[str, An
     return _refresh_ocr_style_summary(result)
 
 
+def _build_endpoint_url(base: str, path: str) -> str:
+    normalized_base = str(base or "").strip().rstrip("/")
+    normalized_path = "/" + path.lstrip("/")
+    if normalized_base.endswith(normalized_path):
+        return normalized_base
+    return normalized_base + normalized_path
+
+
+def _extract_paddleocr_service_inputs(image: dict[str, Any], index: int) -> tuple[str, int]:
+    data_url = str(image.get("dataUrl") or "").strip()
+    parsed = _parse_data_url_header(data_url)
+    if not parsed:
+        raise HTTPException(status_code=400, detail=f"第 {index} 张图片格式无效")
+
+    header, payload = parsed
+    mime = header[5:].split(";", 1)[0].strip().lower()
+    if not payload:
+        raise HTTPException(status_code=400, detail=f"第 {index} 张图片内容为空")
+    if mime == "application/pdf":
+        return payload, 0
+    if not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"第 {index} 张图片不是支持的图片格式")
+    return payload, 1
+
+
+def _build_paddleocr_service_payload(
+    image: dict[str, Any],
+    index: int,
+    task_type: str,
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    file_payload, file_type = _extract_paddleocr_service_inputs(image, index)
+    normalized_task = _normalize_ocr_task_type(task_type)
+    payload: dict[str, Any] = {
+        "file": file_payload,
+        "fileType": file_type,
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useLayoutDetection": True,
+        "useChartRecognition": normalized_task in {"chart", "general_parse"},
+        "useSealRecognition": False,
+        "useOcrForImageBlock": True,
+        "formatBlockContent": True,
+        "mergeLayoutBlocks": normalized_task in {"general_parse", "document_text"},
+        "prettifyMarkdown": True,
+        "showFormulaNumber": normalized_task == "formula",
+    }
+    if normalized_task == "handwriting":
+        payload["useLayoutDetection"] = False
+        payload["promptLabel"] = "ocr"
+    return payload
+
+
+def _extract_paddleocr_service_results(body: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: Any = None
+    if isinstance(body.get("result"), dict):
+        candidates = body["result"].get("layoutParsingResults")
+    if not isinstance(candidates, list):
+        candidates = body.get("layoutParsingResults")
+    if isinstance(candidates, list):
+        return [item for item in candidates if isinstance(item, dict)]
+    return []
+
+
+def _extract_paddleocr_markdown(result: dict[str, Any]) -> str:
+    markdown = result.get("markdown")
+    if isinstance(markdown, dict):
+        return _stringify_content(markdown.get("text") or markdown.get("content") or markdown.get("markdown")).strip()
+    return _stringify_content(markdown).strip()
+
+
+def _extract_paddleocr_parsing_items(result: dict[str, Any]) -> list[dict[str, Any]]:
+    pruned = result.get("prunedResult")
+    if not isinstance(pruned, dict):
+        return []
+    items = pruned.get("parsing_res_list")
+    if not isinstance(items, list):
+        items = pruned.get("parsingResList")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _normalize_paddleocr_block_kind(value: Any) -> str:
+    normalized = str(value or "paragraph").strip().lower().replace("-", "_")
+    if normalized in {"doc_title", "title", "heading"}:
+        return "heading"
+    if normalized in {"table"}:
+        return "table"
+    if normalized in {"chart", "figure"}:
+        return "chart"
+    if normalized in {"formula", "equation", "math"}:
+        return "formula"
+    if normalized in {"list", "ordered_list", "unordered_list"}:
+        return "list"
+    return "paragraph"
+
+
+def _extract_paddleocr_structured_content(result: dict[str, Any]) -> dict[str, Any]:
+    parsing_items = _extract_paddleocr_parsing_items(result)
+    markdown = _extract_paddleocr_markdown(result)
+    blocks: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
+    charts: list[dict[str, Any]] = []
+    formulas: list[dict[str, Any]] = []
+    plain_text_parts: list[str] = []
+
+    for item in parsing_items:
+        label = item.get("block_label") or item.get("blockLabel") or item.get("type")
+        kind = _normalize_paddleocr_block_kind(label)
+        content = _stringify_content(
+            item.get("block_content")
+            or item.get("blockContent")
+            or item.get("text")
+            or item.get("markdown")
+        ).strip()
+        if content:
+            blocks.append({
+                "kind": kind,
+                "text": content,
+                "styleHints": {},
+            })
+
+        if kind == "table" and (content or markdown):
+            tables.append({
+                "title": "",
+                "markdown": content or markdown,
+                "rowCount": 0,
+                "columnCount": 0,
+            })
+        elif kind == "chart" and content:
+            charts.append({"title": "", "summary": content, "series": []})
+        elif kind == "formula" and content:
+            formulas.append({"latex": content, "text": content})
+
+        if content and kind not in {"table", "chart"}:
+            plain_text_parts.append(content)
+
+    plain_text = "\n".join(part for part in plain_text_parts if part).strip()
+    if not plain_text:
+        plain_text = markdown.strip()
+
+    return {
+        "plainText": plain_text,
+        "markdown": markdown,
+        "blocks": blocks[:24],
+        "tables": tables[:12],
+        "charts": charts[:8],
+        "formulas": formulas[:16],
+    }
+
+
+async def _call_paddleocr_service_layout_parsing(
+    ocr_config: OCRConfig,
+    image: dict[str, Any],
+    index: int,
+    task_type: str,
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    headers = {"Content-Type": "application/json"}
+    if ocr_config.apiKey:
+        headers["Authorization"] = f"Bearer {ocr_config.apiKey}"
+
+    payload = _build_paddleocr_service_payload(image, index, task_type, instruction)
+    endpoint = _build_endpoint_url(ocr_config.endpoint, "/layout-parsing")
+    async with httpx.AsyncClient(timeout=float(ocr_config.timeoutSeconds)) as client:
+        try:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip() or str(exc)
+            logger.warning(
+                "[openwps.ocr.service] image=%s task=%s http_error status=%s endpoint=%s detail=%s",
+                index,
+                _normalize_ocr_task_type(task_type),
+                exc.response.status_code,
+                endpoint,
+                _compact_text_preview(detail),
+            )
+            raise HTTPException(status_code=502, detail=f"PaddleOCR 服务请求失败: {detail}") from exc
+        except Exception as exc:
+            logger.warning(
+                "[openwps.ocr.service] image=%s task=%s request_error endpoint=%s error=%s",
+                index,
+                _normalize_ocr_task_type(task_type),
+                endpoint,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail=f"PaddleOCR 服务请求失败: {exc}") from exc
+
+    results = _extract_paddleocr_service_results(body if isinstance(body, dict) else {})
+    if not results:
+        logger.warning(
+            "[openwps.ocr.service] image=%s task=%s empty_result preview=%s",
+            index,
+            _normalize_ocr_task_type(task_type),
+            _compact_text_preview(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else str(body)),
+        )
+        raise HTTPException(status_code=502, detail="PaddleOCR 服务未返回 layoutParsingResults")
+    return results[0]
+
+
+def _normalize_paddleocr_service_image_result(
+    service_result: dict[str, Any],
+    image: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    structured = _extract_paddleocr_structured_content(service_result)
+    warnings = [
+        "当前 OCR 使用 PaddleOCR 官方 layout-parsing 服务，返回结果以文档结构解析为主，样式摘要主要根据版面块推断。",
+    ]
+    raw = {
+        **structured,
+        "warnings": warnings,
+        "styleSummary": {
+            "documentType": None,
+            "dominantAlignment": None,
+            "overallTone": None,
+            "layoutNotes": "官方服务模式返回结构化版面块与 Markdown，适合识别型任务。",
+        },
+    }
+    return _normalize_ocr_result(raw, image, index)
+
+
+def _normalize_paddleocr_service_task_result(
+    service_result: dict[str, Any],
+    image: dict[str, Any],
+    index: int,
+    task_type: str,
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    structured = _extract_paddleocr_structured_content(service_result)
+    warnings: list[str] = []
+    if instruction and instruction.strip():
+        warnings.append("当前官方 PaddleOCR 服务模式主要按任务类型做结构化解析，自由文本指令不会像聊天模型那样完整透传。")
+
+    handwriting_text = structured["plainText"] if task_type == "handwriting" else ""
+    raw_payload: dict[str, Any] = {
+        **structured,
+        "warnings": warnings,
+        "handwritingText": handwriting_text,
+    }
+    if task_type == "table" and not structured["tables"] and structured["markdown"]:
+        raw_payload["tables"] = [{
+            "title": "",
+            "markdown": structured["markdown"],
+            "rowCount": 0,
+            "columnCount": 0,
+        }]
+    if task_type == "formula" and not structured["formulas"] and structured["plainText"]:
+        raw_payload["formulas"] = [{
+            "latex": structured["plainText"],
+            "text": structured["plainText"],
+        }]
+    return _normalize_ocr_task_result(raw_payload, image, index, task_type)
+
+
 async def _call_ocr_model_for_image(ocr_config: OCRConfig, image: dict[str, Any], index: int) -> dict[str, Any]:
+    if _normalize_ocr_backend(ocr_config.backend) == OCR_BACKEND_PADDLEOCR_SERVICE:
+        service_result = await _call_paddleocr_service_layout_parsing(ocr_config, image, index, "general_parse")
+        return _normalize_paddleocr_service_image_result(service_result, image, index)
+
     headers = {"Content-Type": "application/json"}
     if ocr_config.apiKey:
         headers["Authorization"] = f"Bearer {ocr_config.apiKey}"
@@ -1325,6 +1857,152 @@ async def _process_ocr_images(body: ChatRequest, ocr_config: OCRConfig) -> list[
     return await asyncio.gather(*tasks)
 
 
+async def _call_ocr_model_for_task(
+    ocr_config: OCRConfig,
+    image: dict[str, Any],
+    index: int,
+    task_type: str,
+    instruction: str | None,
+) -> dict[str, Any]:
+    normalized_task = _normalize_ocr_task_type(task_type)
+    if _normalize_ocr_backend(ocr_config.backend) == OCR_BACKEND_PADDLEOCR_SERVICE:
+        service_result = await _call_paddleocr_service_layout_parsing(ocr_config, image, index, normalized_task, instruction)
+        return _normalize_paddleocr_service_task_result(service_result, image, index, normalized_task, instruction)
+
+    headers = {"Content-Type": "application/json"}
+    if ocr_config.apiKey:
+        headers["Authorization"] = f"Bearer {ocr_config.apiKey}"
+
+    base_payload = {
+        "model": ocr_config.model,
+        "temperature": 0.1,
+        "max_tokens": 3200,
+        "messages": [
+            {"role": "system", "content": OCR_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _build_ocr_user_instruction(normalized_task, instruction),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": str(image.get("dataUrl") or "")},
+                    },
+                ],
+            },
+        ],
+    }
+    attempts = [
+        {**base_payload, "response_format": {"type": "json_object"}},
+        base_payload,
+    ]
+    last_error = ""
+
+    async with httpx.AsyncClient(timeout=float(ocr_config.timeoutSeconds)) as client:
+        for payload in attempts:
+            attempt_label = "json_object" if payload.get("response_format") is not None else "plain"
+            try:
+                response = await client.post(f"{ocr_config.endpoint}/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text.strip() or str(exc)
+                last_error = detail
+                logger.warning(
+                    "[openwps.ocr.task] image=%s task=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
+                    index,
+                    normalized_task,
+                    attempt_label,
+                    exc.response.status_code,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    _compact_text_preview(detail),
+                )
+                if payload.get("response_format") is not None and exc.response.status_code in {400, 404, 422}:
+                    continue
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {detail}") from exc
+            except Exception as exc:
+                logger.warning(
+                    "[openwps.ocr.task] image=%s task=%s attempt=%s request_error endpoint=%s model=%s error=%s",
+                    index,
+                    normalized_task,
+                    attempt_label,
+                    ocr_config.endpoint,
+                    ocr_config.model,
+                    exc,
+                )
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {exc}") from exc
+
+            content, finish_reason = _extract_ocr_response_content(body)
+            parsed = _extract_json_object(content)
+            if parsed is not None:
+                normalized = _normalize_ocr_task_result(parsed, image, index, normalized_task)
+                if _is_output_truncated_finish_reason(finish_reason):
+                    normalized = _append_ocr_warning(normalized, "OCR 输出可能因响应长度限制被截断，请结合原图复核。")
+                if _has_meaningful_ocr_content(normalized):
+                    return normalized
+                last_error = "OCR 返回了 JSON，但未提取到可用内容。"
+                continue
+
+            fallback_payload = _build_fallback_task_payload(content, finish_reason, normalized_task)
+            if fallback_payload is not None:
+                return _normalize_ocr_task_result(fallback_payload, image, index, normalized_task)
+
+            last_error = f"OCR 返回不可解析内容（finish_reason={finish_reason or '-'})"
+
+    raise HTTPException(status_code=502, detail=f"OCR 结果解析失败: {last_error}")
+
+
+def _select_ocr_images(images: list[dict[str, Any]], image_indices: list[int]) -> list[tuple[int, dict[str, Any]]]:
+    if not image_indices:
+        return list(enumerate(images, start=1))
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for raw_index in image_indices:
+        try:
+            image_index = int(raw_index)
+        except Exception:
+            continue
+        if image_index < 1 or image_index > len(images) or image_index in seen:
+            continue
+        seen.add(image_index)
+        selected.append((image_index, images[image_index - 1]))
+    return selected
+
+
+async def analyze_images_with_ocr(body: OCRCommandRequest) -> dict[str, Any]:
+    images = body.images or []
+    if not images:
+        raise HTTPException(status_code=400, detail="未提供可识别的图片")
+
+    task_type = _normalize_ocr_task_type(body.taskType)
+    ocr_config = _resolve_ocr_config(body.ocrConfig)
+    selected_images = _select_ocr_images(images, body.imageIndices)
+    if not selected_images:
+        raise HTTPException(status_code=400, detail="没有可用的 OCR 图片索引")
+
+    pseudo_request = ChatRequest(
+        message=body.instruction or "",
+        images=[image for _, image in selected_images],
+        ocrConfig=ocr_config,
+    )
+    _validate_ocr_request(pseudo_request, ocr_config)
+
+    results = await asyncio.gather(*[
+        _call_ocr_model_for_task(ocr_config, image, image_index, task_type, body.instruction)
+        for image_index, image in selected_images
+    ])
+
+    return {
+        "taskType": task_type,
+        "imageCount": len(selected_images),
+        "results": results,
+    }
+
+
 def _format_ocr_results_for_model(ocr_results: list[dict[str, Any]]) -> str:
     parts = [
         "[OCR 识别结果]",
@@ -1354,22 +2032,40 @@ def _format_ocr_results_for_model(ocr_results: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _format_text_attachments_for_model(attachments: list[dict[str, Any]] | None) -> str:
+    if not attachments:
+        return ""
+
+    parts = ["[文件附件]"]
+    total_chars = 0
+    max_total_chars = 24000
+    for index, attachment in enumerate(attachments, start=1):
+        if not isinstance(attachment, dict):
+            continue
+        text_content = _stringify_content(attachment.get("textContent")).strip()
+        if not text_content:
+            continue
+        name = str(attachment.get("name") or f"attachment-{index}").strip() or f"attachment-{index}"
+        text_format = str(attachment.get("textFormat") or "text").strip() or "text"
+        remaining = max_total_chars - total_chars
+        if remaining <= 0:
+            parts.append("其余附件内容因长度限制已省略。")
+            break
+        clipped = text_content[:remaining]
+        total_chars += len(clipped)
+        suffix = "\n[后续内容已截断]" if len(clipped) < len(text_content) else ""
+        parts.append(f"附件 {index}: {name} ({text_format})\n{clipped}{suffix}")
+
+    return "\n\n".join(parts) if len(parts) > 1 else ""
+
+
 async def prepare_chat_request(body: ChatRequest) -> ChatRequest:
-    mode = _resolve_image_processing_mode(body)
-    prepared = body.model_copy(update={"imageProcessingMode": mode})
-    if not prepared.images:
-        return prepared
-
-    if mode == "ocr_text":
-        ocr_config = _normalize_ocr_config(prepared)
-        _validate_ocr_request(prepared, ocr_config)
-        ocr_results = await _process_ocr_images(prepared, ocr_config)
-        return prepared.model_copy(update={
-            "ocrConfig": ocr_config,
-            "ocrResults": ocr_results,
-        })
-
-    _validate_multimodal_request(prepared)
+    prepared = body.model_copy(update={
+        "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
+        "ocrResults": [],
+    })
+    if prepared.images:
+        _validate_multimodal_request(prepared)
     return prepared
 
 
@@ -1377,13 +2073,14 @@ def _build_human_content(
     message: str,
     context_block: str,
     images: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
     ocr_results: list[dict[str, Any]] | None = None,
     image_processing_mode: str = DEFAULT_IMAGE_PROCESSING_MODE,
 ) -> str | list[dict[str, Any]]:
     user_text = _normalize_user_text(message, context_block)
-    if ocr_results:
-        return user_text + "\n\n" + _format_ocr_results_for_model(ocr_results)
-
+    attachment_block = _format_text_attachments_for_model(attachments)
+    if attachment_block:
+        user_text = f"{user_text}\n\n{attachment_block}" if user_text else attachment_block
     if not images:
         return user_text
 
@@ -2951,6 +3648,7 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
                     original,
                     context_block,
                     body.images,
+                    body.attachments,
                     body.ocrResults,
                     body.imageProcessingMode,
                 )))
@@ -2966,6 +3664,7 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
         body.message,
         context_block,
         body.images,
+        body.attachments,
         body.ocrResults,
         body.imageProcessingMode,
     )))

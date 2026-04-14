@@ -4,7 +4,6 @@ import {
   CUSTOM_PROVIDER_TEMPLATE,
   type AISettingsData,
   type AIProviderSettings,
-  type ImageProcessingMode,
   type ModelOption,
   type OcrConfigData,
 } from '../ai/providers'
@@ -79,9 +78,9 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
   const [providers, setProviders] = useState<EditableProvider[]>([])
   const [selectedProviderId, setSelectedProviderId] = useState('')
   const [activeProviderId, setActiveProviderId] = useState('')
-  const [imageProcessingMode, setImageProcessingMode] = useState<ImageProcessingMode>('direct_multimodal')
   const [ocrConfig, setOcrConfig] = useState<EditableOcrConfig>(toEditableOcrConfig({
     enabled: true,
+    backend: 'compat_chat',
     providerId: 'siliconflow',
     endpoint: 'https://api.siliconflow.cn/v1',
     model: 'PaddlePaddle/PaddleOCR-VL-1.5',
@@ -103,7 +102,6 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
         setProviders(data.providers.map(toEditableProvider))
         setSelectedProviderId(data.activeProviderId)
         setActiveProviderId(data.activeProviderId)
-        setImageProcessingMode(data.imageProcessingMode || 'direct_multimodal')
         setOcrConfig(toEditableOcrConfig(data.ocrConfig))
       })
       .catch(() => setAiError('无法连接到后端，请确认服务已启动（端口 5174）'))
@@ -127,6 +125,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
     () => providers.find(provider => provider.id === ocrConfig.providerId) ?? null,
     [providers, ocrConfig.providerId],
   )
+  const ocrBackendRequiresModel = ocrConfig.backend === 'compat_chat'
 
   function handlePageSave() {
     onPageConfigChange(draft)
@@ -176,6 +175,15 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
   }
 
   async function handleFetchOcrModels() {
+    if (!ocrBackendRequiresModel) {
+      updateOcrConfig(current => ({
+        ...current,
+        modelsLoading: false,
+        modelsError: '官方 PaddleOCR 服务模式不提供 /models 枚举，模型发现仅适用于兼容 chat/completions 端点。',
+      }))
+      return
+    }
+
     updateOcrConfig(current => ({ ...current, modelsLoading: true, modelsError: null }))
     setAiError(null)
 
@@ -254,6 +262,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
 
     const normalizedOcrConfig: Record<string, unknown> = {
       enabled: ocrConfig.enabled,
+      backend: ocrConfig.backend,
       providerId: ocrConfig.providerId.trim() || 'siliconflow',
       endpoint: ocrConfig.endpoint.trim(),
       model: ocrConfig.model.trim(),
@@ -273,8 +282,8 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
       return
     }
 
-    if (imageProcessingMode === 'ocr_text') {
-      if (!String(normalizedOcrConfig.model || '').trim()) {
+    if (ocrConfig.enabled) {
+      if (ocrBackendRequiresModel && !String(normalizedOcrConfig.model || '').trim()) {
         setAiError('请填写 OCR 模型 ID')
         return
       }
@@ -292,7 +301,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           activeProviderId,
-          imageProcessingMode,
+          imageProcessingMode: 'direct_multimodal',
           ocrConfig: normalizedOcrConfig,
           providers: normalizedProviders,
         }),
@@ -303,7 +312,6 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
       setProviders(updated.providers.map(toEditableProvider))
       setSelectedProviderId(updated.activeProviderId)
       setActiveProviderId(updated.activeProviderId)
-      setImageProcessingMode(updated.imageProcessingMode || 'direct_multimodal')
       setOcrConfig(toEditableOcrConfig(updated.ocrConfig))
       setAiSavedOk(true)
       setTimeout(() => {
@@ -340,8 +348,8 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
               key={i}
               onClick={() => setTab(i as 0 | 1)}
               className={`flex-1 py-2.5 text-sm font-medium transition-colors ${tab === i
-                  ? 'text-blue-600 border-b-2 border-blue-500 bg-blue-50/50'
-                  : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+                ? 'text-blue-600 border-b-2 border-blue-500 bg-blue-50/50'
+                : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
                 }`}
             >{label}</button>
           ))}
@@ -428,8 +436,8 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
                       type="button"
                       onClick={() => setSelectedProviderId(provider.id)}
                       className={`w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${selectedProviderId === provider.id
-                          ? 'border-blue-300 bg-white shadow-sm'
-                          : 'border-transparent hover:border-gray-200 hover:bg-white'
+                        ? 'border-blue-300 bg-white shadow-sm'
+                        : 'border-transparent hover:border-gray-200 hover:bg-white'
                         }`}
                     >
                       <div className="flex items-center justify-between gap-2">
@@ -570,8 +578,8 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
                                 type="button"
                                 onClick={() => updateProvider(selectedProvider.id, current => ({ ...current, defaultModel: model.id }))}
                                 className={`w-full px-3 py-2 text-left text-xs border-b border-gray-100 last:border-b-0 transition-colors ${selectedProvider.defaultModel === model.id
-                                    ? 'bg-blue-50 text-blue-700'
-                                    : 'text-gray-700 hover:bg-gray-50'
+                                  ? 'bg-blue-50 text-blue-700'
+                                  : 'text-gray-700 hover:bg-gray-50'
                                   }`}
                               >
                                 <div className="font-medium">{model.id}{model.supportsVision ? ' · 多模态' : ''}</div>
@@ -584,190 +592,193 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
 
                       <div className="rounded-xl border border-violet-200 bg-violet-50/70 px-3 py-3 space-y-3">
                         <div>
-                          <div className="text-xs font-medium text-violet-700">图片处理方式</div>
-                          <div className="text-[11px] text-violet-500 mt-1">全局决定图片是直接交给多模态模型，还是先经过 OCR 再交给文本模型。</div>
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className={`rounded-lg border px-3 py-2 text-xs transition-colors ${imageProcessingMode === 'direct_multimodal' ? 'border-violet-300 bg-white text-violet-700' : 'border-violet-100 bg-white/70 text-gray-600'}`}>
-                            <input
-                              type="radio"
-                              name="image-processing-mode"
-                              className="mr-2"
-                              checked={imageProcessingMode === 'direct_multimodal'}
-                              onChange={() => setImageProcessingMode('direct_multimodal')}
-                            />
-                            直接多模态
-                          </label>
-                          <label className={`rounded-lg border px-3 py-2 text-xs transition-colors ${imageProcessingMode === 'ocr_text' ? 'border-violet-300 bg-white text-violet-700' : 'border-violet-100 bg-white/70 text-gray-600'}`}>
-                            <input
-                              type="radio"
-                              name="image-processing-mode"
-                              className="mr-2"
-                              checked={imageProcessingMode === 'ocr_text'}
-                              onChange={() => setImageProcessingMode('ocr_text')}
-                            />
-                            OCR + 文本模型
-                          </label>
+                          <div className="text-xs font-medium text-violet-700">OCR 专用识别配置</div>
+                          <div className="text-[11px] text-violet-500 mt-1">默认图片聊天始终直连多模态模型。这里的 OCR 只用于 /ocr 命令、自然语言 OCR 识别请求，以及 agent 专用 OCR tool。</div>
                         </div>
 
                         <div className="text-[11px] text-violet-600">
-                          {imageProcessingMode === 'direct_multimodal'
-                            ? '当前模式下，图片会直接发送给多模态模型。'
-                            : '当前模式下，图片会先调用 OCR 模型提取内容和样式线索，再交给主文本模型继续完成写作与排版。'}
+                          聊天附图默认不会先做 OCR 预处理；OCR 更适合表格、图表、手写、公式、扫描件文字等识别型任务。
                         </div>
 
-                        {imageProcessingMode === 'ocr_text' && (
-                          <div className="space-y-3 rounded-lg border border-violet-100 bg-white px-3 py-3">
-                            <label className="flex items-center gap-2 text-xs text-gray-600">
-                              <input
-                                type="checkbox"
-                                checked={ocrConfig.enabled}
-                                onChange={event => updateOcrConfig(current => ({ ...current, enabled: event.target.checked }))}
-                              />
-                              <span>启用 OCR 预处理</span>
-                            </label>
+                        <div className="text-[11px] text-violet-600">
+                          官方推荐是 PaddleOCR 的 layout-parsing 服务接口；如果你只有硅基流动这类 OpenAI 兼容端点，就切到“兼容 chat/completions”。
+                        </div>
 
-                            <div className="grid grid-cols-2 gap-3">
-                              <label className="block">
-                                <span className="block text-xs font-medium text-gray-500 mb-1">OCR 服务商</span>
-                                <select
-                                  className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                  value={ocrConfig.providerId}
-                                  onChange={event => {
-                                    const nextProviderId = event.target.value
-                                    const nextProvider = providers.find(provider => provider.id === nextProviderId)
-                                    updateOcrConfig(current => ({
-                                      ...current,
-                                      providerId: nextProviderId,
-                                      endpoint: nextProvider?.endpoint || current.endpoint,
-                                    }))
-                                  }}
-                                >
-                                  {providers.map(provider => (
-                                    <option key={provider.id} value={provider.id}>{provider.label}</option>
-                                  ))}
-                                </select>
-                              </label>
+                        <div className="space-y-3 rounded-lg border border-violet-100 bg-white px-3 py-3">
+                          <label className="flex items-center gap-2 text-xs text-gray-600">
+                            <input
+                              type="checkbox"
+                              checked={ocrConfig.enabled}
+                              onChange={event => updateOcrConfig(current => ({ ...current, enabled: event.target.checked }))}
+                            />
+                            <span>启用 OCR 预处理</span>
+                          </label>
 
-                              <label className="block">
-                                <span className="block text-xs font-medium text-gray-500 mb-1">OCR 模型 ID</span>
-                                <input
-                                  list="ocr-models"
-                                  type="text"
-                                  className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                  value={ocrConfig.model}
-                                  onChange={event => updateOcrConfig(current => ({ ...current, model: event.target.value }))}
-                                  placeholder="PaddlePaddle/PaddleOCR-VL-1.5"
-                                />
-                                <datalist id="ocr-models">
-                                  {ocrConfig.models.map(model => (
-                                    <option key={model.id} value={model.id}>{model.label}</option>
-                                  ))}
-                                </datalist>
-                              </label>
-                            </div>
-
+                          <div className="grid grid-cols-2 gap-3">
                             <label className="block">
-                              <span className="block text-xs font-medium text-gray-500 mb-1">OCR 端点 URL</span>
-                              <input
-                                type="text"
+                              <span className="block text-xs font-medium text-gray-500 mb-1">OCR 接口模式</span>
+                              <select
                                 className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                value={ocrConfig.endpoint}
-                                onChange={event => updateOcrConfig(current => ({ ...current, endpoint: event.target.value, apiKeyChanged: current.apiKeyChanged }))}
-                                placeholder="https://api.siliconflow.cn/v1"
-                              />
+                                value={ocrConfig.backend}
+                                onChange={event => {
+                                  const nextBackend = event.target.value as EditableOcrConfig['backend']
+                                  updateOcrConfig(current => ({
+                                    ...current,
+                                    backend: nextBackend,
+                                    model: nextBackend === 'compat_chat'
+                                      ? (current.model || 'PaddlePaddle/PaddleOCR-VL-1.5')
+                                      : current.model,
+                                    modelsError: null,
+                                  }))
+                                }}
+                              >
+                                <option value="compat_chat">兼容 chat/completions</option>
+                                <option value="paddleocr_service">官方 layout-parsing 服务</option>
+                              </select>
                             </label>
 
                             <label className="block">
-                              <span className="block text-xs font-medium text-gray-500 mb-1">
-                                OCR API Key
-                                {(ocrConfig.hasApiKey && !ocrConfig.apiKeyChanged) && (
-                                  <span className="ml-1 font-normal text-gray-400">（留空则保持不变）</span>
-                                )}
-                              </span>
-                              <input
-                                type="password"
+                              <span className="block text-xs font-medium text-gray-500 mb-1">OCR 服务商</span>
+                              <select
                                 className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                value={ocrConfig.apiKey}
-                                onChange={event => updateOcrConfig(current => ({
-                                  ...current,
-                                  apiKey: event.target.value,
-                                  apiKeyChanged: true,
-                                }))}
-                                placeholder={ocrConfig.hasApiKey && !ocrConfig.apiKeyChanged ? '已配置，留空不修改' : '输入 OCR API Key，可留空以复用所选服务商 Key'}
-                                autoComplete="off"
-                              />
+                                value={ocrConfig.providerId}
+                                onChange={event => {
+                                  const nextProviderId = event.target.value
+                                  const nextProvider = providers.find(provider => provider.id === nextProviderId)
+                                  updateOcrConfig(current => ({
+                                    ...current,
+                                    providerId: nextProviderId,
+                                    endpoint: nextProvider?.endpoint || current.endpoint,
+                                  }))
+                                }}
+                              >
+                                {providers.map(provider => (
+                                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                                ))}
+                              </select>
                             </label>
-
-                            <div className="grid grid-cols-2 gap-3">
-                              <label className="block">
-                                <span className="block text-xs font-medium text-gray-500 mb-1">OCR 超时（秒）</span>
-                                <input
-                                  type="number"
-                                  min={5}
-                                  max={600}
-                                  className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                  value={ocrConfig.timeoutSeconds}
-                                  onChange={event => updateOcrConfig(current => ({ ...current, timeoutSeconds: Number(event.target.value) || 60 }))}
-                                />
-                              </label>
-
-                              <label className="block">
-                                <span className="block text-xs font-medium text-gray-500 mb-1">最多图片数</span>
-                                <input
-                                  type="number"
-                                  min={1}
-                                  max={20}
-                                  className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
-                                  value={ocrConfig.maxImages}
-                                  onChange={event => updateOcrConfig(current => ({ ...current, maxImages: Number(event.target.value) || 5 }))}
-                                />
-                              </label>
-                            </div>
-
-                            <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div>
-                                  <div className="text-xs font-medium text-gray-600">OCR 模型发现</div>
-                                  <div className="text-[11px] text-gray-400 mt-1">从 OCR 端点拉取模型列表，方便选择 PaddleOCR-VL-1.5 或兼容模型。</div>
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={() => void handleFetchOcrModels()}
-                                  disabled={!ocrConfig.endpoint || ocrConfig.modelsLoading}
-                                  className="px-3 py-1.5 text-xs rounded-lg border border-gray-300 bg-white hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
-                                >
-                                  {ocrConfig.modelsLoading ? '查询中...' : '查询 OCR 模型'}
-                                </button>
-                              </div>
-
-                              {ocrConfig.modelsError && (
-                                <div className="text-xs text-red-600">{ocrConfig.modelsError}</div>
-                              )}
-
-                              {ocrConfig.models.length > 0 && (
-                                <div className="max-h-40 overflow-y-auto rounded-lg border border-gray-200 bg-white">
-                                  {ocrConfig.models.map(model => (
-                                    <button
-                                      key={model.id}
-                                      type="button"
-                                      onClick={() => updateOcrConfig(current => ({ ...current, model: model.id }))}
-                                      className={`w-full px-3 py-2 text-left text-xs border-b border-gray-100 last:border-b-0 transition-colors ${ocrConfig.model === model.id ? 'bg-violet-50 text-violet-700' : 'text-gray-700 hover:bg-gray-50'}`}
-                                    >
-                                      <div className="font-medium">{model.id}</div>
-                                      {model.label !== model.id && <div className="text-[11px] text-gray-400 mt-0.5">{model.label}</div>}
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-
-                            <div className="text-[11px] text-gray-500">
-                              当前默认建议模型：PaddlePaddle/PaddleOCR-VL-1.5。你也可以填写硅基流动实际开放的兼容模型 ID。
-                            </div>
                           </div>
-                        )}
+
+                          <label className="block">
+                            <span className="block text-xs font-medium text-gray-500 mb-1">
+                              {ocrBackendRequiresModel ? 'OCR 模型 ID' : 'OCR 模型 ID（可选）'}
+                            </span>
+                            <input
+                              list="ocr-models"
+                              type="text"
+                              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
+                              value={ocrConfig.model}
+                              onChange={event => updateOcrConfig(current => ({ ...current, model: event.target.value }))}
+                              placeholder={ocrBackendRequiresModel ? 'PaddlePaddle/PaddleOCR-VL-1.5' : '官方服务模式通常不需要填写'}
+                              disabled={!ocrBackendRequiresModel}
+                            />
+                            <datalist id="ocr-models">
+                              {ocrConfig.models.map(model => (
+                                <option key={model.id} value={model.id}>{model.label}</option>
+                              ))}
+                            </datalist>
+                          </label>
+
+                          <label className="block">
+                            <span className="block text-xs font-medium text-gray-500 mb-1">OCR 端点 URL</span>
+                            <input
+                              type="text"
+                              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
+                              value={ocrConfig.endpoint}
+                              onChange={event => updateOcrConfig(current => ({ ...current, endpoint: event.target.value, apiKeyChanged: current.apiKeyChanged }))}
+                              placeholder={ocrBackendRequiresModel ? 'https://api.siliconflow.cn/v1' : 'http://your-paddleocr-service'}
+                            />
+                          </label>
+
+                          <label className="block">
+                            <span className="block text-xs font-medium text-gray-500 mb-1">
+                              OCR API Key
+                              {(ocrConfig.hasApiKey && !ocrConfig.apiKeyChanged) && (
+                                <span className="ml-1 font-normal text-gray-400">（留空则保持不变）</span>
+                              )}
+                            </span>
+                            <input
+                              type="password"
+                              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
+                              value={ocrConfig.apiKey}
+                              onChange={event => updateOcrConfig(current => ({
+                                ...current,
+                                apiKey: event.target.value,
+                                apiKeyChanged: true,
+                              }))}
+                              placeholder={ocrConfig.hasApiKey && !ocrConfig.apiKeyChanged ? '已配置，留空不修改' : '输入 OCR API Key，可留空以复用所选服务商 Key'}
+                              autoComplete="off"
+                            />
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">OCR 超时（秒）</span>
+                              <input
+                                type="number"
+                                min={5}
+                                max={600}
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
+                                value={ocrConfig.timeoutSeconds}
+                                onChange={event => updateOcrConfig(current => ({ ...current, timeoutSeconds: Number(event.target.value) || 60 }))}
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">最多图片数</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={20}
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-violet-300"
+                                value={ocrConfig.maxImages}
+                                onChange={event => updateOcrConfig(current => ({ ...current, maxImages: Number(event.target.value) || 5 }))}
+                              />
+                            </label>
+                          </div>
+
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-3">
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <div className="text-xs font-medium text-gray-600">OCR 模型发现</div>
+                                <div className="text-[11px] text-gray-400 mt-1">从 OCR 端点拉取模型列表，方便选择 PaddleOCR-VL-1.5 或兼容模型。官方服务模式通常不提供这类枚举接口。</div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => void handleFetchOcrModels()}
+                                disabled={!ocrConfig.endpoint || ocrConfig.modelsLoading || !ocrBackendRequiresModel}
+                                className="px-3 py-1.5 text-xs rounded-lg border border-gray-300 bg-white hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {ocrConfig.modelsLoading ? '查询中...' : '查询 OCR 模型'}
+                              </button>
+                            </div>
+
+                            {ocrConfig.modelsError && (
+                              <div className="text-xs text-red-600">{ocrConfig.modelsError}</div>
+                            )}
+
+                            {ocrConfig.models.length > 0 && (
+                              <div className="max-h-40 overflow-y-auto rounded-lg border border-gray-200 bg-white">
+                                {ocrConfig.models.map(model => (
+                                  <button
+                                    key={model.id}
+                                    type="button"
+                                    onClick={() => updateOcrConfig(current => ({ ...current, model: model.id }))}
+                                    className={`w-full px-3 py-2 text-left text-xs border-b border-gray-100 last:border-b-0 transition-colors ${ocrConfig.model === model.id ? 'bg-violet-50 text-violet-700' : 'text-gray-700 hover:bg-gray-50'}`}
+                                  >
+                                    <div className="font-medium">{model.id}</div>
+                                    {model.label !== model.id && <div className="text-[11px] text-gray-400 mt-0.5">{model.label}</div>}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-gray-500">
+                            {ocrBackendRequiresModel
+                              ? '当前默认建议模型：PaddlePaddle/PaddleOCR-VL-1.5。你也可以填写硅基流动实际开放的兼容模型 ID。'
+                              : '官方服务模式会直接调用 /layout-parsing，不再依赖聊天模型 ID；请把端点指到 PaddleOCR 服务根地址。'}
+                          </div>
+                        </div>
                       </div>
                     </div>
                   ) : (

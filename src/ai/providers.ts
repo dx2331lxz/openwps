@@ -1,7 +1,9 @@
 export type ImageProcessingMode = 'direct_multimodal' | 'ocr_text'
+export type OcrBackendMode = 'compat_chat' | 'paddleocr_service'
 
 export interface OcrConfigData {
   enabled: boolean
+  backend: OcrBackendMode
   providerId: string
   endpoint: string
   model: string

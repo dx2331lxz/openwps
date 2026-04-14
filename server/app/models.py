@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class ChatMessage(BaseModel):
     role: str
     content: Optional[str] = None
+    attachments: Optional[list[dict[str, Any]]] = None
     tool_calls: Optional[list[dict[str, Any]]] = None
     toolCalls: Optional[list[dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
@@ -17,6 +18,7 @@ class ChatMessage(BaseModel):
 
 class OCRConfig(BaseModel):
     enabled: bool = True
+    backend: str = "compat_chat"
     providerId: str = "siliconflow"
     endpoint: str = ""
     model: str = "PaddlePaddle/PaddleOCR-VL-1.5"
@@ -24,6 +26,14 @@ class OCRConfig(BaseModel):
     hasApiKey: bool = False
     timeoutSeconds: int = 60
     maxImages: int = 5
+
+
+class OCRCommandRequest(BaseModel):
+    images: list[dict[str, Any]] = Field(default_factory=list)
+    taskType: str = "general_parse"
+    instruction: Optional[str] = None
+    imageIndices: list[int] = Field(default_factory=list)
+    ocrConfig: Optional[OCRConfig] = None
 
 
 class ChatRequest(BaseModel):
@@ -34,6 +44,7 @@ class ChatRequest(BaseModel):
     reactMessages: list[dict[str, Any]] = Field(default_factory=list)
     mode: str = "agent"
     images: list[dict[str, Any]] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
     model: Optional[str] = None
     providerId: Optional[str] = None
     imageProcessingMode: str = "direct_multimodal"

@@ -49,6 +49,7 @@ export const schema = new Schema({
     table: {
       content: 'table_row+',
       group: 'block',
+      tableRole: 'table',
       parseDOM: [{ tag: 'table' }],
       toDOM() {
         return ['table', { style: 'border-collapse:collapse;width:100%;margin:8px 0;box-sizing:border-box;table-layout:fixed' }, ['tbody', 0]]
@@ -56,11 +57,14 @@ export const schema = new Schema({
     },
     table_row: {
       content: 'table_cell+',
+      tableRole: 'row',
       parseDOM: [{ tag: 'tr' }],
       toDOM() { return ['tr', 0] },
     },
     table_cell: {
       content: 'paragraph+',
+      tableRole: 'cell',
+      isolating: true,
       attrs: {
         header: { default: false },
         colspan: { default: 1 },
