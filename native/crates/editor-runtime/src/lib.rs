@@ -1,4 +1,6 @@
 use document_core::{Document, DocumentEditor, Paragraph, Selector};
+use layout_engine::layout_document;
+use renderer_skia::render_layout;
 
 pub struct EditorRuntime {
     editor: DocumentEditor,
@@ -26,6 +28,11 @@ impl EditorRuntime {
 
     pub fn document(&self) -> &Document {
         &self.editor.document
+    }
+
+    pub fn render_frame(&self, viewport_width: u32, viewport_height: u32) -> Vec<u32> {
+        let layout = layout_document(&self.editor.document, viewport_width, viewport_height);
+        render_layout(&layout)
     }
 
     pub fn window_title(&self) -> String {
@@ -96,5 +103,14 @@ mod tests {
         let runtime = EditorRuntime::from_document(document);
         assert!(runtime.window_title().contains("Recovered"));
         assert!(runtime.document().metadata.title.as_deref() == Some("Recovered"));
+    }
+
+    #[test]
+    fn renders_non_empty_frame() {
+        let runtime = EditorRuntime::new();
+        let frame = runtime.render_frame(900, 700);
+
+        assert_eq!(frame.len(), 900 * 700);
+        assert!(frame.iter().any(|pixel| *pixel != 0));
     }
 }

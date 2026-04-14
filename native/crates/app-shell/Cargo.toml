@@ -8,3 +8,4 @@ editor-runtime = { path = "../editor-runtime" }
 ai-bridge = { path = "../ai-bridge" }
 native-storage = { path = "../native-storage" }
 winit = { workspace = true }
+softbuffer = { workspace = true }

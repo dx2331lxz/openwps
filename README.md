@@ -87,7 +87,7 @@ cargo test -p native-storage
 cargo run -p app-shell
 ```
 
-你现在会看到一个原生窗口，标题和状态行会展示 Native V2 当前接入的文档运行时状态。
+你现在会看到一个原生窗口，包含页面预览骨架、文档块占位和顶部状态条，不再只是空白窗口。
 
 ## 仓库结构
 

@@ -6,3 +6,5 @@ edition.workspace = true
 [dependencies]
 layout-engine = { path = "../layout-engine" }
 document-core = { path = "../document-core" }
+tiny-skia = { workspace = true }
+font8x8 = { workspace = true }

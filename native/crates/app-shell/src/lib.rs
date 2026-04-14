@@ -1,29 +1,36 @@
 use std::env;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use editor_runtime::EditorRuntime;
 use native_storage::{clear_autosave, load_package, recover_from_autosave, save_package, StorageError, PACKAGE_EXTENSION};
+use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 pub struct OpenWpsApp {
+    context: Context<OwnedDisplayHandle>,
     runtime: EditorRuntime,
     package_path: PathBuf,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
+    surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
 }
 
 impl OpenWpsApp {
-    pub fn new() -> Self {
+    pub fn new(context: Context<OwnedDisplayHandle>) -> Self {
         let package_path = default_package_path();
         let mut runtime = load_runtime(&package_path);
         runtime.bootstrap_selection();
         Self {
+            context,
             runtime,
             package_path,
             window: None,
+            surface: None,
         }
     }
 
@@ -44,11 +51,38 @@ impl OpenWpsApp {
             eprintln!("failed to clear autosave {}: {error}", self.package_path.display());
         }
     }
-}
 
-impl Default for OpenWpsApp {
-    fn default() -> Self {
-        Self::new()
+    fn redraw(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let Some(width) = NonZeroU32::new(size.width.max(1)) else {
+            return;
+        };
+        let Some(height) = NonZeroU32::new(size.height.max(1)) else {
+            return;
+        };
+
+        if let Err(error) = surface.resize(width, height) {
+            eprintln!("failed to resize surface: {error}");
+            return;
+        }
+
+        let frame = self.runtime.render_frame(size.width.max(1), size.height.max(1));
+        match surface.buffer_mut() {
+            Ok(mut buffer) => {
+                buffer.copy_from_slice(&frame);
+                if let Err(error) = buffer.present() {
+                    eprintln!("failed to present frame: {error}");
+                }
+            }
+            Err(error) => eprintln!("failed to acquire frame buffer: {error}"),
+        }
     }
 }
 
@@ -60,8 +94,18 @@ impl ApplicationHandler for OpenWpsApp {
 
         match event_loop.create_window(self.build_window_attributes()) {
             Ok(window) => {
+                let window = Arc::new(window);
                 window.set_title(&format!("{} | {}", self.runtime.window_title(), self.runtime.status_line()));
-                self.window = Some(window);
+                match Surface::new(&self.context, window.clone()) {
+                    Ok(surface) => {
+                        self.surface = Some(surface);
+                        self.window = Some(window);
+                    }
+                    Err(error) => {
+                        eprintln!("failed to create native surface: {error}");
+                        event_loop.exit();
+                    }
+                }
             }
             Err(error) => {
                 eprintln!("failed to create native window: {error}");
@@ -91,8 +135,9 @@ impl ApplicationHandler for OpenWpsApp {
                     size.width,
                     size.height
                 ));
+                self.redraw();
             }
-            WindowEvent::RedrawRequested => {}
+            WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
@@ -134,7 +179,8 @@ fn load_runtime(package_path: &PathBuf) -> EditorRuntime {
 
 pub fn run() -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::new()?;
-    let mut app = OpenWpsApp::new();
+    let context = Context::new(event_loop.owned_display_handle()).expect("softbuffer context");
+    let mut app = OpenWpsApp::new(context);
     event_loop.run_app(&mut app)
 }
 
@@ -146,8 +192,8 @@ mod tests {
 
     #[test]
     fn creates_native_app_model() {
-        let app = OpenWpsApp::new();
-        assert!(app.runtime.window_title().contains("openwps Native V2"));
+        let runtime = EditorRuntime::new();
+        assert!(runtime.window_title().contains("openwps Native V2"));
     }
 
     #[test]
