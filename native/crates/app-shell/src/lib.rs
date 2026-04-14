@@ -1,4 +1,8 @@
+use std::env;
+use std::path::PathBuf;
+
 use editor_runtime::EditorRuntime;
+use native_storage::{clear_autosave, load_package, recover_from_autosave, save_package, StorageError, PACKAGE_EXTENSION};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -7,15 +11,18 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 pub struct OpenWpsApp {
     runtime: EditorRuntime,
+    package_path: PathBuf,
     window: Option<Window>,
 }
 
 impl OpenWpsApp {
     pub fn new() -> Self {
-        let mut runtime = EditorRuntime::new();
+        let package_path = default_package_path();
+        let mut runtime = load_runtime(&package_path);
         runtime.bootstrap_selection();
         Self {
             runtime,
+            package_path,
             window: None,
         }
     }
@@ -25,6 +32,17 @@ impl OpenWpsApp {
             .with_title(self.runtime.window_title())
             .with_inner_size(LogicalSize::new(1180.0, 820.0))
             .with_min_inner_size(LogicalSize::new(900.0, 640.0))
+    }
+
+    fn persist_runtime(&self) {
+        if let Err(error) = save_package(&self.package_path, self.runtime.document()) {
+            eprintln!("failed to save native package {}: {error}", self.package_path.display());
+            return;
+        }
+
+        if let Err(error) = clear_autosave(&self.package_path) {
+            eprintln!("failed to clear autosave {}: {error}", self.package_path.display());
+        }
     }
 }
 
@@ -61,7 +79,10 @@ impl ApplicationHandler for OpenWpsApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.persist_runtime();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 window.set_title(&format!(
                     "{} | {} | {}x{}",
@@ -83,6 +104,34 @@ impl ApplicationHandler for OpenWpsApp {
     }
 }
 
+fn default_package_path() -> PathBuf {
+    let root = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    root.join(".openwps-native").join(format!("workspace.{}", PACKAGE_EXTENSION))
+}
+
+fn load_runtime(package_path: &PathBuf) -> EditorRuntime {
+    if let Ok(Some(bundle)) = recover_from_autosave(package_path) {
+        return EditorRuntime::from_document(bundle.snapshot.document);
+    }
+
+    match load_package(package_path) {
+        Ok(package) => EditorRuntime::from_document(package.document),
+        Err(StorageError::InvalidPackage(_)) | Err(StorageError::Io(_)) => {
+            let document = EditorRuntime::default_document();
+            if let Err(error) = save_package(package_path, &document) {
+                eprintln!("failed to bootstrap native package {}: {error}", package_path.display());
+            }
+            EditorRuntime::from_document(document)
+        }
+        Err(error) => {
+            eprintln!("failed to load native package {}: {error}", package_path.display());
+            EditorRuntime::new()
+        }
+    }
+}
+
 pub fn run() -> Result<(), winit::error::EventLoopError> {
     let event_loop = EventLoop::new()?;
     let mut app = OpenWpsApp::new();
@@ -92,10 +141,34 @@ pub fn run() -> Result<(), winit::error::EventLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn creates_native_app_model() {
         let app = OpenWpsApp::new();
         assert!(app.runtime.window_title().contains("openwps Native V2"));
+    }
+
+    #[test]
+    fn bootstraps_missing_native_package() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let package_path = std::env::temp_dir()
+            .join("openwps-app-shell-tests")
+            .join(format!("workspace-{unique}.{}", PACKAGE_EXTENSION));
+        if let Some(parent) = package_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+
+        let runtime = load_runtime(&package_path);
+        assert!(package_path.exists());
+        assert!(runtime.window_title().contains("Native Workspace"));
+
+        if let Some(parent) = package_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
     }
 }

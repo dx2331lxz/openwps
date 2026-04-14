@@ -6,14 +6,26 @@ pub struct EditorRuntime {
 
 impl EditorRuntime {
     pub fn new() -> Self {
-        let mut document = Document::new();
-        if let Some(document_core::Block::Paragraph(paragraph)) = document.sections[0].blocks.first_mut() {
-            *paragraph = Paragraph::with_text("openwps Native V2 已启动。下一步接入 layout-engine 与 renderer-skia。")
-        }
+        Self::from_document(Self::default_document())
+    }
 
+    pub fn from_document(document: Document) -> Self {
         Self {
             editor: DocumentEditor::new(document),
         }
+    }
+
+    pub fn default_document() -> Document {
+        let mut document = Document::new();
+        document.metadata.title = Some("Native Workspace".to_string());
+        if let Some(document_core::Block::Paragraph(paragraph)) = document.sections[0].blocks.first_mut() {
+            *paragraph = Paragraph::with_text("openwps Native V2 已启动。下一步接入 layout-engine 与 renderer-skia。")
+        }
+        document
+    }
+
+    pub fn document(&self) -> &Document {
+        &self.editor.document
     }
 
     pub fn window_title(&self) -> String {
@@ -74,5 +86,15 @@ mod tests {
         let runtime = EditorRuntime::new();
         assert!(runtime.window_title().starts_with("openwps Native V2"));
         assert!(runtime.status_line().contains("sections=1"));
+    }
+
+    #[test]
+    fn creates_runtime_from_external_document() {
+        let mut document = EditorRuntime::default_document();
+        document.metadata.title = Some("Recovered".to_string());
+
+        let runtime = EditorRuntime::from_document(document);
+        assert!(runtime.window_title().contains("Recovered"));
+        assert!(runtime.document().metadata.title.as_deref() == Some("Recovered"));
     }
 }
