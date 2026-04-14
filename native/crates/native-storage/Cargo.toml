@@ -1,0 +1,11 @@
+[package]
+name = "native-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+document-core = { path = "../document-core" }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

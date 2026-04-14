@@ -24,6 +24,11 @@ dist-ssr
 *.sw?
 __pycache__/
 *.pyc
+.venv/
+
+# Rust native workspace
+native/target/
+native/**/*.owps/
 
 # 敏感配置和数据（不提交）
 server/config/ai.json

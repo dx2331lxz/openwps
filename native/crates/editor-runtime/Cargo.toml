@@ -1,0 +1,9 @@
+[package]
+name = "editor-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+document-core = { path = "../document-core" }
+layout-engine = { path = "../layout-engine" }
+renderer-skia = { path = "../renderer-skia" }

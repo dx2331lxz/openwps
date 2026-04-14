@@ -1,0 +1,8 @@
+[package]
+name = "renderer-skia"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+layout-engine = { path = "../layout-engine" }
+document-core = { path = "../document-core" }

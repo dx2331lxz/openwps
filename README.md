@@ -1,88 +1,140 @@
 # openwps
 
-AI 驱动的 WPS 级排版 Web 文档编辑器。
+openwps 当前同时包含两条实现线：
 
-## 功能
+1. Web 版编辑器：React + Vite + FastAPI，是目前功能最完整、可直接使用的主线。
+2. Native V2 原型：Rust workspace，正在按原生桌面软件规格逐步实现 document-core、storage、app-shell 等模块。
 
-- **精确分页**：基于 [@chenglou/pretext](https://github.com/chenglou/pretext)，A4 精确布局，不依赖 CSS
-- **完整排版工具栏**：字体/字号/颜色/对齐/缩进/行距/列表/表格等 16+ 功能
-- **AI 排版助手**：类 VS Code Copilot 侧边栏，自然语言驱动排版
-- **流式 AI 输出**：SSE 逐 token 推送，思考过程可折叠显示
-- **ReAct 架构**：AI 多轮工具调用，默认 50 轮
-- **会话历史**：对话持久化，支持切换历史会话
-- **Markdown 渲染**：AI 回复支持 Markdown 格式
-- **多模型支持**：硅基流动 / OpenAI / Claude / Ollama 自定义端点
+## 当前状态
 
-## 快速开始
+- Web 版可运行，可用于现有编辑、排版和 AI 助手能力验证。
+- Native V2 已完成第一批基础设施：文档模型、命令系统、Undo/Redo、native-storage 第一版。
+- Native V2 现在还不是完整办公软件，当前可运行的是原生窗口壳和底层 crate 测试闭环。
+
+## 运行环境
+
+建议环境：
+
+- Node.js 20+
+- Python 3.11+
+- Rust stable
+- macOS 当前优先验证，Windows 为下一阶段目标
+
+## 运行 Web 版
+
+首次安装依赖：
 
 ```bash
-# 安装依赖
 npm install
-pip3 install -r server/requirements.txt --break-system-packages
-
-# 配置 AI（在设置界面或直接编辑）
-# server/config/ai.json 填写端点和 API Key
-
-# 开发模式
-python3 server/main.py &    # 后端 5174
-npx vite --host             # 前端 5173
-
-# 生产模式（单端口）
-npm run build
-python3 server/main.py
-# 访问 http://localhost:5174
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r server/requirements.txt
 ```
 
-## 发布流程
+配置 AI：
 
-**每次改动完成后必须执行：**
+- 编辑 server/config/ai.json
+- 填入兼容 OpenAI 接口的 base URL、model 和 API key
+
+开发模式：
 
 ```bash
-cd ~/projects/openwps
+source .venv/bin/activate
+python3 server/main.py
+```
+
+另开一个终端：
+
+```bash
+npm run dev -- --host
+```
+
+默认端口：
+
+- 前端：http://localhost:5173
+- 后端：http://localhost:5174
+
+生产构建：
+
+```bash
 npm run build
-pkill -f "python3 server/main.py" 2>/dev/null
-nohup python3 server/main.py &>/tmp/openwps-server.log &
-sleep 3 && curl -s http://localhost:5174/api/health
-git add -A && git commit -m "描述" && git push
+source .venv/bin/activate
+python3 server/main.py
 ```
 
-详细说明见 [DEPLOY.md](./DEPLOY.md)
+然后访问 http://localhost:5174。
 
-## 技术栈
+## 运行 Native V2
 
-| 层 | 技术 |
-|---|---|
-| 框架 | React + TypeScript + Vite |
-| 文档模型 | ProseMirror |
-| 布局引擎 | @chenglou/pretext |
-| 后端 | Python FastAPI + LangGraph |
-| AI | OpenAI 兼容接口（硅基流动/OpenAI/Claude/Ollama） |
-| Markdown | marked |
+Native V2 位于 native 目录，当前适合做 crate 级验证和基础窗口运行。
 
-## 排版引擎说明
+先进入原生 workspace：
 
-项目的文本测量与分页都以 `@chenglou/pretext` 为基础。
-
-- `prepare/prepareWithSegments`：对文本做一次性预处理与宽度测量缓存
-- `layout/layoutWithLines`：在给定宽度下做纯算术断行与高度计算
-- `walkLineRanges/layoutNextLine`：支持更细粒度的逐行排版，适合分页、多栏、绕排
-
-详细原理和在本项目中的接入方式见 [docs/PRETEXT.md](./docs/PRETEXT.md)
-
-## 目录结构
-
+```bash
+cd native
 ```
+
+运行关键测试：
+
+```bash
+cargo test -p document-core
+cargo test -p native-storage
+```
+
+启动当前原生窗口壳：
+
+```bash
+cargo run -p app-shell
+```
+
+你现在会看到一个原生窗口，标题和状态行会展示 Native V2 当前接入的文档运行时状态。
+
+## 仓库结构
+
+```text
 openwps/
-├── src/              # 前端源码
-├── server/           # Python 后端
-│   ├── main.py       # FastAPI 入口壳
-│   ├── app/          # LangGraph/路由/配置/存储
-│   ├── requirements.txt
-│   ├── config/       # AI 配置（不提交）
-│   └── data/         # 会话数据（不提交）
-├── docs/             # 项目设计说明
-└── dist/             # 构建产物
+├── src/                     # Web 前端
+├── server/                  # Python 后端
+├── docs/                    # 设计与规格文档
+├── native/                  # Rust 原生 workspace
+│   ├── crates/
+│   │   ├── document-core/
+│   │   ├── native-storage/
+│   │   ├── app-shell/
+│   │   ├── editor-runtime/
+│   │   ├── layout-engine/
+│   │   ├── renderer-skia/
+│   │   ├── docx-interop/
+│   │   └── ai-bridge/
+│   └── specs/
+└── public/
 ```
+
+## 常用命令
+
+Web：
+
+```bash
+npm run dev
+npm run build
+```
+
+Native：
+
+```bash
+cd native
+cargo test -p document-core
+cargo test -p native-storage
+cargo run -p app-shell
+```
+
+## 相关文档
+
+- [DEPLOY.md](./DEPLOY.md)
+- [docs/PRETEXT.md](./docs/PRETEXT.md)
+- [docs/NATIVE_SOFTWARE_PLAN.md](./docs/NATIVE_SOFTWARE_PLAN.md)
+- [native/specs/01-document-model.md](./native/specs/01-document-model.md)
+- [native/specs/02-command-protocol.md](./native/specs/02-command-protocol.md)
 
 ## GitHub
 

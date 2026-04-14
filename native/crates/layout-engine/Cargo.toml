@@ -1,0 +1,9 @@
+[package]
+name = "layout-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+document-core = { path = "../document-core" }
+uuid = { workspace = true }
+serde = { workspace = true }

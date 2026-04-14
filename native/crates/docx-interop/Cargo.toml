@@ -1,0 +1,8 @@
+[package]
+name = "docx-interop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+document-core = { path = "../document-core" }
+serde = { workspace = true }

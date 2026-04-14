@@ -1,0 +1,10 @@
+[package]
+name = "app-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+editor-runtime = { path = "../editor-runtime" }
+ai-bridge = { path = "../ai-bridge" }
+native-storage = { path = "../native-storage" }
+winit = { workspace = true }

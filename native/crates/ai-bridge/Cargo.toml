@@ -1,0 +1,9 @@
+[package]
+name = "ai-bridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+document-core = { path = "../document-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
