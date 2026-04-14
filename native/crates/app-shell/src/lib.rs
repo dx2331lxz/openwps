@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn creates_native_app_model() {
         let runtime = EditorRuntime::new();
-        assert!(runtime.window_title().contains("openwps Native V2"));
+        assert!(runtime.window_title().contains("openwps 原生版 V2"));
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
 
         let runtime = load_runtime(&package_path);
         assert!(package_path.exists());
-        assert!(runtime.window_title().contains("Native Workspace"));
+        assert!(runtime.window_title().contains("原生工作区"));
 
         if let Some(parent) = package_path.parent() {
             let _ = fs::remove_dir_all(parent);

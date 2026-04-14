@@ -1,4 +1,4 @@
-use document_core::{Document, DocumentEditor, Paragraph, Selector};
+use document_core::{Block, CodeBlock, Document, DocumentEditor, HorizontalRule, Paragraph, Selector, Table};
 use layout_engine::layout_document;
 use renderer_skia::render_layout;
 
@@ -19,10 +19,17 @@ impl EditorRuntime {
 
     pub fn default_document() -> Document {
         let mut document = Document::new();
-        document.metadata.title = Some("Native Workspace".to_string());
-        if let Some(document_core::Block::Paragraph(paragraph)) = document.sections[0].blocks.first_mut() {
-            *paragraph = Paragraph::with_text("openwps Native V2 已启动。下一步接入 layout-engine 与 renderer-skia。")
-        }
+        document.metadata.title = Some("原生工作区".to_string());
+        document.sections[0].blocks = vec![
+            Block::Paragraph(Paragraph::with_text("openwps 原生版已接入文档模型、命令系统、撤销重做、原生存储与窗口渲染。")),
+            Block::HorizontalRule(HorizontalRule::new()),
+            Block::Paragraph(Paragraph::with_text("当前界面已经不再是空白壳，页面区会显示原生布局预览，左侧会展示已完成能力状态。")),
+            Block::Table(Table::new(3, 3, 120.0)),
+            Block::CodeBlock(CodeBlock::new(
+                "document-core -> native-storage -> app-shell\nlayout-engine -> renderer-skia",
+                "text",
+            )),
+        ];
         document
     }
 
@@ -42,8 +49,8 @@ impl EditorRuntime {
             .metadata
             .title
             .as_deref()
-            .unwrap_or("Untitled");
-        format!("openwps Native V2 - {title}")
+            .unwrap_or("未命名文档");
+        format!("openwps 原生版 V2 - {title}")
     }
 
     pub fn status_line(&self) -> String {
@@ -58,7 +65,7 @@ impl EditorRuntime {
             .unwrap_or_else(|| "文档为空".to_string());
 
         format!(
-            "sections={} blocks={} revision={} first=\"{}\"",
+            "章节={} 块={} 修订={} 首段=\"{}\"",
             self.editor.document.sections.len(),
             self.editor.document.block_ids().len(),
             self.editor.document.revision_counter,
@@ -91,8 +98,8 @@ mod tests {
     #[test]
     fn creates_default_runtime() {
         let runtime = EditorRuntime::new();
-        assert!(runtime.window_title().starts_with("openwps Native V2"));
-        assert!(runtime.status_line().contains("sections=1"));
+        assert!(runtime.window_title().starts_with("openwps 原生版 V2"));
+        assert!(runtime.status_line().contains("章节=1"));
     }
 
     #[test]
