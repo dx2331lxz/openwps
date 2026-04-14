@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use document_core::{Block, Document};
 use editor_runtime::EditorRuntime;
 use native_storage::{clear_autosave, load_package, recover_from_autosave, save_package, StorageError, PACKAGE_EXTENSION};
 use softbuffer::{Context, Surface};
@@ -158,11 +159,22 @@ fn default_package_path() -> PathBuf {
 
 fn load_runtime(package_path: &PathBuf) -> EditorRuntime {
     if let Ok(Some(bundle)) = recover_from_autosave(package_path) {
-        return EditorRuntime::from_document(bundle.snapshot.document);
+        let (document, migrated) = migrate_bootstrap_document(bundle.snapshot.document);
+        if migrated {
+            let _ = save_package(package_path, &document);
+            let _ = clear_autosave(package_path);
+        }
+        return EditorRuntime::from_document(document);
     }
 
     match load_package(package_path) {
-        Ok(package) => EditorRuntime::from_document(package.document),
+        Ok(package) => {
+            let (document, migrated) = migrate_bootstrap_document(package.document);
+            if migrated {
+                let _ = save_package(package_path, &document);
+            }
+            EditorRuntime::from_document(document)
+        }
         Err(StorageError::InvalidPackage(_)) | Err(StorageError::Io(_)) => {
             let document = EditorRuntime::default_document();
             if let Err(error) = save_package(package_path, &document) {
@@ -175,6 +187,33 @@ fn load_runtime(package_path: &PathBuf) -> EditorRuntime {
             EditorRuntime::new()
         }
     }
+}
+
+fn migrate_bootstrap_document(document: Document) -> (Document, bool) {
+    if is_legacy_bootstrap_document(&document) {
+        let mut migrated = EditorRuntime::default_document();
+        migrated.revision_counter = document.revision_counter;
+        return (migrated, true);
+    }
+
+    (document, false)
+}
+
+fn is_legacy_bootstrap_document(document: &Document) -> bool {
+    let title_matches = matches!(document.metadata.title.as_deref(), Some("Native Workspace"));
+    let first_paragraph = document
+        .sections
+        .first()
+        .and_then(|section| section.blocks.first())
+        .and_then(|block| match block {
+            Block::Paragraph(paragraph) => Some(paragraph.plain_text()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    title_matches
+        || first_paragraph.contains("openwps Native V2 已启动")
+        || first_paragraph.contains("layout-engine 与 renderer-skia")
 }
 
 pub fn run() -> Result<(), winit::error::EventLoopError> {
@@ -216,5 +255,21 @@ mod tests {
         if let Some(parent) = package_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn migrates_legacy_bootstrap_document() {
+        let mut legacy = Document::new();
+        legacy.metadata.title = Some("Native Workspace".to_string());
+        if let Some(Block::Paragraph(paragraph)) = legacy.sections[0].blocks.first_mut() {
+            *paragraph = document_core::Paragraph::with_text(
+                "openwps Native V2 已启动。下一步接入 layout-engine 与 renderer-skia。",
+            );
+        }
+
+        let (migrated, changed) = migrate_bootstrap_document(legacy);
+        assert!(changed);
+        assert_eq!(migrated.metadata.title.as_deref(), Some("原生工作区"));
+        assert_eq!(migrated.sections[0].blocks.len(), 5);
     }
 }
