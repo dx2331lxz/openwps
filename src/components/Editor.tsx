@@ -7,6 +7,7 @@ import { baseKeymap } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
 import { goToNextCell, isInTable, tableEditing } from 'prosemirror-tables'
 import { schema } from '../editor/schema'
+import { createImageNodeViewFactory } from '../editor/imageNodeView'
 import {
   paginate,
   DEFAULT_PAGE_CONFIG,
@@ -185,7 +186,6 @@ const PM_STYLES = `
   color: transparent !important;
   -webkit-text-fill-color: transparent !important;
 }
-.pretext-driving-editor .ProseMirror img,
 .pretext-driving-editor .ProseMirror table {
   opacity: 0;
 }
@@ -387,6 +387,41 @@ function initState(): EditorState {
         'Mod-b': (s, d) => toggleMarkAttr(s, d, 'bold'),
         'Mod-i': (s, d) => toggleMarkAttr(s, d, 'italic'),
         'Mod-u': (s, d) => toggleMarkAttr(s, d, 'underline'),
+        // ── Protect the empty paragraph that sits directly after a table ──────
+        // Pressing Backspace at the start of such a paragraph (or Delete when the
+        // paragraph is empty) must NOT merge it into the table above.
+        'Backspace': (state) => {
+          const { $from, empty } = state.selection
+          if (!empty) return false
+          // Cursor must be at the very start of its paragraph (offset 0)
+          if ($from.parentOffset !== 0) return false
+          // The parent must be a paragraph that is a direct child of the doc
+          if ($from.depth !== 1) return false
+          const paraNode = $from.parent
+          if (paraNode.type.name !== 'paragraph') return false
+          // The paragraph must be empty
+          if (paraNode.content.size !== 0) return false
+          // The preceding sibling must be a table
+          const paraIndex = $from.index(0)
+          if (paraIndex === 0) return false
+          const prevNode = state.doc.child(paraIndex - 1)
+          if (prevNode.type.name !== 'table') return false
+          // Block the deletion — swallow the Backspace
+          return true
+        },
+        'Delete': (state) => {
+          const { $from, empty } = state.selection
+          if (!empty) return false
+          if ($from.depth !== 1) return false
+          const paraNode = $from.parent
+          if (paraNode.type.name !== 'paragraph') return false
+          if (paraNode.content.size !== 0) return false
+          const paraIndex = $from.index(0)
+          if (paraIndex === 0) return false
+          const prevNode = state.doc.child(paraIndex - 1)
+          if (prevNode.type.name !== 'table') return false
+          return true
+        },
         'Tab': (state, dispatch) => {
           if (isInTable(state)) return false
           if (!dispatch) return false
@@ -429,6 +464,7 @@ function initState(): EditorState {
 export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [fileModalMode, setFileModalMode] = useState<'open' | 'save' | null>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -451,6 +487,32 @@ export const Editor: React.FC = () => {
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
   useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
+
+  // ── Fullscreen ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const handler = () => setIsFullscreen(Boolean(document.fullscreenElement))
+    document.addEventListener('fullscreenchange', handler)
+    return () => document.removeEventListener('fullscreenchange', handler)
+  }, [])
+
+  const handleToggleFullscreen = useCallback(async () => {
+    if (!document.fullscreenElement) {
+      await document.documentElement.requestFullscreen()
+    } else {
+      await document.exitFullscreen()
+    }
+  }, [])
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'F11') {
+        e.preventDefault()
+        void handleToggleFullscreen()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [handleToggleFullscreen])
 
   const clearImportedDocxCompatibility = useCallback(() => {
     if (docxLetterSpacingRef.current === 0 && Object.keys(docxExportOptionsRef.current).length === 0) return
@@ -555,6 +617,9 @@ export const Editor: React.FC = () => {
     const state = initState()
     const editorView = new EditorView(mountRef.current, {
       state,
+      nodeViews: {
+        image: createImageNodeViewFactory(repaginate),
+      },
       handleDOMEvents: {
         focus: () => {
           setEditorFocused(true)
@@ -731,6 +796,23 @@ export const Editor: React.FC = () => {
     }
   }, [])
 
+  const handleInsertImage = useCallback((file: File) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const src = e.target?.result
+      if (typeof src !== 'string') return
+      const { state, dispatch } = editorView
+      const imageNode = schema.nodes.image.create({ src, alt: file.name, width: null, height: null })
+      const paragraphNode = schema.nodes.paragraph.create(undefined, imageNode)
+      const insertPos = state.selection.to
+      dispatch(state.tr.insert(insertPos, paragraphNode))
+      editorView.focus()
+    }
+    reader.readAsDataURL(file)
+  }, [])
+
   const handleRequestCaretPos = useCallback((pos: number) => {
     const editorView = viewRef.current
     if (!editorView) return
@@ -772,6 +854,9 @@ export const Editor: React.FC = () => {
           onSaveServerFile={openSaveFileModal}
           onImportDocx={handleImportFile}
           onExportDocx={handleExportDocx}
+          onInsertImage={handleInsertImage}
+          onToggleFullscreen={() => { void handleToggleFullscreen() }}
+          isFullscreen={isFullscreen}
         />
       </div>
 

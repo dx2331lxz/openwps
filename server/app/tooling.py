@@ -519,6 +519,36 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_image",
+            "description": (
+                "将一张图片（通过 src URL 或 data URL）插入到正文中。"
+                "当需要把 Mermaid 流程图、图表等渲染结果以图片形式放入文档时，必须使用此工具。"
+                "openwps 文档支持图片节点，可以直接插入 SVG data URL 或普通图片 URL。"
+                "src 必须是有效的 URL 或 data:image/... 格式的 data URL。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {
+                        "type": "string",
+                        "description": "图片 URL 或 data URL（如 data:image/svg+xml;base64,...）",
+                    },
+                    "alt": {
+                        "type": "string",
+                        "description": "图片描述文字，可选",
+                    },
+                    "afterParagraph": {
+                        "type": "integer",
+                        "description": "在该段落后插入图片；不传或传 -1 则追加到文档末尾",
+                    },
+                },
+                "required": ["src"],
+            },
+        },
+    },
 ]
 
 LAYOUT_TOOL_NAMES = {
@@ -557,6 +587,7 @@ EDIT_TOOL_NAMES = {
     "replace_selection_text",
     "delete_selection_text",
     "delete_paragraph",
+    "insert_image",
 }
 
 AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr"}

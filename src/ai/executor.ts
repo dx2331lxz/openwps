@@ -1395,6 +1395,27 @@ export function executeTool(
         return { success: result.success, message: result.message }
       }
 
+      case 'insert_image': {
+        const src = String(params.src ?? '')
+        if (!src) return { success: false, message: 'insert_image 需要 src 参数' }
+        const alt = String(params.alt ?? '')
+        const afterParagraph = params.afterParagraph !== undefined ? Number(params.afterParagraph) : -2
+        const imageNode = schema.nodes.image.create({ src, alt, width: null, height: null })
+        const paragraphNode = schema.nodes.paragraph.create(undefined, imageNode)
+
+        if (afterParagraph === -2) {
+          // 未指定位置 → 插入到文档末尾
+          const insertPos = state.doc.content.size
+          dispatch(state.tr.insert(insertPos, paragraphNode))
+        } else {
+          const inserted = insertBlockAfterParagraph(state, afterParagraph, paragraphNode)
+          if (!inserted.success || !inserted.tr) return inserted
+          dispatch(inserted.tr)
+        }
+        view.focus()
+        return { success: true, message: `已插入图片${alt ? `（${alt}）` : ''}` }
+      }
+
       case 'insert_paragraph_after': {
         const afterParagraph = Number(params.afterParagraph)
         const text = normalizeToolText(String(params.text ?? ''))

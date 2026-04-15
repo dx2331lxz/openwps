@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent as ReactClipboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import type { Node as ProseMirrorNode } from 'prosemirror-model'
 import { marked } from 'marked'
+import mermaid from 'mermaid'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
 import {
@@ -15,6 +16,7 @@ import {
   type StreamingWriteSession,
 } from '../ai/executor'
 import { agentTools } from '../ai/tools'
+import { schema } from '../editor/schema'
 import type {
   AIProviderSettings,
   AISettingsData,
@@ -681,6 +683,99 @@ function toHtml(markdown: string) {
   const parsed = marked.parse(markdown)
   return typeof parsed === 'string' ? parsed : markdown
 }
+
+// ─── Mermaid 初始化 ────────────────────────────────────────────────────────────
+mermaid.initialize({ startOnLoad: false, theme: 'default' })
+
+// ─── Mermaid 代码块组件 ────────────────────────────────────────────────────────
+const MermaidBlock: React.FC<{
+  code: string
+  onInsertToEditor?: (svgDataUrl: string) => void
+}> = ({ code, onInsertToEditor }) => {
+  const [svgContent, setSvgContent] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [codeExpanded, setCodeExpanded] = useState(false)
+  const idRef = useRef(`mermaid-${Math.random().toString(36).slice(2)}`)
+
+  useEffect(() => {
+    setSvgContent(null)
+    setError(null)
+    mermaid.render(idRef.current, code)
+      .then(({ svg }) => setSvgContent(svg))
+      .catch(err => setError(String(err)))
+  }, [code])
+
+  const handleInsert = () => {
+    if (!svgContent || !onInsertToEditor) return
+    // SVG → base64 data URL（用 TextEncoder 替代已废弃的 unescape）
+    const bytes = new TextEncoder().encode(svgContent)
+    let binary = ''
+    bytes.forEach(b => { binary += String.fromCharCode(b) })
+    const b64 = btoa(binary)
+    onInsertToEditor(`data:image/svg+xml;base64,${b64}`)
+  }
+
+  return (
+    <div style={{ border: '1px solid #e5e7eb', borderRadius: 6, overflow: 'hidden', margin: '4px 0' }}>
+      {/* 代码折叠区 */}
+      <div
+        onClick={() => setCodeExpanded(v => !v)}
+        style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', background: '#f9fafb', fontSize: 12, color: '#6b7280', cursor: 'pointer', userSelect: 'none' }}
+      >
+        <span>{codeExpanded ? '▾' : '▸'}</span>
+        <span style={{ fontFamily: 'monospace' }}>mermaid</span>
+        <span style={{ marginLeft: 'auto', color: '#9ca3af' }}>代码</span>
+      </div>
+      {codeExpanded && (
+        <pre style={{ margin: 0, padding: '8px 10px', fontSize: 12, background: '#f3f4f6', overflowX: 'auto', lineHeight: 1.5 }}>
+          <code>{code}</code>
+        </pre>
+      )}
+      {/* 预览区 */}
+      <div style={{ padding: '8px 10px', background: 'white', textAlign: 'center' }}>
+        {error
+          ? <div style={{ color: '#dc2626', fontSize: 12 }}>渲染失败：{error}</div>
+          : svgContent
+            ? <div dangerouslySetInnerHTML={{ __html: svgContent }} style={{ display: 'inline-block', maxWidth: '100%' }} />
+            : <div style={{ color: '#9ca3af', fontSize: 12, padding: '8px 0' }}>渲染中…</div>
+        }
+      </div>
+      {/* 插入正文按钮 */}
+      {svgContent && onInsertToEditor && (
+        <div style={{ padding: '6px 10px', borderTop: '1px solid #e5e7eb', background: '#f9fafb' }}>
+          <button
+            onMouseDown={e => { e.preventDefault(); handleInsert() }}
+            style={{ fontSize: 12, padding: '3px 10px', borderRadius: 4, border: '1px solid #d1d5db', background: 'white', cursor: 'pointer', color: '#374151' }}
+          >
+            📄 插入正文（图片）
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── AI markdown 智能渲染（识别 mermaid 块） ─────────────────────────────────
+const MERMAID_BLOCK_RE = /^```mermaid\n([\s\S]*?)\n```/gm
+
+function splitMermaidParts(markdown: string): Array<{ type: 'text'; content: string } | { type: 'mermaid'; code: string }> {
+  const parts: Array<{ type: 'text'; content: string } | { type: 'mermaid'; code: string }> = []
+  let lastIndex = 0
+  MERMAID_BLOCK_RE.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = MERMAID_BLOCK_RE.exec(markdown)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', content: markdown.slice(lastIndex, match.index) })
+    }
+    parts.push({ type: 'mermaid', code: match[1] })
+    lastIndex = match.index + match[0].length
+  }
+  if (lastIndex < markdown.length) {
+    parts.push({ type: 'text', content: markdown.slice(lastIndex) })
+  }
+  return parts
+}
+
 
 function normalizeToolParams(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -1374,6 +1469,21 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     if (!textareaRef.current) return
     textareaRef.current.style.height = `${TEXTAREA_MIN_HEIGHT}px`
   }, [])
+
+  const insertMermaidToEditor = useCallback((svgDataUrl: string) => {
+    if (!editorView) return
+    const { state, dispatch } = editorView
+    const imageNode = schema.nodes.image.create({ src: svgDataUrl, alt: 'Mermaid 图表', width: null, height: null })
+    const paragraphNode = schema.nodes.paragraph.create(undefined, imageNode)
+    // 插入到文档最后一个顶级节点之后（doc.content.size 是文档末尾的关闭 token，
+    // 正确插入位置是 doc.content.size，对于 top-level insert 是正确的）
+    // ProseMirror: doc 节点 size = sum(child.nodeSize) + 2（开/关 token）
+    // 正确方式：在最后一个 block 节点末尾后插入
+    const lastChildEnd = state.doc.content.size
+    const tr = state.tr.insert(lastChildEnd, paragraphNode)
+    dispatch(tr)
+    editorView.focus()
+  }, [editorView])
 
   const getContext = useCallback(() => {
     if (!editorView) return {}
@@ -2697,8 +2807,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                                 <div
                                   key={segment.id}
                                   className="ai-markdown relative w-full text-sm text-gray-800 leading-6 before:absolute before:-left-4 before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-slate-300"
-                                  dangerouslySetInnerHTML={{ __html: toHtml(segment.text) }}
-                                />
+                                >
+                                  {splitMermaidParts(segment.text).map((part, partIdx) =>
+                                    part.type === 'mermaid'
+                                      ? <MermaidBlock key={partIdx} code={part.code} onInsertToEditor={insertMermaidToEditor} />
+                                      : part.content
+                                        ? <div key={partIdx} dangerouslySetInnerHTML={{ __html: toHtml(part.content) }} />
+                                        : null
+                                  )}
+                                </div>
                               )
                             }
 

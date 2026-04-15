@@ -6,6 +6,8 @@ import {
   addRowBefore,
   deleteColumn,
   deleteRow,
+  mergeCells,
+  splitCell,
   isInTable,
 } from 'prosemirror-tables'
 import type { EditorView } from 'prosemirror-view'
@@ -25,6 +27,9 @@ interface ToolbarProps {
   onSaveServerFile?: () => void | Promise<void>
   onImportDocx?: (file: File) => void | Promise<void>
   onExportDocx?: () => void | Promise<void>
+  onInsertImage?: (file: File) => void | Promise<void>
+  onToggleFullscreen?: () => void
+  isFullscreen?: boolean
 }
 
 // ─── Format derivation ────────────────────────────────────────────────────────
@@ -261,7 +266,150 @@ function runTableCommand(
   view.focus()
 }
 
-// ─── Color swatch ─────────────────────────────────────────────────────────────
+function insertTable(view: EditorView, rows: number, cols: number) {
+  const { state, dispatch } = view
+  const s = state.schema
+
+  // Build table rows (all regular cells, no special header type needed)
+  const allRows = Array.from({ length: rows }, () => {
+    const cells = Array.from({ length: cols }, () =>
+      s.nodes.table_cell.create(
+        { colspan: 1, rowspan: 1 },
+        s.nodes.paragraph.create(),
+      ),
+    )
+    return s.nodes.table_row.create(undefined, cells)
+  })
+
+  const tableNode = s.nodes.table.create(undefined, allRows)
+
+  // Find a safe insertion point: end of the top-level block containing the cursor
+  // (depth 1 = direct child of doc)
+  const $from = state.selection.$from
+  let insertPos: number
+  if ($from.depth >= 1) {
+    const topPos = $from.before(1)
+    const topBlock = $from.node(1)
+    insertPos = topPos + topBlock.nodeSize
+  } else {
+    insertPos = state.doc.content.size
+  }
+
+  // Always insert an empty paragraph after the table so the cursor can be
+  // placed below it (table cannot be the last node without a following paragraph)
+  const emptyParagraph = s.nodes.paragraph.create()
+  const tr = state.tr.insert(insertPos, [tableNode, emptyParagraph])
+  // Place cursor in the first cell
+  const firstCellPos = insertPos + 2 // table(1) + row(1) + cell(1) + paragraph open = +2 to be inside first cell para
+  try {
+    tr.setSelection(TextSelection.create(tr.doc, firstCellPos))
+  } catch {
+    // ignore if position is invalid
+  }
+  dispatch(tr)
+  view.focus()
+}
+
+function deleteTableNode(view: EditorView) {
+  const { state, dispatch } = view
+  const $pos = state.selection.$anchor
+  for (let depth = $pos.depth; depth >= 0; depth--) {
+    const node = $pos.node(depth)
+    if (node.type.name === 'table') {
+      const from = $pos.before(depth)
+      const to = from + node.nodeSize
+      dispatch(state.tr.delete(from, to))
+      view.focus()
+      return
+    }
+  }
+}
+
+// ─── Table picker (row×col grid selector) ────────────────────────────────────
+
+const TablePicker: React.FC<{
+  onSelect: (rows: number, cols: number) => void
+  onClose: () => void
+  anchorRef: React.RefObject<HTMLElement | null>
+}> = ({ onSelect, onClose, anchorRef }) => {
+  const [hovered, setHovered] = React.useState({ rows: 0, cols: 0 })
+  const MAX_ROWS = 8
+  const MAX_COLS = 8
+  const pickerRef = React.useRef<HTMLDivElement>(null)
+
+  const rect = anchorRef.current?.getBoundingClientRect()
+
+  // Close on outside click — delay attaching the listener by one tick so the
+  // click that opened the picker doesn't immediately close it.
+  React.useEffect(() => {
+    let handler: ((e: MouseEvent) => void) | null = null
+    const timer = setTimeout(() => {
+      handler = (e: MouseEvent) => {
+        if (pickerRef.current && pickerRef.current.contains(e.target as Node)) return
+        onClose()
+      }
+      document.addEventListener('mousedown', handler)
+    }, 0)
+    return () => {
+      clearTimeout(timer)
+      if (handler) document.removeEventListener('mousedown', handler)
+    }
+  }, [onClose])
+
+  return (
+    <div
+      ref={pickerRef}
+      style={{
+        position: 'fixed',
+        top: rect ? rect.bottom + 4 : 60,
+        left: rect ? rect.left : 0,
+        zIndex: 9999,
+        background: 'white',
+        border: '1px solid #d1d5db',
+        borderRadius: 6,
+        boxShadow: '0 4px 16px rgba(0,0,0,0.15)',
+        padding: 8,
+        userSelect: 'none',
+      }}
+    >
+      <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6, textAlign: 'center' }}>
+        {hovered.rows > 0 && hovered.cols > 0
+          ? `${hovered.rows} 行 × ${hovered.cols} 列`
+          : '选择行列数'}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${MAX_COLS}, 20px)`, gap: 2 }}>
+        {Array.from({ length: MAX_ROWS }, (_, ri) =>
+          Array.from({ length: MAX_COLS }, (_, ci) => {
+            const r = ri + 1
+            const c = ci + 1
+            const active = r <= hovered.rows && c <= hovered.cols
+            return (
+              <div
+                key={`${r}-${c}`}
+                onMouseEnter={() => setHovered({ rows: r, cols: c })}
+                onMouseDown={e => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onSelect(r, c)
+                  onClose()
+                }}
+                style={{
+                  width: 18,
+                  height: 18,
+                  border: `1px solid ${active ? '#2563eb' : '#d1d5db'}`,
+                  borderRadius: 2,
+                  background: active ? '#dbeafe' : '#f9fafb',
+                  cursor: 'pointer',
+                  boxSizing: 'border-box',
+                }}
+              />
+            )
+          })
+        )}
+      </div>
+    </div>
+  )
+}
 
 const TEXT_COLORS = ['#000000', '#FF0000', '#E65C00', '#FFB300', '#1B8000', '#0066CC', '#7B00D4', '#FFFFFF']
 const HIGHLIGHT_COLORS = ['', '#FFFF00', '#99FF99', '#99CCFF', '#FF9999', '#FFB366', '#E0B3FF', '#CCCCCC']
@@ -379,9 +527,19 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onSaveServerFile,
   onImportDocx,
   onExportDocx,
+  onInsertImage,
+  onToggleFullscreen,
+  isFullscreen,
 }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
+  const [activeTab, setActiveTab] = React.useState<'home' | 'insert' | 'page'>('home')
+  const [tablePickerOpen, setTablePickerOpen] = React.useState(false)
+  const tablePickerBtnRef = React.useRef<HTMLButtonElement | null>(null)
+  // Snapshot of the EditorView state captured when the table-ops select is opened
+  // (mousedown). This lets us run commands against the correct selection even
+  // after the select element has stolen browser focus from the editor.
+  const savedTableViewRef = React.useRef<EditorView | null>(null)
 
   // Close spacing popover on outside click
   React.useEffect(() => {
@@ -390,9 +548,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [spacingPopover])
+
   // Save selection before a <select> opens (it shifts browser focus away from editor)
   const savedRangeRef = React.useRef<{ from: number; to: number } | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
+  const imageInputRef = React.useRef<HTMLInputElement>(null)
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
   const selectionInTable = Boolean(editorState && isInTable(editorState))
@@ -443,256 +603,350 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   return (
     <>
       <div
-        className="toolbar-row"
         style={{
           display: 'flex',
-          alignItems: 'center',
-          gap: 2,
-          padding: '4px 8px',
+          alignItems: 'stretch',
           background: 'white',
           borderBottom: '1px solid #e5e7eb',
-          flexWrap: 'nowrap',
-          overflowX: 'auto',
-          overflowY: 'hidden',
-          whiteSpace: 'nowrap',
-          minHeight: 36,
-          scrollbarWidth: 'none',
+          minHeight: 40,
         }}
       >
-        {/* Undo / Redo */}
-        <button className={btn(false)} title="撤销 (Ctrl+Z)" onMouseDown={e => { e.preventDefault(); if (view) undo(view.state, view.dispatch) }}>↩</button>
-        <button className={btn(false)} title="重做 (Ctrl+Y)" onMouseDown={e => { e.preventDefault(); if (view) redo(view.state, view.dispatch) }}>↪</button>
-
-        {sep}
-
-        {/* 导入/导出 */}
-        <button
-          className={btn(false)}
-          title="打开服务器文件"
-          onMouseDown={e => { e.preventDefault(); void onOpenServerFile?.() }}
-        >📁 打开</button>
-        <button
-          className={btn(false)}
-          title="保存到服务器文件"
-          onMouseDown={e => { e.preventDefault(); void onSaveServerFile?.() }}
-        >💾 保存</button>
-        <button
-          className={btn(false)}
-          title="导入 .docx / .md"
-          onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
-        >📥 导入</button>
-        <button
-          className={btn(false)}
-          title="导出 .docx"
-          onMouseDown={e => { e.preventDefault(); void onExportDocx?.() }}
-        >📤 导出</button>
-
-        {sep}
-
-        {/* Font size (select, placed first so test can find by index 0) */}
-        <select
-          title="字号"
-          value={String(fmt.text.fontSize)}
-          style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onMouseDown={saveSelection}
-          onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
-        >
-          {fontSizeOptions.map(v => (
-            <option key={v} value={String(v)}>{v}pt</option>
-          ))}
-        </select>
-
-        {/* Font family */}
-        <select
-          title="字体"
-          value={fmt.text.fontFamily}
-          style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onMouseDown={saveSelection}
-          onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
-        >
-          <option value={FONT_STACKS.song}>宋体</option>
-          <option value={FONT_STACKS.hei}>黑体</option>
-          <option value={FONT_STACKS.kai}>楷体</option>
-          <option value={FONT_STACKS.fang}>仿宋</option>
-          <option value={FONT_STACKS.arial}>Arial</option>
-          <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
-        </select>
-
-        {sep}
-
-        {/* B I U S X² X₂ */}
-        <button className={btn(fmt.text.bold)} title="加粗 (Ctrl+B)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }}><b>B</b></button>
-        <button className={btn(fmt.text.italic)} title="斜体 (Ctrl+I)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }}><i>I</i></button>
-        <button className={btn(fmt.text.underline)} title="下划线 (Ctrl+U)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }}><u>U</u></button>
-        <button className={btn(fmt.text.strikethrough)} title="删除线" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }}><s>S</s></button>
-        <button className={btn(fmt.text.superscript)} title="上标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }}>X²</button>
-        <button className={btn(fmt.text.subscript)} title="下标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }}>X₂</button>
-
-        {/* Text color */}
-        <div style={{ position: 'relative' }}>
-          <button
-            title="文字颜色"
-            onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'text' ? null : 'text') }}
-            style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-            className={btn(false)}
-          >
-            <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
-            <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
-          </button>
-          {colorPickerOpen === 'text' && (
-            <ColorSwatch
-              colors={TEXT_COLORS}
-              current={fmt.text.color}
-              onChange={c => { if (view) applyTextStyle(view, { color: c }) }}
-              onClose={() => setColorPickerOpen(null)}
-            />
-          )}
+        {/* ── Tab 标签（左固定） ── */}
+        <div style={{ display: 'flex', alignItems: 'stretch', flexShrink: 0, borderRight: '1px solid #e5e7eb' }}>
+          {(['home', 'insert', 'page'] as const).map(tab => {
+            const label = tab === 'home' ? '开始' : tab === 'insert' ? '插入' : '页面'
+            const active = activeTab === tab
+            return (
+              <button
+                key={tab}
+                onMouseDown={e => { e.preventDefault(); setActiveTab(tab) }}
+                style={{
+                  padding: '0 14px',
+                  fontSize: 13,
+                  fontWeight: active ? 600 : 400,
+                  cursor: 'pointer',
+                  border: 'none',
+                  borderBottom: active ? '2px solid #2563eb' : '2px solid transparent',
+                  background: active ? '#f0f7ff' : 'transparent',
+                  color: active ? '#2563eb' : '#374151',
+                  borderRadius: 0,
+                  transition: 'background 0.1s',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {label}
+              </button>
+            )
+          })}
         </div>
 
-        {/* Highlight / background color */}
-        <div style={{ position: 'relative' }}>
-          <button
-            title="文字背景色（高亮）"
-            onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'bg' ? null : 'bg') }}
-            style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-            className={btn(false)}
-          >
-            <span style={{ fontSize: 11 }}>🖍</span>
-            <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
-          </button>
-          {colorPickerOpen === 'bg' && (
-            <ColorSwatch
-              colors={HIGHLIGHT_COLORS}
-              current={fmt.text.backgroundColor}
-              onChange={c => { if (view) applyTextStyle(view, { backgroundColor: c }) }}
-              onClose={() => setColorPickerOpen(null)}
-            />
-          )}
-        </div>
-
-        {/* Clear format */}
-        <button className={btn(false)} title="清除格式" onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }}>✕</button>
-
-        {sep}
-
-        {/* Alignment */}
-        <button className={btn(fmt.para.align === 'left')} title="左对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }}>≡L</button>
-        <button className={btn(fmt.para.align === 'center')} title="居中" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }}>≡C</button>
-        <button className={btn(fmt.para.align === 'right')} title="右对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }}>≡R</button>
-        <button className={btn(fmt.para.align === 'justify')} title="两端对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }}>≡J</button>
-
-        {sep}
-
-        {/* Lists */}
-        <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
-        <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
-
-        {sep}
-
-        {/* First-line indent */}
-        <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
-        <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
-
-        {/* Overall indent */}
-        <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
-        <button className={btn(false)} title="减少缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }}>⇤</button>
-
-        {sep}
-
-        {/* Line height */}
-        <select
-          title="行距"
-          value={fmt.para.lineHeight}
-          style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-          onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
-        >
-          {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
-        </select>
-
-        {/* Space before */}
-        <button
-          title="段前间距"
-          className={btn(spacingPopover?.which === 'before')}
-          style={{ minWidth: 52, fontSize: 12 }}
-          onMouseDown={e => {
-            e.preventDefault()
-            e.stopPropagation()
-            if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
-            setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
-          }}
-        >
-          段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
-        </button>
-
-        {/* Space after */}
-        <button
-          title="段后间距"
-          className={btn(spacingPopover?.which === 'after')}
-          style={{ minWidth: 52, fontSize: 12 }}
-          onMouseDown={e => {
-            e.preventDefault()
-            e.stopPropagation()
-            if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
-            setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
-          }}
-        >
-          段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
-        </button>
-
-        {sep}
-
-        {/* Insert HR */}
-        <button className={btn(false)} title="插入水平分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view) }}>──</button>
-
-        {/* Insert page break */}
-        <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞</button>
-
-        {selectionInTable && (
-          <>
-            {sep}
-            <select
-              title="表格行列操作"
-              value=""
-              style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-              onChange={e => {
-                const action = e.target.value
-                e.target.value = ''
-                if (!view) return
-                switch (action) {
-                  case 'row-before': runTableCommand(view, addRowBefore); break
-                  case 'row-after': runTableCommand(view, addRowAfter); break
-                  case 'row-delete': runTableCommand(view, deleteRow); break
-                  case 'col-before': runTableCommand(view, addColumnBefore); break
-                  case 'col-after': runTableCommand(view, addColumnAfter); break
-                  case 'col-delete': runTableCommand(view, deleteColumn); break
-                }
-              }}
-            >
-              <option value="" disabled>表格▾</option>
-              <option value="row-before">↑ 在上方插入行</option>
-              <option value="row-after">↓ 在下方插入行</option>
-              <option value="row-delete">✕ 删除当前行</option>
-              <option value="col-before">← 在左侧插入列</option>
-              <option value="col-after">→ 在右侧插入列</option>
-              <option value="col-delete">✕ 删除当前列</option>
-            </select>
-          </>
-        )}
-
-        {/* AI Sidebar toggle */}
-        <button
-          title="openwps AI 助手"
-          onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
+        {/* ── 工具内容区（中，flex:1） ── */}
+        <div
+          className="toolbar-row"
           style={{
-            padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
-            background: sidebarOpen ? '#2563eb' : '#f3f4f6',
-            color: sidebarOpen ? 'white' : '#374151',
-            border: '1px solid #d1d5db',
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 2,
+            padding: '0 6px',
+            overflow: 'hidden',
+            scrollbarWidth: 'none',
           }}
         >
-          🤖 AI
-        </button>
+          {/* ══ 开始 Tab ══ */}
+          {activeTab === 'home' && (
+            <>
+              {/* 撤销 / 重做 */}
+              <button className={btn(false)} title="撤销 (Ctrl+Z)" onMouseDown={e => { e.preventDefault(); if (view) undo(view.state, view.dispatch) }}>↩</button>
+              <button className={btn(false)} title="重做 (Ctrl+Y)" onMouseDown={e => { e.preventDefault(); if (view) redo(view.state, view.dispatch) }}>↪</button>
 
+              {sep}
+
+              {/* 字号 */}
+              <select
+                title="字号"
+                value={String(fmt.text.fontSize)}
+                style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                onMouseDown={saveSelection}
+                onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
+              >
+                {fontSizeOptions.map(v => (
+                  <option key={v} value={String(v)}>{v}pt</option>
+                ))}
+              </select>
+
+              {/* 字体 */}
+              <select
+                title="字体"
+                value={fmt.text.fontFamily}
+                style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                onMouseDown={saveSelection}
+                onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
+              >
+                <option value={FONT_STACKS.song}>宋体</option>
+                <option value={FONT_STACKS.hei}>黑体</option>
+                <option value={FONT_STACKS.kai}>楷体</option>
+                <option value={FONT_STACKS.fang}>仿宋</option>
+                <option value={FONT_STACKS.arial}>Arial</option>
+                <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
+              </select>
+
+              {sep}
+
+              {/* B I U S X² X₂ */}
+              <button className={btn(fmt.text.bold)} title="加粗 (Ctrl+B)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }}><b>B</b></button>
+              <button className={btn(fmt.text.italic)} title="斜体 (Ctrl+I)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }}><i>I</i></button>
+              <button className={btn(fmt.text.underline)} title="下划线 (Ctrl+U)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }}><u>U</u></button>
+              <button className={btn(fmt.text.strikethrough)} title="删除线" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }}><s>S</s></button>
+              <button className={btn(fmt.text.superscript)} title="上标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }}>X²</button>
+              <button className={btn(fmt.text.subscript)} title="下标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }}>X₂</button>
+
+              {/* 文字颜色 */}
+              <div style={{ position: 'relative' }}>
+                <button
+                  title="文字颜色"
+                  onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'text' ? null : 'text') }}
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                  className={btn(false)}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
+                  <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
+                </button>
+                {colorPickerOpen === 'text' && (
+                  <ColorSwatch
+                    colors={TEXT_COLORS}
+                    current={fmt.text.color}
+                    onChange={c => { if (view) applyTextStyle(view, { color: c }) }}
+                    onClose={() => setColorPickerOpen(null)}
+                  />
+                )}
+              </div>
+
+              {/* 背景色 */}
+              <div style={{ position: 'relative' }}>
+                <button
+                  title="文字背景色（高亮）"
+                  onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'bg' ? null : 'bg') }}
+                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                  className={btn(false)}
+                >
+                  <span style={{ fontSize: 11 }}>🖍</span>
+                  <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
+                </button>
+                {colorPickerOpen === 'bg' && (
+                  <ColorSwatch
+                    colors={HIGHLIGHT_COLORS}
+                    current={fmt.text.backgroundColor}
+                    onChange={c => { if (view) applyTextStyle(view, { backgroundColor: c }) }}
+                    onClose={() => setColorPickerOpen(null)}
+                  />
+                )}
+              </div>
+
+              {/* 清除格式 */}
+              <button className={btn(false)} title="清除格式" onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }}>✕</button>
+
+              {sep}
+
+              {/* 对齐 */}
+              <button className={btn(fmt.para.align === 'left')} title="左对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }}>≡L</button>
+              <button className={btn(fmt.para.align === 'center')} title="居中" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }}>≡C</button>
+              <button className={btn(fmt.para.align === 'right')} title="右对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }}>≡R</button>
+              <button className={btn(fmt.para.align === 'justify')} title="两端对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }}>≡J</button>
+
+              {sep}
+
+              {/* 列表 */}
+              <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
+              <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
+
+              {sep}
+
+              {/* 首行缩进 */}
+              <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
+              <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
+              {/* 整体缩进 */}
+              <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
+              <button className={btn(false)} title="减少缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }}>⇤</button>
+
+              {sep}
+
+              {/* 行距 */}
+              <select
+                title="行距"
+                value={fmt.para.lineHeight}
+                style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
+              >
+                {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+
+              {/* 段前间距 */}
+              <button
+                title="段前间距"
+                className={btn(spacingPopover?.which === 'before')}
+                style={{ minWidth: 52, fontSize: 12 }}
+                onMouseDown={e => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
+                  setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
+                }}
+              >
+                段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
+              </button>
+
+              {/* 段后间距 */}
+              <button
+                title="段后间距"
+                className={btn(spacingPopover?.which === 'after')}
+                style={{ minWidth: 52, fontSize: 12 }}
+                onMouseDown={e => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
+                  setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
+                }}
+              >
+                段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
+              </button>
+
+            </>
+          )}
+
+          {/* ══ 插入 Tab ══ */}
+          {activeTab === 'insert' && (
+            <>
+              {/* 文件操作 */}
+              <button
+                className={btn(false)}
+                title="打开服务器文件"
+                onMouseDown={e => { e.preventDefault(); void onOpenServerFile?.() }}
+              >📁 打开</button>
+              <button
+                className={btn(false)}
+                title="保存到服务器文件"
+                onMouseDown={e => { e.preventDefault(); void onSaveServerFile?.() }}
+              >💾 保存</button>
+              <button
+                className={btn(false)}
+                title="导入 .docx / .md"
+                onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
+              >📥 导入</button>
+              <button
+                className={btn(false)}
+                title="导出 .docx"
+                onMouseDown={e => { e.preventDefault(); void onExportDocx?.() }}
+              >📤 导出</button>
+
+              {sep}
+
+              {/* 插入内容 */}
+              <button className={btn(false)} title="插入水平分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view) }}>── 分割线</button>
+              <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞ 分页符</button>
+              <button
+                className={btn(false)}
+                title="插入本地图片"
+                onMouseDown={e => { e.preventDefault(); imageInputRef.current?.click() }}
+              >🖼 图片</button>
+
+              {sep}
+
+              {/* 插入表格 */}
+              <button
+                ref={tablePickerBtnRef}
+                className={btn(tablePickerOpen)}
+                title="插入表格（选择行列数）"
+                onClick={() => setTablePickerOpen(v => !v)}
+              >⊞ 表格</button>
+              {tablePickerOpen && (
+                <TablePicker
+                  anchorRef={tablePickerBtnRef}
+                  onSelect={(rows, cols) => { if (view) insertTable(view, rows, cols) }}
+                  onClose={() => setTablePickerOpen(false)}
+                />
+              )}
+
+              {/* 表格操作（仅当光标在表格内时显示） */}
+              {selectionInTable && (
+                <>
+                  {sep}
+                  <select
+                    title="表格行列操作"
+                    value=""
+                    style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                    onMouseDown={() => {
+                      savedTableViewRef.current = view
+                    }}
+                    onChange={e => {
+                      const action = e.target.value
+                      e.target.value = ''
+                      const v = savedTableViewRef.current ?? view
+                      if (!v) return
+                      switch (action) {
+                        case 'row-before': runTableCommand(v, addRowBefore); break
+                        case 'row-after': runTableCommand(v, addRowAfter); break
+                        case 'row-delete': runTableCommand(v, deleteRow); break
+                        case 'col-before': runTableCommand(v, addColumnBefore); break
+                        case 'col-after': runTableCommand(v, addColumnAfter); break
+                        case 'col-delete': runTableCommand(v, deleteColumn); break
+                        case 'merge': runTableCommand(v, mergeCells); break
+                        case 'split': runTableCommand(v, splitCell); break
+                        case 'delete-table': deleteTableNode(v); break
+                      }
+                      savedTableViewRef.current = null
+                    }}
+                  >
+                    <option value="" disabled>表格操作▾</option>
+                    <option value="row-before">↑ 在上方插入行</option>
+                    <option value="row-after">↓ 在下方插入行</option>
+                    <option value="row-delete">✕ 删除当前行</option>
+                    <option value="col-before">← 在左侧插入列</option>
+                    <option value="col-after">→ 在右侧插入列</option>
+                    <option value="col-delete">✕ 删除当前列</option>
+                    <option value="merge">⊞ 合并单元格</option>
+                    <option value="split">⊟ 拆分单元格</option>
+                    <option value="delete-table">🗑 删除整个表格</option>
+                  </select>
+                </>
+              )}
+            </>
+          )}
+
+          {/* ══ 页面 Tab ══ */}
+          {activeTab === 'page' && (
+            <span style={{ fontSize: 13, color: '#9ca3af', padding: '0 8px' }}>页面设置功能即将推出</span>
+          )}
+        </div>
+
+        {/* ── 固定按钮区（右固定）── */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '0 8px', flexShrink: 0, borderLeft: '1px solid #e5e7eb' }}>
+          {/* AI 助手 */}
+          <button
+            title="openwps AI 助手"
+            onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
+            style={{
+              padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
+              background: sidebarOpen ? '#2563eb' : '#f3f4f6',
+              color: sidebarOpen ? 'white' : '#374151',
+              border: '1px solid #d1d5db',
+            }}
+          >
+            🤖 AI
+          </button>
+
+          {/* 全屏 */}
+          <button
+            title={isFullscreen ? '退出全屏 (F11)' : '全屏模式 (F11)'}
+            onMouseDown={e => { e.preventDefault(); onToggleFullscreen?.() }}
+            className={btn(false)}
+            style={{ fontSize: 15, lineHeight: 1 }}
+          >
+            {isFullscreen ? '⊡' : '⛶'}
+          </button>
+        </div>
+
+        {/* 隐藏文件 input */}
         <input
           type="file"
           accept=".docx,.md,.markdown,text/markdown"
@@ -700,6 +954,18 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           onChange={(event) => {
             const file = event.target.files?.[0]
             if (file) void onImportDocx?.(file)
+            event.target.value = ''
+          }}
+          style={{ display: 'none' }}
+        />
+        {/* 隐藏图片 input */}
+        <input
+          type="file"
+          accept="image/*"
+          ref={imageInputRef}
+          onChange={(event) => {
+            const file = event.target.files?.[0]
+            if (file) void onInsertImage?.(file)
             event.target.value = ''
           }}
           style={{ display: 'none' }}

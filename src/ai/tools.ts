@@ -313,6 +313,19 @@ export const layoutTools = [
 
 export const editTools = [
   {
+    name: 'insert_image',
+    description: '将一张图片（通过 src URL / data URL）插入到正文中。当需要把 Mermaid 流程图、图表等渲染结果以图片形式放入文档时使用此工具。src 必须是有效的 URL 或 data:image/... 格式。',
+    parameters: {
+      type: 'object',
+      properties: {
+        src: { type: 'string', description: '图片 URL 或 data URL（data:image/svg+xml;base64,...）' },
+        alt: { type: 'string', description: '图片描述文字，可选' },
+        afterParagraph: { type: 'integer', description: '在该段后插入图片；不传则追加到文档末尾' },
+      },
+      required: ['src'],
+    },
+  },
+  {
     name: 'begin_streaming_write',
     description: '开始一次流式正文写入。先声明写入位置，然后把真正要写入文档的 Markdown 正文作为后续 assistant 文本直接输出，前端会实时解析并写入文档。适合新增长段落、表格、分割线或整体改写整段。',
     parameters: {
