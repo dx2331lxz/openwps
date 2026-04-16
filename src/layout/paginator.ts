@@ -48,6 +48,7 @@ export interface RenderUnit {
   startPos: number | null
   endPos: number | null
   style: RenderTextStyle
+  hasComment: boolean
   width: number
   renderWidth: number
   glyphWidth: number
@@ -106,6 +107,7 @@ interface MeasureUnit {
   displayText: string
   measuredText: string
   style: RenderTextStyle
+  hasComment: boolean
   fontStr: string
   width: number
   compressedWidth: number
@@ -268,6 +270,7 @@ function getPunctuationAnchor(char: string): 'start' | 'end' {
 interface SourceChar {
   char: string
   style: RenderTextStyle
+  hasComment: boolean
   startPos: number | null
   endPos: number | null
 }
@@ -287,6 +290,7 @@ function extractParagraphSourceChars(paraNode: PMNode, paraPos: number): SourceC
       chars.push({
         char: text[index] ?? '',
         style,
+        hasComment: child.marks.some((mark) => mark.type.name === 'comment'),
         startPos: childStart + index,
         endPos: childStart + index + 1,
       })
@@ -366,6 +370,7 @@ function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
       displayText: sourceChar.char,
       measuredText,
       style: sourceChar.style,
+      hasComment: sourceChar.hasComment,
       fontStr: textStyleToFontStr(sourceChar.style),
       width: 0,
       compressedWidth: 0,
@@ -464,6 +469,7 @@ function fitUnitsToLines(
         startPos: unit.startPos,
         endPos: unit.endPos,
         style: unit.style,
+        hasComment: unit.hasComment,
         width: unit.width,
         renderWidth: unit.width,
         glyphWidth: unit.compressedWidth,
@@ -481,6 +487,7 @@ function fitUnitsToLines(
           startPos: unit.startPos,
           endPos: unit.endPos,
           style: unit.style,
+          hasComment: unit.hasComment,
           width: unit.width,
           renderWidth: unit.width,
           glyphWidth: unit.compressedWidth,
@@ -499,6 +506,7 @@ function fitUnitsToLines(
         startPos: unit.startPos,
         endPos: unit.endPos,
         style: unit.style,
+        hasComment: unit.hasComment,
         width: unit.width,
         renderWidth: Math.max(unit.compressedWidth, unit.width - applied),
         glyphWidth: unit.compressedWidth,
@@ -670,6 +678,7 @@ function measureParagraph(
             startPos: null,
             endPos: null,
             style: { ...DEFAULT_TEXT_STYLE, fontSize },
+            hasComment: false,
             width: fontSizePx,
             renderWidth: fontSizePx,
             glyphWidth: fontSizePx,

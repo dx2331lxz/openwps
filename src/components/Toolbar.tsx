@@ -30,6 +30,7 @@ interface ToolbarProps {
   onInsertImage?: (file: File) => void | Promise<void>
   onToggleFullscreen?: () => void
   isFullscreen?: boolean
+  onAddComment?: () => void
 }
 
 // ─── Format derivation ────────────────────────────────────────────────────────
@@ -530,6 +531,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onInsertImage,
   onToggleFullscreen,
   isFullscreen,
+  onAddComment,
 }) => {
   const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
   const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
@@ -866,6 +868,18 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   onClose={() => setTablePickerOpen(false)}
                 />
               )}
+
+              {sep}
+
+              {/* 插入批注 */}
+              <button
+                className={btn(false)}
+                title="添加批注（先选中文字）"
+                onMouseDown={e => { e.preventDefault(); onAddComment?.() }}
+                style={{ display: 'flex', alignItems: 'center', gap: 3 }}
+              >
+                <span style={{ fontSize: 14 }}>💬</span> 批注
+              </button>
 
               {/* 表格操作（仅当光标在表格内时显示） */}
               {selectionInTable && (

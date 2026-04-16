@@ -1532,6 +1532,48 @@ export function executeTool(
       case 'get_paragraph':
         return getParagraph(state, Number(params.index))
 
+      case 'get_comments': {
+        interface CommentEntry {
+          id: string
+          author: string
+          date: string
+          content: string
+          paragraphIndex: number
+          markedText: string
+        }
+        const comments: CommentEntry[] = []
+        const commentType = schema.marks.comment
+        if (!commentType) {
+          return { success: true, message: '当前文档不支持批注功能', data: { comments: [] } }
+        }
+
+        let paraIdx = 0
+        state.doc.forEach((node) => {
+          if (node.type.name === 'paragraph') {
+            node.forEach((inline) => {
+              const commentMark = commentType.isInSet(inline.marks)
+              if (commentMark && inline.isText) {
+                comments.push({
+                  id:             String(commentMark.attrs.id ?? ''),
+                  author:         String(commentMark.attrs.author ?? ''),
+                  date:           String(commentMark.attrs.date ?? ''),
+                  content:        String(commentMark.attrs.content ?? ''),
+                  paragraphIndex: paraIdx,
+                  markedText:     inline.text ?? '',
+                })
+              }
+            })
+            paraIdx++
+          }
+        })
+
+        return {
+          success: true,
+          message: comments.length > 0 ? `共找到 ${comments.length} 条批注` : '文档中没有批注',
+          data: { comments },
+        }
+      }
+
       case 'apply_style_batch': {
         const rules = Array.isArray(params.rules) ? params.rules : []
         if (rules.length === 0) return { success: false, message: 'apply_style_batch 需要至少一条规则' }

@@ -161,6 +161,17 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_comments",
+            "description": "获取文档中所有批注，返回批注内容、作者、日期以及被批注文字所在的段落索引和具体文字",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "analyze_image_with_ocr",
             "description": (
                 "对当前轮上传的图片执行 OCR 专项识别。适合表格、图表、手写、公式、扫描件文字提取等任务；"
@@ -560,6 +571,7 @@ LAYOUT_TOOL_NAMES = {
     "get_page_content",
     "get_page_style_summary",
     "get_paragraph",
+    "get_comments",
     "set_text_style",
     "set_paragraph_style",
     "clear_formatting",
@@ -580,6 +592,7 @@ EDIT_TOOL_NAMES = {
     "get_page_content",
     "get_page_style_summary",
     "get_paragraph",
+    "get_comments",
     "begin_streaming_write",
     "insert_text",
     "insert_paragraph_after",

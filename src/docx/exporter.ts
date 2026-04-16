@@ -254,6 +254,171 @@ function insertIntoSettingsXml(settingsXml: string, snippet: string, beforeTag =
   return settingsXml.replace('</w:settings>', `${snippet}</w:settings>`)
 }
 
+// ─── Comment helpers ──────────────────────────────────────────────────────────
+
+interface CollectedComment {
+  id: string
+  author: string
+  date: string
+  content: string
+}
+
+/** Walk the PMNode tree and collect unique comments (deduped by id). */
+function collectComments(pmDoc: PMNode): CollectedComment[] {
+  const seen = new Map<string, CollectedComment>()
+
+  pmDoc.descendants((node) => {
+    for (const mark of node.marks) {
+      if (mark.type.name === 'comment') {
+        const id = String(mark.attrs.id ?? '')
+        if (id && !seen.has(id)) {
+          seen.set(id, {
+            id,
+            author: String(mark.attrs.author ?? ''),
+            date: String(mark.attrs.date ?? ''),
+            content: String(mark.attrs.content ?? ''),
+          })
+        }
+      }
+    }
+    return true
+  })
+
+  return Array.from(seen.values())
+}
+
+/** Build word/comments.xml string. */
+function buildCommentsXml(comments: CollectedComment[]): string {
+  const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+  const commentEls = comments.map((c) => {
+    const text = c.content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    return `  <w:comment w:id="${c.id}" w:author="${c.author.replace(/"/g, '&quot;')}" w:date="${c.date}" w:initials=""><w:p><w:r><w:t>${text}</w:t></w:r></w:p></w:comment>`
+  })
+
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments xmlns:w="${W_NS}">\n${commentEls.join('\n')}\n</w:comments>`
+}
+
+/**
+ * Patch word/document.xml: for each run that has comment marks, wrap the run
+ * with commentRangeStart / commentRangeEnd and append a commentReference run.
+ *
+ * Strategy: use a simple regex/string approach to find runs in the serialised
+ * XML and inject the markers. We track which comment ids we've already emitted
+ * start/end markers for (a comment may span multiple runs in the same paragraph
+ * — we emit start before the first, end after the last).
+ *
+ * Because the docx package generates deterministic XML we can rely on the
+ * `<w:t>` content to match the text from the ProseMirror tree.
+ */
+function patchDocumentXmlWithComments(documentXml: string, pmDoc: PMNode): string {
+  // Build a list of (text, commentIds[]) for all comment-marked inline runs
+  interface MarkedRun {
+    text: string
+    commentIds: string[]
+  }
+  const markedRuns: MarkedRun[] = []
+
+  pmDoc.descendants((node) => {
+    if (node.type.name !== 'text' || !node.text) return true
+    const commentIds = node.marks
+      .filter(m => m.type.name === 'comment')
+      .map(m => String(m.attrs.id ?? ''))
+      .filter(Boolean)
+    if (commentIds.length > 0) {
+      markedRuns.push({ text: node.text, commentIds })
+    }
+    return true
+  })
+
+  if (markedRuns.length === 0) return documentXml
+
+  // For each marked run, inject markers around the <w:r>...</w:r> that contains matching <w:t>
+  // We process each run once; comment start/end are emitted around each run individually
+  // (simpler than tracking span boundaries — Word/WPS accept per-run comment markers)
+  let result = documentXml
+
+  for (const { text, commentIds } of markedRuns) {
+    // Escape text for regex matching in XML (the docx package may encode special chars)
+    const escapedText = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+
+    // Match the run containing exactly this text in a <w:t> element
+    // We use a non-greedy match to find the first <w:r>...</w:r> with this text
+    const runPattern = new RegExp(
+      `(<w:r(?:\\s[^>]*)?>(?:(?!<w:r(?:\\s|>)).)*?<w:t(?:[^>]*)?>)(${escapedText.replace(/[$()*+.[\]?\\^{}|]/g, '\\$&')})(</w:t>(?:(?!<w:r(?:\\s|>)).)*?</w:r>)`,
+      's'
+    )
+
+    const starts = commentIds.map(id => `<w:commentRangeStart w:id="${id}"/>`).join('')
+    const ends = commentIds.map(id => `<w:commentRangeEnd w:id="${id}"/>`).join('')
+    const refs = commentIds.map(id =>
+      `<w:r><w:commentReference w:id="${id}"/></w:r>`
+    ).join('')
+
+    result = result.replace(runPattern, (_, pre, t, post) => {
+      return `${starts}${pre}${t}${post}${ends}${refs}`
+    })
+  }
+
+  return result
+}
+
+/** Ensure word/_rels/document.xml.rels includes the comments relationship. */
+function patchRelsXmlForComments(relsXml: string): string {
+  const commentType = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'
+  if (relsXml.includes(commentType)) return relsXml
+
+  const newRel = `<Relationship Id="rIdComments" Type="${commentType}" Target="comments.xml"/>`
+  return relsXml.replace('</Relationships>', `${newRel}</Relationships>`)
+}
+
+/** Ensure [Content_Types].xml has the comments.xml override. */
+function patchContentTypesForComments(contentTypesXml: string): string {
+  if (contentTypesXml.includes('word/comments.xml')) return contentTypesXml
+
+  const override = '<Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>'
+  return contentTypesXml.replace('</Types>', `${override}</Types>`)
+}
+
+async function patchDocxComments(blob: Blob, pmDoc: PMNode): Promise<Blob> {
+  const comments = collectComments(pmDoc)
+  if (comments.length === 0) return blob
+
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer())
+
+  // 1. Generate and write word/comments.xml
+  zip.file('word/comments.xml', buildCommentsXml(comments))
+
+  // 2. Patch word/document.xml with comment range markers
+  const documentFile = zip.file('word/document.xml')
+  if (documentFile) {
+    const documentXml = await documentFile.async('string')
+    zip.file('word/document.xml', patchDocumentXmlWithComments(documentXml, pmDoc))
+  }
+
+  // 3. Patch relationships
+  const relsFile = zip.file('word/_rels/document.xml.rels')
+  if (relsFile) {
+    const relsXml = await relsFile.async('string')
+    zip.file('word/_rels/document.xml.rels', patchRelsXmlForComments(relsXml))
+  }
+
+  // 4. Patch Content_Types
+  const ctFile = zip.file('[Content_Types].xml')
+  if (ctFile) {
+    const ctXml = await ctFile.async('string')
+    zip.file('[Content_Types].xml', patchContentTypesForComments(ctXml))
+  }
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    compression: 'DEFLATE',
+  })
+}
+
 async function patchDocxSettings(
   blob: Blob,
   exportOptions: DocxExportOptions
@@ -359,7 +524,8 @@ export async function buildDocxBlob(
   })
 
   const blob = await Packer.toBlob(doc)
-  return patchDocxSettings(blob, exportOptions)
+  const settingsPatched = await patchDocxSettings(blob, exportOptions)
+  return patchDocxComments(settingsPatched, pmDoc)
 }
 
 export async function exportDocx(

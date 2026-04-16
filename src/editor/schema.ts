@@ -204,6 +204,34 @@ export const schema = new Schema({
         }, 0]
       },
     },
+    comment: {
+      attrs: {
+        id: { default: '' },
+        author: { default: '' },
+        date: { default: '' },
+        content: { default: '' },
+      },
+      inclusive: false,
+      spanning: true,
+      parseDOM: [{
+        tag: 'span[data-comment-id]',
+        getAttrs: (dom) => ({
+          id: (dom as HTMLElement).getAttribute('data-comment-id') ?? '',
+          author: (dom as HTMLElement).getAttribute('data-comment-author') ?? '',
+          date: (dom as HTMLElement).getAttribute('data-comment-date') ?? '',
+          content: (dom as HTMLElement).getAttribute('data-comment-content') ?? '',
+        }),
+      }],
+      toDOM(mark) {
+        return ['span', {
+          'data-comment-id': mark.attrs.id,
+          'data-comment-author': mark.attrs.author,
+          'data-comment-date': mark.attrs.date,
+          'data-comment-content': mark.attrs.content,
+          class: 'pm-comment',
+        }, 0]
+      },
+    },
   },
 })
 

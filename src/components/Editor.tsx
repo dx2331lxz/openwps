@@ -23,6 +23,9 @@ import { buildDocxBlob, exportDocx, type DocxExportOptions } from '../docx/expor
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 import { markdownToDocument } from '../markdown/importer'
 import { PretextPageRenderer } from './PretextPageRenderer'
+import type { CommentData } from './CommentPopover'
+import { CommentSidebar, type SidebarCommentData } from './CommentSidebar'
+import { AddCommentDialog } from './AddCommentDialog'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -33,6 +36,80 @@ interface ServerDocumentSummary {
   name: string
   size: number
   updatedAt: string
+}
+
+interface PendingCommentTarget {
+  from: number
+  to: number
+  anchorRect: DOMRect
+}
+
+function collectVisibleComments(
+  canvasElement: HTMLDivElement | null,
+  editorElement: HTMLDivElement | null,
+): SidebarCommentData[] {
+  if (!canvasElement || !editorElement) return []
+
+  const canvasRect = canvasElement.getBoundingClientRect()
+  const commentNodes = Array.from(editorElement.querySelectorAll<HTMLElement>('.pm-comment[data-comment-id]'))
+  if (commentNodes.length === 0) return []
+
+  const commentMap = new Map<string, {
+    id: string
+    author: string
+    date: string
+    content: string
+    selectionText: string[]
+    rects: DOMRect[]
+  }>()
+
+  commentNodes.forEach((node) => {
+    const id = node.getAttribute('data-comment-id') ?? ''
+    if (!id) return
+
+    const group = commentMap.get(id) ?? {
+      id,
+      author: node.getAttribute('data-comment-author') ?? '',
+      date: node.getAttribute('data-comment-date') ?? '',
+      content: node.getAttribute('data-comment-content') ?? '',
+      selectionText: [],
+      rects: [],
+    }
+
+    const text = node.textContent?.trim()
+    if (text) group.selectionText.push(text)
+
+    const rects = Array.from(node.getClientRects())
+    if (rects.length === 0) {
+      const rect = node.getBoundingClientRect()
+      if (rect.width > 0 || rect.height > 0) group.rects.push(rect)
+    } else {
+      rects.forEach((rect) => {
+        if (rect.width > 0 || rect.height > 0) group.rects.push(rect)
+      })
+    }
+
+    commentMap.set(id, group)
+  })
+
+  return Array.from(commentMap.values())
+    .filter((comment) => comment.rects.length > 0)
+    .map((comment) => {
+      const left = Math.min(...comment.rects.map((rect) => rect.left)) - canvasRect.left
+      const top = Math.min(...comment.rects.map((rect) => rect.top)) - canvasRect.top
+      const right = Math.max(...comment.rects.map((rect) => rect.right)) - canvasRect.left
+      const bottom = Math.max(...comment.rects.map((rect) => rect.bottom)) - canvasRect.top
+
+      return {
+        id: comment.id,
+        author: comment.author,
+        date: comment.date,
+        content: comment.content,
+        selectionText: Array.from(new Set(comment.selectionText)).join(''),
+        anchorRect: new DOMRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top)),
+      }
+    })
+    .sort((first, second) => first.anchorRect.top - second.anchorRect.top)
 }
 
 async function readJsonResponse<T>(response: Response): Promise<T> {
@@ -174,6 +251,10 @@ const PM_STYLES = `
   -webkit-text-fill-color: transparent;
   caret-color: transparent;
   text-rendering: geometricPrecision;
+  pointer-events: none;
+}
+.pretext-driving-editor {
+  pointer-events: none;
 }
 .pretext-driving-editor .ProseMirror * {
   color: transparent !important;
@@ -193,10 +274,13 @@ const PM_STYLES = `
   opacity: 1;
 }
 .pretext-driving-editor .ProseMirror table,
+.pretext-driving-editor .ProseMirror img,
+.pretext-driving-editor .ProseMirror [data-pm-image-wrapper],
 .pretext-driving-editor .ProseMirror table * {
   color: #111827 !important;
   -webkit-text-fill-color: #111827 !important;
   caret-color: #111827 !important;
+  pointer-events: auto;
 }
 .pretext-driving-editor .ProseMirror table p,
 .pretext-driving-editor .ProseMirror table span {
@@ -211,6 +295,19 @@ const PM_STYLES = `
 .pretext-driving-editor .ProseMirror hr {
   opacity: 1;
   border-top-color: #cbd5e1;
+}
+.pretext-driving-editor .ProseMirror .pm-comment,
+.pretext-driving-editor .ProseMirror .pm-comment:hover {
+  background-color: transparent !important;
+  border-bottom-color: transparent !important;
+}
+.ProseMirror .pm-comment {
+  background-color: rgba(253, 224, 71, 0.35);
+  border-bottom: 2px solid #f59e0b;
+  cursor: pointer;
+}
+.ProseMirror .pm-comment:hover {
+  background-color: rgba(253, 224, 71, 0.6);
 }
 @keyframes openwps-caret-blink {
   0%, 49% { opacity: 1; }
@@ -463,6 +560,7 @@ function initState(): EditorState {
 // ─── Editor component ─────────────────────────────────────────────────────────
 export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
+  const canvasRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -485,8 +583,23 @@ export const Editor: React.FC = () => {
   const [currentDocumentName, setCurrentDocumentName] = useState(DEFAULT_SERVER_DOCUMENT_NAME)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // ── Comment state ───────────────────────────────────────────────────────────
+  const [activeComment, setActiveComment] = useState<CommentData | null>(null)
+  const [addCommentAnchor, setAddCommentAnchor] = useState<DOMRect | null>(null)
+  const [pendingCommentTarget, setPendingCommentTarget] = useState<PendingCommentTarget | null>(null)
+  const [visibleComments, setVisibleComments] = useState<SidebarCommentData[]>([])
+
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
   useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
+
+  const closeAddCommentDialog = useCallback(() => {
+    setPendingCommentTarget(null)
+    setAddCommentAnchor(null)
+  }, [])
+
+  const refreshVisibleComments = useCallback(() => {
+    setVisibleComments(collectVisibleComments(canvasRef.current, mountRef.current))
+  }, [])
 
   // ── Fullscreen ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -629,6 +742,27 @@ export const Editor: React.FC = () => {
           setEditorFocused(false)
           return false
         },
+        click: (_view, event) => {
+          // Detect click on a comment-marked span in the ProseMirror DOM
+          let el = event.target as HTMLElement | null
+          while (el && el !== _view.dom) {
+            if (el.classList?.contains('pm-comment')) {
+              const id      = el.getAttribute('data-comment-id')      ?? ''
+              const author  = el.getAttribute('data-comment-author')   ?? ''
+              const date    = el.getAttribute('data-comment-date')     ?? ''
+              const content = el.getAttribute('data-comment-content')  ?? ''
+              setActiveComment({
+                id, author, date, content,
+                anchorRect: new DOMRect(event.clientX, event.clientY, 0, 0),
+              })
+              return false  // don't prevent default so caret still moves
+            }
+            el = el.parentElement
+          }
+          // Clicked outside any comment mark — close popover
+          setActiveComment(null)
+          return false
+        },
       },
       dispatchTransaction(tx) {
         const next = editorView.state.apply(tx)
@@ -659,6 +793,18 @@ export const Editor: React.FC = () => {
   useEffect(() => {
     if (viewRef.current) repaginate()
   }, [docxLetterSpacingPx, repaginate])
+
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      refreshVisibleComments()
+    })
+    return () => window.cancelAnimationFrame(frameId)
+  }, [editorState, layoutResult, pageConfig, refreshVisibleComments])
+
+  useEffect(() => {
+    window.addEventListener('resize', refreshVisibleComments)
+    return () => window.removeEventListener('resize', refreshVisibleComments)
+  }, [refreshVisibleComments])
 
   const handleImportDocx = useCallback(async (file: File) => {
     const editorView = viewRef.current
@@ -813,15 +959,124 @@ export const Editor: React.FC = () => {
     reader.readAsDataURL(file)
   }, [])
 
-  const handleRequestCaretPos = useCallback((pos: number) => {
+  // ── Comment handlers ────────────────────────────────────────────────────────
+
+  /** Called from Toolbar "批注" button: open the AddCommentDialog anchored to selection */
+  const handleStartAddComment = useCallback(() => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const { from, to, empty } = editorView.state.selection
+    if (empty) {
+      window.alert('请先选中要批注的文字')
+      return
+    }
+
+    // Try to get the real visible rect from the browser selection first
+    let rect: DOMRect | null = null
+    const nativeSel = window.getSelection()
+    if (nativeSel && nativeSel.rangeCount > 0) {
+      const range = nativeSel.getRangeAt(0)
+      const r = range.getBoundingClientRect()
+      if (r.width > 0 || r.height > 0) rect = r
+    }
+
+    // Fallback: use ProseMirror coordsAtPos
+    if (!rect) {
+      const fromCoords = editorView.coordsAtPos(from)
+      const toCoords   = editorView.coordsAtPos(to)
+      rect = new DOMRect(
+        fromCoords.left,
+        fromCoords.top,
+        toCoords.right - fromCoords.left,
+        toCoords.bottom - fromCoords.top,
+      )
+    }
+
+    setPendingCommentTarget({ from, to, anchorRect: rect })
+    setAddCommentAnchor(rect)
+  }, [])
+
+  /** Confirm adding a comment: apply the comment mark to the current selection */
+  const handleConfirmAddComment = useCallback((content: string) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    if (!pendingCommentTarget) {
+      closeAddCommentDialog()
+      window.alert('批注目标已失效，请重新选择文字')
+      return
+    }
+
+    const maxPos = editorView.state.doc.content.size
+    const { from, to } = pendingCommentTarget
+    if (from < 0 || to > maxPos || from >= to) {
+      closeAddCommentDialog()
+      window.alert('批注目标已失效，请重新选择文字')
+      return
+    }
+
+    const id = String(Date.now())
+    const author = '我'
+    const date = new Date().toISOString()
+    const mark = schema.marks.comment.create({ id, author, date, content })
+    const selection = TextSelection.create(editorView.state.doc, from, to)
+    const tr = editorView.state.tr.setSelection(selection).addMark(from, to, mark)
+    editorView.dispatch(tr)
+    setActiveComment({ id, author, date, content, anchorRect: pendingCommentTarget.anchorRect })
+    closeAddCommentDialog()
+    editorView.focus()
+  }, [closeAddCommentDialog, pendingCommentTarget])
+
+  /** Delete a comment: remove the comment mark with matching id from the whole doc */
+  const handleDeleteComment = useCallback((id: string) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const { state, dispatch } = editorView
+    const { doc, tr } = state
+    const commentMark = schema.marks.comment
+    doc.descendants((node, pos) => {
+      if (!node.isText) return true
+      const mark = node.marks.find(m => m.type === commentMark && m.attrs.id === id)
+      if (mark) {
+        tr.removeMark(pos, pos + node.nodeSize, mark)
+      }
+      return true
+    })
+    dispatch(tr)
+    setActiveComment(null)
+    editorView.focus()
+  }, [])
+
+  /** Resolve a comment: remove the mark (mark it as done) */
+  const handleResolveComment = useCallback((id: string) => {
+    handleDeleteComment(id)
+  }, [handleDeleteComment])
+
+  const handleRequestCaretPos = useCallback((pos: number, clientX?: number, clientY?: number) => {
     const editorView = viewRef.current
     if (!editorView) return
 
     const clampedPos = Math.max(0, Math.min(pos, editorView.state.doc.content.size))
+    editorView.focus()
+
+    // Check if there's a comment mark at this position — if so, show the popover
+    // (This path is hit when PretextPageRenderer handles the click, not ProseMirror DOM)
+    const $pos = editorView.state.doc.resolve(clampedPos)
+    const commentMark = $pos.marks().find(m => m.type === schema.marks.comment)
+    if (commentMark) {
+      setActiveComment({
+        id:      String(commentMark.attrs.id ?? ''),
+        author:  String(commentMark.attrs.author ?? ''),
+        date:    String(commentMark.attrs.date ?? ''),
+        content: String(commentMark.attrs.content ?? ''),
+        anchorRect: new DOMRect(clientX ?? 0, clientY ?? 0, 0, 0),
+      })
+    } else {
+      setActiveComment(null)
+    }
+
     const selection = TextSelection.create(editorView.state.doc, clampedPos)
     const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
     editorView.dispatch(tr)
-    editorView.focus()
   }, [])
 
   const handleRequestSelectionRange = useCallback((anchor: number, head: number) => {
@@ -831,10 +1086,10 @@ export const Editor: React.FC = () => {
     const maxPos = editorView.state.doc.content.size
     const clampedAnchor = Math.max(0, Math.min(anchor, maxPos))
     const clampedHead = Math.max(0, Math.min(head, maxPos))
+    editorView.focus()
     const selection = TextSelection.create(editorView.state.doc, clampedAnchor, clampedHead)
     const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
     editorView.dispatch(tr)
-    editorView.focus()
   }, [])
 
   // Canvas height = all A4 cards stacked with gaps
@@ -857,13 +1112,23 @@ export const Editor: React.FC = () => {
           onInsertImage={handleInsertImage}
           onToggleFullscreen={() => { void handleToggleFullscreen() }}
           isFullscreen={isFullscreen}
+          onAddComment={handleStartAddComment}
         />
       </div>
+
+      {/* Add comment dialog */}
+      {addCommentAnchor && (
+        <AddCommentDialog
+          anchorRect={addCommentAnchor}
+          onConfirm={handleConfirmAddComment}
+          onCancel={closeAddCommentDialog}
+        />
+      )}
 
       {/* Main content + optional AI sidebar */}
       <div className="flex flex-1 min-h-0">
         {/* Scrollable editor area */}
-        <div className="flex-1 overflow-auto" style={{ paddingTop: 32, paddingBottom: 32 }}>
+        <div className="flex-1 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
           {/*
           Canvas: explicit height so absolute page cards create scroll space.
           Width = page width, centered.
@@ -874,8 +1139,9 @@ export const Editor: React.FC = () => {
                Inside the editor, transparent widgets push content between cards.
         */}
           <div
+            ref={canvasRef}
             className="relative mx-auto"
-            style={{ width: cfg.pageWidth, height: canvasH }}
+            style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
           >
             {/* ── Layer 1: page cards ── */}
             {Array.from({ length: pageCount }).map((_, i) => (
@@ -937,6 +1203,21 @@ export const Editor: React.FC = () => {
                 ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
                 zIndex: 2,
               }}
+            />
+
+            <CommentSidebar
+              comments={visibleComments}
+              pageWidth={cfg.pageWidth}
+              canvasHeight={canvasH}
+              activeCommentId={activeComment?.id ?? null}
+              onActivate={(id) => {
+                const matchedComment = visibleComments.find((comment) => comment.id === id)
+                if (matchedComment) {
+                  setActiveComment(matchedComment)
+                }
+              }}
+              onDelete={handleDeleteComment}
+              onResolve={handleResolveComment}
             />
           </div>
           {/* end canvas */}

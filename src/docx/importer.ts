@@ -47,7 +47,17 @@ type PMLinkMarkJSON = {
   }
 }
 
-type PMMarkJSON = PMTextStyleMarkJSON | PMLinkMarkJSON
+type PMCommentMarkJSON = {
+  type: 'comment'
+  attrs: {
+    id: string
+    author: string
+    date: string
+    content: string
+  }
+}
+
+type PMMarkJSON = PMTextStyleMarkJSON | PMLinkMarkJSON | PMCommentMarkJSON
 
 export type PMNodeJSON = {
   type: string
@@ -607,6 +617,34 @@ function parseStyles(
   }
 }
 
+interface CommentInfo {
+  author: string
+  date: string
+  text: string
+}
+
+type CommentMap = Map<string, CommentInfo>
+
+function parseComments(commentsXml: string): CommentMap {
+  const map: CommentMap = new Map()
+  if (!commentsXml) return map
+
+  const dom = parseXml(commentsXml)
+  for (const commentEl of Array.from(dom.getElementsByTagNameNS(W_NS, 'comment'))) {
+    const id = getAttr(commentEl, 'id')
+    if (!id) continue
+    const author = getAttr(commentEl, 'author')
+    const date = getAttr(commentEl, 'date')
+    // collect all text content from the comment paragraph(s)
+    const text = Array.from(commentEl.getElementsByTagNameNS(W_NS, 't'))
+      .map(t => t.textContent ?? '')
+      .join('')
+    map.set(id, { author, date, text })
+  }
+
+  return map
+}
+
 function parseRels(relsXml: string): RelMap {
   if (!relsXml) return {}
   const dom = parseXml(relsXml)
@@ -730,7 +768,8 @@ async function parseRunNodes(
   themeFonts: ThemeFonts,
   rels: RelMap,
   zip: JSZip,
-  linkHref?: string
+  linkHref?: string,
+  activeCommentMarks: PMCommentMarkJSON[] = []
 ): Promise<PMNodeJSON[]> {
   const rPr = directChild(rEl, 'rPr')
   const styleId = getAttr(directChild(rPr, 'rStyle'), 'val')
@@ -739,7 +778,10 @@ async function parseRunNodes(
     { ...paragraphStyle, ...(styleId ? styleMap[styleId] : {}) },
     themeFonts
   )
-  const extraMarks = linkHref ? [{ type: 'link', attrs: { href: linkHref } } satisfies PMLinkMarkJSON] : []
+  const extraMarks: PMMarkJSON[] = [
+    ...(linkHref ? [{ type: 'link', attrs: { href: linkHref } } satisfies PMLinkMarkJSON] : []),
+    ...activeCommentMarks,
+  ]
 
   const nodes: PMNodeJSON[] = []
   let textBuffer = ''
@@ -810,7 +852,8 @@ async function parseParagraph(
   docGridLinePitchPt: number | null,
   numberingMap: NumberingMap,
   rels: RelMap,
-  zip: JSZip
+  zip: JSZip,
+  commentMap: CommentMap = new Map()
 ): Promise<PMNodeJSON> {
   const pPr = directChild(pEl, 'pPr')
   const styleId = getAttr(directChild(pPr, 'pStyle'), 'val')
@@ -821,11 +864,41 @@ async function parseParagraph(
 
   const content: PMNodeJSON[] = []
 
+  // Track which comment ids are currently "open" in this paragraph
+  const openCommentIds = new Set<string>()
+
   for (const child of elementChildren(pEl)) {
     const localName = getLocalName(child)
     if (localName === 'pPr') continue
+
+    if (localName === 'commentRangeStart') {
+      const id = getAttr(child, 'id')
+      if (id) openCommentIds.add(id)
+      continue
+    }
+    if (localName === 'commentRangeEnd') {
+      const id = getAttr(child, 'id')
+      if (id) openCommentIds.delete(id)
+      continue
+    }
+
+    // Build active comment marks for runs inside the open range
+    const activeCommentMarks: PMCommentMarkJSON[] = Array.from(openCommentIds)
+      .map((id) => {
+        const info = commentMap.get(id)
+        return {
+          type: 'comment' as const,
+          attrs: {
+            id,
+            author: info?.author ?? '',
+            date: info?.date ?? '',
+            content: info?.text ?? '',
+          },
+        }
+      })
+
     if (localName === 'r') {
-      content.push(...await parseRunNodes(child, styleMap, paragraphStyle, themeFonts, rels, zip))
+      content.push(...await parseRunNodes(child, styleMap, paragraphStyle, themeFonts, rels, zip, undefined, activeCommentMarks))
       continue
     }
     if (localName === 'hyperlink') {
@@ -834,7 +907,7 @@ async function parseParagraph(
       const relTarget = relId ? rels[relId]?.target : ''
       const linkHref = relTarget || (anchor ? `#${anchor}` : '')
       for (const run of directChildren(child, 'r')) {
-        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip, linkHref || undefined))
+        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip, linkHref || undefined, activeCommentMarks))
       }
     }
   }
@@ -867,7 +940,8 @@ async function parseTableCell(
   docGridLinePitchPt: number | null,
   numberingMap: NumberingMap,
   rels: RelMap,
-  zip: JSZip
+  zip: JSZip,
+  commentMap: CommentMap = new Map()
 ): Promise<{ node?: PMNodeJSON; colspan: number; continueMerge: boolean }> {
   const tcPr = directChild(tcEl, 'tcPr')
   const colspan = Math.max(1, parseNumber(getAttr(directChild(tcPr, 'gridSpan'), 'val'), 1))
@@ -888,7 +962,7 @@ async function parseTableCell(
   for (const child of elementChildren(tcEl)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip))
+      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap))
     }
   }
 
@@ -916,7 +990,8 @@ async function parseTable(
   docGridLinePitchPt: number | null,
   numberingMap: NumberingMap,
   rels: RelMap,
-  zip: JSZip
+  zip: JSZip,
+  commentMap: CommentMap = new Map()
 ): Promise<PMNodeJSON> {
   const rows: PMNodeJSON[] = []
   const mergeAnchors = new Map<number, PMNodeJSON>()
@@ -928,7 +1003,7 @@ async function parseTable(
     let columnIndex = 0
 
     for (const tcEl of directChildren(trEl, 'tc')) {
-      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip)
+      const parsedCell = await parseTableCell(tcEl, isHeader, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap)
       const colspan = parsedCell.colspan
 
       if (parsedCell.continueMerge) {
@@ -976,7 +1051,8 @@ async function parseDocument(
   docGridLinePitchPt: number | null,
   numberingMap: NumberingMap,
   rels: RelMap,
-  zip: JSZip
+  zip: JSZip,
+  commentMap: CommentMap = new Map()
 ): Promise<PMNodeJSON> {
   const dom = parseXml(documentXml)
   const body = dom.getElementsByTagNameNS(W_NS, 'body')[0]
@@ -985,7 +1061,7 @@ async function parseDocument(
   for (const child of elementChildren(body)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip)
+      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap)
       // 跳过开头的连续空段落
       const isEmpty = !para.content || para.content.length === 0 ||
         para.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
@@ -1012,7 +1088,7 @@ async function parseDocument(
       continue
     }
     if (localName === 'tbl') {
-      content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip))
+      content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap))
     }
   }
 
@@ -1032,10 +1108,12 @@ export async function importDocx(file: File): Promise<DocxImportResult> {
   const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string') ?? ''
   const numberingXml = await zip.file('word/numbering.xml')?.async('string') ?? ''
   const themeXml = await zip.file('word/theme/theme1.xml')?.async('string') ?? ''
+  const commentsXml = await zip.file('word/comments.xml')?.async('string') ?? ''
 
   const rels = parseRels(relsXml)
   const numberingMap = parseNumbering(numberingXml)
   const themeFonts = parseThemeFonts(themeXml)
+  const commentMap = parseComments(commentsXml)
   const docDefaults = parseStyleDefaults(stylesXml, themeFonts)
   const { styleMap, defaultParagraphStyle } = parseStyles(stylesXml, themeFonts, docDefaults, numberingMap)
   const { pageConfig, docGridLinePitchPt } = parseDocumentLayout(documentXml)
@@ -1048,7 +1126,8 @@ export async function importDocx(file: File): Promise<DocxImportResult> {
     docGridLinePitchPt,
     numberingMap,
     rels,
-    zip
+    zip,
+    commentMap
   )
 
   return { doc, pageConfig, docGridLinePitchPt, typography }

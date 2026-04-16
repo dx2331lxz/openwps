@@ -91,6 +91,14 @@ const commonTools = [
       required: ['index'],
     },
   },
+  {
+    name: 'get_comments',
+    description: '获取文档中所有批注，返回批注内容、作者、日期以及被批注文字所在的段落索引和具体文字',
+    parameters: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ]
 
 export const layoutTools = [

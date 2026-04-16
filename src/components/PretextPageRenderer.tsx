@@ -10,7 +10,7 @@ interface PretextPageRendererProps {
   selectionTo?: number | null
   showCaret?: boolean
   showSelection?: boolean
-  onRequestCaretPos?: (pos: number) => void
+  onRequestCaretPos?: (pos: number, clientX: number, clientY: number) => void
   onRequestSelectionRange?: (anchor: number, head: number) => void
 }
 
@@ -25,6 +25,16 @@ function getVerticalOffset(unit: RenderUnit) {
   if (unit.style.superscript) return '-0.35em'
   if (unit.style.subscript) return '0.2em'
   return '0'
+}
+
+function getUnitBackgroundColor(unit: RenderUnit) {
+  if (unit.hasComment) return 'rgba(253, 224, 71, 0.35)'
+  return unit.style.backgroundColor || undefined
+}
+
+function getUnitUnderline(unit: RenderUnit) {
+  if (!unit.hasComment) return undefined
+  return 'inset 0 -2px 0 #f59e0b'
 }
 
 interface LineLayoutMetrics {
@@ -319,7 +329,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
 
       const pos = getPointerCaretPos(event.clientX, event.clientY)
       if (typeof pos !== 'number') return
-      if (pos === anchor) onRequestCaretPos?.(pos)
+      if (pos === anchor) onRequestCaretPos?.(pos, event.clientX, event.clientY)
       else onRequestSelectionRange?.(anchor, pos)
     }
 
@@ -335,14 +345,6 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
     <div
       ref={containerRef}
       aria-hidden="true"
-      onMouseDown={(event) => {
-        if ((!onRequestCaretPos && !onRequestSelectionRange) || event.button !== 0) return
-        const pos = getPointerCaretPos(event.clientX, event.clientY)
-        if (typeof pos !== 'number') return
-        event.preventDefault()
-        dragStateRef.current = { active: true, anchor: pos }
-        onRequestCaretPos?.(pos)
-      }}
       style={{
         position: 'absolute',
         inset: 0,
@@ -370,70 +372,101 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
         return page.lines.map((line) => {
           const metrics = getLineLayoutMetrics(line, pageIndex, pageConfig, pageGap)
           const isHorizontalRule = line.blockType === 'horizontal_rule'
+          const isParagraphLine = line.blockType === 'paragraph'
+          const hitZoneLeft = pageConfig.marginLeft + line.xOffset
+          const hitZoneWidth = Math.max(1, line.availableWidth)
 
           return (
-            <div
-              key={`${pageIndex}-${line.blockIndex}-${line.lineIndex}-${line.startPos ?? 0}`}
-              style={{
-                position: 'absolute',
-                top: metrics.top,
-                left: metrics.left,
-                height: line.lineHeight,
-                display: 'flex',
-                alignItems: 'flex-end',
-                width: metrics.justifyEnabled ? line.availableWidth : Math.max(1, line.renderedWidth),
-                whiteSpace: 'pre',
-                overflow: 'visible',
-              }}
-            >
-              {isHorizontalRule ? (
+            <React.Fragment key={`${pageIndex}-${line.blockIndex}-${line.lineIndex}-${line.startPos ?? 0}`}>
+              {isParagraphLine && (
                 <div
+                  data-pretext-hit="text-line"
+                  onMouseDown={(event) => {
+                    if ((!onRequestCaretPos && !onRequestSelectionRange) || event.button !== 0) return
+                    const pos = getPointerCaretPos(event.clientX, event.clientY)
+                    if (typeof pos !== 'number') return
+                    event.preventDefault()
+                    dragStateRef.current = { active: true, anchor: pos }
+                    onRequestCaretPos?.(pos, event.clientX, event.clientY)
+                  }}
                   style={{
-                    alignSelf: 'center',
-                    width: Math.max(40, line.availableWidth),
-                    borderTop: '1px solid #cbd5e1',
-                    opacity: 0.95,
+                    position: 'absolute',
+                    top: metrics.top,
+                    left: hitZoneLeft,
+                    width: hitZoneWidth,
+                    height: line.lineHeight,
+                    pointerEvents: 'auto',
+                    background: 'transparent',
+                    cursor: 'text',
+                    zIndex: 0,
                   }}
                 />
-              ) : line.units.length > 0 ? (
-                line.units.map((unit, index) => {
-                  const isLastUnit = index === line.units.length - 1
-                  const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
-                  const fontSizePt = unit.style.superscript || unit.style.subscript
-                    ? unit.style.fontSize * 0.75
-                    : unit.style.fontSize
+              )}
 
-                  return (
-                    <span
-                      key={`${unit.startPos ?? index}-${unit.text}`}
-                      style={{
-                        display: 'inline-flex',
-                        alignItems: 'flex-end',
-                        justifyContent: unit.anchor === 'end' ? 'flex-end' : 'flex-start',
-                        width: Math.max(0, boxWidth),
-                        minWidth: 0,
-                        overflow: 'visible',
-                        whiteSpace: 'pre',
-                        fontFamily: unit.style.fontFamily,
-                        fontSize: `${fontSizePt}pt`,
-                        fontWeight: unit.style.bold ? 700 : 400,
+              <div
+                style={{
+                  position: 'absolute',
+                  top: metrics.top,
+                  left: metrics.left,
+                  height: line.lineHeight,
+                  display: 'flex',
+                  alignItems: 'flex-end',
+                  width: metrics.justifyEnabled ? line.availableWidth : Math.max(1, line.renderedWidth),
+                  whiteSpace: 'pre',
+                  overflow: 'visible',
+                  pointerEvents: 'none',
+                }}
+              >
+                {isHorizontalRule ? (
+                  <div
+                    style={{
+                      alignSelf: 'center',
+                      width: Math.max(40, line.availableWidth),
+                      borderTop: '1px solid #cbd5e1',
+                      opacity: 0.95,
+                    }}
+                  />
+                ) : line.units.length > 0 ? (
+                  line.units.map((unit, index) => {
+                    const isLastUnit = index === line.units.length - 1
+                    const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
+                    const fontSizePt = unit.style.superscript || unit.style.subscript
+                      ? unit.style.fontSize * 0.75
+                      : unit.style.fontSize
+
+                    return (
+                      <span
+                        key={`${unit.startPos ?? index}-${unit.text}`}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'flex-end',
+                          justifyContent: unit.anchor === 'end' ? 'flex-end' : 'flex-start',
+                          width: Math.max(0, boxWidth),
+                          minWidth: 0,
+                          overflow: 'visible',
+                          whiteSpace: 'pre',
+                          fontFamily: unit.style.fontFamily,
+                          fontSize: `${fontSizePt}pt`,
+                          fontWeight: unit.style.bold ? 700 : 400,
                         fontStyle: unit.style.italic ? 'italic' : 'normal',
                         letterSpacing: unit.style.letterSpacing ? `${unit.style.letterSpacing}pt` : undefined,
                         color: unit.style.color || '#000000',
-                        backgroundColor: unit.style.backgroundColor || undefined,
+                        backgroundColor: getUnitBackgroundColor(unit),
                         textDecoration: getTextDecoration(unit),
                         lineHeight: `${line.lineHeight}px`,
                         transform: `translateY(${getVerticalOffset(unit)})`,
+                        boxShadow: getUnitUnderline(unit),
                       }}
                     >
-                      {unit.text}
-                    </span>
-                  )
-                })
-              ) : (
-                <span style={{ width: 1, height: line.lineHeight }} />
-              )}
-            </div>
+                        {unit.text}
+                      </span>
+                    )
+                  })
+                ) : (
+                  <span style={{ width: 1, height: line.lineHeight }} />
+                )}
+              </div>
+            </React.Fragment>
           )
         })
       })}
