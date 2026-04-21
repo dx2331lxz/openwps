@@ -322,7 +322,7 @@ export const layoutTools = [
 export const editTools = [
   {
     name: 'insert_image',
-    description: '将一张图片（通过 src URL / data URL）插入到正文中。当需要把 Mermaid 流程图、图表等渲染结果以图片形式放入文档时使用此工具。src 必须是有效的 URL 或 data:image/... 格式。',
+    description: '将一张已有图片（通过 src URL / data URL）插入到正文中。注意：此工具只能插入已有 URL 的图片，不能用于生成图表。要插入流程图/时序图/思维导图等图表，请使用 insert_mermaid。',
     parameters: {
       type: 'object',
       properties: {
@@ -331,6 +331,19 @@ export const editTools = [
         afterParagraph: { type: 'integer', description: '在该段后插入图片；不传则追加到文档末尾' },
       },
       required: ['src'],
+    },
+  },
+  {
+    name: 'insert_mermaid',
+    description: '将 Mermaid 图表代码渲染为 SVG 图片并插入到正文中。当需要插入流程图、时序图、类图、甘特图、思维导图、关系图等图表时，使用此工具而非 insert_image。前端会自动将 Mermaid 代码渲染为 SVG 图片并插入文档。',
+    parameters: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'Mermaid 图表代码，如 "graph TD; A-->B" 或 "sequenceDiagram; participant A"' },
+        alt: { type: 'string', description: '图表描述文字，可选，如 "Transformer 架构思维导图"' },
+        afterParagraph: { type: 'integer', description: '在该段后插入图表；不传则追加到文档末尾' },
+      },
+      required: ['code'],
     },
   },
   {

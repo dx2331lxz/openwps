@@ -187,8 +187,7 @@ function blocksFromTokens(tokens: Token[], context: BlockContext): PMNode[] {
       case 'code': {
         const codeToken = token as Tokens.Code
         if (codeToken.lang === 'mermaid') {
-          // mermaid 代码块不能在正文中直接渲染，插入占位提示
-          return createParagraphsFromText('[Mermaid 图表 — 请在 AI 侧边栏点击"插入正文"按钮以图片形式插入]', context, {
+          return createParagraphsFromText('[Mermaid 图表]', context, {
             textStyle: { italic: true, color: '#9ca3af' },
           })
         }

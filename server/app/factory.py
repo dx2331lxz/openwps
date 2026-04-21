@@ -106,6 +106,7 @@ def create_api_router() -> APIRouter:
             "activeProviderId": body.activeProviderId,
             "imageProcessingMode": body.imageProcessingMode,
             "ocrConfig": {},
+            "tavilyConfig": {},
             "providers": [],
         }
         for provider in body.providers:
@@ -119,6 +120,13 @@ def create_api_router() -> APIRouter:
         if "apiKey" not in ocr_item:
             ocr_item["apiKey"] = existing_ocr.get("apiKey", "")
         cfg["ocrConfig"] = ocr_item
+
+        existing_tavily = dict(current.get("tavilyConfig") or {})
+        tavily_item = body.tavilyConfig.model_dump(exclude_none=True)
+        tavily_item.pop("hasApiKey", None)
+        if "apiKey" not in tavily_item:
+            tavily_item["apiKey"] = existing_tavily.get("apiKey", "")
+        cfg["tavilyConfig"] = tavily_item
         write_config(cfg)
         return public_config(cfg)
 

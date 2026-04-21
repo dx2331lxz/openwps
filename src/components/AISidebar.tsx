@@ -98,7 +98,8 @@ interface Message {
 interface TodoItem {
   id: string
   title: string
-  status: 'pending' | 'in_progress' | 'completed' | 'failed'
+  activeForm: string
+  status: 'pending' | 'in_progress' | 'completed'
 }
 
 type OcrTaskType = 'general_parse' | 'document_text' | 'table' | 'chart' | 'handwriting' | 'formula'
@@ -413,6 +414,7 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'get_page_content') return target ? `查看${target}的分页快照` : '查看指定页面的排版快照'
   if (toolCall.name === 'get_page_style_summary') return target ? `查看${target}的样式摘要` : '查看指定页面的样式摘要'
   if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
+  if (toolCall.name === 'web_search') return '联网搜索最新网页、新闻或外部资料'
   if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
   if (toolCall.name === 'set_paragraph_style') return target ? `调整${target}的段落格式` : '调整段落格式'
@@ -753,7 +755,7 @@ const MermaidBlock: React.FC<{
             onMouseDown={e => { e.preventDefault(); handleInsert() }}
             style={{ fontSize: 12, padding: '3px 10px', borderRadius: 4, border: '1px solid #d1d5db', background: 'white', cursor: 'pointer', color: '#374151' }}
           >
-            📄 插入正文（图片）
+            📄 插入正文
           </button>
         </div>
       )}
@@ -2050,6 +2052,9 @@ export default function AISidebar({
       return null
     }
 
+    const serverExecutedToolResults: ToolCallRecord[] = []
+    let persistRoundToolResults = (_toolResults: ToolCallRecord[]) => {}
+
     try {
       if (!conversationId) {
         const createResponse = await fetch('/api/conversations', {
@@ -2134,6 +2139,21 @@ export default function AISidebar({
       let roundThinkingText = ''
       let roundNumber = 0
       const pendingToolCalls: ToolCallResult[] = []
+      let roundToolResultsPersisted = false
+
+      persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
+        if (roundToolResultsPersisted || toolResults.length === 0) return
+
+        appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+        persistedRecords.push(
+          ...toolResults.map(tool => ({
+            role: 'tool' as const,
+            tool_call_id: tool.id,
+            content: serializeToolResult(tool),
+          })),
+        )
+        roundToolResultsPersisted = true
+      }
 
       // Helper: execute pending tool calls and POST results back to session
       const executeAndPostToolResults = async (plan: ToolExecutionPlan) => {
@@ -2172,13 +2192,27 @@ export default function AISidebar({
               .map(t => ({
                 id: String(t.id ?? ''),
                 title: String(t.title ?? ''),
-                status: (['pending', 'in_progress', 'completed', 'failed'].includes(String(t.status))
+                activeForm: String(t.activeForm ?? t.title ?? ''),
+                status: (['pending', 'in_progress', 'completed'].includes(String(t.status))
                   ? t.status
                   : 'pending') as TodoItem['status'],
               }))
-            setTodos(nextTodos)
-            todosRef.current = nextTodos
-            result = { success: true, message: 'todo list updated' }
+
+            // Auto-clear when all todos are completed (Claude Code pattern)
+            const allCompleted = nextTodos.length > 0 && nextTodos.every(t => t.status === 'completed')
+            const finalTodos = allCompleted ? [] : nextTodos
+
+            setTodos(finalTodos)
+            todosRef.current = finalTodos
+            result = {
+              success: true,
+              message: allCompleted
+                ? '所有任务已完成，任务清单已自动清空。现在可以向用户总结完成情况。'
+                : 'todo list updated',
+              data: allCompleted
+                ? { cleared: true, completedCount: nextTodos.length }
+                : { todos: finalTodos, total: finalTodos.length },
+            }
           } else if (execution.toolName === 'get_todo_list') {
             result = {
               success: true,
@@ -2189,7 +2223,6 @@ export default function AISidebar({
                 completed: todosRef.current.filter(todo => todo.status === 'completed').length,
                 pending: todosRef.current.filter(todo => todo.status === 'pending').length,
                 inProgress: todosRef.current.filter(todo => todo.status === 'in_progress').length,
-                failed: todosRef.current.filter(todo => todo.status === 'failed').length,
               },
             }
           } else if (execution.toolName === 'begin_streaming_write') {
@@ -2305,17 +2338,23 @@ export default function AISidebar({
           })
         }
 
-        appendAssistantRound(roundAssistantText, roundThinkingText, persistedToolResults)
-
-        persistedRecords.push(
-          ...persistedToolResults.map(tool => ({
-            role: 'tool' as const,
-            tool_call_id: tool.id,
-            content: serializeToolResult(tool),
-          })),
-        )
+        persistRoundToolResults([...serverExecutedToolResults, ...persistedToolResults])
 
         if (sessionId) {
+          // Get latest context for delta injection (selection may have changed, etc.)
+          const latestContext = getContext()
+          try {
+            const wsRes = await fetch('/api/workspace')
+            if (wsRes.ok) {
+              const wsDocs = await wsRes.json()
+              if (Array.isArray(wsDocs) && wsDocs.length > 0) {
+                latestContext.workspaceDocs = wsDocs.map((d: { id: string; name: string; type: string; size: number; textLength: number }) => ({
+                  id: d.id, name: d.name, type: d.type, size: d.size, textLength: d.textLength,
+                }))
+              }
+            }
+          } catch { /* ignore */ }
+
           const toolResultsResponse = await fetch(`/api/ai/react/${sessionId}/tool-results`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2325,12 +2364,14 @@ export default function AISidebar({
               round: plan.round,
               results: executionResults,
               stop: false,
+              context: latestContext,
             }),
           })
           if (!toolResultsResponse.ok) throw new Error(`HTTP ${toolResultsResponse.status}`)
         }
 
         pendingToolCalls.length = 0
+        serverExecutedToolResults.length = 0
         currentToolPlan = null
       }
 
@@ -2358,10 +2399,13 @@ export default function AISidebar({
               break
 
             case 'round_start':
+              persistRoundToolResults(serverExecutedToolResults)
               roundNumber = Number(event.round ?? 0)
               roundAssistantText = ''
               roundThinkingText = ''
               currentToolPlan = null
+              serverExecutedToolResults.length = 0
+              roundToolResultsPersisted = false
               break
 
             case 'thinking':
@@ -2425,6 +2469,51 @@ export default function AISidebar({
               break
             }
 
+            case 'tool_result': {
+              const toolId = typeof event.id === 'string' ? event.id : undefined
+              const toolName = String(event.name ?? '')
+              const result = (event.result && typeof event.result === 'object' && !Array.isArray(event.result))
+                ? event.result as Record<string, unknown>
+                : {}
+              const toolRecord: ToolCallRecord = {
+                id: toolId ?? String(event.executionId ?? newId()),
+                name: toolName,
+                params: normalizeToolParams(event.params),
+                originalParams: normalizeToolParams(event.originalParams),
+                result: {
+                  success: result.success === true,
+                  message: typeof result.message === 'string' ? result.message : '',
+                  data: result.data,
+                },
+              }
+
+              serverExecutedToolResults.push(toolRecord)
+              if (toolId) {
+                const toolIndex = pendingToolCalls.findIndex(toolCall => toolCall.id === toolId)
+                if (toolIndex >= 0) pendingToolCalls.splice(toolIndex, 1)
+              }
+
+              updateMessage(message => {
+                const updated = updateToolCallInMessage(
+                  message,
+                  currentToolCall => Boolean(toolId && currentToolCall.id === toolId) || (!toolId && currentToolCall.name === toolName && currentToolCall.status === 'pending'),
+                  currentToolCall => ({
+                    ...currentToolCall,
+                    params: normalizeToolParams(event.params),
+                    status: toolRecord.result.success ? 'ok' : 'err',
+                    message: toolRecord.result.message,
+                    data: toolRecord.result.data,
+                    isExpanded: false,
+                  }),
+                )
+                return {
+                  ...updated,
+                  activityLabel: toolRecord.result.success ? '已收到后端工具结果，继续下一步...' : '后端工具执行失败，正在调整策略...',
+                }
+              })
+              break
+            }
+
             case 'awaiting_tool_results':
               flushStreamingWrite(true)
               {
@@ -2446,7 +2535,8 @@ export default function AISidebar({
             case 'round_complete': {
               flushStreamingWrite(true)
               const emptyStreamingWarning = closeStreamingWriteSession('finish')
-              if (roundAssistantText || roundThinkingText) {
+              persistRoundToolResults(serverExecutedToolResults)
+              if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
                 appendAssistantRound(roundAssistantText, roundThinkingText, [])
               }
               updateMessage(message => {
@@ -2466,8 +2556,9 @@ export default function AISidebar({
               finished = true
               {
                 const emptyStreamingWarning = closeStreamingWriteSession('done')
+                persistRoundToolResults(serverExecutedToolResults)
                 // Persist the final round (content-only, no tools)
-                if (roundAssistantText || roundThinkingText) {
+                if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
                   appendAssistantRound(roundAssistantText, roundThinkingText, [])
                 }
                 updateMessage(message => {
@@ -2562,6 +2653,7 @@ export default function AISidebar({
       }
       flushStreamingWrite(true)
       closeStreamingWriteSession('error')
+      persistRoundToolResults(serverExecutedToolResults)
       if (error instanceof Error && error.name === 'AbortError') {
         persistedAssistantText = '（已取消）'
         if (!persistedRecords.some(message => message.role === 'assistant')) {
@@ -2750,8 +2842,7 @@ export default function AISidebar({
                             {!isTodoPanelExpanded && activeTodo && (
                               <span className="mt-0.5 block truncate text-[11px] text-blue-600">
                                 {activeTodo.status === 'completed' ? '已完成' :
-                                  activeTodo.status === 'failed' ? '失败' :
-                                    activeTodo.status === 'in_progress' ? '进行中' : '待处理'}：{activeTodo.title}
+                                  activeTodo.status === 'in_progress' ? '进行中' : '待处理'}：{activeTodo.title}
                               </span>
                             )}
                           </span>
@@ -2769,8 +2860,7 @@ export default function AISidebar({
                                 <span className="flex-shrink-0 mt-px">
                                   {todo.status === 'completed' ? '✅' :
                                     todo.status === 'in_progress' ? '🔄' :
-                                      todo.status === 'failed' ? '❌' :
-                                        '⬜'}
+                                      '⬜'}
                                 </span>
                                 <span
                                   className={
@@ -2778,9 +2868,7 @@ export default function AISidebar({
                                       ? 'text-gray-400 line-through'
                                       : todo.status === 'in_progress'
                                         ? 'text-blue-700 font-medium'
-                                        : todo.status === 'failed'
-                                          ? 'text-red-500'
-                                          : 'text-gray-600'
+                                        : 'text-gray-600'
                                   }
                                 >
                                   {todo.title}

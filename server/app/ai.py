@@ -18,10 +18,23 @@ from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables import Runnable
 
-from .config import DEFAULT_IMAGE_PROCESSING_MODE, DEFAULT_OCR_BACKEND, DEFAULT_OCR_CONFIG, get_provider, read_config
+try:
+    from tavily import AsyncTavilyClient
+except ImportError:  # pragma: no cover - optional dependency until installed
+    AsyncTavilyClient = None
+
+from .config import (
+    DEFAULT_IMAGE_PROCESSING_MODE,
+    DEFAULT_OCR_BACKEND,
+    DEFAULT_OCR_CONFIG,
+    DEFAULT_TAVILY_CONFIG,
+    get_provider,
+    read_config,
+)
 from .models import ChatMessage, ChatRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
-from .prompts import get_system_prompt
+from .prompts import assemble_system_prompt, get_system_prompt
 from .tooling import get_tools
+from .delta_injection import compute_all_deltas, build_initial_context_attachment
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -94,6 +107,7 @@ OCR_TASK_ALIASES = {
 
 OCR_BACKEND_COMPAT_CHAT = "compat_chat"
 OCR_BACKEND_PADDLEOCR_SERVICE = "paddleocr_service"
+SERVER_SIDE_TOOL_NAMES = {"web_search"}
 
 
 class AgentState(TypedDict):
@@ -2158,6 +2172,7 @@ MAX_RETRIES_PER_ROUND = 2
 MAX_FORCED_FOLLOW_UPS = 3
 MAX_OUTPUT_CONTINUATIONS = 3
 MAX_MULTIMODAL_IMAGES = 5
+TODO_REMINDER_INTERVAL = 10  # turns between todo reminders (Claude Code pattern)
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 RETRY_DELAYS = [1.0, 2.0, 4.0]
@@ -2231,6 +2246,12 @@ class LoopState:
     budget_stagnation_warning_level: int = 0
     output_continuation_attempts: int = 0
     last_model_finish_reason: str = ""
+    # Delta tracking (Claude Code-style attachment system)
+    previous_workspace_docs: list[dict] = field(default_factory=list)
+    previous_template: dict | None = None
+    injected_dynamic_boundary: bool = False
+    # Todo reminder tracking
+    rounds_since_last_todo_update: int = 0
 
 
 # ─── Stop Hooks ────────────────────────────────────────────────────────────────
@@ -2344,11 +2365,19 @@ class SessionTrace:
 
 
 def _evaluate_stop_hooks(state: LoopState, tool_calls: list[dict[str, Any]],
-                          tool_results: list[dict[str, str]]) -> StopEvaluation:
+                           tool_results: list[dict[str, str]]) -> StopEvaluation:
     """Evaluate whether the loop should stop, continue, or hint the LLM."""
     # ── 1. Tool-loop detection: same tool pattern 3 times in a row ──
     if tool_calls:
-        pattern = "|".join(sorted(tc["name"] for tc in tool_calls))
+        # Build pattern from tool name + parameter hash to detect true duplicates
+        pattern_parts = []
+        for tc in sorted(tool_calls, key=lambda x: x["name"]):
+            name = tc["name"]
+            args = tc.get("args", {})
+            # Hash the arguments to detect same call with same params
+            args_str = json.dumps(args, sort_keys=True, default=str)
+            pattern_parts.append(f"{name}:{args_str}")
+        pattern = "|".join(pattern_parts)
         state.recent_tool_patterns.append(pattern)
         if len(state.recent_tool_patterns) > 6:
             state.recent_tool_patterns = state.recent_tool_patterns[-6:]
@@ -2357,7 +2386,7 @@ def _evaluate_stop_hooks(state: LoopState, tool_calls: list[dict[str, Any]],
             return StopEvaluation(
                 StopDecision.RETRY_WITH_HINT,
                 "tool_loop_detected",
-                "你正在重复调用完全相同的工具组合。请检查当前文档状态：如果目标已达成，请直接回复用户；如果未达成，请尝试不同策略。",
+                "你正在重复调用完全相同的工具组合（相同的工具+相同参数）。请检查当前文档状态：如果目标已达成，请直接回复用户；如果未达成，请尝试不同策略。",
             )
 
     # ── 2. Repeated failures of the same tool ──
@@ -2429,6 +2458,7 @@ def _extract_todos_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]
             todos.append({
                 "id": str(item.get("id", "")).strip(),
                 "title": str(item.get("title", "")).strip(),
+                "activeForm": str(item.get("activeForm", item.get("title", ""))).strip(),
                 "status": str(item.get("status", "pending")).strip().lower(),
             })
         return todos
@@ -2542,10 +2572,12 @@ def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str,
 
         if tool_name in TODO_UPDATE_TOOLS:
             state.requires_todo_check = True
+            state.rounds_since_last_todo_update = 0
             continue
 
         if tool_name in TODO_CHECK_TOOLS:
             state.requires_todo_check = False
+            state.rounds_since_last_todo_update = 0
 
 
 def _needs_forced_continuation(state: LoopState, messages: list[BaseMessage]) -> tuple[bool, list[dict[str, str]]]:
@@ -3000,6 +3032,249 @@ def _extract_delete_paragraph_indexes(params: dict[str, Any]) -> list[int] | Non
     return [index] if index >= 0 else None
 
 
+def _is_server_side_tool(tool_name: str) -> bool:
+    return tool_name in SERVER_SIDE_TOOL_NAMES
+
+
+def _split_execution_plan(plan: ToolExecutionPlan) -> tuple[list[PlannedToolExecution], list[PlannedToolExecution]]:
+    server_executions: list[PlannedToolExecution] = []
+    client_executions: list[PlannedToolExecution] = []
+    for execution in plan.executions:
+        if _is_server_side_tool(execution.tool_name):
+            server_executions.append(execution)
+        else:
+            client_executions.append(execution)
+    return server_executions, client_executions
+
+
+def _normalize_web_search_depth(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "advanced":
+        return "advanced"
+    return str(DEFAULT_TAVILY_CONFIG["searchDepth"])
+
+
+def _normalize_web_search_topic(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"general", "news", "finance"}:
+        return normalized
+    return str(DEFAULT_TAVILY_CONFIG["topic"])
+
+
+def _normalize_web_search_max_results(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(DEFAULT_TAVILY_CONFIG["maxResults"])
+    return max(1, min(parsed, 10))
+
+
+def _normalize_web_search_timeout(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(DEFAULT_TAVILY_CONFIG["timeoutSeconds"])
+    return max(5, min(parsed, 60))
+
+
+def _serialize_tool_result_payload(
+    *,
+    tool_name: str,
+    success: bool,
+    message: str,
+    executed_params: dict[str, Any],
+    original_params: dict[str, Any] | None = None,
+    data: Any = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "success": success,
+        "message": message,
+        "data": data,
+        "toolName": tool_name,
+        "originalParams": original_params if original_params is not None else None,
+        "executedParams": executed_params,
+        "paramsRepaired": False,
+    }
+    if extra:
+        payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _build_tool_result_event(
+    execution: PlannedToolExecution,
+    source_call: SourceToolCall,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "tool_result",
+        "id": source_call.id,
+        "name": source_call.name,
+        "executionId": execution.execution_id,
+        "params": execution.params,
+        "originalParams": source_call.params,
+        "sourceToolCallIds": [item.id for item in execution.source_calls],
+        "mergeStrategy": execution.merge_strategy,
+        "result": {
+            "success": payload.get("success") is True,
+            "message": _stringify_content(payload.get("message")),
+            "data": payload.get("data"),
+        },
+    }
+
+
+def _trim_tavily_result_item(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    title = _stringify_content(item.get("title")).strip()
+    url = _stringify_content(item.get("url")).strip()
+    content = _stringify_content(item.get("content")).strip()
+    if not (title or url or content):
+        return None
+    trimmed: dict[str, Any] = {
+        "title": title,
+        "url": url,
+        "content": content[:500],
+    }
+    score = item.get("score")
+    if isinstance(score, (int, float)):
+        trimmed["score"] = round(float(score), 4)
+    published_date = item.get("published_date")
+    if isinstance(published_date, str) and published_date.strip():
+        trimmed["publishedDate"] = published_date.strip()
+    return trimmed
+
+
+def _summarize_web_search_data(data: dict[str, Any]) -> str:
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
+        return "未找到合适的网页结果"
+    previews: list[str] = []
+    for item in results[:3]:
+        if not isinstance(item, dict):
+            continue
+        title = _stringify_content(item.get("title")).strip() or _stringify_content(item.get("url")).strip()
+        snippet = _stringify_content(item.get("content")).strip().replace("\n", " ")
+        previews.append(f"{title}: {snippet[:80]}")
+    if not previews:
+        return f"已返回 {len(results)} 条联网搜索结果"
+    return "；".join(previews)
+
+
+async def _run_web_search_tool(params: dict[str, Any]) -> str:
+    query = _stringify_content(params.get("query")).strip()
+    if not query:
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message="web_search 缺少 query 参数",
+            executed_params=params,
+            original_params=params,
+        )
+
+    cfg = read_config()
+    tavily_cfg = dict(cfg.get("tavilyConfig") or {})
+    if not bool(tavily_cfg.get("enabled", DEFAULT_TAVILY_CONFIG["enabled"])):
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message="Tavily web search 当前未启用，请先在 AI 设置中开启。",
+            executed_params=params,
+            original_params=params,
+        )
+
+    api_key = str(tavily_cfg.get("apiKey") or "").strip()
+    if not api_key:
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message="尚未配置 Tavily API Key，请先在 AI 设置中填写。",
+            executed_params=params,
+            original_params=params,
+        )
+
+    if AsyncTavilyClient is None:
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message="服务端缺少 tavily-python 依赖，请安装后重试。",
+            executed_params=params,
+            original_params=params,
+        )
+
+    topic = _normalize_web_search_topic(params.get("topic") or tavily_cfg.get("topic"))
+    search_depth = _normalize_web_search_depth(params.get("searchDepth") or tavily_cfg.get("searchDepth"))
+    max_results = _normalize_web_search_max_results(params.get("maxResults") or tavily_cfg.get("maxResults"))
+    timeout = _normalize_web_search_timeout(tavily_cfg.get("timeoutSeconds"))
+    normalized_params = {
+        "query": query[:400],
+        "topic": topic,
+        "searchDepth": search_depth,
+        "maxResults": max_results,
+    }
+
+    try:
+        client = AsyncTavilyClient(api_key=api_key)
+        response = await client.search(
+            query=normalized_params["query"],
+            topic=topic,
+            search_depth=search_depth,
+            max_results=max_results,
+            include_answer=False,
+            include_raw_content=False,
+            include_images=False,
+            include_image_descriptions=False,
+            include_favicon=False,
+            include_usage=False,
+            timeout=timeout,
+        )
+    except httpx.TimeoutException:
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message=f"Tavily 搜索超时（{timeout}s），请缩小问题范围后重试。",
+            executed_params=normalized_params,
+            original_params=params,
+        )
+    except Exception as exc:
+        return _serialize_tool_result_payload(
+            tool_name="web_search",
+            success=False,
+            message=f"Tavily 搜索失败：{_stringify_content(exc)}",
+            executed_params=normalized_params,
+            original_params=params,
+        )
+
+    raw_results = response.get("results") if isinstance(response, dict) else []
+    trimmed_results = [
+        item
+        for item in (_trim_tavily_result_item(result) for result in (raw_results if isinstance(raw_results, list) else []))
+        if item is not None
+    ][:max_results]
+    data = {
+        "query": normalized_params["query"],
+        "topic": topic,
+        "searchDepth": search_depth,
+        "responseTime": response.get("response_time") if isinstance(response, dict) else None,
+        "requestId": response.get("request_id") if isinstance(response, dict) else None,
+        "results": trimmed_results[:5],
+        "resultCount": len(trimmed_results),
+    }
+
+    message = _summarize_web_search_data(data)
+    if not trimmed_results:
+        message = "未找到与当前问题足够相关的网页结果"
+
+    return _serialize_tool_result_payload(
+        tool_name="web_search",
+        success=True,
+        message=message,
+        executed_params=normalized_params,
+        original_params=params,
+        data=data,
+    )
+
+
 def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -> ToolExecutionPlan:
     executions: list[PlannedToolExecution] = []
     mergeable_style_tools = {"set_text_style", "set_paragraph_style", "clear_formatting"}
@@ -3156,7 +3431,7 @@ class ReactSession:
 
     __slots__ = (
         "session_id", "body", "messages", "tool_result_queue",
-        "state", "finished", "expected_plan", "trace",
+        "state", "finished", "expected_plan", "trace", "latest_context",
     )
 
     def __init__(self, session_id: str, body: ChatRequest, messages: list[BaseMessage]):
@@ -3167,6 +3442,7 @@ class ReactSession:
         self.state = LoopState()
         self.finished = False
         self.expected_plan: ToolExecutionPlan | None = None
+        self.latest_context: dict[str, Any] = body.context or {}  # Updated each round
         self.trace = SessionTrace(
             session_id=session_id,
             conversation_id=body.conversationId,
@@ -3276,6 +3552,10 @@ def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -
         _record_trace_event(session, "client_stop_requested")
         session.tool_result_queue.put_nowait(None)
         return
+
+    # Update session's latest context from frontend
+    if body.context is not None:
+        session.latestContext = body.context
 
     expected_plan = session.expected_plan
     if expected_plan is None:
@@ -3654,31 +3934,28 @@ def _determine_compression_tier(messages: list[BaseMessage], current_tier: int) 
 
 
 def build_messages(body: ChatRequest) -> list[BaseMessage]:
-    messages: list[BaseMessage] = [SystemMessage(content=get_system_prompt(body.mode))]
-    context_block = _build_context_block(body.context)
+    # Static system prompt only (context injected as delta attachment)
+    system_prompt = get_system_prompt(body.mode)
+    messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+
+    # Inject initial context as delta attachment (full state announcement)
+    context = body.context or {}
+    initial_attachment = build_initial_context_attachment(context)
+    if initial_attachment:
+        messages.append(HumanMessage(content=initial_attachment))
 
     if body.reactMessages:
-        last_user_idx = -1
-        if context_block:
-            for i in range(len(body.reactMessages) - 1, -1, -1):
-                if dict(body.reactMessages[i]).get("role") == "user":
-                    last_user_idx = i
-                    break
-
         for i, item in enumerate(body.reactMessages):
-            if i == last_user_idx:
-                raw = dict(item)
-                original = _stringify_content(raw.get("content"))
-                messages.append(HumanMessage(content=_build_human_content(
-                    original,
-                    context_block,
-                    body.images,
-                    body.attachments,
-                    body.ocrResults,
-                    body.imageProcessingMode,
-                )))
-            else:
-                messages.append(_to_langchain_message(item))
+            raw = dict(item)
+            original = _stringify_content(raw.get("content"))
+            messages.append(HumanMessage(content=_build_human_content(
+                original,
+                "",  # context now injected as delta attachment
+                body.images,
+                body.attachments,
+                body.ocrResults,
+                body.imageProcessingMode,
+            )))
         _log_final_user_message(body, messages)
         return messages
 
@@ -3687,7 +3964,7 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
 
     messages.append(HumanMessage(content=_build_human_content(
         body.message,
-        context_block,
+        "",  # context now injected as delta attachment
         body.images,
         body.attachments,
         body.ocrResults,
@@ -4090,9 +4367,54 @@ class QueryCoordinator:
 
         return execution_results
 
+    async def _execute_server_execution(
+        self,
+        execution: PlannedToolExecution,
+    ) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
+        if execution.tool_name == "web_search":
+            content = await _run_web_search_tool(execution.params)
+        else:
+            content = _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=False,
+                message=f"未知服务端工具：{execution.tool_name}",
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
+
+        payload = _parse_tool_result_payload(content)
+        result = {
+            "execution_id": execution.execution_id,
+            "content": content,
+        }
+        summary = {
+            "executionId": execution.execution_id,
+            "toolName": execution.tool_name,
+            "success": payload.get("success") is True,
+            "message": _truncate_preview(payload.get("message", ""), 120),
+            "mergeStrategy": execution.merge_strategy,
+            "sourceToolCallCount": len(execution.source_calls),
+        }
+
+        events: list[dict[str, Any]] = []
+        for source_call in execution.source_calls:
+            self.session.messages.append(ToolMessage(
+                content=_decorate_tool_result_content(content, execution, source_call),
+                tool_call_id=source_call.id,
+            ))
+            events.append(_build_tool_result_event(execution, source_call, payload))
+
+        return result, summary, events
+
     async def stream(self) -> AsyncGenerator[dict[str, Any], None]:
         _record_trace_event(self.session, "session_created")
         yield {"type": "session_created", "sessionId": self.session.session_id}
+
+        # Inject initial context as attachment (full state announcement)
+        context = self.session.latestContext
+        initial_attachment = build_initial_context_attachment(context)
+        if initial_attachment:
+            self.session.messages.append(HumanMessage(content=initial_attachment))
 
         try:
             while self.state.round < MAX_REACT_ROUNDS and not self.session.finished:
@@ -4294,7 +4616,9 @@ class QueryCoordinator:
                 ))
 
                 execution_plan = _build_execution_plan(self.state.round, round_tool_calls)
-                self.session.expected_plan = execution_plan
+                server_executions, client_executions = _split_execution_plan(execution_plan)
+                server_execution_results: list[dict[str, str]] = []
+                server_execution_summary: list[dict[str, Any]] = []
                 _record_trace_event(
                     self.session,
                     "tool_plan",
@@ -4303,46 +4627,63 @@ class QueryCoordinator:
                     executionCount=len(execution_plan.executions),
                     sourceToolCallCount=len(round_tool_calls),
                 )
-                yield _serialize_execution_plan(execution_plan)
-                _record_trace_event(
-                    self.session,
-                    "awaiting_tool_results",
-                    round=self.state.round,
-                    planId=execution_plan.plan_id,
-                    executionCount=len(execution_plan.executions),
-                )
-                yield {
-                    "type": "awaiting_tool_results",
-                    "round": execution_plan.round,
-                    "planId": execution_plan.plan_id,
-                    "count": len(execution_plan.executions),
-                    "toolCallCount": len(round_tool_calls),
-                }
+                for execution in server_executions:
+                    server_result, server_summary, server_events = await self._execute_server_execution(execution)
+                    server_execution_results.append(server_result)
+                    server_execution_summary.append(server_summary)
+                    for server_event in server_events:
+                        yield server_event
 
-                try:
-                    posted_results = await asyncio.wait_for(
-                        self.session.tool_result_queue.get(),
-                        timeout=TOOL_RESULT_TIMEOUT,
+                execution_results = list(server_execution_results)
+                execution_summary = list(server_execution_summary)
+
+                if client_executions:
+                    client_plan = ToolExecutionPlan(
+                        plan_id=execution_plan.plan_id,
+                        round=execution_plan.round,
+                        executions=client_executions,
                     )
-                except asyncio.TimeoutError:
-                    self.session.expected_plan = None
-                    self.state.transition = Transition.TIMEOUT
-                    _record_trace_event(self.session, "error", round=self.state.round, message="等待工具结果超时")
-                    yield {"type": "error", "message": "等待工具结果超时"}
-                    self.session.finished = True
-                    break
+                    self.session.expected_plan = client_plan
+                    yield _serialize_execution_plan(client_plan)
+                    _record_trace_event(
+                        self.session,
+                        "awaiting_tool_results",
+                        round=self.state.round,
+                        planId=client_plan.plan_id,
+                        executionCount=len(client_plan.executions),
+                    )
+                    yield {
+                        "type": "awaiting_tool_results",
+                        "round": client_plan.round,
+                        "planId": client_plan.plan_id,
+                        "count": len(client_plan.executions),
+                        "toolCallCount": len(round_tool_calls),
+                    }
 
-                if posted_results is None:
-                    self.session.expected_plan = None
-                    self.state.transition = Transition.STOPPED_BY_CLIENT
-                    self.session.finished = True
-                    _record_trace_event(self.session, "done", round=self.state.round, reason="stopped_by_client")
-                    yield {"type": "done", "reason": "stopped_by_client"}
-                    break
+                    try:
+                        posted_results = await asyncio.wait_for(
+                            self.session.tool_result_queue.get(),
+                            timeout=TOOL_RESULT_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        self.session.expected_plan = None
+                        self.state.transition = Transition.TIMEOUT
+                        _record_trace_event(self.session, "error", round=self.state.round, message="等待工具结果超时")
+                        yield {"type": "error", "message": "等待工具结果超时"}
+                        self.session.finished = True
+                        break
 
-                execution_results = self._apply_execution_results(execution_plan, posted_results)
-                execution_summary = self._summarize_execution_results(execution_plan, posted_results)
-                self.session.expected_plan = None
+                    if posted_results is None:
+                        self.session.expected_plan = None
+                        self.state.transition = Transition.STOPPED_BY_CLIENT
+                        self.session.finished = True
+                        _record_trace_event(self.session, "done", round=self.state.round, reason="stopped_by_client")
+                        yield {"type": "done", "reason": "stopped_by_client"}
+                        break
+
+                    execution_results.extend(self._apply_execution_results(client_plan, posted_results))
+                    execution_summary.extend(self._summarize_execution_results(client_plan, posted_results))
+                    self.session.expected_plan = None
                 _update_completion_gate_state(self.state, execution_results)
                 self.state.pending_write_follow_up = _tool_results_started_streaming_write(execution_results)
                 self.state.forced_follow_up_attempts = 0
@@ -4433,6 +4774,35 @@ class QueryCoordinator:
                     model_finish_reason=round_finish_reason,
                 )
                 _record_trace_event(self.session, "round_transition", round=self.state.round, transition=self.state.transition.value)
+
+                # Delta injection: inject context changes after tool results
+                # Use latestContext (updated by frontend each round) instead of body.context (frozen at session start)
+                context = self.session.latestContext
+                force_delta = compression_outcome.source != "none"
+                delta_messages = compute_all_deltas(context, self.session.messages, force_full=force_delta)
+                for delta_msg in delta_messages:
+                    self.session.messages.append(HumanMessage(content=delta_msg))
+
+                # Todo reminder: inject reminder if no todo update for TODO_REMINDER_INTERVAL rounds
+                self.state.rounds_since_last_todo_update += 1
+                if self.state.rounds_since_last_todo_update >= TODO_REMINDER_INTERVAL:
+                    current_todos = _get_latest_todos(self.session.messages)
+                    todo_summary = ""
+                    if current_todos:
+                        lines = []
+                        for t in current_todos:
+                            status_icon = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}.get(t.get("status", "pending"), "⬜")
+                            lines.append(f"{status_icon} {t.get('title', '?')}")
+                        todo_summary = "\n当前任务列表：\n" + "\n".join(lines)
+                    reminder = (
+                        f"<system-reminder>\n"
+                        f"TodoWrite 工具已经 {self.state.rounds_since_last_todo_update} 轮未使用。"
+                        f"如果你正在处理多步骤任务，建议使用 update_todo_list 跟踪进度。\n"
+                        f"标记每个任务为 completed 后立即继续下一步，不要批量更新。\n"
+                        f"确保始终至少有一个任务处于 in_progress 状态。{todo_summary}\n"
+                        f"</system-reminder>"
+                    )
+                    self.session.messages.append(HumanMessage(content=reminder))
 
             if self.state.round >= MAX_REACT_ROUNDS and not self.session.finished:
                 self.state.transition = Transition.MAX_ROUNDS

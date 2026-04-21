@@ -9,3 +9,4 @@ python-pptx
 python-multipart
 pdfplumber
 pypdfium2
+tavily-python

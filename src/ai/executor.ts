@@ -11,11 +11,14 @@ import {
   findTable,
   isInTable,
 } from 'prosemirror-tables'
+import mermaid from 'mermaid'
 import { schema } from '../editor/schema'
 import { paginate, type PageConfig } from '../layout/paginator'
 import { mapFontFamily, presetStyles } from './presets'
 import { fontNameFromFamily } from '../fonts'
 import { markdownToFragment } from '../markdown/importer'
+
+mermaid.initialize({ startOnLoad: false, theme: 'default' })
 
 const PAPER_SIZES: Record<string, { pageWidth: number; pageHeight: number }> = {
   A4: { pageWidth: 794, pageHeight: 1123 },
@@ -1414,6 +1417,51 @@ export async function executeTool(
         }
         view.focus()
         return { success: true, message: `已插入图片${alt ? `（${alt}）` : ''}` }
+      }
+
+      case 'insert_mermaid': {
+        const mermaidCode = String(params.code ?? '')
+        if (!mermaidCode) return { success: false, message: 'insert_mermaid 需要 code 参数' }
+        const mermaidAlt = String(params.alt ?? '') || 'Mermaid 图表'
+
+        try {
+          const renderId = `mermaid-tool-${Date.now()}`
+          const { svg } = await mermaid.render(renderId, mermaidCode)
+          const bytes = new TextEncoder().encode(svg)
+          let binary = ''
+          bytes.forEach(b => { binary += String.fromCharCode(b) })
+          const b64 = btoa(binary)
+          const svgDataUrl = `data:image/svg+xml;base64,${b64}`
+
+          const imageNode = schema.nodes.image.create({ src: svgDataUrl, alt: mermaidAlt, width: null, height: null })
+          const paragraphNode = schema.nodes.paragraph.create(undefined, imageNode)
+
+          const afterParagraph = params.afterParagraph !== undefined ? Number(params.afterParagraph) : -2
+          // Re-read state since mermaid.render is async
+          const latestState = view.state
+          if (afterParagraph === -2) {
+            const insertPos = latestState.doc.content.size
+            view.dispatch(latestState.tr.insert(insertPos, paragraphNode))
+          } else {
+            const paragraph = afterParagraph >= 0 ? getParagraphAtIndex(latestState, afterParagraph) : getParagraphAtIndex(latestState, 0)
+            if (afterParagraph < -1 || !paragraph) {
+              return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+            }
+            const insertPos = getInsertPosAfterParagraph(latestState, afterParagraph)
+            if (insertPos == null) {
+              return { success: false, message: `未找到第 ${afterParagraph + 1} 段` }
+            }
+            const shouldAppendTrailingParagraph = insertPos >= latestState.doc.content.size && paragraphNode.type !== schema.nodes.paragraph
+            const fragment = shouldAppendTrailingParagraph
+              ? Fragment.fromArray([paragraphNode, schema.nodes.paragraph.create()])
+              : Fragment.from(paragraphNode)
+            view.dispatch(latestState.tr.insert(insertPos, fragment))
+          }
+          view.focus()
+          return { success: true, message: `已插入 Mermaid 图表（${mermaidAlt}）` }
+        } catch (err) {
+          return { success: false, message: `Mermaid 渲染失败: ${err instanceof Error ? err.message : String(err)}` }
+        }
       }
 
       case 'insert_paragraph_after': {

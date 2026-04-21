@@ -28,6 +28,16 @@ class OCRConfig(BaseModel):
     maxImages: int = 5
 
 
+class TavilyConfig(BaseModel):
+    enabled: bool = True
+    apiKey: Optional[str] = None
+    hasApiKey: bool = False
+    searchDepth: str = "basic"
+    topic: str = "general"
+    maxResults: int = 5
+    timeoutSeconds: int = 15
+
+
 class OCRCommandRequest(BaseModel):
     images: list[dict[str, Any]] = Field(default_factory=list)
     taskType: str = "general_parse"
@@ -66,6 +76,7 @@ class SettingsUpdate(BaseModel):
     activeProviderId: str
     imageProcessingMode: str = "direct_multimodal"
     ocrConfig: OCRConfig = Field(default_factory=OCRConfig)
+    tavilyConfig: TavilyConfig = Field(default_factory=TavilyConfig)
     providers: list[ProviderSettings] = Field(default_factory=list)
 
 
@@ -90,6 +101,7 @@ class ToolResultsRequest(BaseModel):
     round: Optional[int] = None
     results: list[ToolResultItem] = Field(default_factory=list)
     stop: bool = False
+    context: Optional[dict[str, Any]] = None  # Frontend sends latest context each round
 
 
 class TemplateCreateRequest(BaseModel):

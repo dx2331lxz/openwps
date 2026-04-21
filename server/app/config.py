@@ -80,11 +80,21 @@ DEFAULT_OCR_CONFIG = {
     "maxImages": 5,
 }
 
+DEFAULT_TAVILY_CONFIG = {
+    "enabled": True,
+    "apiKey": "",
+    "searchDepth": "basic",
+    "topic": "general",
+    "maxResults": 5,
+    "timeoutSeconds": 15,
+}
+
 DEFAULT_CONFIG = {
     "version": 2,
     "activeProviderId": "siliconflow",
     "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
     "ocrConfig": deepcopy(DEFAULT_OCR_CONFIG),
+    "tavilyConfig": deepcopy(DEFAULT_TAVILY_CONFIG),
     "providers": deepcopy(PRESET_PROVIDERS),
 }
 
@@ -105,6 +115,20 @@ def _normalize_ocr_backend(value: Any) -> str:
     if normalized in {"paddleocr_service", "official_service", "layout_parsing"}:
         return "paddleocr_service"
     return DEFAULT_OCR_BACKEND
+
+
+def _normalize_tavily_search_depth(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "advanced":
+        return "advanced"
+    return DEFAULT_TAVILY_CONFIG["searchDepth"]
+
+
+def _normalize_tavily_topic(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"general", "news", "finance"}:
+        return normalized
+    return DEFAULT_TAVILY_CONFIG["topic"]
 
 
 def _normalize_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 600) -> int:
@@ -159,6 +183,28 @@ def _sanitize_ocr_config(raw: dict[str, Any] | None, providers: list[dict[str, A
             DEFAULT_OCR_CONFIG["maxImages"],
             minimum=1,
             maximum=20,
+        ),
+    }
+
+
+def _sanitize_tavily_config(raw: dict[str, Any] | None) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": bool(source.get("enabled", DEFAULT_TAVILY_CONFIG["enabled"])),
+        "apiKey": str(source.get("apiKey") or "").strip(),
+        "searchDepth": _normalize_tavily_search_depth(source.get("searchDepth")),
+        "topic": _normalize_tavily_topic(source.get("topic")),
+        "maxResults": _normalize_positive_int(
+            source.get("maxResults"),
+            DEFAULT_TAVILY_CONFIG["maxResults"],
+            minimum=1,
+            maximum=10,
+        ),
+        "timeoutSeconds": _normalize_positive_int(
+            source.get("timeoutSeconds"),
+            DEFAULT_TAVILY_CONFIG["timeoutSeconds"],
+            minimum=5,
+            maximum=60,
         ),
     }
 
@@ -234,6 +280,7 @@ def _migrate_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
         "activeProviderId": active_provider_id,
         "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
         "ocrConfig": _sanitize_ocr_config(None, providers),
+        "tavilyConfig": deepcopy(DEFAULT_TAVILY_CONFIG),
         "providers": providers,
     }
 
@@ -252,6 +299,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             "activeProviderId": active_provider_id,
             "imageProcessingMode": _normalize_image_processing_mode(raw.get("imageProcessingMode")),
             "ocrConfig": _sanitize_ocr_config(raw.get("ocrConfig"), providers),
+            "tavilyConfig": _sanitize_tavily_config(raw.get("tavilyConfig")),
             "providers": providers,
         }
 
@@ -288,6 +336,7 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
     normalized = normalize_config(cfg if cfg is not None else read_config())
     active_provider = get_provider(normalized)
     ocr_config = _sanitize_ocr_config(normalized.get("ocrConfig"), normalized["providers"])
+    tavily_config = _sanitize_tavily_config(normalized.get("tavilyConfig"))
     ocr_provider = get_provider(normalized, ocr_config.get("providerId"))
     return {
         "activeProviderId": normalized["activeProviderId"],
@@ -313,6 +362,14 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
             "hasApiKey": bool(ocr_config.get("apiKey") or ocr_provider.get("apiKey")),
             "timeoutSeconds": int(ocr_config.get("timeoutSeconds") or DEFAULT_OCR_CONFIG["timeoutSeconds"]),
             "maxImages": int(ocr_config.get("maxImages") or DEFAULT_OCR_CONFIG["maxImages"]),
+        },
+        "tavilyConfig": {
+            "enabled": bool(tavily_config.get("enabled", DEFAULT_TAVILY_CONFIG["enabled"])),
+            "hasApiKey": bool(tavily_config.get("apiKey")),
+            "searchDepth": _normalize_tavily_search_depth(tavily_config.get("searchDepth")),
+            "topic": _normalize_tavily_topic(tavily_config.get("topic")),
+            "maxResults": int(tavily_config.get("maxResults") or DEFAULT_TAVILY_CONFIG["maxResults"]),
+            "timeoutSeconds": int(tavily_config.get("timeoutSeconds") or DEFAULT_TAVILY_CONFIG["timeoutSeconds"]),
         },
         "endpoint": active_provider["endpoint"],
         "model": active_provider["defaultModel"],

@@ -12,6 +12,15 @@ export interface OcrConfigData {
   maxImages: number
 }
 
+export interface TavilyConfigData {
+  enabled: boolean
+  hasApiKey: boolean
+  searchDepth: 'basic' | 'advanced'
+  topic: 'general' | 'news' | 'finance'
+  maxResults: number
+  timeoutSeconds: number
+}
+
 export interface AIProviderSettings {
   id: string
   label: string
@@ -26,6 +35,7 @@ export interface AISettingsData {
   activeProviderId: string
   imageProcessingMode: ImageProcessingMode
   ocrConfig: OcrConfigData
+  tavilyConfig: TavilyConfigData
   providers: AIProviderSettings[]
   endpoint: string
   model: string

@@ -6,6 +6,7 @@ import {
   type AIProviderSettings,
   type ModelOption,
   type OcrConfigData,
+  type TavilyConfigData,
 } from '../ai/providers'
 
 const pxToMm = (px: number) => Math.round(px / 3.7795)
@@ -31,6 +32,11 @@ interface EditableOcrConfig extends OcrConfigData {
   models: ModelOption[]
   modelsLoading: boolean
   modelsError: string | null
+}
+
+interface EditableTavilyConfig extends TavilyConfigData {
+  apiKey: string
+  apiKeyChanged: boolean
 }
 
 interface Props {
@@ -71,6 +77,14 @@ function toEditableOcrConfig(ocrConfig: OcrConfigData): EditableOcrConfig {
   }
 }
 
+function toEditableTavilyConfig(tavilyConfig: TavilyConfigData): EditableTavilyConfig {
+  return {
+    ...tavilyConfig,
+    apiKey: '',
+    apiKeyChanged: false,
+  }
+}
+
 export default function SettingsModal({ pageConfig, onPageConfigChange, onClose, defaultTab = 0 }: Props) {
   const [tab, setTab] = useState<0 | 1>(defaultTab)
   const [draft, setDraft] = useState({ ...pageConfig })
@@ -88,6 +102,14 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
     timeoutSeconds: 60,
     maxImages: 5,
   }))
+  const [tavilyConfig, setTavilyConfig] = useState<EditableTavilyConfig>(toEditableTavilyConfig({
+    enabled: true,
+    hasApiKey: false,
+    searchDepth: 'basic',
+    topic: 'general',
+    maxResults: 5,
+    timeoutSeconds: 15,
+  }))
   const [aiSaving, setAiSaving] = useState(false)
   const [aiSavedOk, setAiSavedOk] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
@@ -103,6 +125,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
         setSelectedProviderId(data.activeProviderId)
         setActiveProviderId(data.activeProviderId)
         setOcrConfig(toEditableOcrConfig(data.ocrConfig))
+        setTavilyConfig(toEditableTavilyConfig(data.tavilyConfig))
       })
       .catch(() => setAiError('无法连接到后端，请确认服务已启动（端口 5174）'))
   }, [])
@@ -138,6 +161,10 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
 
   function updateOcrConfig(updater: (config: EditableOcrConfig) => EditableOcrConfig) {
     setOcrConfig(prev => updater(prev))
+  }
+
+  function updateTavilyConfig(updater: (config: EditableTavilyConfig) => EditableTavilyConfig) {
+    setTavilyConfig(prev => updater(prev))
   }
 
   async function handleFetchModels(provider: EditableProvider) {
@@ -271,6 +298,15 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
     }
     if (ocrConfig.apiKeyChanged) normalizedOcrConfig.apiKey = ocrConfig.apiKey.trim()
 
+    const normalizedTavilyConfig: Record<string, unknown> = {
+      enabled: tavilyConfig.enabled,
+      searchDepth: tavilyConfig.searchDepth,
+      topic: tavilyConfig.topic,
+      maxResults: tavilyConfig.maxResults,
+      timeoutSeconds: tavilyConfig.timeoutSeconds,
+    }
+    if (tavilyConfig.apiKeyChanged) normalizedTavilyConfig.apiKey = tavilyConfig.apiKey.trim()
+
     if (!normalizedProviders.some(provider => provider.id === activeProviderId)) {
       setAiError('请选择一个默认服务商')
       return
@@ -303,6 +339,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
           activeProviderId,
           imageProcessingMode: 'direct_multimodal',
           ocrConfig: normalizedOcrConfig,
+          tavilyConfig: normalizedTavilyConfig,
           providers: normalizedProviders,
         }),
       })
@@ -313,6 +350,7 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
       setSelectedProviderId(updated.activeProviderId)
       setActiveProviderId(updated.activeProviderId)
       setOcrConfig(toEditableOcrConfig(updated.ocrConfig))
+      setTavilyConfig(toEditableTavilyConfig(updated.tavilyConfig))
       setAiSavedOk(true)
       setTimeout(() => {
         setAiSavedOk(false)
@@ -777,6 +815,108 @@ export default function SettingsModal({ pageConfig, onPageConfigChange, onClose,
                             {ocrBackendRequiresModel
                               ? '当前默认建议模型：PaddlePaddle/PaddleOCR-VL-1.5。你也可以填写硅基流动实际开放的兼容模型 ID。'
                               : '官方服务模式会直接调用 /layout-parsing，不再依赖聊天模型 ID；请把端点指到 PaddleOCR 服务根地址。'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-3 space-y-3">
+                        <div>
+                          <div className="text-xs font-medium text-emerald-700">Tavily 联网搜索配置</div>
+                          <div className="text-[11px] text-emerald-600 mt-1">Agent 在需要最新网页、新闻和外部资料时会调用 Tavily 的 web_search 工具。当前工作区能回答的问题仍会优先使用本地文档搜索。</div>
+                        </div>
+
+                        <div className="space-y-3 rounded-lg border border-emerald-100 bg-white px-3 py-3">
+                          <label className="flex items-center gap-2 text-xs text-gray-600">
+                            <input
+                              type="checkbox"
+                              checked={tavilyConfig.enabled}
+                              onChange={event => updateTavilyConfig(current => ({ ...current, enabled: event.target.checked }))}
+                            />
+                            <span>启用联网搜索</span>
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">默认搜索深度</span>
+                              <select
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                                value={tavilyConfig.searchDepth}
+                                onChange={event => updateTavilyConfig(current => ({
+                                  ...current,
+                                  searchDepth: event.target.value as EditableTavilyConfig['searchDepth'],
+                                }))}
+                              >
+                                <option value="basic">basic（更快更省）</option>
+                                <option value="advanced">advanced（更深入）</option>
+                              </select>
+                            </label>
+
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">默认搜索主题</span>
+                              <select
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                                value={tavilyConfig.topic}
+                                onChange={event => updateTavilyConfig(current => ({
+                                  ...current,
+                                  topic: event.target.value as EditableTavilyConfig['topic'],
+                                }))}
+                              >
+                                <option value="general">general</option>
+                                <option value="news">news</option>
+                                <option value="finance">finance</option>
+                              </select>
+                            </label>
+                          </div>
+
+                          <label className="block">
+                            <span className="block text-xs font-medium text-gray-500 mb-1">
+                              Tavily API Key
+                              {(tavilyConfig.hasApiKey && !tavilyConfig.apiKeyChanged) && (
+                                <span className="ml-1 font-normal text-gray-400">（留空则保持不变）</span>
+                              )}
+                            </span>
+                            <input
+                              type="password"
+                              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                              value={tavilyConfig.apiKey}
+                              onChange={event => updateTavilyConfig(current => ({
+                                ...current,
+                                apiKey: event.target.value,
+                                apiKeyChanged: true,
+                              }))}
+                              placeholder={tavilyConfig.hasApiKey && !tavilyConfig.apiKeyChanged ? '已配置，留空不修改' : '输入 tvly- 开头的 API Key'}
+                              autoComplete="off"
+                            />
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">默认结果数</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={10}
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                                value={tavilyConfig.maxResults}
+                                onChange={event => updateTavilyConfig(current => ({ ...current, maxResults: Number(event.target.value) || 5 }))}
+                              />
+                            </label>
+
+                            <label className="block">
+                              <span className="block text-xs font-medium text-gray-500 mb-1">超时（秒）</span>
+                              <input
+                                type="number"
+                                min={5}
+                                max={60}
+                                className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                                value={tavilyConfig.timeoutSeconds}
+                                onChange={event => updateTavilyConfig(current => ({ ...current, timeoutSeconds: Number(event.target.value) || 15 }))}
+                              />
+                            </label>
+                          </div>
+
+                          <div className="text-[11px] text-gray-500">
+                            推荐默认保持 basic + 5 条结果，只有在你希望更深入检索时再切到 advanced。用户明确说“联网搜索”时，agent 会优先尝试调用 web_search。
                           </div>
                         </div>
                       </div>

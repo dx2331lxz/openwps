@@ -44,6 +44,8 @@ TOOLS = [
                 "更新任务计划列表。当任务包含 3 个或以上步骤时，在开始工作前调用此工具创建任务清单，"
                 "并在执行过程中随时更新每项任务的状态。"
                 "每次调用都会完整替换当前的任务列表。"
+                "确保始终至少有一个任务处于 in_progress 状态。"
+                "为每个任务同时提供 title（命令式，如'读取文档'）和 activeForm（进行时，如'正在读取文档'）。"
             ),
             "parameters": {
                 "type": "object",
@@ -60,15 +62,19 @@ TOOLS = [
                                 },
                                 "title": {
                                     "type": "string",
-                                    "description": "任务标题，简短描述，如 '读取文档内容'",
+                                    "description": "任务标题，命令式描述，如 '读取文档内容'",
+                                },
+                                "activeForm": {
+                                    "type": "string",
+                                    "description": "任务的进行时描述，如 '正在读取文档内容'",
                                 },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "failed"],
-                                    "description": "pending=待执行, in_progress=进行中, completed=已完成, failed=失败",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "pending=待执行, in_progress=进行中, completed=已完成",
                                 },
                             },
-                            "required": ["id", "title", "status"],
+                            "required": ["id", "title", "activeForm", "status"],
                         },
                     },
                 },
@@ -536,9 +542,9 @@ TOOLS = [
             "name": "insert_image",
             "description": (
                 "将一张图片（通过 src URL 或 data URL）插入到正文中。"
-                "当需要把 Mermaid 流程图、图表等渲染结果以图片形式放入文档时，必须使用此工具。"
-                "openwps 文档支持图片节点，可以直接插入 SVG data URL 或普通图片 URL。"
                 "src 必须是有效的 URL 或 data:image/... 格式的 data URL。"
+                "注意：此工具只能插入已有 URL 的图片，不能用于生成图表。"
+                "要插入流程图/时序图/思维导图等图表，请使用 insert_mermaid 工具。"
             ),
             "parameters": {
                 "type": "object",
@@ -557,6 +563,35 @@ TOOLS = [
                     },
                 },
                 "required": ["src"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_mermaid",
+            "description": (
+                "将 Mermaid 图表代码渲染为图片并插入到正文中。"
+                "当需要插入流程图、时序图、类图、甘特图、思维导图、关系图等图表时，"
+                "使用此工具而非 insert_image。前端会自动将 Mermaid 代码渲染为 SVG 图片并插入文档。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Mermaid 图表代码，如 'graph TD; A-->B' 或 'sequenceDiagram; participant A'",
+                    },
+                    "alt": {
+                        "type": "string",
+                        "description": "图表描述文字，可选，如 'Transformer 架构思维导图'",
+                    },
+                    "afterParagraph": {
+                        "type": "integer",
+                        "description": "在该段落后插入图表；不传或传 -1 则追加到文档末尾",
+                    },
+                },
+                "required": ["code"],
             },
         },
     },
@@ -583,6 +618,41 @@ TOOLS = [
                     "context_lines": {
                         "type": "integer",
                         "description": "搜索结果上下文行数，默认3",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "使用 Tavily 执行联网搜索，获取最新网页、新闻和外部资料。"
+                "当问题依赖实时信息、公开网页或工作区外部知识时使用；"
+                "如果当前工作区文档已经足够回答，就优先使用 workspace_search / workspace_read。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词或问题，尽量具体，适合直接在网页上检索。",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "enum": ["general", "news", "finance"],
+                        "description": "搜索主题，默认 general；新闻可选 news。",
+                    },
+                    "searchDepth": {
+                        "type": "string",
+                        "enum": ["basic", "advanced"],
+                        "description": "搜索深度，basic 更快更省，advanced 更重更详细。",
+                    },
+                    "maxResults": {
+                        "type": "integer",
+                        "description": "返回结果数量，建议 1-10，默认 5。",
                     },
                 },
                 "required": ["query"],
@@ -658,9 +728,10 @@ EDIT_TOOL_NAMES = {
     "delete_selection_text",
     "delete_paragraph",
     "insert_image",
+    "insert_mermaid",
 }
 
-AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr", "workspace_search", "workspace_read"}
+AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr", "workspace_search", "workspace_read", "web_search"}
 
 def get_tools(mode: str | None) -> list[dict]:
     if mode == "edit":

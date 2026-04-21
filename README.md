@@ -33,6 +33,36 @@ python3 server/main.py
 # 访问 http://localhost:5174
 ```
 
+## AI 联网搜索
+
+项目已集成 Tavily web search，AI 可以在需要最新外部信息时自动调用联网搜索。
+
+### 配置方式
+
+1. 启动后端与前端后，打开设置弹窗。
+2. 在 AI 设置中正常配置一个可用的大模型提供商。
+3. 在新增的 Tavily 配置区域填写 API Key，并按需设置：
+	- `Search Depth`：`basic` 或 `advanced`
+	- `Topic`：`general` 或 `news`
+	- `Max Results`
+	- `Timeout Seconds`
+
+### 说明
+
+- Tavily API Key 仅保存在后端配置中，不会下发到浏览器。
+- `web_search` 工具由后端执行，前端只接收工具调用结果与最终回答。
+- 后端健康检查地址为 `http://localhost:5174/api/health`。
+
+### 验证是否生效
+
+在 AI 侧边栏发送类似问题：
+
+```text
+请联网搜索今天的 OpenAI 最新新闻，并简短总结。
+```
+
+如果配置正确，AI 会自动触发 `web_search`，并基于 Tavily 返回的实时结果生成回答。
+
 ## 发布流程
 
 **每次改动完成后必须执行：**
