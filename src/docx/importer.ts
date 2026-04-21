@@ -9,6 +9,11 @@ const EMU_TO_PX = 1 / 9525
 
 type Align = 'left' | 'center' | 'right' | 'justify'
 
+interface ParagraphTabStop {
+  align: 'left' | 'center' | 'right'
+  position: number
+}
+
 interface TextStyleAttrs extends Record<string, unknown> {
   fontFamily: string
   fontSize: number
@@ -27,12 +32,24 @@ interface ParagraphAttrs extends Record<string, unknown> {
   align: Align
   firstLineIndent: number
   indent: number
+  rightIndent: number
   lineHeight: number
   spaceBefore: number
   spaceAfter: number
   listType: 'bullet' | 'ordered' | null
   listLevel: number
   pageBreakBefore: boolean
+  tabStops: ParagraphTabStop[]
+}
+
+interface ParsedParagraphResult {
+  node: PMNodeJSON | null
+  floatingObjects: PMNodeJSON[]
+}
+
+interface ParsedRunResult {
+  nodes: PMNodeJSON[]
+  floatingObjects: PMNodeJSON[]
 }
 
 type PMTextStyleMarkJSON = {
@@ -74,7 +91,7 @@ export interface DocxImportResult {
   typography: DocxTypographyConfig
 }
 
-type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'indent' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'listType' | 'listLevel' | 'pageBreakBefore'>>
+type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'indent' | 'rightIndent' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'listType' | 'listLevel' | 'pageBreakBefore' | 'tabStops'>>
 
 interface RawStyle {
   basedOn?: string
@@ -150,12 +167,14 @@ const DEFAULT_PARAGRAPH_ATTRS: ParagraphAttrs = {
   align: 'left',
   firstLineIndent: 0,
   indent: 0,
+  rightIndent: 0,
   lineHeight: 1.5,
   spaceBefore: 0,
   spaceAfter: 0,
   listType: null,
   listLevel: 0,
   pageBreakBefore: false,
+  tabStops: [],
 }
 
 function normalizeFont(name: string): string {
@@ -180,6 +199,10 @@ function normalizeFont(name: string): string {
     'STFangsong': FONT_STACKS.fang,
     '微软雅黑': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
     'Microsoft YaHei': '"Microsoft YaHei", 微软雅黑, "PingFang SC", sans-serif',
+    '华文行楷': '"STXingkai", "Kaiti SC", serif',
+    'STXingkai': '"STXingkai", "Kaiti SC", serif',
+    '隶书': '"STLiti", "SimLi", serif',
+    'STLiti': '"STLiti", "SimLi", serif',
     'Times New Roman': FONT_STACKS.timesNewRoman,
     'Arial': FONT_STACKS.arial,
     'Calibri': 'Calibri, Arial, sans-serif',
@@ -244,6 +267,10 @@ function twipToPt(value: number) {
 
 function twipToEm(value: number, fontSizePt: number) {
   return twipToPt(value) / Math.max(fontSizePt, 1)
+}
+
+function hundredthCharToEm(value: number) {
+  return value / 100
 }
 
 function halfPtToPt(value: number) {
@@ -457,6 +484,7 @@ function readParagraphStyle(
     right: 'right',
     both: 'justify',
     justify: 'justify',
+    distribute: 'center',
   }
 
   const attrs: StyleAttrs = {}
@@ -466,11 +494,41 @@ function readParagraphStyle(
   const baseFontSize = inherited.fontSize ?? DEFAULT_TEXT_STYLE.fontSize
   const ind = directChild(pPr, 'ind')
   const leftIndent = parseNumber(getAttr(ind, 'left') || getAttr(ind, 'start'))
+  const leftChars = parseNumber(getAttr(ind, 'leftChars') || getAttr(ind, 'startChars'))
   const firstLine = parseNumber(getAttr(ind, 'firstLine'))
+  const firstLineChars = parseNumber(getAttr(ind, 'firstLineChars'))
   const hanging = parseNumber(getAttr(ind, 'hanging'))
-  if (leftIndent > 0) attrs.indent = twipToEm(leftIndent, baseFontSize) / 2
-  if (firstLine > 0) attrs.firstLineIndent = twipToEm(firstLine, baseFontSize)
-  if (hanging > 0) attrs.firstLineIndent = -twipToEm(hanging, baseFontSize)
+  const hangingChars = parseNumber(getAttr(ind, 'hangingChars'))
+  const rightIndent = parseNumber(getAttr(ind, 'right') || getAttr(ind, 'end'))
+  const rightChars = parseNumber(getAttr(ind, 'rightChars') || getAttr(ind, 'endChars'))
+  const shouldIgnoreWordIndents = jc === 'distribute'
+  if (!shouldIgnoreWordIndents) {
+    if (leftIndent > 0) attrs.indent = twipToEm(leftIndent, baseFontSize) / 2
+    else if (leftChars > 0) attrs.indent = hundredthCharToEm(leftChars) / 2
+
+    if (rightIndent > 0) attrs.rightIndent = twipToEm(rightIndent, baseFontSize) / 2
+    else if (rightChars > 0) attrs.rightIndent = hundredthCharToEm(rightChars) / 2
+
+    if (firstLine > 0) attrs.firstLineIndent = twipToEm(firstLine, baseFontSize)
+    else if (firstLineChars > 0) attrs.firstLineIndent = hundredthCharToEm(firstLineChars)
+
+    if (hanging > 0) attrs.firstLineIndent = -twipToEm(hanging, baseFontSize)
+    else if (hangingChars > 0) attrs.firstLineIndent = -hundredthCharToEm(hangingChars)
+  }
+
+  const tabStops = directChildren(directChild(pPr, 'tabs'), 'tab')
+    .map((tab): ParagraphTabStop | null => {
+      const rawAlign = getAttr(tab, 'val')
+      const align = rawAlign === 'center' || rawAlign === 'right' ? rawAlign : 'left'
+      const pos = parseNumber(getAttr(tab, 'pos'))
+      if (pos <= 0) return null
+      return {
+        align,
+        position: Math.round(twipToPx(pos)),
+      }
+    })
+    .filter((tab): tab is ParagraphTabStop => tab != null)
+  if (tabStops.length > 0) attrs.tabStops = tabStops
 
   const spacing = directChild(pPr, 'spacing')
   const before = parseNumber(getAttr(spacing, 'before'))
@@ -761,16 +819,249 @@ async function parseImageNode(drawingEl: Element, rels: RelMap, zip: JSZip): Pro
   }
 }
 
+function parseBooleanAttr(element: Element | undefined, name: string, fallback = false) {
+  const raw = getAttr(element, name)
+  if (!raw) return fallback
+  return !['0', 'false', 'off', 'none'].includes(raw)
+}
+
+async function parseFloatingObjectNode(
+  drawingEl: Element,
+  styleMap: StyleMap,
+  defaultParagraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
+  rels: RelMap,
+  zip: JSZip,
+  commentMap: CommentMap = new Map()
+): Promise<PMNodeJSON | null> {
+  const anchorEl = directChild(drawingEl, 'anchor')
+  if (!anchorEl) return null
+
+  const extent = directChild(anchorEl, 'extent') ?? findDescendant(anchorEl, 'ext')
+  const width = parseNumber(getAttr(extent, 'cx'))
+  const height = parseNumber(getAttr(extent, 'cy'))
+  const docPr = directChild(anchorEl, 'docPr') ?? findDescendant(anchorEl, 'docPr')
+  const positionH = directChild(anchorEl, 'positionH')
+  const positionV = directChild(anchorEl, 'positionV')
+  const positionX = parseNumber(directChild(positionH, 'posOffset')?.textContent ?? '0')
+  const positionY = parseNumber(directChild(positionV, 'posOffset')?.textContent ?? '0')
+  const wrapChild = elementChildren(anchorEl).find((child) => getLocalName(child).startsWith('wrap'))
+  const wrap = wrapChild ? getLocalName(wrapChild).replace(/^wrap/, '').toLowerCase() : 'none'
+  const txbxContent = findDescendant(anchorEl, 'txbxContent')
+  const bodyPr = findDescendant(anchorEl, 'bodyPr')
+  const paddingLeft = Math.round(parseNumber(getAttr(bodyPr, 'lIns')) * EMU_TO_PX)
+  const paddingTop = Math.round(parseNumber(getAttr(bodyPr, 'tIns')) * EMU_TO_PX)
+  const paddingRight = Math.round(parseNumber(getAttr(bodyPr, 'rIns')) * EMU_TO_PX)
+  const paddingBottom = Math.round(parseNumber(getAttr(bodyPr, 'bIns')) * EMU_TO_PX)
+
+  if (txbxContent) {
+    const paragraphs: PMNodeJSON[] = []
+    const paragraphElements = directChildren(txbxContent, 'p')
+    for (let index = 0; index < paragraphElements.length; index += 1) {
+      const paragraphEl = paragraphElements[index]!
+      const parsed = await parseParagraph(
+        paragraphEl,
+        styleMap,
+        defaultParagraphStyle,
+        themeFonts,
+        docGridLinePitchPt,
+        numberingMap,
+        rels,
+        zip,
+        commentMap
+      )
+      if (!parsed.node) continue
+
+      if (parsed.node.type === 'paragraph' && parsed.node.attrs) {
+        const spacing = directChild(directChild(paragraphEl, 'pPr'), 'spacing')
+        const hasExplicitLineHeight = parseNumber(getAttr(spacing, 'line')) > 0
+        parsed.node.attrs = {
+          ...parsed.node.attrs,
+          lineHeight: hasExplicitLineHeight
+            ? parsed.node.attrs.lineHeight
+            : 1,
+          spaceBefore: 0,
+          spaceAfter: 0,
+        }
+      }
+
+      const isEmptyParagraph =
+        parsed.node.type === 'paragraph' &&
+        (!parsed.node.content || parsed.node.content.length === 0)
+      const isLastParagraph = index === paragraphElements.length - 1
+      if (isEmptyParagraph && isLastParagraph) continue
+
+      paragraphs.push(parsed.node)
+    }
+
+    return {
+      type: 'floating_object',
+      attrs: {
+        kind: 'textbox',
+        alt: getAttr(docPr, 'descr') || getAttr(docPr, 'name') || '',
+        title: getAttr(docPr, 'name') || '',
+        width: width > 0 ? Math.round(width * EMU_TO_PX) : null,
+        height: height > 0 ? Math.round(height * EMU_TO_PX) : null,
+        positionX: Math.round(positionX * EMU_TO_PX),
+        positionY: Math.round(positionY * EMU_TO_PX),
+        relativeFromX: getAttr(positionH, 'relativeFrom') || 'column',
+        relativeFromY: getAttr(positionV, 'relativeFrom') || 'paragraph',
+        wrap,
+        behindDoc: parseBooleanAttr(anchorEl, 'behindDoc'),
+        allowOverlap: parseBooleanAttr(anchorEl, 'allowOverlap', true),
+        distT: Math.round(parseNumber(getAttr(anchorEl, 'distT')) * EMU_TO_PX),
+        distB: Math.round(parseNumber(getAttr(anchorEl, 'distB')) * EMU_TO_PX),
+        distL: Math.round(parseNumber(getAttr(anchorEl, 'distL')) * EMU_TO_PX),
+        distR: Math.round(parseNumber(getAttr(anchorEl, 'distR')) * EMU_TO_PX),
+        paddingTop,
+        paddingRight,
+        paddingBottom,
+        paddingLeft,
+        paragraphs,
+      },
+    }
+  }
+
+  const imageNode = await parseImageNode(anchorEl, rels, zip)
+  if (!imageNode) return null
+
+  return {
+    type: 'floating_object',
+    attrs: {
+      kind: 'image',
+      src: imageNode.attrs?.src ?? '',
+      alt: imageNode.attrs?.alt ?? '',
+      title: imageNode.attrs?.title ?? '',
+      width: imageNode.attrs?.width ?? null,
+      height: imageNode.attrs?.height ?? null,
+      positionX: Math.round(positionX * EMU_TO_PX),
+      positionY: Math.round(positionY * EMU_TO_PX),
+      relativeFromX: getAttr(positionH, 'relativeFrom') || 'column',
+      relativeFromY: getAttr(positionV, 'relativeFrom') || 'paragraph',
+      wrap,
+      behindDoc: parseBooleanAttr(anchorEl, 'behindDoc'),
+      allowOverlap: parseBooleanAttr(anchorEl, 'allowOverlap', true),
+      distT: Math.round(parseNumber(getAttr(anchorEl, 'distT')) * EMU_TO_PX),
+      distB: Math.round(parseNumber(getAttr(anchorEl, 'distB')) * EMU_TO_PX),
+      distL: Math.round(parseNumber(getAttr(anchorEl, 'distL')) * EMU_TO_PX),
+      distR: Math.round(parseNumber(getAttr(anchorEl, 'distR')) * EMU_TO_PX),
+      paddingTop: 0,
+      paddingRight: 0,
+      paddingBottom: 0,
+      paddingLeft: 0,
+      paragraphs: [],
+    },
+  }
+}
+
+async function parseRunChildNode(
+  child: Element,
+  result: ParsedRunResult,
+  flushText: () => void,
+  styleMap: StyleMap,
+  paragraphStyle: StyleAttrs,
+  themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
+  rels: RelMap,
+  zip: JSZip,
+  commentMap: CommentMap,
+  linkHref?: string,
+  activeCommentMarks: PMCommentMarkJSON[] = []
+): Promise<boolean> {
+  const localName = getLocalName(child)
+
+  if (localName === 'drawing') {
+    flushText()
+    const floatingObject = await parseFloatingObjectNode(
+      child,
+      styleMap,
+      paragraphStyle,
+      themeFonts,
+      docGridLinePitchPt,
+      numberingMap,
+      rels,
+      zip,
+      commentMap
+    )
+    if (floatingObject) {
+      result.floatingObjects.push(floatingObject)
+      return true
+    }
+    const imageNode = await parseImageNode(child, rels, zip)
+    if (imageNode) result.nodes.push(imageNode)
+    return true
+  }
+
+  if (localName === 'AlternateContent') {
+    const variants = [
+      ...directChildren(child, 'Choice'),
+      ...directChildren(child, 'Fallback'),
+    ]
+
+    for (const variant of variants) {
+      const nestedResult: ParsedRunResult = { nodes: [], floatingObjects: [] }
+      for (const nestedChild of elementChildren(variant)) {
+        const nestedHandled = await parseRunChildNode(
+          nestedChild,
+          nestedResult,
+          flushText,
+          styleMap,
+          paragraphStyle,
+          themeFonts,
+          docGridLinePitchPt,
+          numberingMap,
+          rels,
+          zip,
+          commentMap,
+          linkHref,
+          activeCommentMarks
+        )
+        if (nestedHandled) continue
+        if (getLocalName(nestedChild) !== 'r') continue
+        const nestedRun = await parseRunNodes(
+          nestedChild,
+          styleMap,
+          paragraphStyle,
+          themeFonts,
+          docGridLinePitchPt,
+          numberingMap,
+          rels,
+          zip,
+          commentMap,
+          linkHref,
+          activeCommentMarks
+        )
+        nestedResult.nodes.push(...nestedRun.nodes)
+        nestedResult.floatingObjects.push(...nestedRun.floatingObjects)
+      }
+      if (nestedResult.nodes.length > 0 || nestedResult.floatingObjects.length > 0) {
+        result.nodes.push(...nestedResult.nodes)
+        result.floatingObjects.push(...nestedResult.floatingObjects)
+        return true
+      }
+    }
+    return true
+  }
+
+  return false
+}
+
 async function parseRunNodes(
   rEl: Element,
   styleMap: StyleMap,
   paragraphStyle: StyleAttrs,
   themeFonts: ThemeFonts,
+  docGridLinePitchPt: number | null,
+  numberingMap: NumberingMap,
   rels: RelMap,
   zip: JSZip,
+  commentMap: CommentMap = new Map(),
   linkHref?: string,
   activeCommentMarks: PMCommentMarkJSON[] = []
-): Promise<PMNodeJSON[]> {
+): Promise<ParsedRunResult> {
   const rPr = directChild(rEl, 'rPr')
   const styleId = getAttr(directChild(rPr, 'rStyle'), 'val')
   const effectiveStyle = readRunStyle(
@@ -783,12 +1074,12 @@ async function parseRunNodes(
     ...activeCommentMarks,
   ]
 
-  const nodes: PMNodeJSON[] = []
+  const result: ParsedRunResult = { nodes: [], floatingObjects: [] }
   let textBuffer = ''
 
   const flushText = () => {
     const node = createTextNode(textBuffer, effectiveStyle, extraMarks)
-    if (node) nodes.push(node)
+    if (node) result.nodes.push(node)
     textBuffer = ''
   }
 
@@ -814,7 +1105,7 @@ async function parseRunNodes(
     if (localName === 'br' || localName === 'cr') {
       if (getAttr(child, 'type') === 'page') {
         flushText()
-        nodes.push({
+        result.nodes.push({
           type: 'text',
           text: '\n',
           marks: [{
@@ -833,15 +1124,26 @@ async function parseRunNodes(
       if (Number.isFinite(parsed)) textBuffer += String.fromCharCode(parsed)
       continue
     }
-    if (localName === 'drawing') {
-      flushText()
-      const imageNode = await parseImageNode(child, rels, zip)
-      if (imageNode) nodes.push(imageNode)
-    }
+    const handled = await parseRunChildNode(
+      child,
+      result,
+      flushText,
+      styleMap,
+      paragraphStyle,
+      themeFonts,
+      docGridLinePitchPt,
+      numberingMap,
+      rels,
+      zip,
+      commentMap,
+      linkHref,
+      activeCommentMarks
+    )
+    if (handled) continue
   }
 
   flushText()
-  return nodes
+  return result
 }
 
 async function parseParagraph(
@@ -854,7 +1156,7 @@ async function parseParagraph(
   rels: RelMap,
   zip: JSZip,
   commentMap: CommentMap = new Map()
-): Promise<PMNodeJSON> {
+): Promise<ParsedParagraphResult> {
   const pPr = directChild(pEl, 'pPr')
   const styleId = getAttr(directChild(pPr, 'pStyle'), 'val')
   const baseStyle = styleId
@@ -863,6 +1165,7 @@ async function parseParagraph(
   const paragraphStyle = { ...baseStyle, ...readParagraphStyle(pPr, baseStyle, docGridLinePitchPt, numberingMap) }
 
   const content: PMNodeJSON[] = []
+  const floatingObjects: PMNodeJSON[] = []
 
   // Track which comment ids are currently "open" in this paragraph
   const openCommentIds = new Set<string>()
@@ -898,7 +1201,21 @@ async function parseParagraph(
       })
 
     if (localName === 'r') {
-      content.push(...await parseRunNodes(child, styleMap, paragraphStyle, themeFonts, rels, zip, undefined, activeCommentMarks))
+      const parsedRun = await parseRunNodes(
+        child,
+        styleMap,
+        paragraphStyle,
+        themeFonts,
+        docGridLinePitchPt,
+        numberingMap,
+        rels,
+        zip,
+        commentMap,
+        undefined,
+        activeCommentMarks
+      )
+      content.push(...parsedRun.nodes)
+      floatingObjects.push(...parsedRun.floatingObjects)
       continue
     }
     if (localName === 'hyperlink') {
@@ -907,27 +1224,80 @@ async function parseParagraph(
       const relTarget = relId ? rels[relId]?.target : ''
       const linkHref = relTarget || (anchor ? `#${anchor}` : '')
       for (const run of directChildren(child, 'r')) {
-        content.push(...await parseRunNodes(run, styleMap, paragraphStyle, themeFonts, rels, zip, linkHref || undefined, activeCommentMarks))
+        const parsedRun = await parseRunNodes(
+          run,
+          styleMap,
+          paragraphStyle,
+          themeFonts,
+          docGridLinePitchPt,
+          numberingMap,
+          rels,
+          zip,
+          commentMap,
+          linkHref || undefined,
+          activeCommentMarks
+        )
+        content.push(...parsedRun.nodes)
+        floatingObjects.push(...parsedRun.floatingObjects)
       }
     }
   }
 
-  const isTrulyEmpty = content.length === 0
+  const hasVisibleInlineContent = content.some((node) => {
+    if (node.type === 'image') return true
+    if (node.type !== 'text') return true
+    return Boolean(node.text && node.text.length > 0)
+  })
+  const nonPropertyChildren = elementChildren(pEl).filter((child) => getLocalName(child) !== 'pPr')
+  const hasSectionProps = Boolean(directChild(pPr, 'sectPr'))
+  const hasOnlyStructuralChildren =
+    nonPropertyChildren.length > 0 &&
+    nonPropertyChildren.every((child) => {
+      const localName = getLocalName(child)
+      return [
+        'bookmarkStart',
+        'bookmarkEnd',
+        'commentRangeStart',
+        'commentRangeEnd',
+        'proofErr',
+        'permStart',
+        'permEnd',
+      ].includes(localName)
+    })
+  const isStructuralOnlyParagraph =
+    !hasVisibleInlineContent &&
+    floatingObjects.length === 0 &&
+    (hasOnlyStructuralChildren || hasSectionProps)
+
+  if (isStructuralOnlyParagraph) {
+    return {
+      node: null,
+      floatingObjects,
+    }
+  }
 
   const attrs: ParagraphAttrs = {
     ...DEFAULT_PARAGRAPH_ATTRS,
     align: paragraphStyle.align ?? DEFAULT_PARAGRAPH_ATTRS.align,
     firstLineIndent: paragraphStyle.firstLineIndent ?? DEFAULT_PARAGRAPH_ATTRS.firstLineIndent,
+    indent: paragraphStyle.indent ?? DEFAULT_PARAGRAPH_ATTRS.indent,
+    rightIndent: paragraphStyle.rightIndent ?? DEFAULT_PARAGRAPH_ATTRS.rightIndent,
+    fontSizeHint: paragraphStyle.fontSize ?? null,
+    fontFamilyHint: paragraphStyle.fontFamily ?? null,
     lineHeight: clampLineHeight(paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight),
     spaceBefore: paragraphStyle.spaceBefore ?? DEFAULT_PARAGRAPH_ATTRS.spaceBefore,
     spaceAfter: paragraphStyle.spaceAfter ?? DEFAULT_PARAGRAPH_ATTRS.spaceAfter,
     pageBreakBefore: paragraphStyle.pageBreakBefore ?? DEFAULT_PARAGRAPH_ATTRS.pageBreakBefore,
+    tabStops: paragraphStyle.tabStops ?? DEFAULT_PARAGRAPH_ATTRS.tabStops,
   }
 
   return {
-    type: 'paragraph',
-    attrs,
-    content: isTrulyEmpty ? [createTextNode('', paragraphStyle) ?? { type: 'text', text: '' }] : content,
+    node: {
+      type: 'paragraph',
+      attrs,
+      content: hasVisibleInlineContent ? content : [],
+    },
+    floatingObjects,
   }
 }
 
@@ -962,7 +1332,8 @@ async function parseTableCell(
   for (const child of elementChildren(tcEl)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      content.push(await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap))
+      const parsed = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap)
+      if (parsed.node) content.push(parsed.node)
     }
   }
 
@@ -1061,20 +1432,16 @@ async function parseDocument(
   for (const child of elementChildren(body)) {
     const localName = getLocalName(child)
     if (localName === 'p') {
-      const para = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap)
+      const parsed = await parseParagraph(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap)
+      const para = parsed.node
+      if (!para) {
+        if (parsed.floatingObjects.length > 0) content.push(...parsed.floatingObjects)
+        continue
+      }
       // 跳过开头的连续空段落
       const isEmpty = !para.content || para.content.length === 0 ||
         para.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
       if (isEmpty && content.length === 0) continue
-      if (isEmpty) {
-        const prevIsEmpty = content.length > 0 && (() => {
-          const prev = content[content.length - 1] as PMNodeJSON
-          if (prev.type !== 'paragraph') return false
-          return !prev.content || prev.content.length === 0 ||
-            prev.content.every((n: PMNodeJSON) => n.type === 'text' && !n.text?.trim())
-        })()
-        if (prevIsEmpty) continue
-      }
       // 文档第一个有内容的段落去掉 spaceBefore（防止标题段前间距把内容往下推）
       const isFirstContent = content.length === 0 || content.every((n: PMNodeJSON) => {
         if (n.type !== 'paragraph') return false
@@ -1085,6 +1452,7 @@ async function parseDocument(
         para.attrs = { ...para.attrs, spaceBefore: 0 }
       }
       content.push(para)
+      if (parsed.floatingObjects.length > 0) content.push(...parsed.floatingObjects)
       continue
     }
     if (localName === 'tbl') {

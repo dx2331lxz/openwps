@@ -53,6 +53,7 @@ export interface RenderUnit {
   renderWidth: number
   glyphWidth: number
   anchor: 'start' | 'end'
+  offsetX?: number
 }
 
 export interface RenderedLine extends LineInfo {
@@ -65,6 +66,37 @@ export interface RenderedLine extends LineInfo {
   isLastLineOfParagraph: boolean
 }
 
+export interface FloatingTextRun {
+  text: string
+  style: RenderTextStyle
+  hasComment: boolean
+}
+
+export interface FloatingParagraph {
+  align: 'left' | 'center' | 'right' | 'justify'
+  lineHeight: number
+  runs: FloatingTextRun[]
+}
+
+export interface RenderedFloatingObject {
+  blockIndex: number
+  kind: 'image' | 'textbox'
+  left: number
+  top: number
+  width: number
+  height: number
+  paddingTop: number
+  paddingRight: number
+  paddingBottom: number
+  paddingLeft: number
+  wrap: string
+  behindDoc: boolean
+  src?: string
+  alt?: string
+  title?: string
+  paragraphs: FloatingParagraph[]
+}
+
 export interface PageLayout {
   lines: LineInfo[]
   totalHeight: number
@@ -73,6 +105,7 @@ export interface PageLayout {
 export interface RenderedPage {
   lines: Array<RenderedLine & { top: number }>
   totalHeight: number
+  floatingObjects: RenderedFloatingObject[]
 }
 
 export interface PageBreakInfo {
@@ -175,8 +208,8 @@ function resolveTextStyle(node: PMNode): RenderTextStyle {
 }
 
 function getParagraphTextStyle(paraNode: PMNode) {
-  let fontFamily = DEFAULT_TEXT_STYLE.fontFamily
-  let fontSize = DEFAULT_TEXT_STYLE.fontSize
+  let fontFamily = String(paraNode.attrs.fontFamilyHint ?? DEFAULT_TEXT_STYLE.fontFamily)
+  let fontSize = Number(paraNode.attrs.fontSizeHint ?? DEFAULT_TEXT_STYLE.fontSize)
 
   paraNode.forEach((child) => {
     if ((child.isText || child.type.name === 'image') && child.marks.length > 0) {
@@ -314,6 +347,22 @@ function splitSourceCharsByNewline(chars: SourceChar[]): SourceChar[][] {
   return groups
 }
 
+function parseParagraphTabStops(rawTabStops: unknown) {
+  if (!Array.isArray(rawTabStops)) return []
+
+  return rawTabStops
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((item): { align: 'left' | 'center' | 'right'; position: number } => {
+      const rawAlign = String(item.align ?? 'left')
+      return {
+        align: rawAlign === 'center' || rawAlign === 'right' ? rawAlign : 'left',
+        position: Math.max(0, Number(item.position) || 0),
+      }
+    })
+    .filter((item) => item.position > 0)
+    .sort((a, b) => a.position - b.position)
+}
+
 function assignMeasuredWidths(units: MeasureUnit[]) {
   if (!units.length) return
 
@@ -383,6 +432,68 @@ function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
 
   assignMeasuredWidths(units)
   return units
+}
+
+function buildTabbedLine(
+  chars: SourceChar[],
+  tabStops: Array<{ align: 'left' | 'center' | 'right'; position: number }>,
+  availableWidth: number
+): FittedLine {
+  const segments: SourceChar[][] = [[]]
+
+  chars.forEach((char) => {
+    if (char.char === '\t') {
+      segments.push([])
+      return
+    }
+    segments[segments.length - 1]!.push(char)
+  })
+
+  const segmentUnits = segments.map((segment) => buildMeasureUnits(segment))
+  const segmentWidths = segmentUnits.map((units) => units.reduce((sum, unit) => sum + unit.width, 0))
+
+  const renderedUnits: RenderUnit[] = []
+  let cursorX = 0
+
+  segmentUnits.forEach((units, segmentIndex) => {
+    if (segmentIndex > 0) {
+      const tabStop = tabStops[Math.min(segmentIndex - 1, tabStops.length - 1)]
+      if (tabStop) {
+        const nextWidth = segmentWidths[segmentIndex] ?? 0
+        const alignedX = tabStop.align === 'center'
+          ? tabStop.position - (nextWidth / 2)
+          : tabStop.align === 'right'
+            ? tabStop.position - nextWidth
+            : tabStop.position
+        cursorX = Math.max(cursorX, alignedX)
+      }
+    }
+
+    units.forEach((unit) => {
+      renderedUnits.push({
+        text: unit.displayText,
+        startPos: unit.startPos,
+        endPos: unit.endPos,
+        style: unit.style,
+        hasComment: unit.hasComment,
+        width: unit.width,
+        renderWidth: unit.width,
+        glyphWidth: unit.compressedWidth,
+        anchor: getPunctuationAnchor(unit.displayText),
+        offsetX: cursorX,
+      })
+      cursorX += unit.width
+    })
+  })
+
+  return {
+    text: renderedUnits.map((unit) => unit.text).join(''),
+    sourceCharCount: renderedUnits.length,
+    units: renderedUnits,
+    usedWidth: cursorX,
+    renderedWidth: cursorX,
+    availableWidth: Math.max(1, availableWidth),
+  }
 }
 
 function fitUnitsToLines(
@@ -593,6 +704,11 @@ function estimateImageHeight(node: PMNode): number {
   return typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 160
 }
 
+function estimateFloatingObjectHeight(node: PMNode): number {
+  if (node.type.name !== 'floating_object') return 0
+  return typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 0
+}
+
 function paragraphHasOnlyTextInlines(paraNode: PMNode): boolean {
   let ok = true
   paraNode.forEach((child) => {
@@ -613,11 +729,13 @@ function measureParagraph(
   const spaceBefore = ptToPx((paraNode.attrs.spaceBefore as number) ?? 0)
   const spaceAfter = ptToPx((paraNode.attrs.spaceAfter as number) ?? 0)
   const paragraphIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.indent as number) ?? 0) * 2)))
+  const paragraphRightIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.rightIndent as number) ?? 0) * 2)))
   const firstLineIndentPx = Math.max(0, ptToPx(fontSize * ((paraNode.attrs.firstLineIndent as number) ?? 0)))
+  const tabStops = parseParagraphTabStops(paraNode.attrs.tabStops)
 
   const fontSizePx = ptToPx(fontSize)
   let lineHeight = fontSizePx * lineHeightMult
-  const layoutWidth = Math.max(1, contentWidth - paragraphIndentPx - PRETEXT_LAYOUT_SAFETY_PX)
+  const layoutWidth = Math.max(1, contentWidth - paragraphIndentPx - paragraphRightIndentPx - PRETEXT_LAYOUT_SAFETY_PX)
   const firstLineWidth = Math.max(1, layoutWidth - firstLineIndentPx)
   const text = paraNode.textContent
   const sourceChars = extractParagraphSourceChars(paraNode, paraPos)
@@ -625,6 +743,7 @@ function measureParagraph(
 
   paraNode.forEach((child) => {
     maxInlineHeight = Math.max(maxInlineHeight, estimateImageHeight(child))
+    maxInlineHeight = Math.max(maxInlineHeight, estimateFloatingObjectHeight(child))
     if (child.isText) {
       const childStyle = resolveTextStyle(child)
       maxInlineHeight = Math.max(maxInlineHeight, ptToPx(childStyle.fontSize) * lineHeightMult)
@@ -660,6 +779,15 @@ function measureParagraph(
   try {
     const groups = sourceChars ? splitSourceCharsByNewline(sourceChars) : []
     fittedGroups = (groups.length ? groups : [[]]).map((groupChars, groupIndex) => {
+      if (groupChars.some((char) => char.char === '\t') && tabStops.length > 0) {
+        return {
+          lines: [buildTabbedLine(
+            groupChars,
+            tabStops,
+            groupIndex === 0 ? firstLineWidth : layoutWidth
+          )],
+        }
+      }
       const units = buildMeasureUnits(groupChars)
       return { lines: fitUnitsToLines(units, layoutWidth, groupIndex === 0 ? firstLineWidth : layoutWidth) }
     })
@@ -731,6 +859,122 @@ function measureParagraph(
     spaceBefore,
     spaceAfter,
   }
+}
+
+function resolveFloatingLeft(node: PMNode, config: PageConfig, contentWidth: number) {
+  const relativeFromX = String(node.attrs.relativeFromX ?? 'column')
+  const positionX = Number(node.attrs.positionX ?? 0)
+
+  switch (relativeFromX) {
+    case 'page':
+      return positionX
+    case 'margin':
+    case 'leftMargin':
+      return config.marginLeft + positionX
+    case 'rightMargin':
+      return config.pageWidth - config.marginRight + positionX
+    case 'column':
+    default:
+      return config.marginLeft + Math.min(contentWidth, Math.max(-contentWidth, positionX))
+  }
+}
+
+function resolveFloatingTop(node: PMNode, anchorTop: number, config: PageConfig) {
+  const relativeFromY = String(node.attrs.relativeFromY ?? 'paragraph')
+  const positionY = Number(node.attrs.positionY ?? 0)
+
+  switch (relativeFromY) {
+    case 'page':
+      return positionY
+    case 'margin':
+    case 'topMargin':
+      return config.marginTop + positionY
+    case 'paragraph':
+    case 'line':
+    default:
+      return config.marginTop + anchorTop + positionY
+  }
+}
+
+function buildFloatingParagraphs(node: PMNode): FloatingParagraph[] {
+  const paragraphs = Array.isArray(node.attrs.paragraphs) ? node.attrs.paragraphs : []
+
+  return paragraphs
+    .filter((paragraph): paragraph is Record<string, unknown> => Boolean(paragraph) && typeof paragraph === 'object')
+    .map((paragraph) => {
+      const attrs = (paragraph.attrs as Record<string, unknown> | undefined) ?? {}
+      const rawContent = Array.isArray(paragraph.content) ? paragraph.content : []
+      let maxFontSize = DEFAULT_TEXT_STYLE.fontSize
+      const runs = rawContent
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+        .map((item) => {
+          const marks = Array.isArray(item.marks) ? item.marks : []
+          const textStyleMark = marks.find((mark) => (
+            Boolean(mark) &&
+            typeof mark === 'object' &&
+            (mark as { type?: string }).type === 'textStyle'
+          )) as { attrs?: Partial<RenderTextStyle> } | undefined
+          const commentMark = marks.find((mark) => (
+            Boolean(mark) &&
+            typeof mark === 'object' &&
+            (mark as { type?: string }).type === 'comment'
+          ))
+          const style = { ...DEFAULT_TEXT_STYLE, ...(textStyleMark?.attrs ?? {}) }
+          maxFontSize = Math.max(maxFontSize, Number(style.fontSize) || DEFAULT_TEXT_STYLE.fontSize)
+          return {
+            text: String(item.text ?? ''),
+            style,
+            hasComment: Boolean(commentMark),
+          }
+        })
+        .filter((run) => run.text.length > 0)
+
+      return {
+        align: ((attrs.align as FloatingParagraph['align']) ?? 'left'),
+        lineHeight: ptToPx(maxFontSize * (Number(attrs.lineHeight ?? 1.5) || 1.5)),
+        runs,
+      }
+    })
+}
+
+function buildRenderedFloatingObject(
+  node: PMNode,
+  blockIndex: number,
+  anchorTop: number,
+  config: PageConfig,
+  contentWidth: number
+): RenderedFloatingObject {
+  const kind = String(node.attrs.kind ?? 'textbox') === 'image' ? 'image' : 'textbox'
+  const width = typeof node.attrs.width === 'number' && node.attrs.width > 0 ? node.attrs.width : contentWidth
+  const height = typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 0
+
+  return {
+    blockIndex,
+    kind,
+    left: resolveFloatingLeft(node, config, contentWidth),
+    top: resolveFloatingTop(node, anchorTop, config),
+    width,
+    height,
+    paddingTop: Math.max(0, Number(node.attrs.paddingTop ?? 0)),
+    paddingRight: Math.max(0, Number(node.attrs.paddingRight ?? 0)),
+    paddingBottom: Math.max(0, Number(node.attrs.paddingBottom ?? 0)),
+    paddingLeft: Math.max(0, Number(node.attrs.paddingLeft ?? 0)),
+    wrap: String(node.attrs.wrap ?? 'none'),
+    behindDoc: Boolean(node.attrs.behindDoc),
+    src: String(node.attrs.src ?? ''),
+    alt: String(node.attrs.alt ?? ''),
+    title: String(node.attrs.title ?? ''),
+    paragraphs: buildFloatingParagraphs(node),
+  }
+}
+
+function getFloatingFlowFloor(page: RenderedPage, config: PageConfig) {
+  return page.floatingObjects.reduce((maxBottom, object) => {
+    if (object.behindDoc || object.wrap !== 'none') return maxBottom
+    const objectTopWithinContent = object.top - config.marginTop
+    const objectBottom = objectTopWithinContent + Math.max(object.height, 0)
+    return Math.max(maxBottom, objectBottom)
+  }, 0)
 }
 
 function measureTableCell(cellNode: PMNode, cellContentWidth: number): number {
@@ -924,16 +1168,31 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
   const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
 
   const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
-  const renderedPages: RenderedPage[] = [{ lines: [], totalHeight: 0 }]
+  const renderedPages: RenderedPage[] = [{ lines: [], totalHeight: 0, floatingObjects: [] }]
   const breaks: PageBreakInfo[] = []
   const lineBreakSet = new Set<number>()
   let currentPage = pages[0]!
   let currentRenderedPage = renderedPages[0]!
   let blockIndex = 0
+  let lastAnchorTop = 0
 
   doc.forEach((node, offset) => {
     const nodePos = offset
+    if (node.type.name === 'floating_object') {
+      currentRenderedPage.floatingObjects.push(
+        buildRenderedFloatingObject(node, blockIndex, lastAnchorTop, config, contentWidth)
+      )
+      blockIndex += 1
+      return
+    }
+
     const measured = measureBlock(node, nodePos, blockIndex, contentWidth)
+    const floatingFlowFloor = getFloatingFlowFloor(currentRenderedPage, config)
+    if (currentPage.totalHeight < floatingFlowFloor) {
+      const gap = floatingFlowFloor - currentPage.totalHeight
+      currentPage.totalHeight += gap
+      currentRenderedPage.totalHeight += gap
+    }
 
     if (measured.canSplit) {
       for (let lineIndex = 1; lineIndex < measured.lines.length; lineIndex += 1) {
@@ -944,16 +1203,19 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
     if (node.attrs.pageBreakBefore && currentPage.lines.length > 0) {
       currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
-      currentRenderedPage = { lines: [], totalHeight: 0 }
+      currentRenderedPage = { lines: [], totalHeight: 0, floatingObjects: [] }
       renderedPages.push(currentRenderedPage)
+      lastAnchorTop = 0
     }
 
     if (!measured.canSplit) {
       if (currentPage.totalHeight + measured.totalHeight > contentHeight && currentPage.lines.length > 0) {
         currentPage = pushPageBreak(breaks, pages, currentPage, nodePos)
-        currentRenderedPage = { lines: [], totalHeight: 0 }
+        currentRenderedPage = { lines: [], totalHeight: 0, floatingObjects: [] }
         renderedPages.push(currentRenderedPage)
+        lastAnchorTop = 0
       }
+      lastAnchorTop = currentRenderedPage.totalHeight + measured.spaceBefore
       currentPage.lines.push(...measured.lines)
       currentPage.totalHeight += measured.totalHeight
       pushRenderedLines(currentRenderedPage, measured, 0, measured.lines.length, measured.lines.length - 1)
@@ -983,8 +1245,9 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
             currentPage,
             measured.lines[startLineIndex]!.startPos ?? nodePos
           )
-          currentRenderedPage = { lines: [], totalHeight: 0 }
+          currentRenderedPage = { lines: [], totalHeight: 0, floatingObjects: [] }
           renderedPages.push(currentRenderedPage)
+          lastAnchorTop = 0
           continue
         }
         fitCount = 1
@@ -995,6 +1258,9 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
 
       for (let lineIndex = startLineIndex; lineIndex < startLineIndex + fitCount; lineIndex += 1) {
         currentPage.lines.push(measured.lines[lineIndex]!)
+      }
+      if (fitCount > 0) {
+        lastAnchorTop = currentRenderedPage.totalHeight + (startLineIndex === 0 ? measured.spaceBefore : 0)
       }
       currentPage.totalHeight += heightSum
       pushRenderedLines(
@@ -1013,8 +1279,9 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
           currentPage,
           measured.lines[startLineIndex]!.startPos ?? nodePos
         )
-        currentRenderedPage = { lines: [], totalHeight: 0 }
+        currentRenderedPage = { lines: [], totalHeight: 0, floatingObjects: [] }
         renderedPages.push(currentRenderedPage)
+        lastAnchorTop = 0
       }
     }
 

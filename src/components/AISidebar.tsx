@@ -17,6 +17,7 @@ import {
 } from '../ai/executor'
 import { agentTools } from '../ai/tools'
 import { schema } from '../editor/schema'
+import type { TemplateRecord, TemplateSummary } from '../templates/types'
 import type {
   AIProviderSettings,
   AISettingsData,
@@ -288,6 +289,11 @@ interface Props {
   view: EditorView | null
   editorState?: EditorState | null
   pageConfig: PageConfig
+  templates: TemplateSummary[]
+  activeTemplate: TemplateRecord | null
+  onModelContextChange?: (next: { providerId: string | null, model: string | null }) => void
+  onActivateTemplate: (templateId: string) => Promise<void> | void
+  onOpenTemplateManager: () => void
   onPageConfigChange: (cfg: PageConfig) => void
   onDocumentStyleMutation?: () => void
   onClose: () => void
@@ -1385,7 +1391,38 @@ function extractClipboardImageFiles(event: ReactClipboardEvent<HTMLTextAreaEleme
     .filter((file): file is File => file !== null)
 }
 
-export default function AISidebar({ view: editorView, editorState, pageConfig, onPageConfigChange, onDocumentStyleMutation, onClose }: Props) {
+function normalizeTemplateName(value: string) {
+  return value.trim().toLowerCase().replace(/\.docx$/i, '')
+}
+
+function resolveTemplateFromMessage(message: string, templates: TemplateSummary[]) {
+  const normalizedMessage = normalizeTemplateName(message)
+  if (!normalizedMessage) return { match: null as TemplateSummary | null, ambiguous: [] as TemplateSummary[] }
+
+  const exact = templates.filter((template) => normalizeTemplateName(template.name) === normalizedMessage)
+  if (exact.length === 1) return { match: exact[0]!, ambiguous: [] }
+  if (exact.length > 1) return { match: null, ambiguous: exact }
+
+  const includes = templates.filter((template) => normalizedMessage.includes(normalizeTemplateName(template.name)))
+  if (includes.length === 1) return { match: includes[0]!, ambiguous: [] }
+  if (includes.length > 1) return { match: null, ambiguous: includes }
+
+  return { match: null, ambiguous: [] }
+}
+
+export default function AISidebar({
+  view: editorView,
+  editorState,
+  pageConfig,
+  templates,
+  activeTemplate,
+  onModelContextChange,
+  onActivateTemplate,
+  onOpenTemplateManager,
+  onPageConfigChange,
+  onDocumentStyleMutation,
+  onClose,
+}: Props) {
   const [viewMode, setViewMode] = useState<View>('history')
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
@@ -1501,13 +1538,27 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       wordCount,
       pageCount: preview.pages.length + preview.omittedPageCount,
       preview,
+      availableTemplates: templates.map((template) => ({
+        id: template.id,
+        name: template.name,
+        summary: template.summary,
+      })),
+    }
+    if (activeTemplate) {
+      ctx.activeTemplate = {
+        id: activeTemplate.id,
+        name: activeTemplate.name,
+        note: activeTemplate.note,
+        summary: activeTemplate.summary,
+        templateText: activeTemplate.templateText,
+      }
     }
     if (includeSelection && editorState) {
       const sel = serializeSelection(editorState)
       if (sel) ctx.selection = sel
     }
     return ctx
-  }, [editorView, editorState, includeSelection, pageConfig])
+  }, [activeTemplate, editorView, editorState, includeSelection, pageConfig, templates])
 
   const requestOcrAnalysis = useCallback(async (
     request: OcrIntentMatch,
@@ -1628,6 +1679,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       active = false
     }
   }, [activeProviderId])
+
+  useEffect(() => {
+    onModelContextChange?.({
+      providerId: activeProviderId || null,
+      model: selectedModel || modelName || null,
+    })
+  }, [activeProviderId, modelName, onModelContextChange, selectedModel])
 
   useEffect(() => {
     if (viewMode !== 'chat') return
@@ -1825,6 +1883,15 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
     const text = rawText || (pendingAttachments.length > 0 ? buildDefaultAttachmentPrompt(assistantMode, pendingAttachments) : '')
     if (!text || loading) return
 
+    const templateMatch = resolveTemplateFromMessage(text, templates)
+    if (templateMatch.ambiguous.length > 0) {
+      window.alert(`检测到多个同名或相近模板：${templateMatch.ambiguous.map((item) => item.name).join('、')}，请在模板选择器中先选定一个模板后再发送。`)
+      return
+    }
+    if (templateMatch.match && templateMatch.match.id !== activeTemplate?.id) {
+      await onActivateTemplate(templateMatch.match.id)
+    }
+
     const shouldStartNewConversation = viewMode === 'history'
     const nextTitle = makeConversationTitle(text)
     const previousConversationMessages = shouldStartNewConversation ? [] : conversationMessagesRef.current
@@ -1873,6 +1940,17 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
 
     let conversationId = shouldStartNewConversation ? null : currentConversationIdRef.current
     const context = getContext()
+    try {
+      const wsRes = await fetch('/api/workspace')
+      if (wsRes.ok) {
+        const wsDocs = await wsRes.json()
+        if (Array.isArray(wsDocs) && wsDocs.length > 0) {
+          context.workspaceDocs = wsDocs.map((d: { id: string; name: string; type: string; size: number; textLength: number }) => ({
+            id: d.id, name: d.name, type: d.type, size: d.size, textLength: d.textLength,
+          }))
+        }
+      }
+    } catch { /* ignore */ }
     let persistedAssistantText = ''
     let conversationPersisted = false
     const persistedRecords: StoredMessage[] = [{ role: 'user', content: text, attachments: pendingAttachments }]
@@ -2147,7 +2225,7 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
             }
           } else {
             result = editorView
-              ? executeTool(editorView, execution.toolName, executedParams, {
+              ? await executeTool(editorView, execution.toolName, executedParams, {
                 pageConfig,
                 onPageConfigChange,
                 onDocumentStyleMutation,
@@ -2537,13 +2615,13 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       void loadConversations()
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
-  }, [activeProviderId, assistantMode, currentModelSupportsVision, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, viewMode])
+  }, [activeProviderId, activeTemplate, assistantMode, currentModelSupportsVision, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
   return (
     <div
-      className="relative flex flex-col flex-shrink-0 bg-white border-l border-gray-200 shadow-lg"
+      className="relative flex flex-col flex-shrink-0 h-full bg-white border-l border-gray-200 shadow-lg"
       style={{ width: sidebarWidth }}
     >
       <div
@@ -2553,40 +2631,40 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
       />
 
       {viewMode === 'history' ? (
-        <div className="flex items-center justify-between px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
+        <div className="flex items-center justify-between px-3 py-2.5 bg-gray-50 border-b border-gray-200 flex-shrink-0 select-none">
           <div className="min-w-0">
-            <span className="font-semibold text-sm truncate">🤖 openwps</span>
+            <span className="font-semibold text-sm truncate text-gray-700">openwps</span>
           </div>
           <button
             onClick={onClose}
-            className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
+            className="w-6 h-6 flex items-center justify-center rounded hover:bg-gray-200 text-lg leading-none flex-shrink-0 text-gray-500"
             title="关闭侧边栏"
           >
             ×
           </button>
         </div>
       ) : (
-        <div className="flex items-center gap-2 px-3 py-2.5 bg-blue-600 text-white flex-shrink-0 select-none">
+        <div className="flex items-center gap-2 px-3 py-2.5 bg-gray-50 border-b border-gray-200 flex-shrink-0 select-none">
           <button
             onClick={() => {
               setViewMode('history')
             }}
-            className="px-1.5 py-0.5 rounded hover:bg-blue-500 text-sm flex-shrink-0"
+            className="px-1.5 py-0.5 rounded hover:bg-gray-200 text-sm flex-shrink-0 text-gray-600"
             title="返回会话历史"
           >
             ←
           </button>
-          <div className="min-w-0 flex-1 font-semibold text-sm truncate">{currentConversationTitle || '新会话'}</div>
+          <div className="min-w-0 flex-1 font-semibold text-sm truncate text-gray-700">{currentConversationTitle || '新会话'}</div>
           <button
             onClick={() => void exportConversation()}
-            className="px-1.5 py-0.5 rounded hover:bg-blue-500 text-sm flex-shrink-0"
+            className="px-1.5 py-0.5 rounded hover:bg-gray-200 text-sm flex-shrink-0 text-gray-600"
             title="导出当前会话调试 JSON"
           >
             ⤓
           </button>
           <button
             onClick={onClose}
-            className="w-6 h-6 flex items-center justify-center rounded hover:bg-blue-500 text-lg leading-none flex-shrink-0"
+            className="w-6 h-6 flex items-center justify-center rounded hover:bg-gray-200 text-lg leading-none flex-shrink-0 text-gray-500"
             title="关闭侧边栏"
           >
             ×
@@ -3092,6 +3170,48 @@ export default function AISidebar({ view: editorView, editorState, pageConfig, o
                     当前命中了 OCR 专用识别请求，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。
                   </div>
                 )}
+              </div>
+
+              <div className="border-b border-slate-100 bg-white px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <label className="flex min-w-0 flex-1 items-center gap-2 rounded-full border border-slate-200 bg-slate-50 pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
+                    <span className="shrink-0">模板</span>
+                    <select
+                      value={activeTemplate?.id ?? ''}
+                      onChange={(event) => {
+                        const nextId = event.target.value
+                        if (!nextId) return
+                        void onActivateTemplate(nextId)
+                      }}
+                      disabled={loading || templates.length === 0}
+                      className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
+                      title={activeTemplate?.name || '未激活模板'}
+                    >
+                      <option value="">{templates.length > 0 ? '未激活模板' : '暂无模板'}</option>
+                      {templates.map((template) => (
+                        <option key={template.id} value={template.id}>{template.name}</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={onOpenTemplateManager}
+                    disabled={loading}
+                    className="shrink-0 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-100 disabled:cursor-not-allowed disabled:text-slate-400"
+                  >
+                    管理
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleSend(`请严格按照当前激活模板「${activeTemplate?.name ?? ''}」对全文进行排版。优先遵循模板中的 templateText 执行页面、结构、标题和正文样式，不要回退到通用预设。`)}
+                    disabled={loading || !activeTemplate}
+                    className="shrink-0 rounded-full bg-emerald-500 px-3 py-1.5 text-[11px] text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-slate-300"
+                  >
+                    按模板排版
+                  </button>
+                </div>
               </div>
 
               <div className="px-3 py-2.5">

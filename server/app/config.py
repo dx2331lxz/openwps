@@ -9,11 +9,15 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = BASE_DIR / "config" / "ai.json"
 CONVERSATIONS_DIR = BASE_DIR / "data" / "conversations"
 DOCUMENTS_DIR = BASE_DIR / "data" / "documents"
+TEMPLATES_DIR = BASE_DIR / "data" / "templates"
+TEMPLATE_SOURCES_DIR = TEMPLATES_DIR / "sources"
 DIST_DIR = BASE_DIR.parent / "dist"
 
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATE_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
 PRESET_PROVIDERS = [
     {

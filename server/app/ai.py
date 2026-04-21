@@ -294,6 +294,31 @@ def _build_context_block(context: dict) -> str:
         parts.append("context.selection = " + json.dumps(selection, ensure_ascii=False, indent=2))
         parts.append("以上是 context.selection 的序列化结果，请按这些字段名理解选区信息。")
 
+    active_template = context.get("activeTemplate")
+    if active_template and isinstance(active_template, dict):
+        parts.append("")
+        parts.append("context.activeTemplate = " + json.dumps(active_template, ensure_ascii=False, indent=2))
+        parts.append("以上是当前激活模板。若用户要求按模板排版，优先遵循其中的 templateText，不要先回退到通用预设。")
+
+    available_templates = context.get("availableTemplates")
+    if available_templates and isinstance(available_templates, list):
+        parts.append("")
+        parts.append("context.availableTemplates = " + json.dumps(available_templates, ensure_ascii=False, indent=2))
+        parts.append("如果用户明确提到某个模板名，可结合这个列表理解模板候选；当前真正生效的模板以 context.activeTemplate 为准。")
+
+    workspaceDocs = context.get("workspaceDocs")
+    if workspaceDocs and isinstance(workspaceDocs, list):
+        parts.append("")
+        parts.append("[工作区文档列表]")
+        parts.append("以下为用户上传到工作区的参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        for doc in workspaceDocs:
+            name = doc.get("name", "?")
+            doc_id = doc.get("id", "?")
+            doc_type = doc.get("type", "?")
+            size = doc.get("size", 0)
+            text_length = doc.get("textLength", 0)
+            parts.append(f"  - [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars)")
+
     return "\n".join(parts)
 
 

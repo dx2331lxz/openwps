@@ -1,5 +1,12 @@
 import React from 'react'
-import type { PageConfig, RenderedLine, RenderedPage, RenderUnit } from '../layout/paginator'
+import type {
+  FloatingParagraph,
+  PageConfig,
+  RenderedFloatingObject,
+  RenderedLine,
+  RenderedPage,
+  RenderUnit,
+} from '../layout/paginator'
 
 interface PretextPageRendererProps {
   pages: RenderedPage[]
@@ -12,6 +19,93 @@ interface PretextPageRendererProps {
   showSelection?: boolean
   onRequestCaretPos?: (pos: number, clientX: number, clientY: number) => void
   onRequestSelectionRange?: (anchor: number, head: number) => void
+}
+
+function renderFloatingParagraph(paragraph: FloatingParagraph, index: number) {
+  return (
+    <div
+      key={`floating-paragraph-${index}`}
+      style={{
+        textAlign: paragraph.align,
+        lineHeight: `${paragraph.lineHeight}px`,
+        minHeight: paragraph.lineHeight,
+        whiteSpace: 'pre-wrap',
+      }}
+    >
+      {paragraph.runs.map((run, runIndex) => (
+        <span
+          key={`floating-run-${runIndex}-${run.text}`}
+          style={{
+            fontFamily: run.style.fontFamily,
+            fontSize: `${run.style.fontSize}pt`,
+            fontWeight: run.style.bold ? 700 : 400,
+            fontStyle: run.style.italic ? 'italic' : 'normal',
+            letterSpacing: run.style.letterSpacing ? `${run.style.letterSpacing}pt` : undefined,
+            color: run.style.color || '#000000',
+            backgroundColor: run.hasComment ? 'rgba(253, 224, 71, 0.35)' : (run.style.backgroundColor || undefined),
+            textDecoration: [
+              run.style.underline ? 'underline' : '',
+              run.style.strikethrough ? 'line-through' : '',
+            ].filter(Boolean).join(' ') || undefined,
+          }}
+        >
+          {run.text}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function renderFloatingObject(
+  object: RenderedFloatingObject,
+  pageIndex: number,
+  pageConfig: PageConfig,
+  pageGap: number
+) {
+  const pageTop = pageIndex * (pageConfig.pageHeight + pageGap)
+  const commonStyle: React.CSSProperties = {
+    position: 'absolute',
+    left: object.left,
+    top: pageTop + object.top,
+    width: object.width,
+    minHeight: Math.max(object.height, 1),
+    boxSizing: 'border-box',
+    paddingTop: object.paddingTop,
+    paddingRight: object.paddingRight,
+    paddingBottom: object.paddingBottom,
+    paddingLeft: object.paddingLeft,
+    pointerEvents: 'none',
+    zIndex: object.behindDoc ? 0 : 3,
+  }
+
+  if (object.kind === 'image' && object.src) {
+    return (
+      <img
+        key={`floating-object-${pageIndex}-${object.blockIndex}`}
+        src={object.src}
+        alt={object.alt}
+        title={object.title}
+        style={{
+          ...commonStyle,
+          height: object.height || undefined,
+          objectFit: 'contain',
+        }}
+      />
+    )
+  }
+
+  return (
+    <div
+      key={`floating-object-${pageIndex}-${object.blockIndex}`}
+      style={{
+        ...commonStyle,
+        background: 'transparent',
+        overflow: 'visible',
+      }}
+    >
+      {object.paragraphs.map(renderFloatingParagraph)}
+    </div>
+  )
 }
 
 function getTextDecoration(unit: RenderUnit) {
@@ -104,6 +198,7 @@ function getCaretRect(
       for (let index = 0; index < line.units.length; index += 1) {
         const unit = line.units[index]!
         const isLastUnit = index === line.units.length - 1
+        if (typeof unit.offsetX === 'number') cursorX = metrics.left + unit.offsetX
         const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
 
         if (caretPos === unit.startPos) {
@@ -140,6 +235,7 @@ function getLineBoundaryStops(
   for (let index = 0; index < line.units.length; index += 1) {
     const unit = line.units[index]!
     const isLastUnit = index === line.units.length - 1
+    if (typeof unit.offsetX === 'number') cursorX = metrics.left + unit.offsetX
     const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
 
     if (typeof unit.startPos === 'number' && !stops.some((stop) => stop.pos === unit.startPos)) {
@@ -369,7 +465,10 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
         />
       ))}
       {pages.map((page, pageIndex) => {
-        return page.lines.map((line) => {
+        return (
+          <React.Fragment key={`page-${pageIndex}`}>
+            {page.floatingObjects.map((object) => renderFloatingObject(object, pageIndex, pageConfig, pageGap))}
+            {page.lines.map((line) => {
           const metrics = getLineLayoutMetrics(line, pageIndex, pageConfig, pageGap)
           const isHorizontalRule = line.blockType === 'horizontal_rule'
           const isParagraphLine = line.blockType === 'paragraph'
@@ -409,7 +508,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                   top: metrics.top,
                   left: metrics.left,
                   height: line.lineHeight,
-                  display: 'flex',
+                  display: line.units.some((unit) => typeof unit.offsetX === 'number') ? 'block' : 'flex',
                   alignItems: 'flex-end',
                   width: metrics.justifyEnabled ? line.availableWidth : Math.max(1, line.renderedWidth),
                   whiteSpace: 'pre',
@@ -438,6 +537,9 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                       <span
                         key={`${unit.startPos ?? index}-${unit.text}`}
                         style={{
+                          position: typeof unit.offsetX === 'number' ? 'absolute' : 'relative',
+                          left: typeof unit.offsetX === 'number' ? unit.offsetX : undefined,
+                          top: typeof unit.offsetX === 'number' ? 0 : undefined,
                           display: 'inline-flex',
                           alignItems: 'flex-end',
                           justifyContent: unit.anchor === 'end' ? 'flex-end' : 'flex-start',
@@ -468,7 +570,9 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
               </div>
             </React.Fragment>
           )
-        })
+            })}
+          </React.Fragment>
+        )
       })}
       {caretRect && (
         <div

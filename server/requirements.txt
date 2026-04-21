@@ -3,3 +3,9 @@ uvicorn
 httpx
 langgraph
 langchain-openai
+python-docx
+PyPDF2
+python-pptx
+python-multipart
+pdfplumber
+pypdfium2

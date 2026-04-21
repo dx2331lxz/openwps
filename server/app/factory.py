@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,8 +29,26 @@ from .conversations import (
     read_conversation,
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
-from .models import AppendMessagesRequest, ChatRequest, ModelDiscoveryRequest, SettingsUpdate, ToolResultsRequest
+from .models import (
+    AppendMessagesRequest,
+    ChatRequest,
+    ModelDiscoveryRequest,
+    SettingsUpdate,
+    TemplateAnalyzeRequest,
+    TemplateCreateRequest,
+    TemplateUpdateRequest,
+    ToolResultsRequest,
+)
 from .models import OCRCommandRequest
+from .template_analysis import analyze_template_request
+from .templates import create_template, delete_template, list_templates, read_template, update_template
+from .workspace import (
+    delete_document as ws_delete,
+    get_document_content as ws_get_content,
+    list_workspace_docs,
+    search_workspace,
+    upload_document,
+)
 
 
 def sse(event_type: str, data: dict) -> str:
@@ -181,6 +199,55 @@ def create_api_router() -> APIRouter:
     def remove_document(name: str):
         delete_document(name)
         return {"success": True}
+
+    @router.get("/templates")
+    def get_templates():
+        return list_templates()
+
+    @router.post("/templates")
+    def post_template(body: TemplateCreateRequest):
+        return create_template(body.model_dump(exclude_none=True))
+
+    @router.post("/templates/analyze")
+    async def analyze_template(body: TemplateAnalyzeRequest):
+        return await analyze_template_request(body.model_dump(exclude_none=True))
+
+    @router.get("/templates/{template_id}")
+    def get_template(template_id: str):
+        return read_template(template_id)
+
+    @router.patch("/templates/{template_id}")
+    def patch_template(template_id: str, body: TemplateUpdateRequest):
+        return update_template(template_id, body.model_dump(exclude_none=True))
+
+    @router.delete("/templates/{template_id}")
+    def remove_template(template_id: str):
+        delete_template(template_id)
+        return {"success": True}
+
+    # ── Workspace (知识库) ──
+
+    @router.get("/workspace")
+    def get_workspace():
+        return list_workspace_docs()
+
+    @router.post("/workspace/upload")
+    async def upload_workspace_doc(file: UploadFile):
+        content = await file.read()
+        result = upload_document(file.filename or "untitled", file.content_type or "", content)
+        return result
+
+    @router.delete("/workspace/{doc_id}")
+    def delete_workspace_doc(doc_id: str):
+        return ws_delete(doc_id)
+
+    @router.get("/workspace/search")
+    def search_workspace_docs(q: str, doc_id: str | None = None, context_lines: int = 3):
+        return search_workspace(q, doc_id, context_lines)
+
+    @router.get("/workspace/{doc_id}/content")
+    def get_workspace_content(doc_id: str, from_line: int | None = None, to_line: int | None = None):
+        return ws_get_content(doc_id, from_line, to_line)
 
     @router.post("/ai/chat")
     async def chat(body: ChatRequest):

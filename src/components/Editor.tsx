@@ -16,6 +16,7 @@ import {
 } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
+import WorkspacePanel from './WorkspacePanel'
 import FileManagerModal from './FileManagerModal'
 import SettingsModal from './SettingsModal'
 import { importDocx, type PMNodeJSON } from '../docx/importer'
@@ -26,6 +27,9 @@ import { PretextPageRenderer } from './PretextPageRenderer'
 import type { CommentData } from './CommentPopover'
 import { CommentSidebar, type SidebarCommentData } from './CommentSidebar'
 import { AddCommentDialog } from './AddCommentDialog'
+import TemplateManagerModal from './TemplateManagerModal'
+import { buildTemplateAnalysisPayload } from '../templates/analyzer'
+import type { TemplateAnalyzeResult, TemplateRecord, TemplateSummary } from '../templates/types'
 
 // ─── Page geometry ───────────────────────────────────────────────────────────
 const PAGE_GAP = 32 // px gap between A4 cards
@@ -38,10 +42,52 @@ interface ServerDocumentSummary {
   updatedAt: string
 }
 
+interface TemplateUpdatePayload {
+  name: string
+  note: string
+  templateText: string
+}
+
 interface PendingCommentTarget {
   from: number
   to: number
   anchorRect: DOMRect
+}
+
+interface AISettingsSnapshot {
+  activeProviderId?: string
+  model?: string
+}
+
+type TemplateExtractionStatus = 'idle' | 'preparing' | 'analyzing' | 'saving' | 'success' | 'error'
+
+interface TemplateExtractionState {
+  status: TemplateExtractionStatus
+  fileName: string
+  providerId: string
+  model: string
+  message: string
+  errorMessage: string
+  startedAt: string
+  finishedAt: string
+  resultTemplateId?: string
+}
+
+interface TemplateNotice {
+  kind: 'success' | 'error'
+  title: string
+  message: string
+}
+
+const IDLE_TEMPLATE_EXTRACTION_STATE: TemplateExtractionState = {
+  status: 'idle',
+  fileName: '',
+  providerId: '',
+  model: '',
+  message: '',
+  errorMessage: '',
+  startedAt: '',
+  finishedAt: '',
 }
 
 function collectVisibleComments(
@@ -117,7 +163,23 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   const contentType = response.headers.get('content-type') ?? ''
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`)
+    let detail = ''
+    if (contentType.includes('application/json')) {
+      try {
+        const parsed = JSON.parse(raw) as { detail?: unknown, message?: unknown }
+        detail = typeof parsed.detail === 'string'
+          ? parsed.detail
+          : typeof parsed.message === 'string'
+            ? parsed.message
+            : ''
+      } catch {
+        detail = ''
+      }
+    }
+    if (!detail) {
+      detail = raw.slice(0, 200).replace(/\s+/g, ' ').trim()
+    }
+    throw new Error(detail || `HTTP ${response.status}`)
   }
 
   if (!contentType.includes('application/json')) {
@@ -562,6 +624,7 @@ export const Editor: React.FC = () => {
   const mountRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [fileModalMode, setFileModalMode] = useState<'open' | 'save' | null>(null)
@@ -581,7 +644,15 @@ export const Editor: React.FC = () => {
   const [serverDocumentsLoading, setServerDocumentsLoading] = useState(false)
   const [serverDocumentsError, setServerDocumentsError] = useState<string | null>(null)
   const [currentDocumentName, setCurrentDocumentName] = useState(DEFAULT_SERVER_DOCUMENT_NAME)
+  const [templates, setTemplates] = useState<TemplateSummary[]>([])
+  const [templateManagerOpen, setTemplateManagerOpen] = useState(false)
+  const [activeTemplate, setActiveTemplate] = useState<TemplateRecord | null>(null)
+  const [currentAIProviderId, setCurrentAIProviderId] = useState<string | null>(null)
+  const [currentAIModel, setCurrentAIModel] = useState<string | null>(null)
+  const [templateExtractionState, setTemplateExtractionState] = useState<TemplateExtractionState>(IDLE_TEMPLATE_EXTRACTION_STATE)
+  const [templateNotice, setTemplateNotice] = useState<TemplateNotice | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const templateManagerOpenRef = useRef(false)
 
   // ── Comment state ───────────────────────────────────────────────────────────
   const [activeComment, setActiveComment] = useState<CommentData | null>(null)
@@ -591,6 +662,9 @@ export const Editor: React.FC = () => {
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
   useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
+  useEffect(() => { templateManagerOpenRef.current = templateManagerOpen }, [templateManagerOpen])
+
+  const isTemplateExtractionRunning = ['preparing', 'analyzing', 'saving'].includes(templateExtractionState.status)
 
   const closeAddCommentDialog = useCallback(() => {
     setPendingCommentTarget(null)
@@ -671,6 +745,183 @@ export const Editor: React.FC = () => {
       setServerDocumentsError(`读取文件列表失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {
       setServerDocumentsLoading(false)
+    }
+  }, [])
+
+  const loadTemplates = useCallback(async () => {
+    try {
+      const response = await fetch('/api/templates')
+      const data = await readJsonResponse<TemplateSummary[]>(response)
+      setTemplates(data)
+    } catch (error) {
+      console.error('[Editor] load templates failed', error)
+      window.alert(`读取模板列表失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [])
+
+  const activateTemplate = useCallback(async (templateId: string) => {
+    const response = await fetch(`/api/templates/${templateId}`)
+    const data = await readJsonResponse<TemplateRecord>(response)
+    setActiveTemplate(data)
+  }, [])
+
+  const loadTemplateDetail = useCallback(async (templateId: string) => {
+    const response = await fetch(`/api/templates/${templateId}`)
+    return await readJsonResponse<TemplateRecord>(response)
+  }, [])
+
+  const handleUploadTemplate = useCallback(async (file: File) => {
+    if (['preparing', 'analyzing', 'saving'].includes(templateExtractionState.status)) return
+
+    const startedAt = new Date().toISOString()
+    setTemplateNotice(null)
+    setTemplateExtractionState({
+      status: 'preparing',
+      fileName: file.name,
+      providerId: currentAIProviderId ?? '',
+      model: currentAIModel ?? '',
+      message: '正在准备模板证据',
+      errorMessage: '',
+      startedAt,
+      finishedAt: '',
+    })
+
+    try {
+      let providerId = currentAIProviderId
+      let model = currentAIModel
+      if (!providerId || !model) {
+        try {
+          const response = await fetch('/api/ai/settings')
+          const settings = await readJsonResponse<AISettingsSnapshot>(response)
+          providerId = providerId || settings.activeProviderId || null
+          model = model || settings.model || null
+        } catch (settingsError) {
+          console.warn('[Editor] load ai settings for template analyze failed', settingsError)
+        }
+      }
+
+      if (!providerId || !model) {
+        throw new Error('当前用户 AI 未配置完成，请先在 AI 侧边栏选择可用的服务商和模型。')
+      }
+
+      setTemplateExtractionState((current) => ({
+        ...current,
+        status: 'preparing',
+        providerId: providerId ?? '',
+        model: model ?? '',
+        message: `已开始提取模板信息，准备调用 ${providerId} / ${model}`,
+      }))
+
+      const analyzePayload = await buildTemplateAnalysisPayload(file, { providerId, model })
+      setTemplateExtractionState((current) => ({
+        ...current,
+        status: 'analyzing',
+        providerId: providerId ?? '',
+        model: model ?? '',
+        message: `正在调用 ${providerId} / ${model} 提取模板信息`,
+      }))
+      const analyzeResponse = await fetch('/api/templates/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(analyzePayload),
+      })
+      const analyzed = await readJsonResponse<TemplateAnalyzeResult>(analyzeResponse)
+
+      setTemplateExtractionState((current) => ({
+        ...current,
+        status: 'saving',
+        message: '模板信息提取完成，正在保存模板',
+      }))
+      const createPayload = {
+        name: analyzePayload.name,
+        summary: analyzed.summary,
+        sourceFilename: analyzePayload.sourceFilename,
+        sourceContentBase64: analyzePayload.sourceContentBase64,
+        templateText: analyzed.templateText,
+      }
+      const response = await fetch('/api/templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(createPayload),
+      })
+      const created = await readJsonResponse<TemplateRecord>(response)
+      setActiveTemplate(created)
+      await loadTemplates()
+      setTemplateExtractionState((current) => ({
+        ...current,
+        status: 'success',
+        message: `模板“${created.name}”已提取完成并保存`,
+        errorMessage: '',
+        finishedAt: new Date().toISOString(),
+        resultTemplateId: created.id,
+      }))
+      if (!templateManagerOpenRef.current) {
+        setTemplateNotice({
+          kind: 'success',
+          title: '模板信息提取完成',
+          message: `模板“${created.name}”已保存，可打开模板库查看。`,
+        })
+      }
+    } catch (error) {
+      console.error('[Editor] upload template failed', error)
+      const message = error instanceof Error ? error.message : String(error)
+      setTemplateExtractionState((current) => ({
+        ...current,
+        status: 'error',
+        message: '模板提取失败',
+        errorMessage: message,
+        finishedAt: new Date().toISOString(),
+      }))
+      if (!templateManagerOpenRef.current) {
+        setTemplateNotice({
+          kind: 'error',
+          title: '模板提取失败',
+          message,
+        })
+      }
+    }
+  }, [currentAIModel, currentAIProviderId, loadTemplates, templateExtractionState.status])
+
+  const handleRenameTemplate = useCallback(async (templateId: string, payload: TemplateUpdatePayload) => {
+    try {
+      const response = await fetch(`/api/templates/${templateId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const updated = await readJsonResponse<TemplateRecord>(response)
+      setTemplates((current) => current.map((item) => (
+        item.id === updated.id
+          ? {
+              id: updated.id,
+              name: updated.name,
+              note: updated.note,
+              summary: updated.summary,
+              createdAt: updated.createdAt,
+              updatedAt: updated.updatedAt,
+              sourceFilename: updated.sourceFilename,
+              sourceSize: updated.sourceSize,
+            }
+          : item
+      )))
+      setActiveTemplate((current) => (current?.id === updated.id ? updated : current))
+      return updated
+    } catch (error) {
+      console.error('[Editor] rename template failed', error)
+      window.alert(`更新模板失败：${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
+  }, [])
+
+  const handleDeleteTemplate = useCallback(async (templateId: string) => {
+    try {
+      const response = await fetch(`/api/templates/${templateId}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      setTemplates((current) => current.filter((item) => item.id !== templateId))
+      setActiveTemplate((current) => (current?.id === templateId ? null : current))
+    } catch (error) {
+      console.error('[Editor] delete template failed', error)
+      window.alert(`删除模板失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }, [])
 
@@ -805,6 +1056,10 @@ export const Editor: React.FC = () => {
     window.addEventListener('resize', refreshVisibleComments)
     return () => window.removeEventListener('resize', refreshVisibleComments)
   }, [refreshVisibleComments])
+
+  useEffect(() => {
+    void loadTemplates()
+  }, [loadTemplates])
 
   const handleImportDocx = useCallback(async (file: File) => {
     const editorView = viewRef.current
@@ -1097,14 +1352,22 @@ export const Editor: React.FC = () => {
   const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
 
   return (
-    <div className="flex flex-col h-screen" style={{ background: '#e8e8e8' }}>
-      {/* Toolbar */}
-      <div className="sticky top-0 z-10 shadow-sm">
+    <div className="flex h-screen" style={{ background: '#e8e8e8' }}>
+      {/* Workspace Panel — left side */}
+      {workspaceOpen && (
+        <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />
+      )}
+
+      <div className="flex flex-col flex-1 min-w-0">
+        {/* Toolbar */}
+        <div className="sticky top-0 z-10 shadow-sm">
         <Toolbar
           view={view}
           editorState={editorState}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
+          onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
+          workspaceOpen={workspaceOpen}
           onOpenServerFile={openServerFileModal}
           onSaveServerFile={openSaveFileModal}
           onImportDocx={handleImportFile}
@@ -1113,6 +1376,7 @@ export const Editor: React.FC = () => {
           onToggleFullscreen={() => { void handleToggleFullscreen() }}
           isFullscreen={isFullscreen}
           onAddComment={handleStartAddComment}
+          onOpenTemplates={() => setTemplateManagerOpen(true)}
         />
       </div>
 
@@ -1125,122 +1389,128 @@ export const Editor: React.FC = () => {
         />
       )}
 
-      {/* Main content + optional AI sidebar */}
-      <div className="flex flex-1 min-h-0">
-        {/* Scrollable editor area */}
-        <div className="flex-1 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
-          {/*
-          Canvas: explicit height so absolute page cards create scroll space.
-          Width = page width, centered.
+      {/* Main content */}
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
+        {/*
+        Canvas: explicit height so absolute page cards create scroll space.
+        Width = page width, centered.
 
-          Layout layers (bottom → top):
-            1. White page cards  (absolute, pointer-events:none, z-index:0)
-            2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
-               Inside the editor, transparent widgets push content between cards.
-        */}
-          <div
-            ref={canvasRef}
-            className="relative mx-auto"
-            style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
-          >
-            {/* ── Layer 1: page cards ── */}
-            {Array.from({ length: pageCount }).map((_, i) => (
-              <div
-                key={i}
-                style={{
-                  position: 'absolute',
-                  top: i * (cfg.pageHeight + PAGE_GAP),
-                  left: 0,
-                  width: cfg.pageWidth,
-                  height: cfg.pageHeight,
-                  background: 'white',
-                  boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
-                  pointerEvents: 'none',
-                  zIndex: 0,
-                }}
-              >
-                <div
-                  style={{
-                    position: 'absolute',
-                    bottom: 12,
-                    width: '100%',
-                    textAlign: 'center',
-                    fontSize: 12,
-                    color: '#aaa',
-                    userSelect: 'none',
-                  }}
-                >
-                  {i + 1} / {pageCount}
-                </div>
-              </div>
-            ))}
-
-            {/* ── Layer 2: Pretext page renderer ── */}
-            {layoutResult && (
-              <PretextPageRenderer
-                pages={layoutResult.renderedPages}
-                pageConfig={cfg}
-                pageGap={PAGE_GAP}
-                caretPos={editorState?.selection.head ?? null}
-                selectionFrom={editorState?.selection.from ?? null}
-                selectionTo={editorState?.selection.to ?? null}
-                showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
-                showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
-                onRequestCaretPos={handleRequestCaretPos}
-                onRequestSelectionRange={handleRequestSelectionRange}
-              />
-            )}
-
-            {/* ── Layer 3: ProseMirror editor ── */}
+        Layout layers (bottom → top):
+          1. White page cards  (absolute, pointer-events:none, z-index:0)
+          2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
+             Inside the editor, transparent widgets push content between cards.
+      */}
+        <div
+          ref={canvasRef}
+          className="relative mx-auto"
+          style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
+        >
+          {/* ── Layer 1: page cards ── */}
+          {Array.from({ length: pageCount }).map((_, i) => (
             <div
-              ref={mountRef}
-              className={layoutResult ? 'pretext-driving-editor' : undefined}
+              key={i}
               style={{
                 position: 'absolute',
-                top: cfg.marginTop,
-                left: cfg.marginLeft,
-                right: cfg.marginRight,
-                ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
-                zIndex: 2,
+                top: i * (cfg.pageHeight + PAGE_GAP),
+                left: 0,
+                width: cfg.pageWidth,
+                height: cfg.pageHeight,
+                background: 'white',
+                boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
+                pointerEvents: 'none',
+                zIndex: 0,
               }}
-            />
+            >
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: 12,
+                  width: '100%',
+                  textAlign: 'center',
+                  fontSize: 12,
+                  color: '#aaa',
+                  userSelect: 'none',
+                }}
+              >
+                {i + 1} / {pageCount}
+              </div>
+            </div>
+          ))}
 
-            <CommentSidebar
-              comments={visibleComments}
-              pageWidth={cfg.pageWidth}
-              canvasHeight={canvasH}
-              activeCommentId={activeComment?.id ?? null}
-              onActivate={(id) => {
-                const matchedComment = visibleComments.find((comment) => comment.id === id)
-                if (matchedComment) {
-                  setActiveComment(matchedComment)
-                }
-              }}
-              onDelete={handleDeleteComment}
-              onResolve={handleResolveComment}
+          {/* ── Layer 2: Pretext page renderer ── */}
+          {layoutResult && (
+            <PretextPageRenderer
+              pages={layoutResult.renderedPages}
+              pageConfig={cfg}
+              pageGap={PAGE_GAP}
+              caretPos={editorState?.selection.head ?? null}
+              selectionFrom={editorState?.selection.from ?? null}
+              selectionTo={editorState?.selection.to ?? null}
+              showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
+              showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
+              onRequestCaretPos={handleRequestCaretPos}
+              onRequestSelectionRange={handleRequestSelectionRange}
             />
-          </div>
-          {/* end canvas */}
-        </div>
-        {/* end scrollable editor area */}
+          )}
 
-        {/* AI Sidebar */}
-        {sidebarOpen && (
-          <AISidebar
-            view={view}
-            editorState={editorState}
-            pageConfig={pageConfig}
-            onPageConfigChange={(newCfg) => {
-              setPageConfig(newCfg)
-              pageConfigRef.current = newCfg
-              repaginate()
+          {/* ── Layer 3: ProseMirror editor ── */}
+          <div
+            ref={mountRef}
+            className={layoutResult ? 'pretext-driving-editor' : undefined}
+            style={{
+              position: 'absolute',
+              top: cfg.marginTop,
+              left: cfg.marginLeft,
+              right: cfg.marginRight,
+              ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
+              zIndex: 2,
             }}
-            onDocumentStyleMutation={clearImportedDocxCompatibility}
-            onClose={() => setSidebarOpen(false)}
           />
-        )}
+
+          <CommentSidebar
+            comments={visibleComments}
+            pageWidth={cfg.pageWidth}
+            canvasHeight={canvasH}
+            activeCommentId={activeComment?.id ?? null}
+            onActivate={(id) => {
+              const matchedComment = visibleComments.find((comment) => comment.id === id)
+              if (matchedComment) {
+                setActiveComment(matchedComment)
+              }
+            }}
+            onDelete={handleDeleteComment}
+            onResolve={handleResolveComment}
+          />
+        </div>
+        {/* end canvas */}
       </div>
-      {/* end main content row */}
+      {/* end main content */}
+      </div>
+      {/* end left column */}
+
+      {/* AI Sidebar — outside left column, full height */}
+      {sidebarOpen && (
+        <AISidebar
+          view={view}
+          editorState={editorState}
+          pageConfig={pageConfig}
+          templates={templates}
+          activeTemplate={activeTemplate}
+          onModelContextChange={(next) => {
+            setCurrentAIProviderId(next.providerId)
+            setCurrentAIModel(next.model)
+          }}
+          onActivateTemplate={activateTemplate}
+          onOpenTemplateManager={() => setTemplateManagerOpen(true)}
+          onPageConfigChange={(newCfg) => {
+            setPageConfig(newCfg)
+            pageConfigRef.current = newCfg
+            repaginate()
+          }}
+          onDocumentStyleMutation={clearImportedDocxCompatibility}
+          onClose={() => setSidebarOpen(false)}
+        />
+      )}
 
       {/* Settings gear button (bottom-left) */}
       <button
@@ -1263,6 +1533,51 @@ export const Editor: React.FC = () => {
           onSave={handleSaveServerDocument}
           onDelete={handleDeleteServerDocument}
         />
+      )}
+
+      {templateManagerOpen && (
+        <TemplateManagerModal
+          templates={templates}
+          activeTemplateId={activeTemplate?.id ?? null}
+          activeTemplate={activeTemplate}
+          extractionState={templateExtractionState}
+          isExtracting={isTemplateExtractionRunning}
+          onClose={() => setTemplateManagerOpen(false)}
+          onUpload={handleUploadTemplate}
+          onLoadDetail={loadTemplateDetail}
+          onActivate={activateTemplate}
+          onDelete={handleDeleteTemplate}
+          onRename={handleRenameTemplate}
+        />
+      )}
+
+      {templateNotice && (
+        <div className="fixed top-4 right-4 z-[60] w-[360px] max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 shadow-2xl backdrop-blur">
+          <div className="flex items-start gap-3">
+            <div className={`mt-0.5 h-2.5 w-2.5 rounded-full ${templateNotice.kind === 'success' ? 'bg-emerald-500' : 'bg-red-500'}`} />
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-slate-800">{templateNotice.title}</div>
+              <div className="mt-1 text-xs leading-5 text-slate-600">{templateNotice.message}</div>
+              <button
+                type="button"
+                onClick={() => {
+                  setTemplateNotice(null)
+                  setTemplateManagerOpen(true)
+                }}
+                className="mt-2 text-xs font-medium text-blue-600 hover:text-blue-700"
+              >
+                打开模板库
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setTemplateNotice(null)}
+              className="text-slate-400 hover:text-slate-600"
+            >
+              ×
+            </button>
+          </div>
+        </div>
       )}
 
       {/* Settings modal */}

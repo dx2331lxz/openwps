@@ -456,7 +456,9 @@ export async function buildDocxBlob(
 ) {
   const children: (Paragraph | Table)[] = []
   for (let index = 0; index < pmDoc.childCount; index += 1) {
-    children.push(await convertNode(pmDoc.child(index), exportOptions))
+    const child = pmDoc.child(index)
+    if (child.type.name === 'floating_object') continue
+    children.push(await convertNode(child, exportOptions))
   }
 
   const sections = [{

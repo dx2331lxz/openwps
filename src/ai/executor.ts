@@ -1188,12 +1188,12 @@ export function abortStreamingWrite(
   return { success: true, message: '已回滚空的流式写入占位内容' }
 }
 
-export function executeTool(
+export async function executeTool(
   view: EditorView,
   toolName: string,
   params: Record<string, unknown>,
   options?: ExecuteOptions
-): ExecuteResult {
+): Promise<ExecuteResult> {
   const { state, dispatch } = view
   let tr = state.tr
 
@@ -1714,6 +1714,44 @@ export function executeTool(
           success: true,
           message: `已应用"${presetName}"预设，影响 ${allIndexes.length} 个段落${applyPage && preset.page ? '，并更新页面配置' : ''}`,
           data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, allIndexes) },
+        }
+      }
+
+      case 'workspace_search': {
+        const query = String(params.query || '')
+        if (!query) return { success: false, message: '请提供搜索关键词' }
+        const searchParams = new URLSearchParams({ q: query })
+        if (params.doc_id) searchParams.set('doc_id', String(params.doc_id))
+        if (params.context_lines) searchParams.set('context_lines', String(params.context_lines))
+        try {
+          const res = await fetch(`/api/workspace/search?${searchParams.toString()}`)
+          const data = await res.json()
+          if (!res.ok) return { success: false, message: data.detail || '搜索失败' }
+          if (!data.results || data.results.length === 0) return { success: true, message: `未在工作区找到包含"${query}"的内容`, data }
+          const totalMatches = data.results.reduce((s: number, r: { matchCount: number }) => s + r.matchCount, 0)
+          return { success: true, message: `在工作区 ${data.matchedDocs} 篇文档中找到 ${totalMatches} 处匹配"${query}"的内容`, data }
+        } catch (e) {
+          return { success: false, message: `搜索请求失败: ${e instanceof Error ? e.message : String(e)}` }
+        }
+      }
+
+      case 'workspace_read': {
+        const docId = String(params.doc_id || '')
+        if (!docId) return { success: false, message: '请提供文档ID' }
+        const readParams = new URLSearchParams()
+        if (params.from_line !== undefined) readParams.set('from_line', String(params.from_line))
+        if (params.to_line !== undefined) readParams.set('to_line', String(params.to_line))
+        const qs = readParams.toString()
+        try {
+          const res = await fetch(`/api/workspace/${docId}/content${qs ? '?' + qs : ''}`)
+          const data = await res.json()
+          if (!res.ok) return { success: false, message: data.detail || '读取文档失败' }
+          const totalLines = data.totalLines ?? 0
+          const fromLine = data.fromLine ?? 0
+          const toLine = data.toLine ?? totalLines
+          return { success: true, message: `文档"${data.name}" 第${fromLine}-${toLine}行（共${totalLines}行）`, data }
+        } catch (e) {
+          return { success: false, message: `读取文档失败: ${e instanceof Error ? e.message : String(e)}` }
         }
       }
 

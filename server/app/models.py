@@ -90,3 +90,27 @@ class ToolResultsRequest(BaseModel):
     round: Optional[int] = None
     results: list[ToolResultItem] = Field(default_factory=list)
     stop: bool = False
+
+
+class TemplateCreateRequest(BaseModel):
+    name: str
+    note: Optional[str] = None
+    summary: str
+    sourceFilename: str
+    sourceContentBase64: str
+    templateText: str = ""
+
+
+class TemplateUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    note: Optional[str] = None
+    templateText: Optional[str] = None
+
+
+class TemplateAnalyzeRequest(BaseModel):
+    name: str
+    sourceFilename: str
+    sourceContentBase64: str
+    rawText: str = ""
+    providerId: Optional[str] = None
+    model: Optional[str] = None

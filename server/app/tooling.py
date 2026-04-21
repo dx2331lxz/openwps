@@ -560,6 +560,63 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_search",
+            "description": (
+                "在用户上传的工作区参考文档中搜索关键词。返回所有文档中包含该关键词的片段及上下文。"
+                "多个关键词用空格分隔，采用AND逻辑（所有关键词都需匹配）。"
+                "用于在写文档时查找参考资料、数据、法规条款等。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词，多个词用空格分隔（AND逻辑）",
+                    },
+                    "doc_id": {
+                        "type": "string",
+                        "description": "可选，限定在指定文档中搜索。不提供则搜索所有工作区文档",
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "搜索结果上下文行数，默认3",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_read",
+            "description": (
+                "读取工作区中某个参考文档的完整内容或指定行范围的内容。"
+                "用于详细查看某篇参考文档的内容。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {
+                        "type": "string",
+                        "description": "文档ID（从workspace_search结果或工作区文档列表中获取）",
+                    },
+                    "from_line": {
+                        "type": "integer",
+                        "description": "起始行号（从0开始），不提供则从0开始",
+                    },
+                    "to_line": {
+                        "type": "integer",
+                        "description": "结束行号（包含），不提供则读到末尾",
+                    },
+                },
+                "required": ["doc_id"],
+            },
+        },
+    },
 ]
 
 LAYOUT_TOOL_NAMES = {
@@ -603,7 +660,7 @@ EDIT_TOOL_NAMES = {
     "insert_image",
 }
 
-AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr"}
+AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr", "workspace_search", "workspace_read"}
 
 def get_tools(mode: str | None) -> list[dict]:
     if mode == "edit":
