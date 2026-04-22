@@ -80,14 +80,14 @@ git add -A && git commit -m "描述" && git push
 
 ## 技术栈
 
-| 层 | 技术 |
-|---|---|
-| 框架 | React + TypeScript + Vite |
-| 文档模型 | ProseMirror |
-| 布局引擎 | @chenglou/pretext |
-| 后端 | Python FastAPI + LangGraph |
-| AI | OpenAI 兼容接口（硅基流动/OpenAI/Claude/Ollama） |
-| Markdown | marked |
+| 层       | 技术                                             |
+| -------- | ------------------------------------------------ |
+| 框架     | React + TypeScript + Vite                        |
+| 文档模型 | ProseMirror                                      |
+| 布局引擎 | @chenglou/pretext                                |
+| 后端     | Python FastAPI + LangGraph                       |
+| AI       | OpenAI 兼容接口（硅基流动/OpenAI/Claude/Ollama） |
+| Markdown | marked                                           |
 
 ## 排版引擎说明
 

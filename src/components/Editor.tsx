@@ -322,6 +322,10 @@ const PM_STYLES = `
   color: transparent !important;
   -webkit-text-fill-color: transparent;
   text-shadow: none !important;
+  text-decoration: none !important;
+  text-decoration-color: transparent !important;
+  text-emphasis-color: transparent !important;
+  box-shadow: none !important;
 }
 .pretext-driving-editor .ProseMirror ::selection,
 .pretext-driving-editor .ProseMirror *::selection {
@@ -342,6 +346,8 @@ const PM_STYLES = `
   color: #111827 !important;
   -webkit-text-fill-color: #111827 !important;
   caret-color: #111827 !important;
+  text-decoration-color: currentColor !important;
+  text-emphasis-color: currentColor !important;
   pointer-events: auto;
 }
 .pretext-driving-editor .ProseMirror table p,
@@ -529,10 +535,40 @@ function toggleMarkAttr(
   return true
 }
 
+function isCaretAtStartOfParagraphAfterTable(state: EditorState) {
+  const { $from, empty } = state.selection
+  if (!empty) return false
+  if ($from.depth !== 1) return false
+  if ($from.parent.type.name !== 'paragraph') return false
+  if ($from.parentOffset !== 0) return false
+
+  const paragraphIndex = $from.index(0)
+  if (paragraphIndex === 0) return false
+
+  const previousNode = state.doc.child(paragraphIndex - 1)
+  return previousNode.type.name === 'table'
+}
+
 function initState(): EditorState {
   const div = document.createElement('div')
   div.innerHTML = '<p>开始输入文字，当内容超过一页高度时将自动出现第二张 A4 白纸...</p>'
   const doc = PMDOMParser.fromSchema(schema).parse(div)
+
+  const isCaretAtStartOfParagraphAfterTable = (state: EditorState) => {
+    const { $from, empty } = state.selection
+    if (!empty) return false
+    if ($from.depth !== 1) return false
+    if ($from.parent.type.name !== 'paragraph') return false
+    if ($from.parentOffset !== 0) return false
+
+    const paragraphIndex = $from.index(0)
+    if (paragraphIndex === 0) return false
+
+    const previousNode = state.doc.child(paragraphIndex - 1)
+    return previousNode.type.name === 'table'
+  }
+
+
   return EditorState.create({
     doc,
     plugins: [
@@ -546,40 +582,15 @@ function initState(): EditorState {
         'Mod-b': (s, d) => toggleMarkAttr(s, d, 'bold'),
         'Mod-i': (s, d) => toggleMarkAttr(s, d, 'italic'),
         'Mod-u': (s, d) => toggleMarkAttr(s, d, 'underline'),
-        // ── Protect the empty paragraph that sits directly after a table ──────
-        // Pressing Backspace at the start of such a paragraph (or Delete when the
-        // paragraph is empty) must NOT merge it into the table above.
+        // ── Protect the paragraph that sits directly after a table ────────────
+        // On macOS, the physical Delete key maps to Backspace. At the start of
+        // the paragraph after a table, deleting backward must never pull the
+        // following line into the table above.
         'Backspace': (state) => {
-          const { $from, empty } = state.selection
-          if (!empty) return false
-          // Cursor must be at the very start of its paragraph (offset 0)
-          if ($from.parentOffset !== 0) return false
-          // The parent must be a paragraph that is a direct child of the doc
-          if ($from.depth !== 1) return false
-          const paraNode = $from.parent
-          if (paraNode.type.name !== 'paragraph') return false
-          // The paragraph must be empty
-          if (paraNode.content.size !== 0) return false
-          // The preceding sibling must be a table
-          const paraIndex = $from.index(0)
-          if (paraIndex === 0) return false
-          const prevNode = state.doc.child(paraIndex - 1)
-          if (prevNode.type.name !== 'table') return false
-          // Block the deletion — swallow the Backspace
-          return true
+          return isCaretAtStartOfParagraphAfterTable(state)
         },
         'Delete': (state) => {
-          const { $from, empty } = state.selection
-          if (!empty) return false
-          if ($from.depth !== 1) return false
-          const paraNode = $from.parent
-          if (paraNode.type.name !== 'paragraph') return false
-          if (paraNode.content.size !== 0) return false
-          const paraIndex = $from.index(0)
-          if (paraIndex === 0) return false
-          const prevNode = state.doc.child(paraIndex - 1)
-          if (prevNode.type.name !== 'table') return false
-          return true
+          return isCaretAtStartOfParagraphAfterTable(state)
         },
         'Tab': (state, dispatch) => {
           if (isInTable(state)) return false
@@ -985,6 +996,13 @@ export const Editor: React.FC = () => {
         image: createImageNodeViewFactory(repaginate),
       },
       handleDOMEvents: {
+        keydown: (view, event) => {
+          if ((event.key === 'Backspace' || event.key === 'Delete') && isCaretAtStartOfParagraphAfterTable(view.state)) {
+            event.preventDefault()
+            return true
+          }
+          return false
+        },
         focus: () => {
           setEditorFocused(true)
           return false

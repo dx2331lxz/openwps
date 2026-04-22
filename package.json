@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test:markdown-import": "node scripts/test-markdown-import.cjs",
+    "test:table-boundary-delete": "node scripts/test-table-boundary-delete.cjs",
     "preview": "vite preview",
     "start:prod": "npm run build && python3 server/main.py"
   },

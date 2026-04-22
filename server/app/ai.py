@@ -3555,7 +3555,7 @@ def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -
 
     # Update session's latest context from frontend
     if body.context is not None:
-        session.latestContext = body.context
+        session.latest_context = body.context
 
     expected_plan = session.expected_plan
     if expected_plan is None:
@@ -4411,7 +4411,7 @@ class QueryCoordinator:
         yield {"type": "session_created", "sessionId": self.session.session_id}
 
         # Inject initial context as attachment (full state announcement)
-        context = self.session.latestContext
+        context = self.session.latest_context
         initial_attachment = build_initial_context_attachment(context)
         if initial_attachment:
             self.session.messages.append(HumanMessage(content=initial_attachment))
@@ -4776,8 +4776,8 @@ class QueryCoordinator:
                 _record_trace_event(self.session, "round_transition", round=self.state.round, transition=self.state.transition.value)
 
                 # Delta injection: inject context changes after tool results
-                # Use latestContext (updated by frontend each round) instead of body.context (frozen at session start)
-                context = self.session.latestContext
+                # Use latest_context (updated by frontend each round) instead of body.context (frozen at session start)
+                context = self.session.latest_context
                 force_delta = compression_outcome.source != "none"
                 delta_messages = compute_all_deltas(context, self.session.messages, force_full=force_delta)
                 for delta_msg in delta_messages:

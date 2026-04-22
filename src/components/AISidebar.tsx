@@ -320,6 +320,74 @@ const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, 
 
 let msgIdCounter = 0
 
+function isEscapedMarkdownMarker(text: string, index: number) {
+  let slashCount = 0
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
+    slashCount += 1
+  }
+  return slashCount % 2 === 1
+}
+
+function findLastUnclosedMarkdownMarker(text: string) {
+  const pairedMarkers = ['```', '**', '__', '~~'] as const
+  let lastUnclosedIndex = -1
+
+  for (const marker of pairedMarkers) {
+    let count = 0
+    let searchFrom = 0
+    let lastIndex = -1
+
+    while (searchFrom < text.length) {
+      const index = text.indexOf(marker, searchFrom)
+      if (index === -1) break
+      if (!isEscapedMarkdownMarker(text, index)) {
+        count += 1
+        lastIndex = index
+      }
+      searchFrom = index + marker.length
+    }
+
+    if (count % 2 === 1 && lastIndex > lastUnclosedIndex) {
+      lastUnclosedIndex = lastIndex
+    }
+  }
+
+  let backtickCount = 0
+  let lastBacktickIndex = -1
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== '`') continue
+    if (text.slice(index, index + 3) === '```') {
+      index += 2
+      continue
+    }
+    if (isEscapedMarkdownMarker(text, index)) continue
+    backtickCount += 1
+    lastBacktickIndex = index
+  }
+
+  if (backtickCount % 2 === 1 && lastBacktickIndex > lastUnclosedIndex) {
+    lastUnclosedIndex = lastBacktickIndex
+  }
+
+  return lastUnclosedIndex
+}
+
+function splitStableStreamingMarkdown(text: string, final: boolean) {
+  if (!text || final) {
+    return { flushable: text, deferred: '' }
+  }
+
+  const unstableStart = findLastUnclosedMarkdownMarker(text)
+  if (unstableStart === -1) {
+    return { flushable: text, deferred: '' }
+  }
+
+  return {
+    flushable: text.slice(0, unstableStart),
+    deferred: text.slice(unstableStart),
+  }
+}
+
 function newId() {
   msgIdCounter += 1
   return `m${msgIdCounter}`
@@ -445,16 +513,6 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   }
 
   return description || '执行工具调用'
-}
-
-function buildToolActionLabel(toolCall: ToolCallResult) {
-  return summarizeToolPurpose(toolCall)
-}
-
-function toolStatusTone(toolCall: ToolCallResult) {
-  if (toolCall.status === 'ok') return 'text-emerald-600'
-  if (toolCall.status === 'err') return 'text-red-500'
-  return 'text-blue-500'
 }
 
 function formatToolParams(params: Record<string, unknown>) {
@@ -856,26 +914,16 @@ function appendThinkingChunk(message: Message, chunk: string): Message {
 
 function appendContentChunk(message: Message, chunk: string, replace = false): Message {
   const nextText = replace ? chunk : message.text + chunk
-  const nextToolCalls = message.toolCalls.map(toolCall => (
-    toolCall.status === 'pending' ? toolCall : { ...toolCall, isExpanded: false }
-  ))
-  let toolIndex = -1
-  const nextSegments = message.segments.map(segment => {
-    if (segment.type !== 'tool') return segment
-    toolIndex += 1
-    const nextToolCall = nextToolCalls[toolIndex]
-    return nextToolCall ? { ...segment, toolCall: nextToolCall } : segment
-  })
-  const content = replace ? chunk : chunk
+  const nextSegments = [...message.segments]
   const lastSegment = nextSegments.at(-1)
 
   if (lastSegment?.type === 'content' && !replace) {
-    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + content }
+    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + chunk }
   } else if (nextText) {
-    nextSegments.push({ id: newId(), type: 'content', text: replace ? nextText : content })
+    nextSegments.push({ id: newId(), type: 'content', text: nextText })
   }
 
-  return { ...message, text: nextText, toolCalls: nextToolCalls, segments: nextSegments }
+  return { ...message, text: nextText, segments: nextSegments }
 }
 
 function appendToolSegment(message: Message, toolCall: ToolCallResult): Message {
@@ -2004,13 +2052,19 @@ export default function AISidebar({
         return
       }
 
+      const { flushable, deferred } = splitStableStreamingMarkdown(pendingStreamingChunk, final)
+      if (!flushable) {
+        pendingStreamingChunk = deferred
+        return
+      }
+
       const streamResult = appendStreamingWrite(
         editorView,
         activeStreamingWriteRef.current,
-        pendingStreamingChunk,
+        flushable,
         { final },
       )
-      pendingStreamingChunk = ''
+      pendingStreamingChunk = deferred
 
       if (!streamResult.success) {
         console.error('[AISidebar] append streaming write failed', streamResult.message)
@@ -2053,7 +2107,7 @@ export default function AISidebar({
     }
 
     const serverExecutedToolResults: ToolCallRecord[] = []
-    let persistRoundToolResults = (_toolResults: ToolCallRecord[]) => {}
+    let persistRoundToolResults = (_toolResults: ToolCallRecord[]) => { }
 
     try {
       if (!conversationId) {
@@ -2986,16 +3040,31 @@ export default function AISidebar({
                             }
 
                             if (segment.type === 'thinking') {
+                              const isActiveThinking = message.streaming && segmentIndex === message.segments.length - 1
+                              const isThinkingExpanded = isActiveThinking || message.isThinkingExpanded
                               return (
                                 <div
                                   key={segment.id}
                                   className="relative border-l-2 border-dashed border-slate-200 pl-3 text-[13px] leading-6 text-slate-500 before:absolute before:-left-[18px] before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-sky-300"
-                                  style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
                                 >
-                                  <div className="mb-1 text-[10px] font-medium uppercase tracking-[0.18em] text-sky-500/80">
-                                    Thinking
-                                  </div>
-                                  <div>{segment.text}</div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      shouldAutoScrollRef.current = false
+                                      setMessages(prev =>
+                                        prev.map(m => (m.id === message.id ? { ...m, isThinkingExpanded: !m.isThinkingExpanded } : m)),
+                                      )
+                                    }}
+                                    className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-[0.18em] text-sky-500/80 hover:text-sky-600 transition-colors"
+                                  >
+                                    <span>{isThinkingExpanded ? '▾' : '▸'}</span>
+                                    <span>Thinking{isActiveThinking ? '…' : ''}</span>
+                                  </button>
+                                  {isThinkingExpanded && (
+                                    <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }} className="mt-1">
+                                      {segment.text}
+                                    </div>
+                                  )}
                                 </div>
                               )
                             }
@@ -3003,125 +3072,88 @@ export default function AISidebar({
                             toolSegmentIndex += 1
                             const toolIndex = toolSegmentIndex
                             const toolCall = segment.toolCall
-                            if (toolCall.name === 'update_todo_list') return null
-                            const isCollapsed = toolCall.status !== 'pending' && !toolCall.isExpanded
+
+                            // 生成紧凑摘要，特殊处理 update_todo_list
+                            let summaryText = summarizeToolPurpose(toolCall)
+                            if (toolCall.name === 'update_todo_list') {
+                              const todoCount = Array.isArray(toolCall.params?.todos) ? toolCall.params.todos.length : 0
+                              summaryText = todoCount > 0 ? `更新任务计划（${todoCount} 个任务）` : '清空任务计划'
+                            }
 
                             return (
                               <div key={segment.id} className="relative space-y-1 before:absolute before:-left-4 before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-slate-300">
-                                {!isCollapsed && (
-                                  <div className="text-[12px] leading-5 text-gray-500">
-                                    准备调用工具：{summarizeToolPurpose(toolCall)}
-                                  </div>
-                                )}
-                                {isCollapsed ? (
-                                  <button
-                                    type="button"
-                                    className={`group flex w-full items-center gap-2 text-left text-[12px] leading-5 text-slate-400 transition-colors hover:text-slate-700 ${toolStatusTone(toolCall)}`}
-                                    onClick={() => {
-                                      shouldAutoScrollRef.current = false
-                                      setMessages(prev =>
-                                        prev.map(item => {
-                                          if (item.id !== message.id) return item
-                                          const nextToolCalls = item.toolCalls.map((currentToolCall, currentIndex) => (
-                                            currentIndex === toolIndex
-                                              ? { ...currentToolCall, isExpanded: true }
-                                              : currentToolCall
-                                          ))
-                                          let currentToolIdx = -1
-                                          const nextSegments = item.segments.map(currentSegment => {
-                                            if (currentSegment.type !== 'tool') return currentSegment
-                                            currentToolIdx += 1
-                                            return currentToolIdx === toolIndex
-                                              ? { ...currentSegment, toolCall: { ...currentSegment.toolCall, isExpanded: true } }
-                                              : currentSegment
-                                          })
-                                          return { ...item, toolCalls: nextToolCalls, segments: nextSegments }
-                                        }),
-                                      )
-                                    }}
-                                  >
-                                    <span className="font-mono text-[12px] text-slate-400 transition-colors group-hover:text-slate-700">
-                                      {toolCall.name}
+                                <button
+                                  type="button"
+                                  className={`group w-full text-left text-xs ${toolCall.status === 'ok'
+                                    ? 'text-green-700'
+                                    : toolCall.status === 'err'
+                                      ? 'text-red-600'
+                                      : 'text-gray-400'
+                                    }`}
+                                  onClick={() => {
+                                    shouldAutoScrollRef.current = false
+                                    setMessages(prev =>
+                                      prev.map(item => {
+                                        if (item.id !== message.id) return item
+                                        const isExpanded = !toolCall.isExpanded
+                                        const nextToolCalls = item.toolCalls.map((currentToolCall, currentIndex) => (
+                                          currentIndex === toolIndex
+                                            ? { ...currentToolCall, isExpanded }
+                                            : currentToolCall
+                                        ))
+                                        let currentToolIdx = -1
+                                        const nextSegments = item.segments.map(currentSegment => {
+                                          if (currentSegment.type !== 'tool') return currentSegment
+                                          currentToolIdx += 1
+                                          return currentToolIdx === toolIndex
+                                            ? { ...currentSegment, toolCall: { ...currentSegment.toolCall, isExpanded } }
+                                            : currentSegment
+                                        })
+                                        return { ...item, toolCalls: nextToolCalls, segments: nextSegments }
+                                      }),
+                                    )
+                                  }}
+                                >
+                                  <div className="flex items-start gap-2">
+                                    <span className={`mt-0.5 flex-shrink-0 ${toolCall.status === 'pending' ? 'ai-status-pulse' : ''}`}>
+                                      {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
                                     </span>
-                                    <span className="text-[11px] text-slate-400 opacity-0 transition-opacity group-hover:opacity-100">
-                                      ▸
-                                    </span>
-                                  </button>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className={`group w-full text-left text-xs ${toolCall.status === 'ok'
-                                      ? 'text-green-700'
-                                      : toolCall.status === 'err'
-                                        ? 'text-red-600'
-                                        : 'text-gray-400'
-                                      }`}
-                                    onClick={() => {
-                                      shouldAutoScrollRef.current = false
-                                      setMessages(prev =>
-                                        prev.map(item => {
-                                          if (item.id !== message.id) return item
-                                          const isExpanded = !toolCall.isExpanded
-                                          const nextToolCalls = item.toolCalls.map((currentToolCall, currentIndex) => (
-                                            currentIndex === toolIndex
-                                              ? { ...currentToolCall, isExpanded }
-                                              : currentToolCall
-                                          ))
-                                          let currentToolIdx = -1
-                                          const nextSegments = item.segments.map(currentSegment => {
-                                            if (currentSegment.type !== 'tool') return currentSegment
-                                            currentToolIdx += 1
-                                            return currentToolIdx === toolIndex
-                                              ? { ...currentSegment, toolCall: { ...currentSegment.toolCall, isExpanded } }
-                                              : currentSegment
-                                          })
-                                          return { ...item, toolCalls: nextToolCalls, segments: nextSegments }
-                                        }),
-                                      )
-                                    }}
-                                  >
-                                    <div className="flex items-start gap-2">
-                                      <span className="mt-0.5 flex-shrink-0">
-                                        {toolCall.status === 'ok' ? '✅' : toolCall.status === 'err' ? '❌' : '⏳'}
-                                      </span>
-                                      <div className="min-w-0 flex-1">
-                                        <div className="flex items-start justify-between gap-2">
-                                          <div className="font-mono break-all text-[11px] text-gray-700">
-                                            {toolCall.name}
-                                          </div>
-                                          <span className="flex-shrink-0 text-[11px] text-gray-400">
-                                            {toolCall.isExpanded ? '▾' : '▸'}
-                                          </span>
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-start justify-between gap-2">
+                                        <div className="min-w-0 flex-1">
+                                          <span className="font-mono break-all text-[11px] text-gray-700">{toolCall.name}</span>
+                                          <span className="mx-1.5 text-[10px] text-gray-300">·</span>
+                                          <span className="text-[11px] text-gray-500">{summaryText}</span>
                                         </div>
+                                        <span className="flex-shrink-0 text-[11px] text-gray-400">
+                                          {toolCall.isExpanded ? '▾' : '▸'}
+                                        </span>
+                                      </div>
 
-                                        {toolCall.isExpanded && (
-                                          <div className="mt-2 space-y-2">
-                                            <div className="text-[12px] leading-5 text-gray-600">
-                                              目的：{buildToolActionLabel(toolCall)}
-                                            </div>
+                                      {toolCall.isExpanded && (
+                                        <div className="mt-2 space-y-2">
+                                          <div>
+                                            <div className="text-[10px] uppercase tracking-wide text-gray-400">params</div>
+                                            <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white border border-gray-200 rounded-md px-2 py-1 text-gray-700">
+                                              {formatToolParams(toolCall.params)}
+                                            </pre>
+                                          </div>
+                                          {toolCall.data != null && (
                                             <div>
-                                              <div className="text-[10px] uppercase tracking-wide text-gray-400">params</div>
-                                              <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-80 bg-white border border-gray-200 rounded-md px-2 py-1 text-gray-700">
-                                                {formatToolParams(toolCall.params)}
+                                              <div className="text-[10px] uppercase tracking-wide text-gray-400">data</div>
+                                              <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
+                                                {formatToolData(toolCall.data)}
                                               </pre>
                                             </div>
-                                            {toolCall.data != null && (
-                                              <div>
-                                                <div className="text-[10px] uppercase tracking-wide text-gray-400">data</div>
-                                                <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-4 opacity-90 bg-white border border-gray-200 rounded-md px-2 py-1 max-h-72 overflow-auto text-gray-700">
-                                                  {formatToolData(toolCall.data)}
-                                                </pre>
-                                              </div>
-                                            )}
-                                            {toolCall.message && (
-                                              <div className="text-[11px] leading-4 text-gray-500 break-all">{toolCall.message}</div>
-                                            )}
-                                          </div>
-                                        )}
-                                      </div>
+                                          )}
+                                          {toolCall.message && (
+                                            <div className="text-[11px] leading-4 text-gray-500 break-all">{toolCall.message}</div>
+                                          )}
+                                        </div>
+                                      )}
                                     </div>
-                                  </button>
-                                )}
+                                  </div>
+                                </button>
                               </div>
                             )
                           })

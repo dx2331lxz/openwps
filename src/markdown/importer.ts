@@ -69,7 +69,11 @@ function createMarks(context: InlineContext): Mark[] {
   const marks: Mark[] = []
 
   if (hasTextStyle(context.textStyle)) {
-    marks.push(schema.marks.textStyle.create(context.textStyle ?? {}))
+    // Filter out null/undefined values to prevent ProseMirror from throwing
+    const safeAttrs = Object.fromEntries(
+      Object.entries(context.textStyle ?? {}).filter(([, value]) => value != null),
+    )
+    marks.push(schema.marks.textStyle.create(safeAttrs))
   }
 
   if (context.linkHref) {
@@ -168,6 +172,30 @@ function createParagraphsFromText(text: string, context: BlockContext, inlineCon
   ))
 }
 
+function createParagraphsFromInlineTokens(tokens: Token[] | undefined, context: BlockContext, inlineContext: InlineContext = {}) {
+  if (!tokens || tokens.length === 0) {
+    return [createParagraph([], context, inlineContext)]
+  }
+
+  const paragraphs: PMNode[] = []
+  let currentTokens: Token[] = []
+
+  tokens.forEach(token => {
+    if (token.type === 'br') {
+      paragraphs.push(createParagraph(currentTokens, context, inlineContext))
+      currentTokens = []
+      return
+    }
+    currentTokens.push(token)
+  })
+
+  if (currentTokens.length > 0 || paragraphs.length === 0) {
+    paragraphs.push(createParagraph(currentTokens, context, inlineContext))
+  }
+
+  return paragraphs
+}
+
 function blocksFromTokens(tokens: Token[], context: BlockContext): PMNode[] {
   return tokens.flatMap(token => {
     switch (token.type) {
@@ -176,6 +204,9 @@ function blocksFromTokens(tokens: Token[], context: BlockContext): PMNode[] {
       case 'paragraph':
         return [createParagraph((token as Tokens.Paragraph).tokens, context)]
       case 'text':
+        if ('tokens' in token && Array.isArray(token.tokens) && token.tokens.length > 0) {
+          return createParagraphsFromInlineTokens(token.tokens, context)
+        }
         return createParagraphsFromText((token as Tokens.Text).text ?? '', context)
       case 'heading': {
         const heading = token as Tokens.Heading
@@ -282,7 +313,8 @@ export function markdownToDocument(markdown: string, options: { baseParagraphAtt
         ? blocks
         : [schema.nodes.paragraph.create(mergeParagraphAttrs(options.baseParagraphAttrs))],
     )
-  } catch {
+  } catch (error) {
+    console.warn('[markdown importer] Failed to parse markdown, falling back to plain text:', error)
     const fallback = createParagraphsFromText(normalized, { baseParagraphAttrs: options.baseParagraphAttrs })
     return schema.nodes.doc.create(
       undefined,
