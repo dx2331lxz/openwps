@@ -649,6 +649,7 @@ export const Editor: React.FC = () => {
   const [pageCount, setPageCount] = useState(1)
   const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
   const [editorFocused, setEditorFocused] = useState(false)
+  const [editorComposing, setEditorComposing] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const docxLetterSpacingRef = useRef(0)
   const [serverDocuments, setServerDocuments] = useState<ServerDocumentSummary[]>([])
@@ -904,15 +905,15 @@ export const Editor: React.FC = () => {
       setTemplates((current) => current.map((item) => (
         item.id === updated.id
           ? {
-              id: updated.id,
-              name: updated.name,
-              note: updated.note,
-              summary: updated.summary,
-              createdAt: updated.createdAt,
-              updatedAt: updated.updatedAt,
-              sourceFilename: updated.sourceFilename,
-              sourceSize: updated.sourceSize,
-            }
+            id: updated.id,
+            name: updated.name,
+            note: updated.note,
+            summary: updated.summary,
+            createdAt: updated.createdAt,
+            updatedAt: updated.updatedAt,
+            sourceFilename: updated.sourceFilename,
+            sourceSize: updated.sourceSize,
+          }
           : item
       )))
       setActiveTemplate((current) => (current?.id === updated.id ? updated : current))
@@ -1009,6 +1010,15 @@ export const Editor: React.FC = () => {
         },
         blur: () => {
           setEditorFocused(false)
+          setEditorComposing(false)
+          return false
+        },
+        compositionstart: () => {
+          setEditorComposing(true)
+          return false
+        },
+        compositionend: () => {
+          setEditorComposing(false)
           return false
         },
         click: (_view, event) => {
@@ -1016,10 +1026,10 @@ export const Editor: React.FC = () => {
           let el = event.target as HTMLElement | null
           while (el && el !== _view.dom) {
             if (el.classList?.contains('pm-comment')) {
-              const id      = el.getAttribute('data-comment-id')      ?? ''
-              const author  = el.getAttribute('data-comment-author')   ?? ''
-              const date    = el.getAttribute('data-comment-date')     ?? ''
-              const content = el.getAttribute('data-comment-content')  ?? ''
+              const id = el.getAttribute('data-comment-id') ?? ''
+              const author = el.getAttribute('data-comment-author') ?? ''
+              const date = el.getAttribute('data-comment-date') ?? ''
+              const content = el.getAttribute('data-comment-content') ?? ''
               setActiveComment({
                 id, author, date, content,
                 anchorRect: new DOMRect(event.clientX, event.clientY, 0, 0),
@@ -1256,7 +1266,7 @@ export const Editor: React.FC = () => {
     // Fallback: use ProseMirror coordsAtPos
     if (!rect) {
       const fromCoords = editorView.coordsAtPos(from)
-      const toCoords   = editorView.coordsAtPos(to)
+      const toCoords = editorView.coordsAtPos(to)
       rect = new DOMRect(
         fromCoords.left,
         fromCoords.top,
@@ -1337,9 +1347,9 @@ export const Editor: React.FC = () => {
     const commentMark = $pos.marks().find(m => m.type === schema.marks.comment)
     if (commentMark) {
       setActiveComment({
-        id:      String(commentMark.attrs.id ?? ''),
-        author:  String(commentMark.attrs.author ?? ''),
-        date:    String(commentMark.attrs.date ?? ''),
+        id: String(commentMark.attrs.id ?? ''),
+        author: String(commentMark.attrs.author ?? ''),
+        date: String(commentMark.attrs.date ?? ''),
         content: String(commentMark.attrs.content ?? ''),
         anchorRect: new DOMRect(clientX ?? 0, clientY ?? 0, 0, 0),
       })
@@ -1379,37 +1389,37 @@ export const Editor: React.FC = () => {
       <div className="flex flex-col flex-1 min-w-0">
         {/* Toolbar */}
         <div className="sticky top-0 z-10 shadow-sm">
-        <Toolbar
-          view={view}
-          editorState={editorState}
-          onToggleSidebar={() => setSidebarOpen(o => !o)}
-          sidebarOpen={sidebarOpen}
-          onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
-          workspaceOpen={workspaceOpen}
-          onOpenServerFile={openServerFileModal}
-          onSaveServerFile={openSaveFileModal}
-          onImportDocx={handleImportFile}
-          onExportDocx={handleExportDocx}
-          onInsertImage={handleInsertImage}
-          onToggleFullscreen={() => { void handleToggleFullscreen() }}
-          isFullscreen={isFullscreen}
-          onAddComment={handleStartAddComment}
-          onOpenTemplates={() => setTemplateManagerOpen(true)}
-        />
-      </div>
+          <Toolbar
+            view={view}
+            editorState={editorState}
+            onToggleSidebar={() => setSidebarOpen(o => !o)}
+            sidebarOpen={sidebarOpen}
+            onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
+            workspaceOpen={workspaceOpen}
+            onOpenServerFile={openServerFileModal}
+            onSaveServerFile={openSaveFileModal}
+            onImportDocx={handleImportFile}
+            onExportDocx={handleExportDocx}
+            onInsertImage={handleInsertImage}
+            onToggleFullscreen={() => { void handleToggleFullscreen() }}
+            isFullscreen={isFullscreen}
+            onAddComment={handleStartAddComment}
+            onOpenTemplates={() => setTemplateManagerOpen(true)}
+          />
+        </div>
 
-      {/* Add comment dialog */}
-      {addCommentAnchor && (
-        <AddCommentDialog
-          anchorRect={addCommentAnchor}
-          onConfirm={handleConfirmAddComment}
-          onCancel={closeAddCommentDialog}
-        />
-      )}
+        {/* Add comment dialog */}
+        {addCommentAnchor && (
+          <AddCommentDialog
+            anchorRect={addCommentAnchor}
+            onConfirm={handleConfirmAddComment}
+            onCancel={closeAddCommentDialog}
+          />
+        )}
 
-      {/* Main content */}
-      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
-        {/*
+        {/* Main content */}
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
+          {/*
         Canvas: explicit height so absolute page cards create scroll space.
         Width = page width, centered.
 
@@ -1418,91 +1428,91 @@ export const Editor: React.FC = () => {
           2. ProseMirror editor (absolute, z-index:1, top=marginTop, left=marginLeft)
              Inside the editor, transparent widgets push content between cards.
       */}
-        <div
-          ref={canvasRef}
-          className="relative mx-auto"
-          style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
-        >
-          {/* ── Layer 1: page cards ── */}
-          {Array.from({ length: pageCount }).map((_, i) => (
-            <div
-              key={i}
-              style={{
-                position: 'absolute',
-                top: i * (cfg.pageHeight + PAGE_GAP),
-                left: 0,
-                width: cfg.pageWidth,
-                height: cfg.pageHeight,
-                background: 'white',
-                boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
-                pointerEvents: 'none',
-                zIndex: 0,
-              }}
-            >
+          <div
+            ref={canvasRef}
+            className="relative mx-auto"
+            style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
+          >
+            {/* ── Layer 1: page cards ── */}
+            {Array.from({ length: pageCount }).map((_, i) => (
               <div
+                key={i}
                 style={{
                   position: 'absolute',
-                  bottom: 12,
-                  width: '100%',
-                  textAlign: 'center',
-                  fontSize: 12,
-                  color: '#aaa',
-                  userSelect: 'none',
+                  top: i * (cfg.pageHeight + PAGE_GAP),
+                  left: 0,
+                  width: cfg.pageWidth,
+                  height: cfg.pageHeight,
+                  background: 'white',
+                  boxShadow: '0 2px 12px rgba(0,0,0,0.18)',
+                  pointerEvents: 'none',
+                  zIndex: 0,
                 }}
               >
-                {i + 1} / {pageCount}
+                <div
+                  style={{
+                    position: 'absolute',
+                    bottom: 12,
+                    width: '100%',
+                    textAlign: 'center',
+                    fontSize: 12,
+                    color: '#aaa',
+                    userSelect: 'none',
+                  }}
+                >
+                  {i + 1} / {pageCount}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
 
-          {/* ── Layer 2: Pretext page renderer ── */}
-          {layoutResult && (
-            <PretextPageRenderer
-              pages={layoutResult.renderedPages}
-              pageConfig={cfg}
-              pageGap={PAGE_GAP}
-              caretPos={editorState?.selection.head ?? null}
-              selectionFrom={editorState?.selection.from ?? null}
-              selectionTo={editorState?.selection.to ?? null}
-              showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
-              showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
-              onRequestCaretPos={handleRequestCaretPos}
-              onRequestSelectionRange={handleRequestSelectionRange}
+            {/* ── Layer 2: Pretext page renderer ── */}
+            {layoutResult && !(editorComposing && !(editorState && isInTable(editorState))) && (
+              <PretextPageRenderer
+                pages={layoutResult.renderedPages}
+                pageConfig={cfg}
+                pageGap={PAGE_GAP}
+                caretPos={editorState?.selection.head ?? null}
+                selectionFrom={editorState?.selection.from ?? null}
+                selectionTo={editorState?.selection.to ?? null}
+                showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
+                showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
+                onRequestCaretPos={handleRequestCaretPos}
+                onRequestSelectionRange={handleRequestSelectionRange}
+              />
+            )}
+
+            {/* ── Layer 3: ProseMirror editor ── */}
+            <div
+              ref={mountRef}
+              className={layoutResult && !(editorComposing && !(editorState && isInTable(editorState))) ? 'pretext-driving-editor' : undefined}
+              style={{
+                position: 'absolute',
+                top: cfg.marginTop,
+                left: cfg.marginLeft,
+                right: cfg.marginRight,
+                ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
+                zIndex: 2,
+              }}
             />
-          )}
 
-          {/* ── Layer 3: ProseMirror editor ── */}
-          <div
-            ref={mountRef}
-            className={layoutResult ? 'pretext-driving-editor' : undefined}
-            style={{
-              position: 'absolute',
-              top: cfg.marginTop,
-              left: cfg.marginLeft,
-              right: cfg.marginRight,
-              ['--docx-letter-spacing' as string]: `${docxLetterSpacingPx}px`,
-              zIndex: 2,
-            }}
-          />
-
-          <CommentSidebar
-            comments={visibleComments}
-            pageWidth={cfg.pageWidth}
-            canvasHeight={canvasH}
-            activeCommentId={activeComment?.id ?? null}
-            onActivate={(id) => {
-              const matchedComment = visibleComments.find((comment) => comment.id === id)
-              if (matchedComment) {
-                setActiveComment(matchedComment)
-              }
-            }}
-            onDelete={handleDeleteComment}
-            onResolve={handleResolveComment}
-          />
+            <CommentSidebar
+              comments={visibleComments}
+              pageWidth={cfg.pageWidth}
+              canvasHeight={canvasH}
+              activeCommentId={activeComment?.id ?? null}
+              onActivate={(id) => {
+                const matchedComment = visibleComments.find((comment) => comment.id === id)
+                if (matchedComment) {
+                  setActiveComment(matchedComment)
+                }
+              }}
+              onDelete={handleDeleteComment}
+              onResolve={handleResolveComment}
+            />
+          </div>
+          {/* end canvas */}
         </div>
-        {/* end canvas */}
-      </div>
-      {/* end main content */}
+        {/* end main content */}
       </div>
       {/* end left column */}
 
