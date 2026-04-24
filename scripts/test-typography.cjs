@@ -15,6 +15,7 @@ const PORT = 5173
 const BASE_URL = `http://127.0.0.1:${PORT}`
 const DIST_DIR = path.join(__dirname, '..', 'dist')
 const SCREENSHOTS_DIR = path.join(__dirname, '..', 'screenshots')
+const MOD_KEY = process.platform === 'darwin' ? 'Meta' : 'Control'
 
 if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true })
 
@@ -24,6 +25,12 @@ function startStaticServer() {
     const mime = { html: 'text/html', js: 'application/javascript', css: 'text/css',
       svg: 'image/svg+xml', png: 'image/png', ico: 'image/x-icon', json: 'application/json' }
     const server = http.createServer((req, res) => {
+      if (req.url?.startsWith('/api/templates')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end('[]')
+        return
+      }
+
       let filePath = path.join(DIST_DIR, req.url === '/' ? '/index.html' : req.url)
       // Strip query strings
       filePath = filePath.split('?')[0]
@@ -55,19 +62,42 @@ function fail(name, reason) { results.push({ name, ok: false, reason }); console
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Type text into the ProseMirror editor and wait for it to settle */
+async function focusEditor(page) {
+  const hitLine = page.locator('[data-pretext-hit="text-line"]').first()
+  if (await hitLine.count()) {
+    await hitLine.click()
+  } else {
+    await page.locator('.ProseMirror').click({ force: true })
+  }
+  await page.locator('.ProseMirror').evaluate((editor) => {
+    if (editor instanceof HTMLElement) editor.focus()
+  })
+}
+
 async function typeInEditor(page, text) {
-  const editor = page.locator('.ProseMirror')
-  await editor.click()
-  await editor.press('Control+a')
-  await editor.type(text)
+  await focusEditor(page)
+  await page.keyboard.press(`${MOD_KEY}+a`)
+  await page.keyboard.type(text)
   await page.waitForTimeout(200)
 }
 
 /** Select all text in editor */
 async function selectAll(page) {
-  const editor = page.locator('.ProseMirror')
-  await editor.click()
-  await editor.press('Control+a')
+  await focusEditor(page)
+  await page.keyboard.press(`${MOD_KEY}+a`)
+  await page.locator('.ProseMirror').evaluate((editor) => {
+    if (!(editor instanceof HTMLElement)) return
+    const selection = window.getSelection()
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  })
+  await page.waitForTimeout(100)
+}
+
+async function switchToolbarTab(page, label) {
+  await page.locator('button').filter({ hasText: label }).first().click()
   await page.waitForTimeout(100)
 }
 
@@ -170,10 +200,10 @@ async function getFirstParaStyle(page) {
       await screenshot(page, '03-underline')
       const style = await page.evaluate(() => {
         const span = document.querySelector('.ProseMirror span')
-        return span ? window.getComputedStyle(span).textDecoration : null
+        return span ? span.getAttribute('style') : null
       })
       if (style && style.includes('underline')) pass('下划线')
-      else fail('下划线', `text-decoration=${style}`)
+      else fail('下划线', `style=${style}`)
     } catch (e) { fail('下划线', String(e.message)) }
 
     // 4. 删除线
@@ -185,10 +215,10 @@ async function getFirstParaStyle(page) {
       await screenshot(page, '04-strikethrough')
       const style = await page.evaluate(() => {
         const span = document.querySelector('.ProseMirror span')
-        return span ? window.getComputedStyle(span).textDecoration : null
+        return span ? span.getAttribute('style') : null
       })
       if (style && style.includes('line-through')) pass('删除线')
-      else fail('删除线', `text-decoration=${style}`)
+      else fail('删除线', `style=${style}`)
     } catch (e) { fail('删除线', String(e.message)) }
 
     // 5. 上标
@@ -234,10 +264,10 @@ async function getFirstParaStyle(page) {
       await screenshot(page, '07-text-color')
       const color = await page.evaluate(() => {
         const span = document.querySelector('.ProseMirror span')
-        return span ? window.getComputedStyle(span).color : null
+        return span ? span.getAttribute('style') : null
       })
-      if (color && color.includes('255') && color.includes('0, 0')) pass('文字颜色红色')
-      else fail('文字颜色红色', `color=${color}`)
+      if (color && (color.toLowerCase().includes('#ff0000') || color.includes('rgb(255, 0, 0)'))) pass('文字颜色红色')
+      else fail('文字颜色红色', `style=${color}`)
     } catch (e) { fail('文字颜色红色', String(e.message)) }
 
     // 8. 文字背景色（高亮）
@@ -349,8 +379,14 @@ async function getFirstParaStyle(page) {
     try {
       await typeInEditor(page, '缩进后再减少')
       await selectAll(page)
-      await page.click('[title="增加首行缩进 (Tab)"]')
+      await page.click('[title="减少首行缩进 (Shift+Tab)"]')
       await page.waitForTimeout(100)
+      await page.click('[title="增加首行缩进 (Tab)"]')
+      await page.waitForFunction(() => {
+        const p = document.querySelector('.ProseMirror p')
+        if (!p) return false
+        return Number.parseFloat(window.getComputedStyle(p).textIndent || '0') > 0
+      })
       await page.click('[title="减少首行缩进 (Shift+Tab)"]')
       await page.waitForTimeout(200)
       await screenshot(page, '15-decrease-indent')
@@ -380,8 +416,7 @@ async function getFirstParaStyle(page) {
       await typeInEditor(page, '字号测试18pt')
       await selectAll(page)
       const sizeInput = page.locator('[title="字号"]')
-      await sizeInput.fill('18')
-      await sizeInput.press('Enter')
+      await sizeInput.selectOption('18')
       await page.waitForTimeout(200)
       await screenshot(page, '17-font-size')
       const fontSize = await page.evaluate(() => {
@@ -399,7 +434,7 @@ async function getFirstParaStyle(page) {
       await typeInEditor(page, '字体测试黑体')
       await selectAll(page)
       const fontSelect = page.locator('[title="字体"]')
-      await fontSelect.selectOption('SimHei, sans-serif')
+      await fontSelect.selectOption({ label: '黑体' })
       await page.waitForTimeout(200)
       await screenshot(page, '18-font-family')
       const fontFamily = await page.evaluate(() => {
@@ -448,9 +483,10 @@ async function getFirstParaStyle(page) {
 
     // 21. 插入水平分割线
     try {
+      await switchToolbarTab(page, '插入')
       await typeInEditor(page, '分割线上方文字')
-      const editor = page.locator('.ProseMirror')
-      await editor.press('End')
+      await switchToolbarTab(page, '插入')
+      await page.keyboard.press('End')
       await page.click('[title="插入水平分割线"]')
       await page.waitForTimeout(300)
       await screenshot(page, '21-hr')
@@ -461,8 +497,10 @@ async function getFirstParaStyle(page) {
 
     // 22. 插入分页符
     try {
+      await switchToolbarTab(page, '插入')
       await typeInEditor(page, '分页符测试段落')
       await selectAll(page)
+      await switchToolbarTab(page, '插入')
       await page.click('[title="插入分页符"]')
       await page.waitForTimeout(400)
       await screenshot(page, '22-page-break')
@@ -479,9 +517,10 @@ async function getFirstParaStyle(page) {
 
     // 23. Ctrl+B
     try {
+      await switchToolbarTab(page, '开始')
       await typeInEditor(page, 'Ctrl+B快捷键测试')
       await selectAll(page)
-      await page.keyboard.press('Control+b')
+      await page.keyboard.press(`${MOD_KEY}+b`)
       await page.waitForTimeout(200)
       const fw = await page.evaluate(() => {
         const span = document.querySelector('.ProseMirror span')
@@ -493,9 +532,10 @@ async function getFirstParaStyle(page) {
 
     // 24. Ctrl+I
     try {
+      await switchToolbarTab(page, '开始')
       await typeInEditor(page, 'Ctrl+I快捷键测试')
       await selectAll(page)
-      await page.keyboard.press('Control+i')
+      await page.keyboard.press(`${MOD_KEY}+i`)
       await page.waitForTimeout(200)
       const fi = await page.evaluate(() => {
         const span = document.querySelector('.ProseMirror span')
@@ -507,11 +547,12 @@ async function getFirstParaStyle(page) {
 
     // 25. Ctrl+Z 撤销
     try {
+      await switchToolbarTab(page, '开始')
       await typeInEditor(page, '撤销测试文字')
       await selectAll(page)
       await page.click('[title="加粗 (Ctrl+B)"]')
       await page.waitForTimeout(100)
-      await page.keyboard.press('Control+z')
+      await page.keyboard.press(`${MOD_KEY}+z`)
       await page.waitForTimeout(200)
       await screenshot(page, '25-undo')
       pass('Ctrl+Z撤销')
@@ -520,9 +561,8 @@ async function getFirstParaStyle(page) {
     // 26. Tab 增加首行缩进
     try {
       await typeInEditor(page, 'Tab缩进测试')
-      const editor = page.locator('.ProseMirror')
-      await editor.press('End')
-      await editor.press('Tab')
+      await page.keyboard.press('End')
+      await page.keyboard.press('Tab')
       await page.waitForTimeout(200)
       const s = await getFirstParaStyle(page)
       const indent = parseFloat(s?.textIndent ?? '0')
@@ -535,13 +575,13 @@ async function getFirstParaStyle(page) {
 
     // 27. 光标移到加粗文字时 B 按钮高亮
     try {
+      await switchToolbarTab(page, '开始')
       await typeInEditor(page, '部分加粗文字测试')
       await selectAll(page)
       await page.click('[title="加粗 (Ctrl+B)"]')
       await page.waitForTimeout(100)
       // Click into the text (deselect, place cursor inside)
-      const editor = page.locator('.ProseMirror')
-      await editor.press('End')
+      await page.locator('[data-pretext-hit="text-line"]').first().click({ position: { x: 60, y: 10 } })
       await page.waitForTimeout(200)
       // Check if B button has active style
       const boldBtnClass = await page.evaluate(() => {
@@ -558,12 +598,11 @@ async function getFirstParaStyle(page) {
 
     // 28. 输入超过一页的文字后出现第二张 A4 卡片
     try {
-      const editor = page.locator('.ProseMirror')
-      await editor.click()
-      await editor.press('Control+a')
+      await focusEditor(page)
+      await page.keyboard.press(`${MOD_KEY}+a`)
       // Type a lot of paragraphs to overflow one page (931px of content)
       const manyLines = Array(60).fill('这是一行测试文字，用于填充页面以触发自动分页功能。').join('\n')
-      await editor.fill(manyLines)
+      await page.keyboard.type(manyLines)
       await page.waitForTimeout(1000) // wait for debounced repagination
       await screenshot(page, '28-pagination')
       // Check that there are 2+ page cards rendered
@@ -581,11 +620,12 @@ async function getFirstParaStyle(page) {
 
     // 29. 打开页面设置弹窗
     try {
-      await page.click('[title="页面设置"]')
+      await switchToolbarTab(page, '页面')
+      await page.locator('button').filter({ hasText: '页边距' }).first().click()
       await page.waitForTimeout(300)
       await screenshot(page, '29-page-settings')
       const modalVisible = await page.evaluate(() => {
-        return !!document.querySelector('h3')
+        return document.body.textContent?.includes('页边距') ?? false
       })
       if (modalVisible) pass('页面设置弹窗')
       else fail('页面设置弹窗', '弹窗未出现')

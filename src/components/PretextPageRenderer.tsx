@@ -85,7 +85,8 @@ function renderFloatingObject(
   object: RenderedFloatingObject,
   pageIndex: number,
   pageConfig: PageConfig,
-  pageGap: number
+  pageGap: number,
+  onRequestCaretPos?: (pos: number, clientX: number, clientY: number) => void
 ) {
   const pageTop = pageIndex * (pageConfig.pageHeight + pageGap)
   const commonStyle: React.CSSProperties = {
@@ -99,7 +100,7 @@ function renderFloatingObject(
     paddingRight: object.paddingRight,
     paddingBottom: object.paddingBottom,
     paddingLeft: object.paddingLeft,
-    pointerEvents: 'none',
+    pointerEvents: object.kind === 'image' ? 'auto' : 'none',
     zIndex: object.behindDoc ? 0 : 3,
   }
 
@@ -110,10 +111,17 @@ function renderFloatingObject(
         src={object.src}
         alt={object.alt}
         title={object.title}
+        onMouseDown={(event) => {
+          if (!onRequestCaretPos || event.button !== 0) return
+          event.preventDefault()
+          event.stopPropagation()
+          onRequestCaretPos(object.blockPos + 1, event.clientX, event.clientY)
+        }}
         style={{
           ...commonStyle,
           height: object.height || undefined,
           objectFit: 'contain',
+          cursor: 'text',
         }}
       />
     )
@@ -635,7 +643,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
       {pages.map((page, pageIndex) => {
         return (
           <React.Fragment key={`page-${pageIndex}`}>
-            {page.floatingObjects.map((object) => renderFloatingObject(object, pageIndex, pageConfig, pageGap))}
+            {page.floatingObjects.map((object) => renderFloatingObject(object, pageIndex, pageConfig, pageGap, onRequestCaretPos))}
             {page.lines.map((line) => {
               const metrics = getLineLayoutMetrics(line, pageIndex, pageConfig, pageGap)
               const isHorizontalRule = line.blockType === 'horizontal_rule'

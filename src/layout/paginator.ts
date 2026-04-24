@@ -1,6 +1,6 @@
 import { prepareWithSegments } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
-import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
 
 export interface PageConfig {
   pageWidth: number
@@ -23,6 +23,7 @@ export const DEFAULT_PAGE_CONFIG: PageConfig = {
 export interface LineInfo {
   text: string
   blockIndex: number
+  blockPos: number
   blockType: string
   lineIndex: number
   lineHeight: number
@@ -95,6 +96,7 @@ export interface FloatingParagraph {
 
 export interface RenderedFloatingObject {
   blockIndex: number
+  blockPos: number
   kind: 'image' | 'textbox'
   left: number
   top: number
@@ -223,21 +225,22 @@ function ptToPx(pt: number): number {
   return (pt * 96) / 72
 }
 
-function resolveTextStyle(node: PMNode): RenderTextStyle {
+function resolveTextStyle(node: PMNode, baseStyle: Partial<RenderTextStyle> = {}): RenderTextStyle {
+  const fallback = { ...DEFAULT_TEXT_STYLE, ...baseStyle }
   const mark = node.marks.find((item) => item.type.name === 'textStyle')
-  if (!mark) return { ...DEFAULT_TEXT_STYLE }
+  if (!mark) return fallback
 
   return {
-    fontFamily: mark.attrs.fontFamily || DEFAULT_TEXT_STYLE.fontFamily,
-    fontSize: mark.attrs.fontSize || DEFAULT_TEXT_STYLE.fontSize,
-    color: mark.attrs.color || DEFAULT_TEXT_STYLE.color,
-    backgroundColor: mark.attrs.backgroundColor || DEFAULT_TEXT_STYLE.backgroundColor,
-    bold: Boolean(mark.attrs.bold),
-    italic: Boolean(mark.attrs.italic),
-    underline: Boolean(mark.attrs.underline),
-    strikethrough: Boolean(mark.attrs.strikethrough),
-    superscript: Boolean(mark.attrs.superscript),
-    subscript: Boolean(mark.attrs.subscript),
+    fontFamily: mark.attrs.fontFamily || fallback.fontFamily,
+    fontSize: mark.attrs.fontSize || fallback.fontSize,
+    color: mark.attrs.color || fallback.color,
+    backgroundColor: mark.attrs.backgroundColor || fallback.backgroundColor,
+    bold: mark.attrs.bold == null ? Boolean(fallback.bold) : Boolean(mark.attrs.bold),
+    italic: mark.attrs.italic == null ? Boolean(fallback.italic) : Boolean(mark.attrs.italic),
+    underline: mark.attrs.underline == null ? Boolean(fallback.underline) : Boolean(mark.attrs.underline),
+    strikethrough: mark.attrs.strikethrough == null ? Boolean(fallback.strikethrough) : Boolean(mark.attrs.strikethrough),
+    superscript: mark.attrs.superscript == null ? Boolean(fallback.superscript) : Boolean(mark.attrs.superscript),
+    subscript: mark.attrs.subscript == null ? Boolean(fallback.subscript) : Boolean(mark.attrs.subscript),
     letterSpacing: Number(mark.attrs.letterSpacing) || 0,
   }
 }
@@ -245,6 +248,8 @@ function resolveTextStyle(node: PMNode): RenderTextStyle {
 function getParagraphTextStyle(paraNode: PMNode) {
   let fontFamily = String(paraNode.attrs.fontFamilyHint ?? DEFAULT_TEXT_STYLE.fontFamily)
   let fontSize = Number(paraNode.attrs.fontSizeHint ?? DEFAULT_TEXT_STYLE.fontSize)
+  const headingLevel = Number(paraNode.attrs.headingLevel ?? 0)
+  const bold = headingLevel >= 1 && headingLevel <= 3
 
   paraNode.forEach((child) => {
     if ((child.isText || child.type.name === 'image') && child.marks.length > 0) {
@@ -254,7 +259,28 @@ function getParagraphTextStyle(paraNode: PMNode) {
     }
   })
 
-  return { fontFamily, fontSize }
+  return { fontFamily, fontSize, bold }
+}
+
+function getParagraphBaseTextStyle(paraNode: PMNode): RenderTextStyle {
+  const headingLevel = Number(paraNode.attrs.headingLevel ?? 0)
+  const headingSizes: Record<number, number> = {
+    1: 22,
+    2: 18,
+    3: 16,
+    4: 14,
+    5: 12,
+    6: 10.5,
+    7: 10.5,
+    8: 9,
+    9: 9,
+  }
+  return {
+    ...DEFAULT_TEXT_STYLE,
+    fontFamily: String(paraNode.attrs.fontFamilyHint ?? (headingLevel >= 1 && headingLevel <= 6 ? FONT_STACKS.hei : DEFAULT_TEXT_STYLE.fontFamily)),
+    fontSize: Number(paraNode.attrs.fontSizeHint ?? headingSizes[headingLevel] ?? DEFAULT_TEXT_STYLE.fontSize),
+    bold: headingLevel >= 1 && headingLevel <= 8,
+  }
 }
 
 function textStyleToFontStr(style: RenderTextStyle) {
@@ -349,11 +375,12 @@ function extractParagraphSourceChars(paraNode: PMNode, paraPos: number): SourceC
 
   const chars: SourceChar[] = []
   const contentStart = paraPos + 1
+  const paragraphBaseStyle = getParagraphBaseTextStyle(paraNode)
   paraNode.forEach((child, offset) => {
     if (!child.isText) return
     const text = child.text ?? ''
     const childStart = contentStart + offset
-    const style = resolveTextStyle(child)
+    const style = resolveTextStyle(child, paragraphBaseStyle)
 
     for (let index = 0; index < text.length; index += 1) {
       chars.push({
@@ -789,7 +816,7 @@ function measureParagraph(
     maxInlineHeight = Math.max(maxInlineHeight, estimateImageHeight(child))
     maxInlineHeight = Math.max(maxInlineHeight, estimateFloatingObjectHeight(child))
     if (child.isText) {
-      const childStyle = resolveTextStyle(child)
+      const childStyle = resolveTextStyle(child, getParagraphBaseTextStyle(paraNode))
       maxInlineHeight = Math.max(maxInlineHeight, ptToPx(childStyle.fontSize) * lineHeightMult)
     }
   })
@@ -803,6 +830,7 @@ function measureParagraph(
       lines: [{
         text: '',
         blockIndex,
+        blockPos: paraPos,
         blockType: 'paragraph',
         lineIndex: 0,
         lineHeight,
@@ -878,6 +906,7 @@ function measureParagraph(
       lines.push({
         text: line.text,
         blockIndex,
+        blockPos: paraPos,
         blockType: 'paragraph',
         lineIndex,
         lineHeight,
@@ -988,6 +1017,7 @@ function buildFloatingParagraphs(node: PMNode): FloatingParagraph[] {
 function buildRenderedFloatingObject(
   node: PMNode,
   blockIndex: number,
+  blockPos: number,
   anchorTop: number,
   config: PageConfig,
   contentWidth: number
@@ -998,6 +1028,7 @@ function buildRenderedFloatingObject(
 
   return {
     blockIndex,
+    blockPos,
     kind,
     left: resolveFloatingLeft(node, config, contentWidth),
     top: resolveFloatingTop(node, anchorTop, config),
@@ -1077,6 +1108,7 @@ function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBl
       lines: [{
         text: buildTablePreviewText(tableNode),
         blockIndex: 0,
+        blockPos: 0,
         blockType: 'table',
         lineIndex: 0,
         lineHeight: contentHeight,
@@ -1123,6 +1155,7 @@ function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBl
     lines: [{
       text: buildTablePreviewText(tableNode),
       blockIndex: 0,
+      blockPos: 0,
       blockType: 'table',
       lineIndex: 0,
       lineHeight: contentHeight,
@@ -1190,7 +1223,7 @@ function measureBlock(
         contentWidth,
         getDomBlockMetric(domBlockMetrics, nodePos, blockIndex, 'table'),
       )
-      measured.lines[0] = { ...measured.lines[0]!, blockIndex, startPos: nodePos + 1 }
+      measured.lines[0] = { ...measured.lines[0]!, blockIndex, blockPos: nodePos, startPos: nodePos + 1 }
       return measured
     }
     case 'horizontal_rule':
@@ -1201,6 +1234,7 @@ function measureBlock(
         lines: [{
           text: '',
           blockIndex,
+          blockPos: nodePos,
           blockType: 'horizontal_rule',
           lineIndex: 0,
           lineHeight: 20,
@@ -1229,6 +1263,7 @@ function measureBlock(
         lines: [{
           text: String(node.attrs.title ?? '目录') || '目录',
           blockIndex,
+          blockPos: nodePos,
           blockType: 'table_of_contents',
           lineIndex: 0,
           lineHeight: tocHeight,
@@ -1256,6 +1291,7 @@ function measureBlock(
         lines: [{
           text: '',
           blockIndex,
+          blockPos: nodePos,
           blockType: node.type.name,
           lineIndex: 0,
           lineHeight: 24,
@@ -1349,7 +1385,7 @@ export function paginate(
     const nodePos = offset
     if (node.type.name === 'floating_object') {
       currentRenderedPage.floatingObjects.push(
-        buildRenderedFloatingObject(node, blockIndex, lastAnchorTop, config, contentWidth)
+        buildRenderedFloatingObject(node, blockIndex, nodePos, lastAnchorTop, config, contentWidth)
       )
       blockIndex += 1
       return

@@ -1,5 +1,6 @@
 import {
   AlignmentType,
+  BorderStyle,
   Document,
   DocumentGridType,
   ImageRun,
@@ -234,6 +235,15 @@ async function convertTableCell(node: PMNode, exportOptions: DocxExportOptions):
     children.push(child.type.name === 'table' ? await convertTable(child, exportOptions) : await convertParagraph(child, exportOptions))
   }
 
+  const backgroundColor = String(node.attrs.backgroundColor ?? '').replace('#', '')
+  const borderColor = String(node.attrs.borderColor ?? '#cccccc').replace('#', '') || 'cccccc'
+  const borderWidth = Math.max(0, Number(node.attrs.borderWidth ?? 1) || 0)
+  const border = {
+    style: borderWidth > 0 ? BorderStyle.SINGLE : BorderStyle.NONE,
+    size: Math.max(1, Math.round(borderWidth * 6)),
+    color: borderColor,
+  }
+
   return new TableCell({
     children: children.length > 0 ? children : [new Paragraph('')],
     columnSpan: Math.max(1, Number(node.attrs.colspan) || 1),
@@ -241,6 +251,13 @@ async function convertTableCell(node: PMNode, exportOptions: DocxExportOptions):
     width: node.attrs.width
       ? { size: pxToTwip(Number.parseInt(String(node.attrs.width), 10) || 0), type: WidthType.DXA }
       : undefined,
+    shading: backgroundColor ? { type: ShadingType.CLEAR, fill: backgroundColor, color: 'auto' } : undefined,
+    borders: {
+      top: border,
+      bottom: border,
+      left: border,
+      right: border,
+    },
   })
 }
 

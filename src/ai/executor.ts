@@ -1033,6 +1033,9 @@ function buildTableContentSnapshot(tableNode: PMNode) {
         header: Boolean(cellNode.attrs.header ?? false),
         colspan: Number(cellNode.attrs.colspan ?? 1),
         rowspan: Number(cellNode.attrs.rowspan ?? 1),
+        backgroundColor: String(cellNode.attrs.backgroundColor ?? ''),
+        borderColor: String(cellNode.attrs.borderColor ?? '#cccccc'),
+        borderWidth: Number(cellNode.attrs.borderWidth ?? 1),
         text: cellText,
       }
     })
@@ -1134,6 +1137,9 @@ function buildTableSnapshot(tableNode: PMNode, includeTextRuns = true) {
         colspan: Number(cellNode.attrs.colspan ?? 1),
         rowspan: Number(cellNode.attrs.rowspan ?? 1),
         width: cellNode.attrs.width ?? null,
+        backgroundColor: String(cellNode.attrs.backgroundColor ?? ''),
+        borderColor: String(cellNode.attrs.borderColor ?? '#cccccc'),
+        borderWidth: Number(cellNode.attrs.borderWidth ?? 1),
         text,
         paragraphs,
       }

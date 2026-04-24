@@ -51,7 +51,71 @@ const defaultTextFmt = {
 const defaultParaFmt = {
   align: 'left', firstLineIndent: 0, indent: 0, lineHeight: 1.5,
   spaceBefore: 0, spaceAfter: 0, listType: null as string | null, listChecked: false, pageBreakBefore: false,
+  headingLevel: null as number | null, fontSizeHint: null as number | null, fontFamilyHint: null as string | null,
 }
+
+interface ParagraphStyleOption {
+  id: string
+  label: string
+  headingLevel: number | null
+  fontSizeHint: number | null
+  fontFamilyHint: string | null
+  lineHeight: number
+  spaceBefore: number
+  spaceAfter: number
+  bold: boolean
+  color?: string
+  previewSize: number
+}
+
+const PARAGRAPH_STYLE_OPTIONS: ParagraphStyleOption[] = [
+  {
+    id: 'body',
+    label: '正文',
+    headingLevel: null,
+    fontSizeHint: null,
+    fontFamilyHint: DEFAULT_EDITOR_FONT_STACK,
+    lineHeight: 1.5,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    bold: false,
+    previewSize: 18,
+  },
+  { id: 'heading-1', label: '标题 1', headingLevel: 1, fontSizeHint: 22, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.3, spaceBefore: 12, spaceAfter: 6, bold: true, previewSize: 30 },
+  { id: 'heading-2', label: '标题 2', headingLevel: 2, fontSizeHint: 18, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.3, spaceBefore: 9, spaceAfter: 4, bold: true, previewSize: 27 },
+  { id: 'heading-3', label: '标题 3', headingLevel: 3, fontSizeHint: 16, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.35, spaceBefore: 6, spaceAfter: 3, bold: true, previewSize: 24 },
+  { id: 'heading-4', label: '标题 4', headingLevel: 4, fontSizeHint: 14, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.35, spaceBefore: 5, spaceAfter: 2, bold: true, previewSize: 21 },
+  { id: 'heading-5', label: '标题 5', headingLevel: 5, fontSizeHint: 12, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.4, spaceBefore: 4, spaceAfter: 2, bold: true, previewSize: 19 },
+  { id: 'heading-6', label: '标题 6', headingLevel: 6, fontSizeHint: 10.5, fontFamilyHint: FONT_STACKS.hei, lineHeight: 1.4, spaceBefore: 3, spaceAfter: 2, bold: true, previewSize: 17 },
+  { id: 'heading-7', label: '标题 7', headingLevel: 7, fontSizeHint: 10.5, fontFamilyHint: FONT_STACKS.song, lineHeight: 1.4, spaceBefore: 3, spaceAfter: 1, bold: true, previewSize: 16 },
+  { id: 'heading-8', label: '标题 8', headingLevel: 8, fontSizeHint: 9, fontFamilyHint: FONT_STACKS.song, lineHeight: 1.4, spaceBefore: 2, spaceAfter: 1, bold: true, previewSize: 15 },
+  { id: 'heading-9', label: '标题 9', headingLevel: 9, fontSizeHint: 9, fontFamilyHint: FONT_STACKS.song, lineHeight: 1.4, spaceBefore: 2, spaceAfter: 0, bold: false, previewSize: 14 },
+  {
+    id: 'comment-text',
+    label: '批注文字',
+    headingLevel: null,
+    fontSizeHint: 10.5,
+    fontFamilyHint: DEFAULT_EDITOR_FONT_STACK,
+    lineHeight: 1.4,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    bold: false,
+    color: '#374151',
+    previewSize: 16,
+  },
+  {
+    id: 'default-paragraph-font',
+    label: '默认段落字体',
+    headingLevel: null,
+    fontSizeHint: 12,
+    fontFamilyHint: DEFAULT_EDITOR_FONT_STACK,
+    lineHeight: 1.5,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    bold: false,
+    previewSize: 17,
+  },
+]
 
 function deriveFormats(state: EditorState) {
   const text = { ...defaultTextFmt }
@@ -172,6 +236,74 @@ function clearFormatting(view: EditorView) {
   })
   dispatch(tr)
   view.focus()
+}
+
+function getTargetParagraphs(state: EditorState) {
+  const { selection } = state
+  const paragraphs: Array<{ node: PMNode; pos: number }> = []
+
+  if (selection.empty) {
+    const { $from } = selection
+    for (let depth = $from.depth; depth >= 0; depth -= 1) {
+      const node = $from.node(depth)
+      if (node.type.name !== 'paragraph') continue
+      paragraphs.push({ node, pos: $from.before(depth) })
+      break
+    }
+    return paragraphs
+  }
+
+  state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
+    if (node.type.name === 'paragraph') paragraphs.push({ node, pos })
+    return true
+  })
+  return paragraphs
+}
+
+function applyParagraphNamedStyle(view: EditorView, option: ParagraphStyleOption) {
+  const { state, dispatch } = view
+  const paragraphs = getTargetParagraphs(state)
+  if (paragraphs.length === 0) return
+
+  const tr = state.tr
+  paragraphs.forEach(({ node, pos }) => {
+    tr.setNodeMarkup(pos, undefined, {
+      ...node.attrs,
+      headingLevel: option.headingLevel,
+      fontSizeHint: option.fontSizeHint,
+      fontFamilyHint: option.fontFamilyHint,
+      lineHeight: option.lineHeight,
+      spaceBefore: option.spaceBefore,
+      spaceAfter: option.spaceAfter,
+      listType: null,
+      listLevel: 0,
+      listChecked: false,
+    })
+
+    const from = pos + 1
+    const to = pos + node.nodeSize - 1
+    if (to <= from) return
+
+    tr.removeMark(from, to, schema.marks.textStyle)
+    if (option.fontSizeHint || option.fontFamilyHint || option.bold || option.color) {
+      tr.addMark(from, to, schema.marks.textStyle.create({
+        fontFamily: option.fontFamilyHint ?? DEFAULT_EDITOR_FONT_STACK,
+        fontSize: option.fontSizeHint ?? 12,
+        bold: option.bold,
+        color: option.color ?? '#000000',
+      }))
+    }
+  })
+
+  dispatch(tr.scrollIntoView())
+  view.focus()
+}
+
+function getCurrentParagraphStyleId(para: typeof defaultParaFmt) {
+  const headingLevel = Number(para.headingLevel ?? 0)
+  if (headingLevel >= 1 && headingLevel <= 9) return `heading-${headingLevel}`
+  const commentStyle = Number(para.fontSizeHint ?? 0) === 10.5 && String(para.fontFamilyHint ?? '') === DEFAULT_EDITOR_FONT_STACK
+  return commentStyle ? 'comment-text' : 'body'
 }
 
 function toggleList(view: EditorView, listType: 'bullet' | 'ordered' | 'task') {
@@ -627,6 +759,104 @@ const PageSettingsPopover: React.FC<{
   )
 }
 
+const ParagraphStyleDropdown: React.FC<{
+  anchorRect: DOMRect
+  activeId: string
+  onSelect: (option: ParagraphStyleOption) => void
+  onClose: () => void
+}> = ({ anchorRect, activeId, onSelect, onClose }) => (
+  <div
+    data-openwps-style-dropdown="true"
+    onMouseDown={event => event.stopPropagation()}
+    style={{
+      position: 'fixed',
+      top: anchorRect.bottom + 4,
+      left: anchorRect.left,
+      width: 260,
+      maxHeight: 520,
+      overflowY: 'auto',
+      zIndex: 9999,
+      padding: '10px 0',
+      border: '1px solid #e5e7eb',
+      borderRadius: 10,
+      background: '#ffffff',
+      boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
+    }}
+  >
+    {PARAGRAPH_STYLE_OPTIONS.map(option => {
+      const active = option.id === activeId
+      return (
+        <button
+          key={option.id}
+          type="button"
+          title={option.label}
+          data-openwps-style-option={option.id}
+          onMouseDown={event => {
+            event.preventDefault()
+            event.stopPropagation()
+            onSelect(option)
+            onClose()
+          }}
+          style={{
+            width: '100%',
+            minHeight: 52,
+            display: 'grid',
+            gridTemplateColumns: '34px 1fr',
+            alignItems: 'center',
+            gap: 8,
+            padding: '8px 18px 8px 12px',
+            border: 'none',
+            background: active ? '#eff6ff' : 'transparent',
+            color: '#111827',
+            cursor: 'pointer',
+            textAlign: 'left',
+          }}
+        >
+          <span style={{ color: '#2563eb', fontSize: 20, lineHeight: 1 }}>{active ? '✓' : ''}</span>
+          <span
+            style={{
+              fontFamily: option.fontFamilyHint ?? DEFAULT_EDITOR_FONT_STACK,
+              fontSize: option.previewSize,
+              fontWeight: option.bold ? 700 : 400,
+              lineHeight: 1.2,
+              color: option.color ?? '#111827',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {option.label}
+          </span>
+        </button>
+      )
+    })}
+    <div style={{ height: 1, background: '#e5e7eb', margin: '8px 16px' }} />
+    <button
+      type="button"
+      title="样式管理"
+      onMouseDown={event => {
+        event.preventDefault()
+        event.stopPropagation()
+        onClose()
+      }}
+      style={{
+        width: '100%',
+        height: 48,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '0 18px',
+        border: 'none',
+        background: 'transparent',
+        color: '#111827',
+        cursor: 'pointer',
+        fontSize: 17,
+      }}
+    >
+      <span style={{ fontSize: 20 }}>A</span>
+      样式管理
+    </button>
+  </div>
+)
+
 function PageToolbarButton({
   label,
   icon,
@@ -701,6 +931,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     lineColor: '#cbd5e1',
   })
   const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
+  const [styleDropdown, setStyleDropdown] = React.useState<{ rect: DOMRect } | null>(null)
   const [activeTab, setActiveTab] = React.useState<'home' | 'insert' | 'page'>('home')
   const [pagePopover, setPagePopover] = React.useState<{ section: PageSettingsSection; rect: DOMRect } | null>(null)
   const [tablePickerOpen, setTablePickerOpen] = React.useState(false)
@@ -731,6 +962,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [spacingPopover])
+
+  React.useEffect(() => {
+    if (!styleDropdown) return
+    const handler = () => setStyleDropdown(null)
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [styleDropdown])
 
   React.useEffect(() => {
     if (!pagePopover) return
@@ -797,12 +1035,14 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72,
     Number(fmt.text.fontSize),
   ])).sort((a, b) => a - b)
+  const activeParagraphStyleId = getCurrentParagraphStyleId(fmt.para)
+  const activeParagraphStyle = PARAGRAPH_STYLE_OPTIONS.find(option => option.id === activeParagraphStyleId) ?? PARAGRAPH_STYLE_OPTIONS[0]!
 
   const btn = (active: boolean) =>
-    'px-2 py-1 rounded text-sm font-medium cursor-pointer select-none ' +
+    'px-3 py-2 rounded text-base font-medium cursor-pointer select-none ' +
     (active ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100 text-gray-700')
 
-  const sep = <div style={{ width: 1, height: 24, background: '#e5e7eb', margin: '0 4px' }} />
+  const sep = <div style={{ width: 1, height: 30, background: '#e5e7eb', margin: '0 6px' }} />
 
   /** Call before a <select> opens so we can restore the selection on change */
   const saveSelection = () => {
@@ -869,8 +1109,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 key={tab}
                 onMouseDown={e => { e.preventDefault(); setActiveTab(tab) }}
                 style={{
-                  padding: '0 14px',
-                  fontSize: 13,
+                  padding: '0 22px',
+                  fontSize: 16,
                   fontWeight: active ? 600 : 400,
                   cursor: 'pointer',
                   border: 'none',
@@ -894,7 +1134,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             title="工作区"
             onMouseDown={e => { e.preventDefault(); onToggleWorkspace?.() }}
             style={{
-              padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
+              padding: '6px 14px', fontSize: 15, borderRadius: 6, cursor: 'pointer',
               background: workspaceOpen ? '#2563eb' : '#f3f4f6',
               color: workspaceOpen ? 'white' : '#374151',
               border: '1px solid #d1d5db',
@@ -906,7 +1146,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             title="AI 助手"
             onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
             style={{
-              padding: '3px 12px', fontSize: 13, borderRadius: 4, cursor: 'pointer',
+              padding: '6px 14px', fontSize: 15, borderRadius: 6, cursor: 'pointer',
               background: sidebarOpen ? '#2563eb' : '#f3f4f6',
               color: sidebarOpen ? 'white' : '#374151',
               border: '1px solid #d1d5db',
@@ -944,7 +1184,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           alignItems: 'stretch',
           background: 'white',
           borderBottom: '1px solid #e5e7eb',
-          minHeight: 40,
+          minHeight: 52,
         }}>
           {/* 左滚动箭头 */}
           {showScrollLeft && (
@@ -972,7 +1212,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               display: 'flex',
               alignItems: 'center',
               gap: 2,
-              padding: '0 6px',
+              padding: '0 10px',
               overflowX: 'auto',
               overflowY: 'hidden',
               scrollbarWidth: 'none',
@@ -1037,12 +1277,41 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   </>
                 ) : (
                   <>
+                    {/* 段落样式 */}
+                    <button
+                      title="段落样式"
+                      data-openwps-style-button="true"
+                      onMouseDown={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setStyleDropdown(current => current ? null : { rect: event.currentTarget.getBoundingClientRect() })
+                      }}
+                      style={{
+                        minWidth: 118,
+                        height: 38,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 10,
+                        padding: '0 14px',
+                        border: '1px solid #ddd',
+                        borderRadius: 4,
+                        background: '#ffffff',
+                        color: '#111827',
+                        cursor: 'pointer',
+                        fontSize: 17,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      <span>{activeParagraphStyle.label}</span>
+                      <span style={{ color: '#6b7280', fontSize: 12 }}>▾</span>
+                    </button>
 
                     {/* 字号 */}
                     <select
                       title="字号"
                       value={String(fmt.text.fontSize)}
-                      style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ width: 76, height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 8px', cursor: 'pointer' }}
                       onMouseDown={saveSelection}
                       onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
                     >
@@ -1055,7 +1324,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     <select
                       title="字体"
                       value={fmt.text.fontFamily}
-                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
                       onMouseDown={saveSelection}
                       onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
                     >
@@ -1180,7 +1449,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     <select
                       title="行距"
                       value={fmt.para.lineHeight}
-                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
                       onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
                     >
                       {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
@@ -1547,6 +1816,15 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           value={fmt.para.spaceAfter as number}
           onChange={v => { if (view) applyParaStyle(view, { spaceAfter: v }) }}
           onClose={() => setSpacingPopover(null)}
+        />
+      )}
+
+      {styleDropdown && (
+        <ParagraphStyleDropdown
+          anchorRect={styleDropdown.rect}
+          activeId={activeParagraphStyleId}
+          onSelect={option => { if (view) applyParagraphNamedStyle(view, option) }}
+          onClose={() => setStyleDropdown(null)}
         />
       )}
 

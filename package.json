@@ -13,6 +13,7 @@
     "test:ai-text-search-style": "node scripts/test-ai-text-search-style.cjs",
     "test:table-layout": "node scripts/test-table-layout.cjs",
     "test:table-boundary-delete": "node scripts/test-table-boundary-delete.cjs",
+    "test:block-controls": "node scripts/test-block-controls.cjs",
     "preview": "vite preview",
     "start:prod": "npm run build && python3 server/main.py"
   },

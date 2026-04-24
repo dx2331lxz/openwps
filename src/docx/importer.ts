@@ -1348,6 +1348,18 @@ async function parseTableCell(
   const widthType = getAttr(tcWidth, 'type')
   const rawWidth = parseNumber(getAttr(tcWidth, 'w'))
   const width = widthType === 'dxa' && rawWidth > 0 ? `${Math.round(twipToPx(rawWidth))}px` : null
+  const shading = directChild(tcPr, 'shd')
+  const backgroundColor = normalizeFill(getAttr(shading, 'fill'))
+  const borders = directChild(tcPr, 'tcBorders')
+  const firstBorder = directChild(borders, 'top')
+    ?? directChild(borders, 'left')
+    ?? directChild(borders, 'start')
+    ?? directChild(borders, 'bottom')
+    ?? directChild(borders, 'right')
+    ?? directChild(borders, 'end')
+  const borderColor = normalizeFill(getAttr(firstBorder, 'color')) || '#cccccc'
+  const rawBorderSize = parseNumber(getAttr(firstBorder, 'sz'), 8)
+  const borderWidth = Math.max(0, Math.round((rawBorderSize / 8) * (96 / 72) * 10) / 10)
 
   const content: PMNodeJSON[] = []
   for (const child of elementChildren(tcEl)) {
@@ -1368,6 +1380,9 @@ async function parseTableCell(
         colspan,
         rowspan: 1,
         width,
+        backgroundColor,
+        borderColor,
+        borderWidth,
       },
       content: content.length > 0 ? content : [{ type: 'paragraph', attrs: DEFAULT_PARAGRAPH_ATTRS, content: [] }],
     },

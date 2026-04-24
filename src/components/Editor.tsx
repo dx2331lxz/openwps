@@ -1,11 +1,21 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { EditorState, NodeSelection, Plugin, TextSelection } from 'prosemirror-state'
+import { EditorState, NodeSelection, Plugin, Selection, TextSelection } from 'prosemirror-state'
 import { EditorView, Decoration, DecorationSet } from 'prosemirror-view'
-import { DOMParser as PMDOMParser } from 'prosemirror-model'
+import { DOMParser as PMDOMParser, type Node as PMNode } from 'prosemirror-model'
 import { keymap } from 'prosemirror-keymap'
 import { baseKeymap } from 'prosemirror-commands'
 import { history, undo, redo } from 'prosemirror-history'
-import { goToNextCell, isInTable, tableEditing } from 'prosemirror-tables'
+import {
+  addColumnAfter,
+  addColumnBefore,
+  addRowAfter,
+  addRowBefore,
+  deleteColumn,
+  deleteRow,
+  goToNextCell,
+  isInTable,
+  tableEditing,
+} from 'prosemirror-tables'
 import { schema } from '../editor/schema'
 import { createImageNodeViewFactory } from '../editor/imageNodeView'
 import {
@@ -23,9 +33,10 @@ import type { DocumentFileSummary, DocumentSettings, DocumentSource } from './Fi
 import SettingsModal from './SettingsModal'
 import { importDocx, type PMNodeJSON } from '../docx/importer'
 import { buildDocxBlob, exportDocx, type DocxExportOptions } from '../docx/exporter'
-import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
 import { markdownToDocument } from '../markdown/importer'
 import { PretextPageRenderer } from './PretextPageRenderer'
+import { BlockControls, type BlockDescriptor, type BlockKind, type BlockTableCommand } from './BlockControls'
 import type { CommentData } from './CommentPopover'
 import { CommentSidebar, type SidebarCommentData } from './CommentSidebar'
 import { AddCommentDialog } from './AddCommentDialog'
@@ -59,6 +70,122 @@ interface PendingCommentTarget {
 interface AISettingsSnapshot {
   activeProviderId?: string
   model?: string
+}
+
+interface BlockAIPopoverState {
+  blockPos: number
+  rect: {
+    left: number
+    top: number
+    width: number
+    height: number
+  }
+  instruction: string
+  loading: boolean
+  error: string | null
+}
+
+type WpsParagraphStyleLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
+
+const WPS_PARAGRAPH_STYLES: Record<WpsParagraphStyleLevel, {
+  headingLevel: WpsParagraphStyleLevel
+  fontSizeHint: number | null
+  fontFamilyHint: string | null
+  lineHeight: number
+  spaceBefore: number
+  spaceAfter: number
+  bold: boolean
+}> = {
+  0: {
+    headingLevel: 0,
+    fontSizeHint: null,
+    fontFamilyHint: DEFAULT_EDITOR_FONT_STACK,
+    lineHeight: 1.5,
+    spaceBefore: 0,
+    spaceAfter: 0,
+    bold: false,
+  },
+  1: {
+    headingLevel: 1,
+    fontSizeHint: 22,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.3,
+    spaceBefore: 12,
+    spaceAfter: 6,
+    bold: true,
+  },
+  2: {
+    headingLevel: 2,
+    fontSizeHint: 18,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.3,
+    spaceBefore: 9,
+    spaceAfter: 4,
+    bold: true,
+  },
+  3: {
+    headingLevel: 3,
+    fontSizeHint: 16,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.35,
+    spaceBefore: 6,
+    spaceAfter: 3,
+    bold: true,
+  },
+  4: {
+    headingLevel: 4,
+    fontSizeHint: 14,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.35,
+    spaceBefore: 5,
+    spaceAfter: 2,
+    bold: true,
+  },
+  5: {
+    headingLevel: 5,
+    fontSizeHint: 12,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.4,
+    spaceBefore: 4,
+    spaceAfter: 2,
+    bold: true,
+  },
+  6: {
+    headingLevel: 6,
+    fontSizeHint: 10.5,
+    fontFamilyHint: FONT_STACKS.hei,
+    lineHeight: 1.4,
+    spaceBefore: 3,
+    spaceAfter: 2,
+    bold: true,
+  },
+  7: {
+    headingLevel: 7,
+    fontSizeHint: 10.5,
+    fontFamilyHint: FONT_STACKS.song,
+    lineHeight: 1.4,
+    spaceBefore: 3,
+    spaceAfter: 1,
+    bold: true,
+  },
+  8: {
+    headingLevel: 8,
+    fontSizeHint: 9,
+    fontFamilyHint: FONT_STACKS.song,
+    lineHeight: 1.4,
+    spaceBefore: 2,
+    spaceAfter: 1,
+    bold: true,
+  },
+  9: {
+    headingLevel: 9,
+    fontSizeHint: 9,
+    fontFamilyHint: FONT_STACKS.song,
+    lineHeight: 1.4,
+    spaceBefore: 2,
+    spaceAfter: 0,
+    bold: false,
+  },
 }
 
 const DEFAULT_DOCUMENT_SETTINGS: DocumentSettings = {
@@ -569,6 +696,225 @@ function collectDomBlockMetrics(view: EditorView): DomBlockMetric[] {
   return metrics
 }
 
+function isPureImageParagraph(node: PMNode) {
+  if (node.type.name !== 'paragraph') return false
+  let imageCount = 0
+  let hasOtherVisibleContent = false
+
+  node.forEach((child) => {
+    if (child.type.name === 'image') {
+      imageCount += 1
+      return
+    }
+    if (child.isText && !(child.text ?? '').trim()) return
+    hasOtherVisibleContent = true
+  })
+
+  return imageCount === 1 && !hasOtherVisibleContent
+}
+
+function getBlockKind(node: PMNode): BlockKind {
+  if (isPureImageParagraph(node)) return 'image'
+  if (node.type.name === 'paragraph') return 'text'
+  if (node.type.name === 'table') return 'table'
+  if (node.type.name === 'table_of_contents') return 'table_of_contents'
+  if (node.type.name === 'horizontal_rule') return 'horizontal_rule'
+  return 'floating_object'
+}
+
+function getBlockTitle(kind: BlockKind) {
+  switch (kind) {
+    case 'image':
+      return '图片块'
+    case 'table':
+      return '表格块'
+    case 'table_of_contents':
+      return '目录块'
+    case 'horizontal_rule':
+      return '分割线块'
+    case 'floating_object':
+      return '浮动对象块'
+    default:
+      return '文本块'
+  }
+}
+
+function getTableStyleSummary(tableNode: PMNode): BlockDescriptor['tableStyle'] {
+  let result: BlockDescriptor['tableStyle'] | undefined
+
+  tableNode.descendants((node) => {
+    if (result || node.type.name !== 'table_cell') return true
+    result = {
+      backgroundColor: String(node.attrs.backgroundColor ?? ''),
+      borderColor: String(node.attrs.borderColor ?? '#cccccc') || '#cccccc',
+      borderWidth: Number(node.attrs.borderWidth ?? 1),
+    }
+    return false
+  })
+
+  return result ?? {
+    backgroundColor: '',
+    borderColor: '#cccccc',
+    borderWidth: 1,
+  }
+}
+
+function mergeBlockRect(
+  map: Map<string, { pos: number; pageIndex: number; left: number; top: number; right: number; bottom: number }>,
+  pos: number,
+  pageIndex: number,
+  rect: { left: number; top: number; width: number; height: number },
+) {
+  const key = `${pos}:${pageIndex}`
+  const existing = map.get(key)
+  const right = rect.left + rect.width
+  const bottom = rect.top + rect.height
+
+  if (!existing) {
+    map.set(key, {
+      pos,
+      pageIndex,
+      left: rect.left,
+      top: rect.top,
+      right,
+      bottom,
+    })
+    return
+  }
+
+  existing.left = Math.min(existing.left, rect.left)
+  existing.top = Math.min(existing.top, rect.top)
+  existing.right = Math.max(existing.right, right)
+  existing.bottom = Math.max(existing.bottom, bottom)
+}
+
+function buildBlockRectMap(layout: PaginateResult, pageConfig: PageConfig) {
+  const rectMap = new Map<string, { pos: number; pageIndex: number; left: number; top: number; right: number; bottom: number }>()
+  const contentWidth = pageConfig.pageWidth - pageConfig.marginLeft - pageConfig.marginRight
+
+  layout.renderedPages.forEach((page, pageIndex) => {
+    const pageTop = pageIndex * (pageConfig.pageHeight + PAGE_GAP)
+
+    page.lines.forEach((line) => {
+      mergeBlockRect(rectMap, line.blockPos, pageIndex, {
+        left: pageConfig.marginLeft,
+        top: pageTop + pageConfig.marginTop + line.top,
+        width: contentWidth,
+        height: Math.max(1, line.lineHeight),
+      })
+    })
+
+    page.floatingObjects.forEach((object) => {
+      mergeBlockRect(rectMap, object.blockPos, pageIndex, {
+        left: object.left,
+        top: pageTop + object.top,
+        width: Math.max(1, object.width),
+        height: Math.max(1, object.height),
+      })
+    })
+  })
+
+  const grouped = new Map<number, BlockDescriptor['rects']>()
+  rectMap.forEach((rect) => {
+    const rects = grouped.get(rect.pos) ?? []
+    rects.push({
+      pageIndex: rect.pageIndex,
+      left: rect.left,
+      top: rect.top,
+      width: Math.max(1, rect.right - rect.left),
+      height: Math.max(1, rect.bottom - rect.top),
+    })
+    grouped.set(rect.pos, rects)
+  })
+
+  grouped.forEach((rects) => {
+    rects.sort((first, second) => first.pageIndex - second.pageIndex || first.top - second.top)
+  })
+
+  return grouped
+}
+
+function buildBlockDescriptors(
+  state: EditorState | null,
+  layout: PaginateResult | null,
+  pageConfig: PageConfig,
+): BlockDescriptor[] {
+  if (!state || !layout) return []
+
+  const rectMap = buildBlockRectMap(layout, pageConfig)
+  const blocks: BlockDescriptor[] = []
+  let paragraphIndex = 0
+
+  state.doc.forEach((node, pos, blockIndex) => {
+    const kind = getBlockKind(node)
+    const currentParagraphIndex = node.type.name === 'paragraph' ? paragraphIndex : null
+    if (node.type.name === 'paragraph') paragraphIndex += 1
+    const rects = rectMap.get(pos) ?? []
+    if (rects.length === 0) return
+
+    blocks.push({
+      blockIndex,
+      pos,
+      nodeSize: node.nodeSize,
+      type: kind,
+      nodeType: node.type.name,
+      paragraphIndex: currentParagraphIndex,
+      title: getBlockTitle(kind),
+      rects,
+      tableStyle: kind === 'table' ? getTableStyleSummary(node) : undefined,
+    })
+  })
+
+  return blocks
+}
+
+function serializeBlockText(node: PMNode) {
+  if (node.type.name !== 'table') return node.textContent
+
+  return node.content.content.map((rowNode) => (
+    rowNode.content.content.map((cellNode) => cellNode.textContent.replace(/\s+/g, ' ').trim()).join('\t')
+  )).join('\n')
+}
+
+function getFirstParagraphTextPosInBlock(blockNode: PMNode, blockPos: number) {
+  let found: number | null = null
+  blockNode.descendants((node, relativePos) => {
+    if (found != null || node.type.name !== 'paragraph') return true
+    found = blockPos + 1 + relativePos + 1
+    return false
+  })
+  return found
+}
+
+function getTopLevelSelectionBlockPos(state: EditorState) {
+  if (state.selection instanceof NodeSelection) return state.selection.from
+  const { $from } = state.selection
+  return $from.depth >= 1 ? $from.before(1) : null
+}
+
+function getBlockByPos(blocks: BlockDescriptor[], pos: number | null) {
+  return pos == null ? null : blocks.find((block) => block.pos === pos) ?? null
+}
+
+function getBlockAIAnchorRect(block: BlockDescriptor) {
+  if (block.rects.length === 0) return null
+  const first = block.rects[0]!
+  const last = block.rects[block.rects.length - 1]!
+  return {
+    left: first.left,
+    top: last.top + last.height + 8,
+    width: Math.max(320, first.width),
+    height: 0,
+  }
+}
+
+function stripAIReply(text: string) {
+  return text
+    .replace(/^```(?:\w+)?\s*/u, '')
+    .replace(/\s*```$/u, '')
+    .trim()
+}
+
 function transactionHasStyleMutation(tx: EditorState['tr']) {
   return tx.steps.some((step) => {
     const stepType = step.toJSON().stepType
@@ -584,10 +930,13 @@ function toggleMarkAttr(
 ): boolean {
   if (state.selection.empty || !dispatch) return false
   const { from, to } = state.selection
+  const resolvedFrom = Math.max(1, from)
+  const resolvedTo = Math.min(state.doc.nodeSize - 1, to)
+  if (resolvedFrom >= resolvedTo) return false
   const { tr, doc } = state
   let isActive = false
   let existing: Record<string, unknown> = {}
-  doc.nodesBetween(from, to, (node) => {
+  doc.nodesBetween(resolvedFrom, resolvedTo, (node) => {
     if (node.isText) {
       const mark = node.marks.find((m) => m.type === schema.marks.textStyle)
       if (mark) {
@@ -596,8 +945,128 @@ function toggleMarkAttr(
       }
     }
   })
-  dispatch(tr.addMark(from, to, schema.marks.textStyle.create({ ...existing, [attr]: !isActive })))
+  dispatch(tr.addMark(resolvedFrom, resolvedTo, schema.marks.textStyle.create({ ...existing, [attr]: !isActive })))
   return true
+}
+
+function BlockAIPopover({
+  state,
+  onChange,
+  onClose,
+  onSubmit,
+}: {
+  state: BlockAIPopoverState
+  onChange: (instruction: string) => void
+  onClose: () => void
+  onSubmit: () => void
+}) {
+  return (
+    <div
+      data-openwps-block-ai-popover="true"
+      onMouseDown={(event) => {
+        event.stopPropagation()
+      }}
+      style={{
+        position: 'absolute',
+        left: Math.max(8, state.rect.left),
+        top: state.rect.top,
+        width: Math.min(420, Math.max(320, state.rect.width)),
+        padding: 10,
+        border: '1px solid #e5e7eb',
+        borderRadius: 8,
+        background: 'rgba(255,255,255,0.98)',
+        boxShadow: '0 18px 38px rgba(15, 23, 42, 0.18)',
+        zIndex: 8,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: '#111827' }}>WPS AI</span>
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          aria-label="关闭块 AI"
+          onClick={onClose}
+          style={{
+            width: 24,
+            height: 24,
+            border: '1px solid transparent',
+            borderRadius: 6,
+            background: 'transparent',
+            cursor: 'pointer',
+            fontSize: 16,
+            lineHeight: '20px',
+          }}
+        >
+          ×
+        </button>
+      </div>
+      <textarea
+        autoFocus
+        data-openwps-block-ai-input="true"
+        value={state.instruction}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="润色、扩写、缩短或改成更正式的语气"
+        disabled={state.loading}
+        style={{
+          width: '100%',
+          minHeight: 76,
+          marginTop: 8,
+          padding: '8px 10px',
+          border: '1px solid #d1d5db',
+          borderRadius: 7,
+          resize: 'vertical',
+          fontSize: 13,
+          lineHeight: 1.5,
+          boxSizing: 'border-box',
+          outline: 'none',
+        }}
+      />
+      {state.error && (
+        <div style={{ marginTop: 6, color: '#dc2626', fontSize: 12 }}>{state.error}</div>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+        <button
+          type="button"
+          onClick={() => onChange('润色这段文字，保持原意。')}
+          disabled={state.loading}
+          style={blockAISecondaryButtonStyle}
+        >
+          润色
+        </button>
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={state.loading}
+          style={blockAIPrimaryButtonStyle}
+        >
+          {state.loading ? '生成中' : '替换块'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+const blockAISecondaryButtonStyle: React.CSSProperties = {
+  height: 30,
+  padding: '0 10px',
+  border: '1px solid #d1d5db',
+  borderRadius: 6,
+  background: '#ffffff',
+  color: '#374151',
+  fontSize: 13,
+  cursor: 'pointer',
+}
+
+const blockAIPrimaryButtonStyle: React.CSSProperties = {
+  height: 30,
+  padding: '0 12px',
+  border: '1px solid #2563eb',
+  borderRadius: 6,
+  background: '#2563eb',
+  color: '#ffffff',
+  fontSize: 13,
+  fontWeight: 700,
+  cursor: 'pointer',
 }
 
 function isCaretAtStartOfParagraphAfterTable(state: EditorState) {
@@ -885,6 +1354,8 @@ export const Editor: React.FC = () => {
   const [pageCount, setPageCount] = useState(1)
   const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
   const layoutResultRef = useRef<PaginateResult | null>(null)
+  const [selectedBlockPos, setSelectedBlockPos] = useState<number | null>(null)
+  const [blockAIPopover, setBlockAIPopover] = useState<BlockAIPopoverState | null>(null)
   const [layoutSettling, setLayoutSettling] = useState(false)
   const [editorFocused, setEditorFocused] = useState(false)
   const [editorComposing, setEditorComposing] = useState(false)
@@ -1313,6 +1784,9 @@ export const Editor: React.FC = () => {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
         setEditorState(next)
+        if (tx.selectionSet && !tx.getMeta('openwpsBlockSelection')) {
+          setSelectedBlockPos(null)
+        }
         if (tx.docChanged && !applyingImportedDocxRef.current && transactionHasStyleMutation(tx)) {
           clearImportedDocxCompatibility()
         }
@@ -1581,9 +2055,15 @@ export const Editor: React.FC = () => {
       const { state, dispatch } = editorView
       const imageNode = schema.nodes.image.create({ src, alt: file.name, width: null, height: null })
       const paragraphNode = schema.nodes.paragraph.create(undefined, imageNode)
-      const insertPos = state.selection.to
-      dispatch(state.tr.insert(insertPos, paragraphNode))
+      const insertPos = state.selection.$to.depth >= 1
+        ? state.selection.$to.after(1)
+        : state.selection.to
+      const tr = state.tr.insert(insertPos, paragraphNode)
+      tr.setSelection(TextSelection.create(tr.doc, insertPos + 1))
+      tr.setMeta('openwpsBlockSelection', true)
+      dispatch(tr.scrollIntoView())
       editorView.focus()
+      setSelectedBlockPos(null)
     }
     reader.readAsDataURL(file)
   }, [])
@@ -1686,6 +2166,7 @@ export const Editor: React.FC = () => {
 
     const clampedPos = Math.max(0, Math.min(pos, editorView.state.doc.content.size))
     editorView.focus()
+    setSelectedBlockPos(null)
 
     if (toggleTaskItemCheckedFromPoint(editorView, clampedPos, clientX)) {
       setActiveComment(null)
@@ -1721,6 +2202,7 @@ export const Editor: React.FC = () => {
     const clampedAnchor = Math.max(0, Math.min(anchor, maxPos))
     const clampedHead = Math.max(0, Math.min(head, maxPos))
     editorView.focus()
+    setSelectedBlockPos(null)
     const selection = TextSelection.create(editorView.state.doc, clampedAnchor, clampedHead)
     const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
     editorView.dispatch(tr)
@@ -1733,11 +2215,414 @@ export const Editor: React.FC = () => {
     const maxPos = editorView.state.doc.content.size
     const clampedPos = Math.max(0, Math.min(pos, maxPos))
     editorView.focus()
+    setSelectedBlockPos(clampedPos)
     setActiveComment(null)
     const selection = NodeSelection.create(editorView.state.doc, clampedPos)
-    const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
+    const tr = editorView.state.tr
+      .setSelection(selection)
+      .setMeta('addToHistory', false)
+      .setMeta('openwpsBlockSelection', true)
     editorView.dispatch(tr)
   }, [])
+
+  const handleSelectBlock = useCallback((block: BlockDescriptor) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const { state } = editorView
+    const node = state.doc.nodeAt(block.pos)
+    if (!node) return
+
+    try {
+      let selection: Selection
+      if (node.type.name === 'paragraph') {
+        const from = Math.min(block.pos + 1, state.doc.content.size)
+        const to = Math.min(block.pos + node.nodeSize - 1, state.doc.content.size)
+        selection = to > from
+          ? TextSelection.create(state.doc, from, to)
+          : TextSelection.create(state.doc, from)
+      } else {
+        selection = NodeSelection.create(state.doc, block.pos)
+      }
+
+      const tr = state.tr
+        .setSelection(selection)
+        .setMeta('addToHistory', false)
+        .setMeta('openwpsBlockSelection', true)
+      editorView.dispatch(tr)
+      editorView.focus()
+      setActiveComment(null)
+      setSelectedBlockPos(block.pos)
+    } catch {
+      setSelectedBlockPos(block.pos)
+    }
+  }, [])
+
+  const handleCopyBlock = useCallback((block: BlockDescriptor) => {
+    const editorView = viewRef.current
+    const node = editorView?.state.doc.nodeAt(block.pos)
+    if (!node) return
+    void navigator.clipboard?.writeText(serializeBlockText(node)).catch(() => undefined)
+    handleSelectBlock(block)
+  }, [handleSelectBlock])
+
+  const handleDeleteBlock = useCallback((block: BlockDescriptor) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const { state } = editorView
+    const node = state.doc.nodeAt(block.pos)
+    if (!node) return
+
+    let tr = state.tr.delete(block.pos, block.pos + node.nodeSize)
+    if (tr.doc.childCount === 0) {
+      tr = tr.insert(0, schema.nodes.paragraph.create())
+    }
+
+    const selectionPos = Math.max(0, Math.min(block.pos, tr.doc.content.size))
+    tr.setSelection(Selection.near(tr.doc.resolve(selectionPos), 1))
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(null)
+  }, [])
+
+  const handleCutBlock = useCallback((block: BlockDescriptor) => {
+    handleCopyBlock(block)
+    handleDeleteBlock(block)
+  }, [handleCopyBlock, handleDeleteBlock])
+
+  const handleDuplicateBlock = useCallback((block: BlockDescriptor) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const { state } = editorView
+    const node = state.doc.nodeAt(block.pos)
+    if (!node) return
+
+    const insertPos = block.pos + node.nodeSize
+    const tr = state.tr.insert(insertPos, node.copy(node.content))
+    const duplicatedPos = insertPos
+    try {
+      const selection = node.type.name === 'paragraph'
+        ? TextSelection.create(tr.doc, Math.min(duplicatedPos + 1, tr.doc.content.size), Math.min(duplicatedPos + node.nodeSize - 1, tr.doc.content.size))
+        : NodeSelection.create(tr.doc, duplicatedPos)
+      tr.setSelection(selection)
+    } catch {
+      tr.setSelection(Selection.near(tr.doc.resolve(Math.min(duplicatedPos, tr.doc.content.size)), 1))
+    }
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(duplicatedPos)
+  }, [])
+
+  const updateParagraphBlock = useCallback((
+    block: BlockDescriptor,
+    updater: (node: PMNode) => Record<string, unknown>,
+  ) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const node = editorView.state.doc.nodeAt(block.pos)
+    if (!node || node.type.name !== 'paragraph') return
+
+    const tr = editorView.state.tr.setNodeMarkup(block.pos, undefined, updater(node))
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(block.pos)
+  }, [])
+
+  const handleSetParagraphRole = useCallback((block: BlockDescriptor, headingLevel: 0 | 1 | 2 | 3) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const node = editorView.state.doc.nodeAt(block.pos)
+    if (!node || node.type.name !== 'paragraph') return
+
+    const style = WPS_PARAGRAPH_STYLES[headingLevel]
+    const from = block.pos + 1
+    const to = block.pos + node.nodeSize - 1
+    const tr = editorView.state.tr.setNodeMarkup(block.pos, undefined, {
+      ...node.attrs,
+      headingLevel: style.headingLevel === 0 ? null : style.headingLevel,
+      fontSizeHint: style.fontSizeHint,
+      fontFamilyHint: style.fontFamilyHint,
+      lineHeight: style.lineHeight,
+      spaceBefore: style.spaceBefore,
+      spaceAfter: style.spaceAfter,
+      listType: null,
+      listLevel: 0,
+      listChecked: false,
+    })
+
+    if (to > from) {
+      tr.removeMark(from, to, schema.marks.textStyle)
+      if (style.fontSizeHint || style.fontFamilyHint || style.bold) {
+        tr.addMark(from, to, schema.marks.textStyle.create({
+          fontFamily: style.fontFamilyHint ?? DEFAULT_EDITOR_FONT_STACK,
+          fontSize: style.fontSizeHint ?? 12,
+          bold: style.bold,
+        }))
+      }
+    }
+
+    tr.setSelection(to > from ? TextSelection.create(tr.doc, from, to) : TextSelection.create(tr.doc, from))
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(block.pos)
+  }, [])
+
+  const handleSetParagraphAlign = useCallback((
+    block: BlockDescriptor,
+    align: 'left' | 'center' | 'right' | 'justify',
+  ) => {
+    updateParagraphBlock(block, (node) => ({ ...node.attrs, align }))
+  }, [updateParagraphBlock])
+
+  const handleToggleParagraphList = useCallback((
+    block: BlockDescriptor,
+    listType: 'bullet' | 'ordered' | 'task',
+  ) => {
+    updateParagraphBlock(block, (node) => {
+      const nextType = node.attrs.listType === listType ? null : listType
+      return {
+        ...node.attrs,
+        listType: nextType,
+        listChecked: nextType === 'task' ? Boolean(node.attrs.listChecked) : false,
+      }
+    })
+  }, [updateParagraphBlock])
+
+  const handleClearBlockFormatting = useCallback((block: BlockDescriptor) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const node = editorView.state.doc.nodeAt(block.pos)
+    if (!node || node.type.name !== 'paragraph') return
+
+    const from = block.pos + 1
+    const to = block.pos + node.nodeSize - 1
+    const tr = editorView.state.tr.removeMark(from, to, schema.marks.textStyle)
+    tr.setNodeMarkup(block.pos, undefined, {
+      ...node.attrs,
+      align: 'left',
+      firstLineIndent: 0,
+      indent: 0,
+      rightIndent: 0,
+      headingLevel: null,
+      fontSizeHint: null,
+      fontFamilyHint: null,
+      lineHeight: 1.5,
+      spaceBefore: 0,
+      spaceAfter: 0,
+      listType: null,
+      listLevel: 0,
+      listChecked: false,
+      pageBreakBefore: false,
+    })
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(block.pos)
+  }, [])
+
+  const handleReplaceImageBlock = useCallback((block: BlockDescriptor, file: File) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const reader = new FileReader()
+    reader.onload = (event) => {
+      const src = event.target?.result
+      if (typeof src !== 'string') return
+
+      const { state } = editorView
+      const paragraphNode = state.doc.nodeAt(block.pos)
+      if (!paragraphNode || !isPureImageParagraph(paragraphNode)) return
+
+      let imagePos: number | null = null
+      paragraphNode.forEach((child, offset) => {
+        if (imagePos == null && child.type.name === 'image') {
+          imagePos = block.pos + 1 + offset
+        }
+      })
+      if (imagePos == null) return
+
+      const imageNode = state.doc.nodeAt(imagePos)
+      if (!imageNode || imageNode.type.name !== 'image') return
+
+      const tr = state.tr.setNodeMarkup(imagePos, undefined, {
+        ...imageNode.attrs,
+        src,
+        alt: file.name,
+        title: file.name,
+        width: null,
+        height: null,
+      })
+      tr.setMeta('openwpsBlockSelection', true)
+      editorView.dispatch(tr.scrollIntoView())
+      editorView.focus()
+      setSelectedBlockPos(block.pos)
+    }
+    reader.readAsDataURL(file)
+  }, [])
+
+  const handleRunTableCommand = useCallback((block: BlockDescriptor, command: BlockTableCommand) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const tableNode = editorView.state.doc.nodeAt(block.pos)
+    if (!tableNode || tableNode.type.name !== 'table') return
+
+    const commandMap = {
+      'row-before': addRowBefore,
+      'row-after': addRowAfter,
+      'row-delete': deleteRow,
+      'col-before': addColumnBefore,
+      'col-after': addColumnAfter,
+      'col-delete': deleteColumn,
+    } satisfies Record<BlockTableCommand, (state: EditorState, dispatch?: (tr: EditorState['tr']) => void) => boolean>
+
+    const currentTopBlockPos = getTopLevelSelectionBlockPos(editorView.state)
+    if (!isInTable(editorView.state) || currentTopBlockPos !== block.pos) {
+      const firstCellTextPos = getFirstParagraphTextPosInBlock(tableNode, block.pos)
+      if (firstCellTextPos != null) {
+        const selectionTr = editorView.state.tr
+          .setSelection(TextSelection.create(editorView.state.doc, firstCellTextPos))
+          .setMeta('addToHistory', false)
+          .setMeta('openwpsBlockSelection', true)
+        editorView.dispatch(selectionTr)
+      }
+    }
+
+    const success = commandMap[command](editorView.state, editorView.dispatch)
+    if (success) {
+      editorView.focus()
+      setSelectedBlockPos(block.pos)
+    }
+  }, [])
+
+  const handleSetTableStyle = useCallback((
+    block: BlockDescriptor,
+    attrs: { backgroundColor?: string; borderColor?: string; borderWidth?: number },
+  ) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+    const tableNode = editorView.state.doc.nodeAt(block.pos)
+    if (!tableNode || tableNode.type.name !== 'table') return
+
+    const tr = editorView.state.tr
+    tableNode.descendants((node, relativePos) => {
+      if (node.type.name !== 'table_cell') return true
+      tr.setNodeMarkup(block.pos + 1 + relativePos, undefined, {
+        ...node.attrs,
+        ...attrs,
+      })
+      return true
+    })
+    tr.setMeta('openwpsBlockSelection', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    setSelectedBlockPos(block.pos)
+  }, [])
+
+  const handleAskAIForBlock = useCallback((block: BlockDescriptor) => {
+    const anchorRect = getBlockAIAnchorRect(block)
+    if (!anchorRect) return
+    handleSelectBlock(block)
+    setBlockAIPopover({
+      blockPos: block.pos,
+      rect: anchorRect,
+      instruction: '',
+      loading: false,
+      error: null,
+    })
+  }, [handleSelectBlock])
+
+  const handleSubmitBlockAI = useCallback(async (instruction: string) => {
+    const editorView = viewRef.current
+    const popover = blockAIPopover
+    if (!editorView || !popover) return
+
+    const node = editorView.state.doc.nodeAt(popover.blockPos)
+    if (!node || node.type.name !== 'paragraph' || isPureImageParagraph(node)) {
+      setBlockAIPopover((current) => current ? { ...current, error: '首版块 AI 只处理文本块。' } : current)
+      return
+    }
+    const blockText = node.textContent
+    if (!blockText.trim()) {
+      setBlockAIPopover((current) => current ? { ...current, error: '这个文本块没有可修改的文字。' } : current)
+      return
+    }
+
+    setBlockAIPopover((current) => current ? { ...current, instruction, loading: true, error: null } : current)
+    try {
+      let providerId = currentAIProviderId
+      let model = currentAIModel
+      if (!providerId || !model) {
+        const settingsResponse = await fetch('/api/ai/settings')
+        const settings = await readJsonResponse<AISettingsSnapshot>(settingsResponse)
+        providerId = providerId || settings.activeProviderId || null
+        model = model || settings.model || null
+      }
+      if (!providerId || !model) {
+        throw new Error('当前 AI 未配置完成，请先在右侧 AI 面板选择服务商和模型。')
+      }
+
+      const response = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'chat',
+          providerId,
+          model,
+          history: [],
+          context: {
+            scope: 'single_block',
+            blockType: 'text',
+          },
+          message: [
+            '你是 openwps 的块级文本改写助手。',
+            '你只能查看下面这个文本块，不能引用、推断或要求访问文档其他内容。',
+            '根据用户要求直接输出修改后的块文字，不要解释，不要 Markdown 代码围栏。',
+            '',
+            `文本块内容：\n${blockText}`,
+            '',
+            `用户要求：${instruction.trim() || '润色这段文字，保持原意。'}`,
+          ].join('\n'),
+        }),
+      })
+      const data = await readJsonResponse<{ reply?: string }>(response)
+      const nextText = stripAIReply(data.reply ?? '')
+      if (!nextText) throw new Error('AI 没有返回可写入的文本。')
+
+      const currentNode = editorView.state.doc.nodeAt(popover.blockPos)
+      if (!currentNode || currentNode.type.name !== 'paragraph') return
+      const from = popover.blockPos + 1
+      const to = popover.blockPos + currentNode.nodeSize - 1
+      let tr = editorView.state.tr.replaceWith(from, to, schema.text(nextText))
+      const rawHeadingLevel = Number(currentNode.attrs.headingLevel ?? 0)
+      const headingLevel = (rawHeadingLevel >= 0 && rawHeadingLevel <= 9 ? rawHeadingLevel : 0) as WpsParagraphStyleLevel
+      const style = WPS_PARAGRAPH_STYLES[headingLevel] ?? WPS_PARAGRAPH_STYLES[0]
+      if (style.fontSizeHint || style.fontFamilyHint || style.bold) {
+        tr = tr.addMark(from, from + nextText.length, schema.marks.textStyle.create({
+          fontFamily: style.fontFamilyHint ?? DEFAULT_EDITOR_FONT_STACK,
+          fontSize: style.fontSizeHint ?? 12,
+          bold: style.bold,
+        }))
+      }
+      tr.setSelection(TextSelection.create(tr.doc, from, from + nextText.length))
+      tr.setMeta('openwpsBlockSelection', true)
+      editorView.dispatch(tr.scrollIntoView())
+      editorView.focus()
+      setSelectedBlockPos(popover.blockPos)
+      setBlockAIPopover(null)
+    } catch (error) {
+      setBlockAIPopover((current) => current ? {
+        ...current,
+        loading: false,
+        error: error instanceof Error ? error.message : String(error),
+      } : current)
+    }
+  }, [blockAIPopover, currentAIModel, currentAIProviderId])
 
   // Canvas height = all A4 cards stacked with gaps
   const cfg = pageConfig  // ← 用 state 而非 ref，确保 React 重渲染时拿到最新值
@@ -1749,6 +2634,10 @@ export const Editor: React.FC = () => {
       ? editorState.selection.from
       : null
   }, [editorState])
+  const selectionBlockPos = React.useMemo(
+    () => (editorState ? getTopLevelSelectionBlockPos(editorState) : null),
+    [editorState],
+  )
   const editorInTable = Boolean(editorState && isInTable(editorState))
   const pretextVisualActive = Boolean(layoutResult && !layoutSettling && !editorComposing && !editorInTable)
   const visualCaretRect = React.useMemo(() => {
@@ -1791,6 +2680,17 @@ export const Editor: React.FC = () => {
       return null
     }
   }, [editorState, layoutResult])
+  const blockDescriptors = React.useMemo(
+    () => buildBlockDescriptors(editorState, layoutResult, cfg),
+    [cfg, editorState, layoutResult],
+  )
+  const expandedBlockPos = selectedBlockPos ?? selectedNodePos
+  const activeBlockPos = expandedBlockPos ?? (editorFocused ? selectionBlockPos : null)
+  const activeBlock = React.useMemo(
+    () => getBlockByPos(blockDescriptors, activeBlockPos),
+    [activeBlockPos, blockDescriptors],
+  )
+  const visibleBlockControls = activeBlock ? [activeBlock] : []
 
   return (
     <div className="flex h-screen" style={{ background: '#e8e8e8' }}>
@@ -1931,6 +2831,35 @@ export const Editor: React.FC = () => {
                   pointerEvents: 'none',
                   animation: 'openwps-caret-blink 1.05s steps(1) infinite',
                 }}
+              />
+            )}
+
+            {layoutResult && !layoutSettling && visibleBlockControls.length > 0 && (
+              <BlockControls
+                blocks={visibleBlockControls}
+                selectedBlockPos={expandedBlockPos}
+                onSelectBlock={handleSelectBlock}
+                onCopyBlock={handleCopyBlock}
+                onCutBlock={handleCutBlock}
+                onDuplicateBlock={handleDuplicateBlock}
+                onDeleteBlock={handleDeleteBlock}
+                onSetParagraphRole={handleSetParagraphRole}
+                onSetParagraphAlign={handleSetParagraphAlign}
+                onToggleParagraphList={handleToggleParagraphList}
+                onClearBlockFormatting={handleClearBlockFormatting}
+                onReplaceImage={handleReplaceImageBlock}
+                onRunTableCommand={handleRunTableCommand}
+                onSetTableStyle={handleSetTableStyle}
+                onAskAI={handleAskAIForBlock}
+              />
+            )}
+
+            {blockAIPopover && (
+              <BlockAIPopover
+                state={blockAIPopover}
+                onChange={(instruction) => setBlockAIPopover((current) => current ? { ...current, instruction } : current)}
+                onClose={() => setBlockAIPopover(null)}
+                onSubmit={() => { void handleSubmitBlockAI(blockAIPopover.instruction) }}
               />
             )}
 

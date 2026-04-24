@@ -1,5 +1,5 @@
 import { Schema } from 'prosemirror-model'
-import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
 
 const DEFAULT_HORIZONTAL_RULE_STYLE = 'solid'
 const DEFAULT_HORIZONTAL_RULE_COLOR = '#cbd5e1'
@@ -47,11 +47,14 @@ export const schema = new Schema({
         getAttrs: (dom) => {
           const element = dom as HTMLElement
           const rawListChecked = element.getAttribute('data-list-checked')
+          const headingLevel = element.getAttribute('data-heading-level') ? Number(element.getAttribute('data-heading-level')) : null
           return {
             listType: element.getAttribute('data-list-type') ?? null,
             listLevel: element.getAttribute('data-list-level') ? Number(element.getAttribute('data-list-level')) : 0,
             listChecked: rawListChecked === 'true',
-            headingLevel: element.getAttribute('data-heading-level') ? Number(element.getAttribute('data-heading-level')) : null,
+            headingLevel,
+            fontSizeHint: element.getAttribute('data-font-size-hint') ? Number(element.getAttribute('data-font-size-hint')) : null,
+            fontFamilyHint: element.getAttribute('data-font-family-hint') ?? null,
             pageBreakBefore: element.getAttribute('data-page-break') === 'true',
           }
         },
@@ -66,6 +69,12 @@ export const schema = new Schema({
         if (node.attrs.spaceBefore) style.push(`margin-top:${node.attrs.spaceBefore}pt`)
         if (node.attrs.spaceAfter) style.push(`margin-bottom:${node.attrs.spaceAfter}pt`)
         if (node.attrs.listType) style.push(`--list-level:${node.attrs.listLevel ?? 0}`)
+        if (node.attrs.fontSizeHint) style.push(`font-size:${node.attrs.fontSizeHint}pt`)
+        if (node.attrs.fontFamilyHint) style.push(`font-family:${node.attrs.fontFamilyHint}`)
+        if (node.attrs.headingLevel) {
+          style.push('font-weight:700')
+          if (!node.attrs.fontFamilyHint) style.push(`font-family:${FONT_STACKS.hei}`)
+        }
 
         const cls: string[] = []
         if (node.attrs.listType === 'bullet') cls.push('list-bullet')
@@ -82,6 +91,8 @@ export const schema = new Schema({
         if (node.attrs.listType) domAttrs['data-list-level'] = String(node.attrs.listLevel ?? 0)
         if (node.attrs.listType === 'task') domAttrs['data-list-checked'] = String(Boolean(node.attrs.listChecked))
         if (node.attrs.headingLevel) domAttrs['data-heading-level'] = String(node.attrs.headingLevel)
+        if (node.attrs.fontSizeHint) domAttrs['data-font-size-hint'] = String(node.attrs.fontSizeHint)
+        if (node.attrs.fontFamilyHint) domAttrs['data-font-family-hint'] = String(node.attrs.fontFamilyHint)
         if (node.attrs.pageBreakBefore) domAttrs['data-page-break'] = 'true'
 
         return ['p', domAttrs, 0]
@@ -146,6 +157,9 @@ export const schema = new Schema({
         colspan: { default: 1 },
         rowspan: { default: 1 },
         width: { default: null },
+        backgroundColor: { default: '' },
+        borderColor: { default: '#cccccc' },
+        borderWidth: { default: 1 },
       },
       parseDOM: [{
         tag: 'td',
@@ -156,6 +170,9 @@ export const schema = new Schema({
             colspan: element.colSpan || 1,
             rowspan: element.rowSpan || 1,
             width: element.style.width || null,
+            backgroundColor: element.style.backgroundColor || '',
+            borderColor: element.style.borderColor || '#cccccc',
+            borderWidth: element.style.borderWidth ? Number.parseFloat(element.style.borderWidth) || 1 : 1,
           }
         },
       }, {
@@ -167,20 +184,27 @@ export const schema = new Schema({
             colspan: element.colSpan || 1,
             rowspan: element.rowSpan || 1,
             width: element.style.width || null,
+            backgroundColor: element.style.backgroundColor || '',
+            borderColor: element.style.borderColor || '#cccccc',
+            borderWidth: element.style.borderWidth ? Number.parseFloat(element.style.borderWidth) || 1 : 1,
           }
         },
       }],
       toDOM(node) {
         const tag = node.attrs.header ? 'th' : 'td'
+        const borderWidth = Math.max(0, Number(node.attrs.borderWidth ?? 1) || 0)
+        const borderColor = String(node.attrs.borderColor ?? '#cccccc') || '#cccccc'
+        const backgroundColor = String(node.attrs.backgroundColor ?? '')
         return [tag, {
           colspan: node.attrs.colspan > 1 ? node.attrs.colspan : undefined,
           rowspan: node.attrs.rowspan > 1 ? node.attrs.rowspan : undefined,
           style: [
-            'border:1px solid #ccc',
+            `border:${borderWidth}px solid ${borderColor}`,
             'padding:4px 8px',
             'min-width:40px',
             'vertical-align:top',
             'box-sizing:border-box',
+            backgroundColor ? `background-color:${backgroundColor}` : '',
             node.attrs.width ? `width:${node.attrs.width}` : '',
           ].filter(Boolean).join(';'),
         }, 0]
