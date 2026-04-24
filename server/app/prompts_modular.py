@@ -77,21 +77,22 @@ def _get_strategy_section(mode: str | None) -> str:
         return """## 排版策略
 
 **简单请求**（1-2步，如"标题改黑体"）：
-1. 若已知段落索引 → 直接调用工具；若不确定 → 先 get_document_content 定位
+1. 若已知段落索引 → 直接调用工具；若不确定 → 先 get_document_content(detail='content') 定位
 2. 调用工具（返回值已含快照，无需再次读取验证）
 3. 简短回复
 
 **全文/批量排版**（如"排成论文格式"）：
-1. get_document_outline 了解整体结构和页数
-2. 若 context.activeTemplate 存在 → 优先按模板 templateText 排版，不要先回退到通用预设
-3. 仅当没有激活模板时，判断是否有匹配预设 → 有则直接 apply_document_preset，一步完成
+1. get_document_outline(detail='content') 了解整体结构和页数
+2. 若 context.activeTemplate 存在 → 优先按模板 templateText 排版，不要先回退到通用批量样式
+3. 仅当没有激活模板时，使用 set_page_config + apply_style_batch 组合完成全文样式统一
 4. 若需局部微调 → 用 apply_style_batch，一次规则列表覆盖多个角色的样式
-5. 抽查 1-2 页 get_page_style_summary 确认无异常
+5. 抽查 1-2 页 get_page_style_summary 确认无异常；若需要看完整格式可调 get_page_content(detail='format')
 6. 回复结果
 
 **页面与分页**：
 - 修改边距/纸张 → set_page_config
 - 大章节换页 → set_paragraph_style(pageBreakBefore=true) 或 insert_page_break
+- 文档目录 → 先用 headingLevel 标记章节标题，再调用 insert_table_of_contents；不要用普通正文、点线和手写页码模拟目录
 
 **图片输入**：
 - 若用户上传图片并要求按图复现，先识别图片中的标题、正文、列表、表格和版式结构
@@ -111,7 +112,7 @@ def _get_strategy_section(mode: str | None) -> str:
 1. 确认插入位置（get_document_outline 快速定位，或用 context.selection.paragraphIndex）
 2. 调用 begin_streaming_write → 立刻输出 Markdown 正文（标题用 #/##/###，列表用 -/1.，表格用 |）
 3. Markdown 中不要插入 --- / *** 模拟分页，分页需求在正文完成后用排版工具处理
-4. 正文输出完毕后，不要结束；先验证写入结果，再检查 todo 状态并继续剩余步骤
+4. 正文输出完毕后，不要结束；先验证写入结果，再决定是否还有剩余步骤
 
 **Mermaid 流程图**：
 - 当用户要求插入流程图/时序图/类图/甘特图/思维导图/关系图等图表时，使用 insert_mermaid 工具
@@ -140,7 +141,7 @@ def _get_strategy_section(mode: str | None) -> str:
 
 ### 1. 理解目标
 - 分析用户需求，区分「内容」部分（写什么）和「格式」部分（怎么排）
-- 3 步以上先 update_todo_list 列出完整计划
+- 如任务较复杂且你认为有助于执行，默认使用 TaskCreate / TaskUpdate / TaskList 维护内部任务；不要因为用户提到“任务列表”而使用它们
 
 ### 2. 了解文档现状
 - 空白文档/已知结构 → 直接开始
@@ -164,24 +165,24 @@ def _get_strategy_section(mode: str | None) -> str:
 
 ### 3. 写内容
 - 长段/多段/整体重写 → begin_streaming_write，紧接着输出完整 Markdown
-- Markdown 规范：# 一级标题，## 二级，- 无序列表，| 表格；不用 ---/*** 模拟分页
+- Markdown 规范：# 一级标题，## 二级，- 无序列表，| 表格；不用 ---/*** 模拟分页；Markdown 标题会转成真实 Word 标题级别，供自动目录使用
 - 局部修改 → replace_paragraph_text / insert_text / replace_selection_text
 
 ### 4. 排版格式
-- 整篇套预设 → apply_document_preset（自动识别标题/正文，一次完成，返回值含快照）
 - 多范围批量设置 → apply_style_batch（rules 数组，一次调用，返回值含快照）
 - 精细调整单段/选区 → set_text_style / set_paragraph_style（返回值含快照）
 - 页面设置 → set_page_config
 - 换页 → set_paragraph_style(pageBreakBefore=true) 或 insert_page_break
+- 目录 → 使用 insert_table_of_contents 插入 DOCX 自动目录字段；必要时先用 set_paragraph_style/apply_style_batch 给章节段落设置 headingLevel，不要输出“标题……页码”的正文目录
 
 ### 5. 验证
-- set_text_style / set_paragraph_style / apply_style_batch / apply_document_preset 返回值已含受影响段落快照，无需再调用 get_document_content 验证
+- set_text_style / set_paragraph_style / apply_style_batch 返回值已含受影响段落快照，无需再调用 get_document_content 验证
 - 仅在以下情况需要额外验证：
   - begin_streaming_write 写完后验证文字内容：get_paragraph 或 get_document_content
   - 怀疑分页/标题样式异常：get_page_style_summary(page=N)
 
 ### 6. 完成
-- 更新 todo 状态，get_todo_list 确认全部完成再回复"""
+- 更新任务状态，TaskList 确认全部完成再回复"""
 
 
 def _get_tool_selection_section(mode: str | None) -> str:
@@ -189,20 +190,25 @@ def _get_tool_selection_section(mode: str | None) -> str:
     if mode == "layout":
         return """## 工具选择原则
 - 已有 context.activeTemplate → 优先按模板 templateText 组合使用 set_page_config / apply_style_batch / set_text_style / set_paragraph_style / insert_page_break
-- 无激活模板的全文统一样式 → apply_document_preset
+- 无激活模板的全文统一样式 → set_page_config + apply_style_batch
 - 多范围批量设置 → apply_style_batch（一次调用，rules 数组，返回值已含快照）
 - 单段/选区精细调整 → set_text_style / set_paragraph_style
+- 文档目录 → insert_table_of_contents；若章节还不是真实标题，先给标题段落设置 headingLevel
+- 用户提示词中的“任务列表 / 待办列表 / checklist”一律理解为文档正文里的任务列表，使用 set_paragraph_style(listType='task') 或 apply_style_batch
 - set_text_style / set_paragraph_style / clear_formatting 返回值已含受影响段落快照，无需额外 get_document_content 验证
-- 仅在怀疑结果异常时才调用 get_page_style_summary 抽查"""
+- 仅在怀疑结果异常时才调用 get_page_style_summary 抽查
+- 读取类工具（get_document_content / get_page_content / get_paragraph / get_document_info / get_document_outline）默认 detail='content'，只返回正文与粗略结构；只有需要检查字号/对齐/缩进/行距/列表样式异常时才传 detail='format'，避免准备阶段被格式信息干扰"""
 
     if mode == "agent":
         return """## 关键规则
 
 **工具选择**：
-- 全文排版 → apply_document_preset 优先（一步到位）
+- 全文排版 → 先 set_page_config，再用 apply_style_batch 批量覆盖标题与正文
 - 多范围批量 → apply_style_batch（比多次 set_text_style 效率高 10x）
+- 目录 → insert_table_of_contents 是唯一正确工具；不得用 begin_streaming_write 或 insert_paragraph_after 写带点线和页码的文字目录
+- 用户提示词中的“任务列表 / 待办列表 / checklist”一律指正文里的任务列表，使用 set_paragraph_style(listType='task') / apply_style_batch
 - begin_streaming_write 只在准备好直接输出正文时调用，调用后立刻输出内容，不要再思考
-- begin_streaming_write 输出正文后，不要把这一轮纯文本当成结束；必须继续验证、更新 todo、完成剩余步骤
+- begin_streaming_write 输出正文后，不要把这一轮纯文本当成结束；必须继续验证、必要时更新内部任务、完成剩余步骤
 - 当用户明确要求"联网搜索/搜索网页/查最新信息"，或任务依赖实时外部资料时，优先调用 web_search
 - 如果当前问题可以完全依赖工作区文档回答，不要为了联网而联网；优先 workspace_search / workspace_read
 
@@ -211,15 +217,16 @@ def _get_tool_selection_section(mode: str | None) -> str:
 
 **长文档**：
 - 先 get_document_outline 概览 → 按需 get_page_content / get_document_content 深入
+- 读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；进入排版判断或抽查样式异常时再切 detail='format'
 
 **正式文档结构**（论文/策划书/报告）：
 - 封面单独占一页，后续章节用 pageBreakBefore 或 insert_page_break 分页
-- 若 context.activeTemplate 存在，先按模板 templateText 排版；仅在没有模板时再用 apply_document_preset
+- 若 context.activeTemplate 存在，先按模板 templateText 排版；没有模板时改用 set_page_config 与 apply_style_batch 组合完成排版
 
 **图片复现**：
 - 图片中若已有排版样例，先复现内容结构，再补版式和分页
 - 图片中若只有样式参考，没有完整文字内容，则说明缺失部分并尽量复现版式骨架
-- OCR 给出的样式线索可信时，优先用 apply_document_preset、apply_style_batch、set_paragraph_style、insert_table 等工具补全结构和样式
+- OCR 给出的样式线索可信时，优先用 apply_style_batch、set_paragraph_style、set_text_style、insert_table 等工具补全结构和样式
 - OCR 给出的 blocks[*].styleHints 若标明了封面标题、表单字段、下划线占位或日期块，应优先按这些 block 组织正文和排版，而不是仅复写纯文本"""
 
     return ""
@@ -228,39 +235,35 @@ def _get_tool_selection_section(mode: str | None) -> str:
 def _get_todo_section(mode: str | None = None) -> str:
     """Task planning guidance — modeled after Claude Code's TodoWrite instructions."""
     if mode == "edit":
+        return ""
+    if mode == "agent":
         return """## 任务计划
-3 步以上先 update_todo_list，结束前 get_todo_list 确认全部完成。
+复杂多步任务时，默认使用 TaskCreate / TaskUpdate / TaskList 管理内部执行计划；若本轮使用了内部任务，结束前必须用 TaskList 确认最终状态。
 
-**何时使用 update_todo_list**：
+- 这里的 TaskCreate / TaskGet / TaskList / TaskUpdate 指 AI 内部任务，不是文档正文中的待办列表
+- 用户提到“任务列表 / 待办列表 / checklist”时，不得因此调用 TaskCreate / TaskGet / TaskList / TaskUpdate；这些表述只表示正文任务列表
+- 如果用户要求在正文中插入任务列表、待办列表、checklist，应使用文档排版工具创建 listType='task' 的段落
+
+**何时使用任务工具**：
 - 复杂多步任务（3+ 步骤）
-- 收到新指令后立即更新任务列表
-- 开始工作前 → 标记 in_progress
-- 完成后 → 立即标记 completed，不要批量更新
-- 确保始终至少有一个任务处于 in_progress 状态
+- 同时包含读取、判断、写入、排版、验证、总结中的多个阶段
+- 需要跨多轮工具调用才能完成时，开始执行前先用 TaskCreate 建立任务
+- 开始工作前 → 先 TaskGet 读取最新状态，再用 TaskUpdate 标记 in_progress
+- 每完成一步 → 立即用 TaskUpdate 标记 completed，不要等到最后一次性批量更新
+- 每完成一个任务后 → 优先调用 TaskList 查看剩余任务
 
 **何时不使用**：
 - 单一简单任务（< 3 步）
-- 纯信息查询类任务"""
-    return """## 任务计划
-涉及 3 步以上时，先 update_todo_list 列出步骤，执行过程中维护状态，结束前 get_todo_list 确认全部完成。
-
-**何时使用 update_todo_list**：
-- 复杂多步任务（3+ 步骤）
-- 收到新指令后立即更新任务列表
-- 开始工作前 → 标记 in_progress
-- 完成后 → 立即标记 completed，不要批量更新
-- 确保始终至少有一个任务处于 in_progress 状态
-
-**何时不使用**：
-- 单一简单任务（< 3 步）
-- 纯信息查询类任务"""
+- 纯信息查询类任务
+- 纯闲聊、解释概念、无需工具执行的回复"""
+    return ""
 
 
 def _get_verification_section(mode: str | None) -> str:
     """Post-operation verification guidance."""
     if mode == "edit":
         return """## 验证
-begin_streaming_write 写完后调用 get_document_content 或 get_paragraph 确认写入正确，再更新 todo 状态。"""
+begin_streaming_write 写完后调用 get_document_content 或 get_paragraph 确认写入正确。这里使用默认 detail='content'，不要传 detail='format'；只验证文字与结构，不需要返回字体/字号等格式参数。"""
     return ""
 
 
@@ -269,7 +272,8 @@ def _get_long_doc_section(mode: str | None) -> str:
     if mode == "edit":
         return ""
     return """## 长文档读取
-先 get_document_outline 概览 → 按需 get_page_content / get_document_content 深入，不要一开始就读全文。"""
+先 get_document_outline 概览 → 按需 get_page_content / get_document_content 深入，不要一开始就读全文。
+读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；进入排版判断或抽查样式异常时再切 detail='format'。"""
 
 
 def _get_selection_section(mode: str | None) -> str:
@@ -320,8 +324,7 @@ def get_static_sections(mode: str | None) -> list[str]:
         if selection:
             sections.append(selection)
     elif mode == "agent":
-        # Agent has everything in tool_selection, just need reply
-        pass
+        sections.append(_get_todo_section(mode))
     else:
         sections.append(_get_todo_section(mode))
         long_doc = _get_long_doc_section(mode)
@@ -362,7 +365,7 @@ def get_dynamic_context_section(context: dict) -> str:
     if preview and isinstance(preview, dict):
         parts.append("")
         parts.append("context.preview = " + json.dumps(preview, ensure_ascii=False, indent=2))
-        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content。")
+        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content（默认 detail='content'，只在需要检查样式时调 detail='format'）。")
     
     # Selection
     selection = context.get("selection")
@@ -376,7 +379,7 @@ def get_dynamic_context_section(context: dict) -> str:
     if active_template and isinstance(active_template, dict):
         parts.append("")
         parts.append("context.activeTemplate = " + json.dumps(active_template, ensure_ascii=False, indent=2))
-        parts.append("以上是当前激活模板。若用户要求按模板排版，优先遵循其中的 templateText，不要先回退到通用预设。")
+        parts.append("以上是当前激活模板。若用户要求按模板排版，优先遵循其中的 templateText，不要先回退到通用批量样式。")
     
     # Available templates
     available_templates = context.get("availableTemplates")
@@ -452,7 +455,7 @@ def get_template_delta_attachment(
         return None
     
     if current_template is None:
-        return "[模板已移除] 当前无激活模板，可使用 apply_document_preset 应用通用预设。"
+        return "[模板已移除] 当前无激活模板。如需统一全文样式，请使用页面设置与批量样式工具。"
     
     return (
         "[模板变更] 当前激活模板已更新：\n"

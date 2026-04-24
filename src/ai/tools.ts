@@ -1,5 +1,11 @@
 import { SUPPORTED_AI_FONT_NAMES } from '../fonts'
 
+const detailParam = {
+  type: 'string',
+  enum: ['content', 'format'],
+  description: "读取视图：content=只返回正文和粗略结构（标题层级启发、列表类型、任务勾选、图片占位、表格行列文字、超链接），不包含字体/字号/颜色/缩进/行距/textRuns/commonStyles；format=带完整格式详情，仅在排版阶段需要字号/对齐/缩进/行距/列表样式判断时使用。默认 content。",
+} as const
+
 const rangeProperties = {
   type: {
     type: 'string',
@@ -30,11 +36,6 @@ const rangeProperties = {
 } as const
 
 const commonTools = [
-  {
-    name: 'get_todo_list',
-    description: '读取当前任务计划列表和各步骤状态，适合在继续执行前、收尾前或怀疑状态不同步时确认 todo 进度。',
-    parameters: { type: 'object', properties: {} },
-  },
   {
     name: 'get_document_info',
     description: '获取文档统计信息、分页信息和常见样式概览，适合先快速了解整篇文档结构',
@@ -82,11 +83,12 @@ const commonTools = [
   },
   {
     name: 'get_paragraph',
-    description: '读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式',
+    description: '读取指定段落。默认 detail=content：只返回文字与粗略结构（role/headingLevel/list/inlineImages/links）；detail=format 时返回段落样式、代表文字样式、textRuns 等格式信息。',
     parameters: {
       type: 'object',
       properties: {
         index: { type: 'integer', description: '段落索引（从 0 开始）' },
+        detail: detailParam,
       },
       required: ['index'],
     },
@@ -100,6 +102,66 @@ const commonTools = [
     },
   },
 ]
+
+const taskTools = [
+  {
+    name: 'TaskCreate',
+    description: '创建 AI 内部执行任务。仅用于复杂多步任务的内部追踪，不会向文档正文写入任务列表。',
+    parameters: {
+      type: 'object',
+      properties: {
+        subject: { type: 'string', description: '任务标题，命令式短语，如“读取文档结构”' },
+        description: { type: 'string', description: '任务详细说明，描述需要完成什么' },
+        activeForm: { type: 'string', description: '任务进行中的描述，如“正在读取文档结构”' },
+        metadata: { type: 'object', description: '附加元数据，可选' },
+      },
+      required: ['subject', 'description'],
+    },
+  },
+  {
+    name: 'TaskGet',
+    description: '按任务 ID 读取 AI 内部任务详情，用于更新前先获取最新状态，避免 stale update。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '任务 ID' },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'TaskList',
+    description: '读取当前会话的全部 AI 内部任务摘要和状态。复杂任务中，完成一个任务后优先用它查看剩余任务。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'TaskUpdate',
+    description: '更新 AI 内部任务。可修改状态、标题、描述、进行中描述、owner、依赖关系和 metadata。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '任务 ID' },
+        subject: { type: 'string', description: '新的任务标题' },
+        description: { type: 'string', description: '新的任务说明' },
+        activeForm: { type: 'string', description: '新的进行中描述' },
+        status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: '任务状态' },
+        owner: { type: 'string', description: '任务 owner，可选' },
+        addBlocks: {
+          type: 'array',
+          description: '当前任务完成后会解锁的任务 ID 列表',
+          items: { type: 'string' },
+        },
+        addBlockedBy: {
+          type: 'array',
+          description: '会阻塞当前任务的任务 ID 列表',
+          items: { type: 'string' },
+        },
+        metadata: { type: 'object', description: '要合并的元数据；键值设为 null 表示删除' },
+      },
+      required: ['taskId'],
+    },
+  },
+] as const
 
 export const layoutTools = [
   ...commonTools,
@@ -142,7 +204,7 @@ export const layoutTools = [
   },
   {
     name: 'set_paragraph_style',
-    description: '设置指定范围段落的格式（对齐、缩进、行距、间距）',
+    description: '设置指定范围段落的格式（对齐、缩进、行距、间距、列表/任务列表）',
     parameters: {
       type: 'object',
       properties: {
@@ -150,10 +212,12 @@ export const layoutTools = [
         align: { type: 'string', enum: ['left', 'center', 'right', 'justify'] },
         firstLineIndent: { type: 'number', description: '首行缩进（字符数，如 2 表示缩进2字）' },
         indent: { type: 'number', description: '整体左缩进（字符数）' },
+        headingLevel: { type: 'integer', enum: [0, 1, 2, 3, 4, 5, 6], description: '真实 Word 标题级别。1-6 对应 Heading 1-6；0 表示普通正文。生成目录前必须给章节标题设置 headingLevel。' },
         lineHeight: { type: 'number', description: '行距倍数，如 1.0/1.5/2.0' },
         spaceBefore: { type: 'number', description: '段前间距（磅）' },
         spaceAfter: { type: 'number', description: '段后间距（磅）' },
-        listType: { type: 'string', enum: ['none', 'bullet', 'ordered'], description: '列表类型' },
+        listType: { type: 'string', enum: ['none', 'bullet', 'ordered', 'task'], description: '列表类型，task 表示任务列表/待办列表' },
+        listChecked: { type: 'boolean', description: '仅任务列表有效，true 为已勾选，false 为未勾选' },
         pageBreakBefore: { type: 'boolean', description: '是否在该段前分页，对应工具栏里的分页符开关' },
       },
       required: ['range'],
@@ -192,6 +256,20 @@ export const layoutTools = [
         afterParagraph: { type: 'integer', description: '在该段落后插入分割线' },
       },
       required: ['afterParagraph'],
+    },
+  },
+  {
+    name: 'insert_table_of_contents',
+    description: '插入真正的 Word/DOCX 自动目录字段，而不是用正文模拟点线和页码。使用前应先把章节标题段落设置 headingLevel；导出 DOCX 后可在 Word/WPS 中更新域得到真实页码。',
+    parameters: {
+      type: 'object',
+      properties: {
+        afterParagraph: { type: 'integer', description: '在该段落后插入目录；-1 表示插到文档开头' },
+        title: { type: 'string', description: '目录标题，默认“目录”' },
+        minLevel: { type: 'integer', minimum: 1, maximum: 6, description: '包含的最小标题级别，默认 1' },
+        maxLevel: { type: 'integer', minimum: 1, maximum: 6, description: '包含的最大标题级别，默认 3' },
+        hyperlink: { type: 'boolean', description: '是否生成可点击超链接，默认 true' },
+      },
     },
   },
   {
@@ -248,7 +326,7 @@ export const layoutTools = [
   },
   {
     name: 'apply_style_batch',
-    description: '批量应用样式规则。一次调用可同时设置多个段落范围的文字样式和段落格式，适合全文排版、按角色（标题/正文/副标题）分别设置样式。返回值包含受影响段落的快照，无需额外调用 get_document_content 验证。',
+    description: '批量应用样式规则。一次调用可同时设置多个段落范围的文字样式和段落格式，适合全文排版、按角色（标题/正文/副标题/待办项）分别设置样式。返回值包含受影响段落的快照，无需额外调用 get_document_content 验证。',
     parameters: {
       type: 'object',
       properties: {
@@ -283,10 +361,12 @@ export const layoutTools = [
                   align: { type: 'string', enum: ['left', 'center', 'right', 'justify'] },
                   firstLineIndent: { type: 'number' },
                   indent: { type: 'number' },
+                  headingLevel: { type: 'integer', enum: [0, 1, 2, 3, 4, 5, 6], description: '真实 Word 标题级别；生成自动目录时用 1-6，正文用 0' },
                   lineHeight: { type: 'number' },
                   spaceBefore: { type: 'number' },
                   spaceAfter: { type: 'number' },
-                  listType: { type: 'string', enum: ['none', 'bullet', 'ordered'] },
+                  listType: { type: 'string', enum: ['none', 'bullet', 'ordered', 'task'] },
+                  listChecked: { type: 'boolean' },
                   pageBreakBefore: { type: 'boolean' },
                 },
               },
@@ -296,25 +376,6 @@ export const layoutTools = [
         },
       },
       required: ['rules'],
-    },
-  },
-  {
-    name: 'apply_document_preset',
-    description: '应用文档预设模板（公文/论文/合同/报告/信函），一次性设置页面配置和全文样式。会自动识别标题段落（短文本+居中/加粗/大字号）和正文段落，分别应用对应样式。返回值包含受影响段落的快照，无需额外验证。',
-    parameters: {
-      type: 'object',
-      properties: {
-        preset: {
-          type: 'string',
-          enum: ['公文', '论文', '合同', '报告', '信函'],
-          description: '预设名称',
-        },
-        applyPageConfig: {
-          type: 'boolean',
-          description: '是否同时应用页面配置（纸张/边距），默认 true',
-        },
-      },
-      required: ['preset'],
     },
   },
 ]
@@ -508,6 +569,6 @@ const workspaceReadTool = {
   },
 } as const
 
-export const agentTools = [...layoutTools, ...editTools, ocrTool, workspaceSearchTool, workspaceReadTool].filter(
+export const agentTools = [...taskTools, ...layoutTools, ...editTools, ocrTool, workspaceSearchTool, workspaceReadTool].filter(
   (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
 )

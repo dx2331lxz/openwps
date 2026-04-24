@@ -64,6 +64,21 @@ export interface RenderedLine extends LineInfo {
   usedWidth: number
   renderedWidth: number
   isLastLineOfParagraph: boolean
+  listType?: 'task' | null
+  listChecked?: boolean
+  lineStyle?: string
+  lineColor?: string
+  tocTitle?: string
+  tocLevelRange?: string
+  tocHyperlink?: boolean
+  tocEntries?: RenderedTableOfContentsEntry[]
+}
+
+export interface RenderedTableOfContentsEntry {
+  title: string
+  level: number
+  page: number | null
+  blockIndex: number
 }
 
 export interface FloatingTextRun {
@@ -121,7 +136,21 @@ export interface PaginateResult {
   lineBreaks: number[]
 }
 
+export interface DomBlockMetric {
+  pos: number
+  blockIndex: number
+  blockType: string
+  height: number
+  marginTop: number
+  marginBottom: number
+}
+
+export interface PaginateOptions {
+  domBlockMetrics?: readonly DomBlockMetric[]
+}
+
 const PRETEXT_LAYOUT_SAFETY_PX = 2
+const IMAGE_NODE_VERTICAL_CHROME_PX = 4
 const COMPRESSIBLE_PUNCT_RE = /^[，。、；：！？,.!?:;、（）()〈〉《》「」『』【】〔〕〖〗〘〙〚〛‘’“”…]+$/
 const TABLE_BLOCK_MARGIN_PX = 8
 const TABLE_CELL_HORIZONTAL_PADDING_PX = 16
@@ -134,6 +163,12 @@ interface MeasuredBlock {
   canSplit: boolean
   spaceBefore: number
   spaceAfter: number
+}
+
+interface DocumentHeading {
+  title: string
+  level: number
+  blockIndex: number
 }
 
 interface MeasureUnit {
@@ -223,10 +258,11 @@ function getParagraphTextStyle(paraNode: PMNode) {
 }
 
 function textStyleToFontStr(style: RenderTextStyle) {
-  const fontSizePx = ptToPx(style.fontSize)
-  const fontStyle = style.italic ? 'italic ' : ''
-  const fontWeight = style.bold ? '700 ' : ''
-  return `${fontStyle}${fontWeight}${fontSizePx}px ${style.fontFamily}`
+  const normalizedStyle = { ...DEFAULT_TEXT_STYLE, ...(style ?? {}) }
+  const fontSizePx = ptToPx(normalizedStyle.fontSize)
+  const fontStyle = normalizedStyle.italic ? 'italic ' : ''
+  const fontWeight = normalizedStyle.bold ? '700 ' : ''
+  return `${fontStyle}${fontWeight}${fontSizePx}px ${normalizedStyle.fontFamily}`
 }
 
 function isHanChar(char: string) {
@@ -410,6 +446,7 @@ function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
   for (let index = 0; index < chars.length; index += 1) {
     const sourceChar = chars[index]!
     const next = chars[index + 1]?.char ?? ''
+    const style = { ...DEFAULT_TEXT_STYLE, ...(sourceChar.style ?? {}) }
     let measuredText = normalizeMeasuredChar(sourceChar.char)
     if (shouldInsertMixedScriptGap(sourceChar.char, next)) {
       // 混排空隙始终跟随前一个字符，避免被拆到下一行开头。
@@ -418,9 +455,9 @@ function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
     units.push({
       displayText: sourceChar.char,
       measuredText,
-      style: sourceChar.style,
+      style,
       hasComment: sourceChar.hasComment,
-      fontStr: textStyleToFontStr(sourceChar.style),
+      fontStr: textStyleToFontStr(style),
       width: 0,
       compressedWidth: 0,
       compressionCapacity: 0,
@@ -701,7 +738,10 @@ function fitUnitsToLines(
 
 function estimateImageHeight(node: PMNode): number {
   if (node.type.name !== 'image') return 0
-  return typeof node.attrs.height === 'number' && node.attrs.height > 0 ? node.attrs.height : 160
+  const contentHeight = typeof node.attrs.height === 'number' && node.attrs.height > 0
+    ? node.attrs.height
+    : 160
+  return contentHeight + IMAGE_NODE_VERTICAL_CHROME_PX
 }
 
 function estimateFloatingObjectHeight(node: PMNode): number {
@@ -731,11 +771,15 @@ function measureParagraph(
   const paragraphIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.indent as number) ?? 0) * 2)))
   const paragraphRightIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.rightIndent as number) ?? 0) * 2)))
   const firstLineIndentPx = Math.max(0, ptToPx(fontSize * ((paraNode.attrs.firstLineIndent as number) ?? 0)))
+  const listType = ((paraNode.attrs.listType as string | null) ?? null) === 'task' ? 'task' : null
+  const listChecked = Boolean(paraNode.attrs.listChecked)
+  const listLevel = Math.max(0, Number(paraNode.attrs.listLevel ?? 0))
+  const listIndentPx = listType === 'task' ? ptToPx(fontSize * (2 + listLevel * 2)) : 0
   const tabStops = parseParagraphTabStops(paraNode.attrs.tabStops)
 
   const fontSizePx = ptToPx(fontSize)
   let lineHeight = fontSizePx * lineHeightMult
-  const layoutWidth = Math.max(1, contentWidth - paragraphIndentPx - paragraphRightIndentPx - PRETEXT_LAYOUT_SAFETY_PX)
+  const layoutWidth = Math.max(1, contentWidth - paragraphIndentPx - paragraphRightIndentPx - listIndentPx - PRETEXT_LAYOUT_SAFETY_PX)
   const firstLineWidth = Math.max(1, layoutWidth - firstLineIndentPx)
   const text = paraNode.textContent
   const sourceChars = extractParagraphSourceChars(paraNode, paraPos)
@@ -766,10 +810,12 @@ function measureParagraph(
         units: [],
         align,
         availableWidth: firstLineWidth,
-        xOffset: paragraphIndentPx + firstLineIndentPx,
+        xOffset: paragraphIndentPx + listIndentPx + firstLineIndentPx,
         usedWidth: 0,
         renderedWidth: 0,
         isLastLineOfParagraph: true,
+        listType,
+        listChecked,
       }],
       totalHeight: lineHeight + spaceBefore + spaceAfter,
     }
@@ -839,10 +885,12 @@ function measureParagraph(
         units: line.units,
         align,
         availableWidth: line.availableWidth,
-        xOffset: paragraphIndentPx + (isFirstLine ? firstLineIndentPx : 0),
+        xOffset: paragraphIndentPx + listIndentPx + (isFirstLine ? firstLineIndentPx : 0),
         usedWidth: line.usedWidth,
         renderedWidth: line.renderedWidth,
         isLastLineOfParagraph: false,
+        listType,
+        listChecked,
       })
       lineIndex += 1
     })
@@ -977,6 +1025,18 @@ function getFloatingFlowFloor(page: RenderedPage, config: PageConfig) {
   }, 0)
 }
 
+function getDomBlockMetric(
+  metrics: readonly DomBlockMetric[],
+  nodePos: number,
+  blockIndex: number,
+  blockType: string,
+) {
+  return metrics.find((metric) => (
+    metric.blockType === blockType
+    && (metric.pos === nodePos || metric.blockIndex === blockIndex)
+  ))
+}
+
 function measureTableCell(cellNode: PMNode, cellContentWidth: number): number {
   let totalHeight = 0
   cellNode.forEach((child) => {
@@ -1005,14 +1065,44 @@ function buildTablePreviewText(tableNode: PMNode) {
   return text.length > 180 ? `${text.slice(0, 180)}...` : text
 }
 
-function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
+function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBlockMetric): MeasuredBlock {
+  if (domMetric) {
+    const contentHeight = Math.max(0, domMetric.height)
+    const spaceBefore = Math.max(0, domMetric.marginTop)
+    const spaceAfter = Math.max(0, domMetric.marginBottom)
+    return {
+      canSplit: false,
+      spaceBefore,
+      spaceAfter,
+      lines: [{
+        text: buildTablePreviewText(tableNode),
+        blockIndex: 0,
+        blockType: 'table',
+        lineIndex: 0,
+        lineHeight: contentHeight,
+        startPos: null,
+        units: [],
+        align: 'left',
+        availableWidth: contentWidth,
+        xOffset: 0,
+        usedWidth: 0,
+        renderedWidth: 0,
+        isLastLineOfParagraph: true,
+      }],
+      totalHeight: spaceBefore + contentHeight + spaceAfter,
+    }
+  }
+
   let maxColumns = 1
   tableNode.forEach((rowNode) => {
     maxColumns = Math.max(maxColumns, countRowColumns(rowNode))
   })
 
   const cellWidth = Math.max(Math.floor(contentWidth / maxColumns), 48)
-  const cellContentWidth = Math.max(cellWidth - TABLE_CELL_HORIZONTAL_PADDING_PX - 2, 40)
+  const cellContentWidth = Math.max(
+    cellWidth - TABLE_CELL_HORIZONTAL_PADDING_PX - 2,
+    40,
+  )
   let contentHeight = 0
 
   tableNode.forEach((rowNode) => {
@@ -1049,17 +1139,57 @@ function measureTable(tableNode: PMNode, contentWidth: number): MeasuredBlock {
   }
 }
 
+function normalizeHeadingLevel(rawLevel: unknown) {
+  const level = Number(rawLevel ?? 0)
+  return Number.isInteger(level) && level >= 1 && level <= 6 ? level : null
+}
+
+function collectDocumentHeadings(doc: PMNode): DocumentHeading[] {
+  const headings: DocumentHeading[] = []
+  let blockIndex = 0
+
+  doc.forEach((node) => {
+    if (node.type.name === 'paragraph') {
+      const level = normalizeHeadingLevel(node.attrs.headingLevel)
+      const title = node.textContent.trim()
+      if (level != null && title) headings.push({ title, level, blockIndex })
+    }
+    blockIndex += 1
+  })
+
+  return headings
+}
+
+function getTableOfContentsLevelRange(node: PMNode) {
+  const minLevel = Math.min(6, Math.max(1, Number(node.attrs.minLevel ?? 1)))
+  const maxLevel = Math.min(6, Math.max(minLevel, Number(node.attrs.maxLevel ?? 3)))
+  return { minLevel, maxLevel }
+}
+
+function getTableOfContentsEntries(node: PMNode, headings: DocumentHeading[]): RenderedTableOfContentsEntry[] {
+  const { minLevel, maxLevel } = getTableOfContentsLevelRange(node)
+  return headings
+    .filter((heading) => heading.level >= minLevel && heading.level <= maxLevel)
+    .map((heading) => ({ ...heading, page: null }))
+}
+
 function measureBlock(
   node: PMNode,
   nodePos: number,
   blockIndex: number,
-  contentWidth: number
+  contentWidth: number,
+  headings: DocumentHeading[] = [],
+  domBlockMetrics: readonly DomBlockMetric[] = [],
 ): MeasuredBlock {
   switch (node.type.name) {
     case 'paragraph':
       return measureParagraph(node, nodePos, blockIndex, contentWidth)
     case 'table': {
-      const measured = measureTable(node, contentWidth)
+      const measured = measureTable(
+        node,
+        contentWidth,
+        getDomBlockMetric(domBlockMetrics, nodePos, blockIndex, 'table'),
+      )
       measured.lines[0] = { ...measured.lines[0]!, blockIndex, startPos: nodePos + 1 }
       return measured
     }
@@ -1082,9 +1212,42 @@ function measureBlock(
           usedWidth: 0,
           renderedWidth: 0,
           isLastLineOfParagraph: true,
+          lineStyle: String(node.attrs.lineStyle ?? 'solid'),
+          lineColor: String(node.attrs.lineColor ?? '#cbd5e1'),
         }],
         totalHeight: 20,
+    }
+    case 'table_of_contents': {
+      const { minLevel, maxLevel } = getTableOfContentsLevelRange(node)
+      const tocEntries = getTableOfContentsEntries(node, headings)
+      const entryHeight = tocEntries.length > 0 ? tocEntries.length * 24 : 28
+      const tocHeight = Math.max(92, 46 + entryHeight)
+      return {
+        canSplit: false,
+        spaceBefore: 8,
+        spaceAfter: 8,
+        lines: [{
+          text: String(node.attrs.title ?? '目录') || '目录',
+          blockIndex,
+          blockType: 'table_of_contents',
+          lineIndex: 0,
+          lineHeight: tocHeight,
+          startPos: nodePos + 1,
+          units: [],
+          align: 'left',
+          availableWidth: contentWidth,
+          xOffset: 0,
+          usedWidth: 0,
+          renderedWidth: contentWidth,
+          isLastLineOfParagraph: true,
+          tocTitle: String(node.attrs.title ?? '目录') || '目录',
+          tocLevelRange: `${minLevel}-${maxLevel}`,
+          tocHyperlink: node.attrs.hyperlink !== false,
+          tocEntries,
+        }],
+        totalHeight: tocHeight + 16,
       }
+    }
     default:
       return {
         canSplit: false,
@@ -1163,9 +1326,15 @@ function lineNeededHeight(
   return extraBefore + line.lineHeight + extraAfter
 }
 
-export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG): PaginateResult {
+export function paginate(
+  doc: PMNode,
+  config: PageConfig = DEFAULT_PAGE_CONFIG,
+  options: PaginateOptions = {},
+): PaginateResult {
   const contentWidth = config.pageWidth - config.marginLeft - config.marginRight
   const contentHeight = config.pageHeight - config.marginTop - config.marginBottom
+  const documentHeadings = collectDocumentHeadings(doc)
+  const domBlockMetrics = options.domBlockMetrics ?? []
 
   const pages: PageLayout[] = [{ lines: [], totalHeight: 0 }]
   const renderedPages: RenderedPage[] = [{ lines: [], totalHeight: 0, floatingObjects: [] }]
@@ -1186,7 +1355,7 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
       return
     }
 
-    const measured = measureBlock(node, nodePos, blockIndex, contentWidth)
+    const measured = measureBlock(node, nodePos, blockIndex, contentWidth, documentHeadings, domBlockMetrics)
     const floatingFlowFloor = getFloatingFlowFloor(currentRenderedPage, config)
     if (currentPage.totalHeight < floatingFlowFloor) {
       const gap = floatingFlowFloor - currentPage.totalHeight
@@ -1292,6 +1461,22 @@ export function paginate(doc: PMNode, config: PageConfig = DEFAULT_PAGE_CONFIG):
     `[paginator] ${pages.length} page(s), contentHeight=${contentHeight}px, ` +
     pages.map((page, index) => `p${index + 1}=${page.totalHeight.toFixed(0)}px`).join(' ')
   )
+
+  const blockPageMap = new Map<number, number>()
+  renderedPages.forEach((page, pageIndex) => {
+    page.lines.forEach((line) => {
+      if (!blockPageMap.has(line.blockIndex)) blockPageMap.set(line.blockIndex, pageIndex + 1)
+    })
+  })
+  renderedPages.forEach((page) => {
+    page.lines.forEach((line) => {
+      if (!line.tocEntries) return
+      line.tocEntries = line.tocEntries.map((entry) => ({
+        ...entry,
+        page: blockPageMap.get(entry.blockIndex) ?? null,
+      }))
+    })
+  })
 
   return {
     pages,

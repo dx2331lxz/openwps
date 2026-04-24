@@ -275,7 +275,7 @@ def compute_template_delta(
     parts.append("")
     
     if current_template is None:
-        parts.append("[模板已移除] 当前无激活模板，可使用 apply_document_preset 应用通用预设。")
+        parts.append("[模板已移除] 当前无激活模板。如需统一全文样式，请使用页面设置与批量样式工具。")
     elif announced is None:
         parts.append("[新模板] 当前激活模板：")
         parts.append(f"context.activeTemplate = {json.dumps(current_template, ensure_ascii=False, indent=2)}")

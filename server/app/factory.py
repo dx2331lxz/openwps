@@ -29,11 +29,15 @@ from .conversations import (
     read_conversation,
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
+from .documents import get_document_settings, update_document_settings
 from .models import (
     AppendMessagesRequest,
     ChatRequest,
+    DocumentSettingsUpdateRequest,
     ModelDiscoveryRequest,
     SettingsUpdate,
+    TaskCreateRequest,
+    TaskUpdateRequest,
     TemplateAnalyzeRequest,
     TemplateCreateRequest,
     TemplateUpdateRequest,
@@ -42,6 +46,7 @@ from .models import (
 from .models import OCRCommandRequest
 from .template_analysis import analyze_template_request
 from .templates import create_template, delete_template, list_templates, read_template, update_template
+from .tasks import create_task, delete_task, get_task, list_tasks, reset_completed_tasks, update_task
 from .workspace import (
     delete_document as ws_delete,
     get_document_content as ws_get_content,
@@ -180,23 +185,55 @@ def create_api_router() -> APIRouter:
         )
         return {"success": True}
 
+    @router.get("/conversations/{conv_id}/tasks")
+    def get_conversation_tasks(conv_id: str):
+        return {"tasks": list_tasks(conv_id)}
+
+    @router.post("/conversations/{conv_id}/tasks")
+    def post_conversation_task(conv_id: str, body: TaskCreateRequest):
+        return {"task": create_task(conv_id, body.model_dump(exclude_none=True))}
+
+    @router.post("/conversations/{conv_id}/tasks/reset-completed")
+    def post_reset_completed_tasks(conv_id: str):
+        return reset_completed_tasks(conv_id)
+
+    @router.get("/conversations/{conv_id}/tasks/{task_id}")
+    def get_conversation_task(conv_id: str, task_id: str):
+        return {"task": get_task(conv_id, task_id)}
+
+    @router.patch("/conversations/{conv_id}/tasks/{task_id}")
+    def patch_conversation_task(conv_id: str, task_id: str, body: TaskUpdateRequest):
+        return {"task": update_task(conv_id, task_id, body.model_dump(exclude_unset=True))}
+
+    @router.delete("/conversations/{conv_id}/tasks/{task_id}")
+    def delete_conversation_task(conv_id: str, task_id: str):
+        return delete_task(conv_id, task_id)
+
     @router.delete("/conversations/{conv_id}")
     def remove_conversation(conv_id: str):
         delete_conversation(conv_id)
         return {"success": True}
 
     @router.get("/documents")
-    def get_documents():
-        return list_documents()
+    def get_documents(source: str | None = None):
+        return list_documents(source)
+
+    @router.get("/documents/settings")
+    def get_documents_settings():
+        return get_document_settings()
+
+    @router.put("/documents/settings")
+    def put_documents_settings(body: DocumentSettingsUpdateRequest):
+        return update_document_settings(body.model_dump(exclude_unset=True))
 
     @router.put("/documents/{name:path}")
-    async def put_document(name: str, request: Request):
+    async def put_document(name: str, request: Request, source: str | None = None):
         content = await request.body()
-        return save_document(name, content)
+        return save_document(name, content, source)
 
     @router.get("/documents/{name:path}")
-    def get_document(name: str):
-        path = read_document_path(name)
+    def get_document(name: str, source: str | None = None):
+        path = read_document_path(name, source)
         return FileResponse(
             path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -204,8 +241,8 @@ def create_api_router() -> APIRouter:
         )
 
     @router.delete("/documents/{name:path}")
-    def remove_document(name: str):
-        delete_document(name)
+    def remove_document(name: str, source: str | None = None):
+        delete_document(name, source)
         return {"success": True}
 
     @router.get("/templates")

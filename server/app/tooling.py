@@ -39,55 +39,79 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "update_todo_list",
+            "name": "TaskCreate",
             "description": (
-                "更新任务计划列表。当任务包含 3 个或以上步骤时，在开始工作前调用此工具创建任务清单，"
-                "并在执行过程中随时更新每项任务的状态。"
-                "每次调用都会完整替换当前的任务列表。"
-                "确保始终至少有一个任务处于 in_progress 状态。"
-                "为每个任务同时提供 title（命令式，如'读取文档'）和 activeForm（进行时，如'正在读取文档'）。"
+                "创建 AI 内部执行任务。仅用于复杂多步任务的内部追踪，不会向文档正文写入任务列表。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "todos": {
-                        "type": "array",
-                        "description": "完整的任务列表（每次调用都会替换全部任务）",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "任务唯一 ID，创建后保持不变，如 'task_1'",
-                                },
-                                "title": {
-                                    "type": "string",
-                                    "description": "任务标题，命令式描述，如 '读取文档内容'",
-                                },
-                                "activeForm": {
-                                    "type": "string",
-                                    "description": "任务的进行时描述，如 '正在读取文档内容'",
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
-                                    "description": "pending=待执行, in_progress=进行中, completed=已完成",
-                                },
-                            },
-                            "required": ["id", "title", "activeForm", "status"],
-                        },
-                    },
+                    "subject": {"type": "string", "description": "任务标题，命令式短语，如“读取文档结构”"},
+                    "description": {"type": "string", "description": "任务详细说明，描述需要完成什么"},
+                    "activeForm": {"type": "string", "description": "任务进行中的描述，如“正在读取文档结构”"},
+                    "metadata": {"type": "object", "description": "附加元数据，可选"},
                 },
-                "required": ["todos"],
+                "required": ["subject", "description"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "get_todo_list",
-            "description": "读取当前任务计划列表和各步骤状态，适合在继续执行前、收尾前或怀疑状态不同步时确认 todo 进度。",
+            "name": "TaskGet",
+            "description": "按任务 ID 读取 AI 内部任务详情，用于更新前先获取最新状态，避免 stale update。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "taskId": {"type": "string", "description": "任务 ID"},
+                },
+                "required": ["taskId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "TaskList",
+            "description": "读取当前会话的全部 AI 内部任务摘要和状态。复杂任务中，完成一个任务后优先用它查看剩余任务。",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "TaskUpdate",
+            "description": "更新 AI 内部任务。可修改状态、标题、描述、进行中描述、owner、依赖关系和 metadata。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "taskId": {"type": "string", "description": "任务 ID"},
+                    "subject": {"type": "string", "description": "新的任务标题"},
+                    "description": {"type": "string", "description": "新的任务说明"},
+                    "activeForm": {"type": "string", "description": "新的进行中描述"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed"],
+                        "description": "任务状态",
+                    },
+                    "owner": {"type": "string", "description": "任务 owner，可选"},
+                    "addBlocks": {
+                        "type": "array",
+                        "description": "当前任务完成后会解锁的任务 ID 列表",
+                        "items": {"type": "string"},
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "description": "会阻塞当前任务的任务 ID 列表",
+                        "items": {"type": "string"},
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "要合并的元数据；键值设为 null 表示删除",
+                    },
+                },
+                "required": ["taskId"],
+            },
         },
     },
     {
@@ -154,11 +178,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_paragraph",
-            "description": "读取指定段落的内容、段落样式，以及 textRuns 形式的分段文字样式",
+            "description": "读取指定段落。默认 detail=content：只返回文字与粗略结构（role/headingLevel/list/inlineImages/links）；detail=format 时返回段落样式、代表文字样式、textRuns 等格式信息。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "index": {"type": "integer", "description": "段落索引（从 0 开始）"},
+                    "detail": {"type": "string", "enum": ["content", "format"], "description": "content=仅文字与粗略结构；format=返回样式信息。默认 content。"},
                 },
                 "required": ["index"],
             },
@@ -241,6 +266,7 @@ TOOLS = [
                     "align": {"type": "string", "enum": ["left", "center", "right", "justify"]},
                     "firstLineIndent": {"type": "number", "description": "首行缩进（字符数，如 2）"},
                     "indent": {"type": "number", "description": "整体左缩进（字符数）"},
+                    "headingLevel": {"type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6], "description": "真实 Word 标题级别。1-6 对应 Heading 1-6；0 表示普通正文。生成目录前必须给章节标题设置 headingLevel。"},
                     "lineHeight": {"type": "number", "description": "行距倍数，如 1.0/1.5/2.0"},
                     "spaceBefore": {"type": "number", "description": "段前间距（磅）"},
                     "spaceAfter": {"type": "number", "description": "段后间距（磅）"},
@@ -248,6 +274,23 @@ TOOLS = [
                     "pageBreakBefore": {"type": "boolean", "description": "是否在该段前分页，对应工具栏里的分页符开关"},
                 },
                 "required": ["range"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table_of_contents",
+            "description": "插入真正的 Word/DOCX 自动目录字段，而不是用正文模拟点线和页码。使用前应先把章节标题段落设置 headingLevel；导出 DOCX 后可在 Word/WPS 中更新域得到真实页码。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "afterParagraph": {"type": "integer", "description": "在该段落后插入目录；-1 表示插到文档开头"},
+                    "title": {"type": "string", "description": "目录标题，默认“目录”"},
+                    "minLevel": {"type": "integer", "minimum": 1, "maximum": 6, "description": "包含的最小标题级别，默认 1"},
+                    "maxLevel": {"type": "integer", "minimum": 1, "maximum": 6, "description": "包含的最大标题级别，默认 3"},
+                    "hyperlink": {"type": "boolean", "description": "是否生成可点击超链接，默认 true"},
+                },
             },
         },
     },
@@ -494,6 +537,7 @@ TOOLS = [
                                         "align": {"type": "string", "enum": ["left", "center", "right", "justify"]},
                                         "firstLineIndent": {"type": "number"},
                                         "indent": {"type": "number"},
+                                        "headingLevel": {"type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6], "description": "真实 Word 标题级别；生成自动目录时用 1-6，正文用 0"},
                                         "lineHeight": {"type": "number"},
                                         "spaceBefore": {"type": "number"},
                                         "spaceAfter": {"type": "number"},
@@ -507,32 +551,6 @@ TOOLS = [
                     },
                 },
                 "required": ["rules"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_document_preset",
-            "description": (
-                "应用文档预设模板（公文/论文/合同/报告/信函），一次性设置页面配置和全文样式。"
-                "会自动识别标题段落（短文本+居中/加粗/大字号）和正文段落，分别应用对应样式。"
-                "返回值包含受影响段落的快照，无需额外验证。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "preset": {
-                        "type": "string",
-                        "enum": ["公文", "论文", "合同", "报告", "信函"],
-                        "description": "预设名称",
-                    },
-                    "applyPageConfig": {
-                        "type": "boolean",
-                        "description": "是否同时应用页面配置（纸张/边距），默认 true",
-                    },
-                },
-                "required": ["preset"],
             },
         },
     },
@@ -690,8 +708,6 @@ TOOLS = [
 ]
 
 LAYOUT_TOOL_NAMES = {
-    "update_todo_list",
-    "get_todo_list",
     "get_document_info",
     "get_document_outline",
     "get_document_content",
@@ -705,14 +721,12 @@ LAYOUT_TOOL_NAMES = {
     "set_page_config",
     "insert_page_break",
     "insert_horizontal_rule",
+    "insert_table_of_contents",
     "insert_table",
     "apply_style_batch",
-    "apply_document_preset",
 }
 
 EDIT_TOOL_NAMES = {
-    "update_todo_list",
-    "get_todo_list",
     "get_document_info",
     "get_document_outline",
     "get_document_content",
@@ -731,7 +745,16 @@ EDIT_TOOL_NAMES = {
     "insert_mermaid",
 }
 
-AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {"analyze_image_with_ocr", "workspace_search", "workspace_read", "web_search"}
+AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "analyze_image_with_ocr",
+    "workspace_search",
+    "workspace_read",
+    "web_search",
+}
 
 def get_tools(mode: str | None) -> list[dict]:
     if mode == "edit":

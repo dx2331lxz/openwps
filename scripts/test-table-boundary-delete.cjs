@@ -113,14 +113,27 @@ async function run() {
         const result = await page.evaluate(() => {
             const paragraphs = Array.from(document.querySelectorAll('.ProseMirror p')).map((paragraph) => paragraph.textContent ?? '')
             const table = document.querySelector('.ProseMirror table')
+            const nextParagraph = Array.from(document.querySelectorAll('.ProseMirror p')).find((paragraph) => {
+                return paragraph.textContent?.includes('表格外下一行')
+            })
+            const tableRect = table?.getBoundingClientRect()
+            const nextRect = nextParagraph?.getBoundingClientRect()
             return {
                 paragraphs,
                 tableText: table?.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+                tableBottom: tableRect?.bottom ?? null,
+                nextParagraphTop: nextRect?.top ?? null,
             }
         })
 
         assert(result.paragraphs.includes('表格外下一行'), `表格后的正文段落被删除或合并: ${JSON.stringify(result.paragraphs)}`)
         assert(!result.tableText.includes('表格外下一行'), `表格后的正文被吸入表格: ${result.tableText}`)
+        assert(
+            typeof result.tableBottom === 'number'
+                && typeof result.nextParagraphTop === 'number'
+                && result.tableBottom <= result.nextParagraphTop + 0.5,
+            `表格与后续正文发生视觉重叠: table.bottom=${result.tableBottom}, next.top=${result.nextParagraphTop}`,
+        )
 
         console.log('✅ 表格边界删除保护测试通过')
     } finally {

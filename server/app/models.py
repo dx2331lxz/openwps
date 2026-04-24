@@ -86,6 +86,11 @@ class ModelDiscoveryRequest(BaseModel):
     providerId: Optional[str] = None
 
 
+class DocumentSettingsUpdateRequest(BaseModel):
+    activeSource: Optional[str] = None
+    wpsDirectory: Optional[str] = None
+
+
 class AppendMessagesRequest(BaseModel):
     messages: list[ChatMessage]
 
@@ -102,6 +107,24 @@ class ToolResultsRequest(BaseModel):
     results: list[ToolResultItem] = Field(default_factory=list)
     stop: bool = False
     context: Optional[dict[str, Any]] = None  # Frontend sends latest context each round
+
+
+class TaskCreateRequest(BaseModel):
+    subject: str
+    description: str
+    activeForm: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    subject: Optional[str] = None
+    description: Optional[str] = None
+    activeForm: Optional[str] = None
+    status: Optional[str] = None
+    owner: Optional[str] = None
+    addBlocks: Optional[list[str]] = None
+    addBlockedBy: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class TemplateCreateRequest(BaseModel):

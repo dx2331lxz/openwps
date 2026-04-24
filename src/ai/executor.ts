@@ -14,7 +14,7 @@ import {
 import mermaid from 'mermaid'
 import { schema } from '../editor/schema'
 import { paginate, type PageConfig } from '../layout/paginator'
-import { mapFontFamily, presetStyles } from './presets'
+import { mapFontFamily } from './presets'
 import { fontNameFromFamily } from '../fonts'
 import { markdownToFragment } from '../markdown/importer'
 
@@ -109,10 +109,12 @@ const DEFAULT_PARAGRAPH_ATTRS = {
   align: 'left',
   firstLineIndent: 0,
   indent: 0,
+  headingLevel: null,
   lineHeight: 1.5,
   spaceBefore: 0,
   spaceAfter: 0,
   listType: null,
+  listChecked: false,
   listLevel: 0,
   pageBreakBefore: false,
 } as const
@@ -144,6 +146,29 @@ function describeRange(range?: RangeSpec) {
       return '整个文档'
     default:
       return '指定范围'
+  }
+}
+
+function getRangeSpecificity(range?: RangeSpec): number {
+  switch (range?.type) {
+    case 'all':
+      return 0
+    case 'odd_paragraphs':
+    case 'even_paragraphs':
+      return 1
+    case 'paragraphs':
+      return 2
+    case 'paragraph_indexes':
+      return 3
+    case 'contains_text':
+      return 4
+    case 'first_paragraph':
+    case 'last_paragraph':
+    case 'paragraph':
+    case 'selection':
+      return 5
+    default:
+      return 2
   }
 }
 
@@ -534,6 +559,9 @@ function buildCompactParagraphSnapshot(state: EditorState, paragraphIndexes: num
           lineHeight: Number(paraStyle.lineHeight ?? 1.5),
           spaceBefore: Number(paraStyle.spaceBefore ?? 0),
           spaceAfter: Number(paraStyle.spaceAfter ?? 0),
+          listType: String(paraStyle.listType ?? 'none'),
+          listChecked: Boolean(paraStyle.listChecked ?? false),
+          headingLevel: paraStyle.headingLevel == null ? null : Number(paraStyle.headingLevel),
         },
       }
     })
@@ -633,10 +661,12 @@ function buildParagraphNodeSnapshot(node: PMNode, index: number | null, includeT
     align: String(node.attrs.align ?? 'left'),
     firstLineIndent: Number(node.attrs.firstLineIndent ?? 0),
     indent: Number(node.attrs.indent ?? 0),
+    headingLevel: node.attrs.headingLevel == null ? null : Number(node.attrs.headingLevel),
     lineHeight: Number(node.attrs.lineHeight ?? 1.5),
     spaceBefore: Number(node.attrs.spaceBefore ?? 0),
     spaceAfter: Number(node.attrs.spaceAfter ?? 0),
     listType: node.attrs.listType ?? 'none',
+    listChecked: Boolean(node.attrs.listChecked ?? false),
     pageBreakBefore: Boolean(node.attrs.pageBreakBefore ?? false),
   }
   const representativeTextStyle = normalizeTextStyle(textStyle)
@@ -659,6 +689,227 @@ function buildParagraphNodeSnapshot(node: PMNode, index: number | null, includeT
 
 function buildParagraphSnapshot(paragraph: ParagraphRef, includeTextRuns = true) {
   return buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns)
+}
+
+// ─── Content-only snapshots ────────────────────────────────────────────────
+// 这些快照只暴露正文 + 粗略结构（标题层级启发、列表类型、任务勾选、图片占位、
+// 超链接、表格行列文本），不含字体/字号/颜色/缩进/行距/textRuns/commonStyles
+// 等格式细节。供编辑阶段读取使用，避免大段样式信息干扰模型。
+
+type DetailMode = 'content' | 'format'
+
+function resolveDetailMode(value: unknown): DetailMode {
+  return value === 'format' ? 'format' : 'content'
+}
+
+const SRC_PREVIEW_MAX = 64
+
+function summarizeImageSrc(rawSrc: unknown): { srcKind: 'data' | 'url'; srcPreview: string } {
+  const src = String(rawSrc ?? '')
+  if (src.startsWith('data:')) {
+    const head = src.slice(0, src.indexOf(',') + 1)
+    return { srcKind: 'data', srcPreview: head ? `${head}...` : 'data:...' }
+  }
+  if (src.length > SRC_PREVIEW_MAX) {
+    return { srcKind: 'url', srcPreview: `${src.slice(0, SRC_PREVIEW_MAX)}...` }
+  }
+  return { srcKind: 'url', srcPreview: src }
+}
+
+interface ParagraphContentSnapshot {
+  index: number | null
+  text: string
+  charCount: number
+  role: 'empty' | 'image-only' | 'task-item' | 'list-item' | 'heading' | 'paragraph'
+  headingLevel?: 1 | 2 | 3
+  list?: { type: 'bullet' | 'ordered' | 'task'; level: number; checked?: boolean }
+  inlineImages?: Array<{ alt: string; srcKind: 'data' | 'url'; srcPreview: string }>
+  links?: Array<{ text: string; href: string }>
+}
+
+function inferHeadingLevel(node: PMNode, text: string): 1 | 2 | 3 | null {
+  if (!text || text.length > 60) return null
+  const explicitLevel = Number(node.attrs.headingLevel ?? 0)
+  if (explicitLevel >= 1 && explicitLevel <= 3) return explicitLevel as 1 | 2 | 3
+  const textStyle = normalizeTextStyle(getRepresentativeTextStyle(node))
+  const align = String(node.attrs.align ?? 'left')
+  if (textStyle.fontSize >= 18) return 1
+  if (textStyle.fontSize >= 16) return 2
+  if (textStyle.fontSize >= 14) return 3
+  if (textStyle.bold && align === 'center') return 3
+  return null
+}
+
+function buildParagraphContentSnapshot(node: PMNode, index: number | null): ParagraphContentSnapshot {
+  // 自定义遍历：文字直接拼接，遇到 image 节点插入 [image:alt] 占位符
+  const textParts: string[] = []
+  const inlineImages: Array<{ alt: string; srcKind: 'data' | 'url'; srcPreview: string }> = []
+  const linkMap = new Map<string, { text: string; href: string }>()
+  let nonImageInlineCount = 0
+
+  node.forEach((child) => {
+    if (child.type.name === 'image') {
+      const alt = String(child.attrs.alt ?? '')
+      textParts.push(alt ? `[image:${alt}]` : '[image]')
+      inlineImages.push({ alt, ...summarizeImageSrc(child.attrs.src) })
+      return
+    }
+    if (child.isText) {
+      const text = child.text ?? ''
+      textParts.push(text)
+      if (text.trim().length > 0) nonImageInlineCount += 1
+      const linkMark = child.marks.find(mark => mark.type.name === 'link')
+      if (linkMark) {
+        const href = String(linkMark.attrs.href ?? '')
+        if (href) {
+          const key = `${href}\u0000${text}`
+          if (!linkMap.has(key)) linkMap.set(key, { text, href })
+        }
+      }
+      return
+    }
+    // 其他 inline 节点（极少）按 textContent 兜底
+    const fallback = child.textContent
+    if (fallback) {
+      textParts.push(fallback)
+      nonImageInlineCount += 1
+    }
+  })
+
+  const text = textParts.join('')
+  const charCount = text.length
+
+  const listTypeRaw = node.attrs.listType
+  const listType = listTypeRaw === 'bullet' || listTypeRaw === 'ordered' || listTypeRaw === 'task'
+    ? listTypeRaw
+    : null
+  const listLevel = Number(node.attrs.listLevel ?? 0)
+
+  let role: ParagraphContentSnapshot['role']
+  let headingLevel: 1 | 2 | 3 | null = null
+  if (charCount === 0 && inlineImages.length === 0) {
+    role = 'empty'
+  } else if (inlineImages.length > 0 && nonImageInlineCount === 0) {
+    role = 'image-only'
+  } else if (listType === 'task') {
+    role = 'task-item'
+  } else if (listType === 'bullet' || listType === 'ordered') {
+    role = 'list-item'
+  } else {
+    headingLevel = inferHeadingLevel(node, text)
+    role = headingLevel != null ? 'heading' : 'paragraph'
+  }
+
+  const snapshot: ParagraphContentSnapshot = { index, text, charCount, role }
+  if (headingLevel != null) snapshot.headingLevel = headingLevel
+  if (listType) {
+    const list: NonNullable<ParagraphContentSnapshot['list']> = { type: listType, level: listLevel }
+    if (listType === 'task') list.checked = Boolean(node.attrs.listChecked ?? false)
+    snapshot.list = list
+  }
+  if (inlineImages.length > 0) snapshot.inlineImages = inlineImages
+  if (linkMap.size > 0) snapshot.links = [...linkMap.values()]
+  return snapshot
+}
+
+function buildTableContentSnapshot(tableNode: PMNode) {
+  const rows = tableNode.content.content.map((rowNode, rowIndex) => {
+    const cells = rowNode.content.content.map((cellNode) => {
+      const cellText = cellNode.content.content
+        .filter(child => child.type.name === 'paragraph')
+        .map(child => buildParagraphContentSnapshot(child, null).text)
+        .join('\n')
+      return {
+        header: Boolean(cellNode.attrs.header ?? false),
+        colspan: Number(cellNode.attrs.colspan ?? 1),
+        rowspan: Number(cellNode.attrs.rowspan ?? 1),
+        text: cellText,
+      }
+    })
+    return { rowIndex, cells }
+  })
+
+  return {
+    rowCount: rows.length,
+    colCount: rows.reduce((max, row) => Math.max(max, row.cells.length), 0),
+    headerRow: rows[0]?.cells.some(cell => cell.header) ?? false,
+    rows,
+  }
+}
+
+function buildBlockContentSnapshot(block: BlockRef) {
+  switch (block.node.type.name) {
+    case 'paragraph':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'paragraph' as const,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        ...buildParagraphContentSnapshot(block.node, block.paragraphIndex),
+      }
+    case 'table':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'table' as const,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        ...buildTableContentSnapshot(block.node),
+      }
+    case 'horizontal_rule':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'horizontal_rule' as const,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        text: '---',
+      }
+    case 'table_of_contents':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'table_of_contents' as const,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        title: String(block.node.attrs.title ?? '目录'),
+        minLevel: Number(block.node.attrs.minLevel ?? 1),
+        maxLevel: Number(block.node.attrs.maxLevel ?? 3),
+        text: '[Word 自动目录]',
+      }
+    case 'floating_object': {
+      const attrs = block.node.attrs as Record<string, unknown>
+      const kind = String(attrs.kind ?? 'textbox')
+      const alt = String(attrs.alt ?? '')
+      const { srcKind, srcPreview } = summarizeImageSrc(attrs.src)
+      const embeddedParagraphsRaw = Array.isArray(attrs.paragraphs) ? attrs.paragraphs : []
+      // floating_object.paragraphs 是序列化后的段落数据，结构与 ProseMirror 节点不同，
+      // 这里只透出可见文字，避免引入额外样式字段。
+      const paragraphs = embeddedParagraphsRaw
+        .map((para: unknown) => {
+          if (!para || typeof para !== 'object') return ''
+          const text = (para as { text?: unknown }).text
+          return typeof text === 'string' ? text : ''
+        })
+        .filter(text => text.length > 0)
+      return {
+        blockIndex: block.blockIndex,
+        type: 'floating_object' as const,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        kind,
+        alt,
+        srcKind: attrs.src ? srcKind : undefined,
+        srcPreview: attrs.src ? srcPreview : undefined,
+        paragraphs,
+      }
+    }
+    default:
+      return {
+        blockIndex: block.blockIndex,
+        type: block.node.type.name,
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        text: block.node.textContent,
+      }
+  }
 }
 
 function buildTableSnapshot(tableNode: PMNode, includeTextRuns = true) {
@@ -752,6 +1003,18 @@ function buildBlockSnapshot(block: BlockRef, includeTextRuns = true) {
         afterParagraphIndex: block.afterParagraphIndex,
         text: '',
       }
+    case 'table_of_contents':
+      return {
+        blockIndex: block.blockIndex,
+        type: 'table_of_contents',
+        paragraphIndex: block.paragraphIndex,
+        afterParagraphIndex: block.afterParagraphIndex,
+        title: String(block.node.attrs.title ?? '目录'),
+        minLevel: Number(block.node.attrs.minLevel ?? 1),
+        maxLevel: Number(block.node.attrs.maxLevel ?? 3),
+        hyperlink: block.node.attrs.hyperlink !== false,
+        text: '[Word 自动目录]',
+      }
     default:
       return {
         blockIndex: block.blockIndex,
@@ -773,6 +1036,7 @@ function buildStyleSignature(paragraph: ReturnType<typeof buildParagraphSnapshot
     `first:${style.firstLineIndent}`,
     `indent:${style.indent}`,
     `list:${style.listType ?? 'none'}`,
+    style.listType === 'task' ? (style.listChecked ? 'checked' : 'unchecked') : 'list-n/a',
     style.pageBreakBefore ? 'page-break' : 'flow',
   ].join(' | ')
 }
@@ -812,9 +1076,9 @@ function buildPaginationSummary(state: EditorState, pageConfig?: PageConfig) {
   return paginate(state.doc, pageConfig)
 }
 
-function getDocumentInfo(state: EditorState, options?: ExecuteOptions): ExecuteResult {
+function getDocumentInfo(state: EditorState, params: Record<string, unknown>, options?: ExecuteOptions): ExecuteResult {
+  const detail = resolveDetailMode(params.detail)
   const paragraphs = getParagraphs(state)
-  const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
   const wordCount = state.doc.textContent.length
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
@@ -823,23 +1087,28 @@ function getDocumentInfo(state: EditorState, options?: ExecuteOptions): ExecuteR
     return counts
   }, {})
 
+  const data: Record<string, unknown> = {
+    paragraphCount: paragraphs.length,
+    wordCount,
+    pageCount: pagination.renderedPages.length,
+    pageBreakCount: pagination.breaks.length,
+    blockCounts,
+  }
+  if (detail === 'format') {
+    const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
+    data.commonStyles = buildCommonStyleSummary(paragraphSnapshots)
+  }
+
   return {
     success: true,
     message: `文档共 ${paragraphs.length} 个段落，约 ${wordCount} 字`,
-    data: {
-      paragraphCount: paragraphs.length,
-      wordCount,
-      pageCount: pagination.renderedPages.length,
-      pageBreakCount: pagination.breaks.length,
-      blockCounts,
-      commonStyles: buildCommonStyleSummary(paragraphSnapshots),
-    },
+    data,
   }
 }
 
-function getDocumentOutline(state: EditorState, options?: ExecuteOptions): ExecuteResult {
+function getDocumentOutline(state: EditorState, params: Record<string, unknown>, options?: ExecuteOptions): ExecuteResult {
+  const detail = resolveDetailMode(params.detail)
   const paragraphs = getParagraphs(state)
-  const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
   const blocks = getBlocks(state)
   const pagination = buildPaginationSummary(state, options?.pageConfig)
 
@@ -859,42 +1128,51 @@ function getDocumentOutline(state: EditorState, options?: ExecuteOptions): Execu
       previewText: buildPageTextPreview(page.lines),
       containsTable: pageBlocks.some(block => block.node.type.name === 'table'),
       containsHorizontalRule: pageBlocks.some(block => block.node.type.name === 'horizontal_rule'),
+      containsImage: pageBlocks.some(block => (
+        block.node.type.name === 'paragraph' && block.node.content.content.some(child => child.type.name === 'image')
+      )),
     }
   })
+
+  const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.node.textContent.length, 0)
+  const data: Record<string, unknown> = {
+    paragraphCount: paragraphs.length,
+    totalChars,
+    pageCount: pages.length,
+    pages,
+  }
+  if (detail === 'format') {
+    const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
+    data.commonStyles = buildCommonStyleSummary(paragraphSnapshots)
+  }
 
   return {
     success: true,
     message: `已生成 ${pages.length} 页文档概览`,
-    data: {
-      paragraphCount: paragraphs.length,
-      totalChars: paragraphSnapshots.reduce((sum, paragraph) => sum + paragraph.charCount, 0),
-      pageCount: pages.length,
-      commonStyles: buildCommonStyleSummary(paragraphSnapshots),
-      pages,
-    },
+    data,
   }
 }
 
 function getDocumentContent(state: EditorState, params: Record<string, unknown>, options?: ExecuteOptions): ExecuteResult {
+  const detail = resolveDetailMode(params.detail)
   const fromParagraph = Number.isInteger(params.fromParagraph) ? Number(params.fromParagraph) : 0
   const allParagraphs = getParagraphs(state)
   const maxIndex = Math.max(0, allParagraphs.length - 1)
   const toParagraph = Number.isInteger(params.toParagraph) ? Number(params.toParagraph) : maxIndex
-  const includeTextRuns = params.includeTextRuns !== false
-  const paragraphs = allParagraphs
-    .filter(paragraph => paragraph.index >= fromParagraph && paragraph.index <= toParagraph)
-    .map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns))
+  const includeTextRuns = detail === 'format' ? params.includeTextRuns !== false : false
+  const paragraphRefs = allParagraphs.filter(paragraph => (
+    paragraph.index >= fromParagraph && paragraph.index <= toParagraph
+  ))
 
-  if (paragraphs.length === 0) {
+  if (paragraphRefs.length === 0) {
     return {
       success: false,
       message: `未找到第 ${fromParagraph + 1} 到第 ${toParagraph + 1} 段`,
     }
   }
 
-  const firstParagraphIndex = paragraphs[0]?.index ?? fromParagraph
-  const lastParagraphIndex = paragraphs.at(-1)?.index ?? toParagraph
-  const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
+  const firstParagraphIndex = paragraphRefs[0]!.index
+  const lastParagraphIndex = paragraphRefs.at(-1)!.index
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
   const blocksInRange = blocks.filter(block => (
@@ -916,25 +1194,50 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
     }
   })
 
+  if (detail === 'format') {
+    const paragraphs = paragraphRefs.map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns))
+    const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
+    return {
+      success: true,
+      message: `已读取第 ${firstParagraphIndex + 1} 到第 ${lastParagraphIndex + 1} 段（format）`,
+      data: {
+        detail,
+        fromParagraph: firstParagraphIndex,
+        toParagraph: lastParagraphIndex,
+        paragraphCount: paragraphs.length,
+        totalChars,
+        paragraphs,
+        blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns)),
+        pageRanges,
+      },
+    }
+  }
+
+  const paragraphs = paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index))
+  const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
   return {
     success: true,
     message: `已读取第 ${firstParagraphIndex + 1} 到第 ${lastParagraphIndex + 1} 段`,
     data: {
+      detail,
       fromParagraph: firstParagraphIndex,
       toParagraph: lastParagraphIndex,
       paragraphCount: paragraphs.length,
       totalChars,
       paragraphs,
-      blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns)),
+      blocks: blocksInRange.map(block => buildBlockContentSnapshot(block)),
       pageRanges,
     },
   }
 }
 
-function getPageContent(state: EditorState, pageNumber: number, includeTextRuns: boolean, options?: ExecuteOptions): ExecuteResult {
+function getPageContent(state: EditorState, params: Record<string, unknown>, options?: ExecuteOptions): ExecuteResult {
+  const pageNumber = Number(params.page)
   if (!Number.isInteger(pageNumber) || pageNumber < 1) {
     return { success: false, message: 'page 必须是从 1 开始的整数' }
   }
+  const detail = resolveDetailMode(params.detail)
+  const includeTextRuns = detail === 'format' ? params.includeTextRuns === true : false
 
   const blocks = getBlocks(state)
   const paragraphs = getParagraphs(state)
@@ -950,15 +1253,41 @@ function getPageContent(state: EditorState, pageNumber: number, includeTextRuns:
     .map(index => blocks[index])
     .filter((block): block is BlockRef => Boolean(block))
   const paragraphIndexes = [...new Set(pageBlocks.flatMap(block => (block.paragraphIndex == null ? [] : [block.paragraphIndex])))]
-  const pageParagraphs = paragraphIndexes
+  const paragraphRefs = paragraphIndexes
     .map(index => paragraphs[index])
     .filter((paragraph): paragraph is ParagraphRef => Boolean(paragraph))
-    .map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns))
+
+  if (detail === 'format') {
+    return {
+      success: true,
+      message: `已读取第 ${pageNumber} 页（format）`,
+      data: {
+        detail,
+        page: pageNumber,
+        pageCount: pagination.renderedPages.length,
+        paragraphIndexes,
+        paragraphRange: paragraphIndexes.length > 0
+          ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
+          : null,
+        previewText: buildPageTextPreview(page.lines),
+        blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns)),
+        lines: page.lines.map(line => ({
+          blockIndex: line.blockIndex,
+          lineIndex: line.lineIndex,
+          text: line.text,
+          top: Math.round(line.top),
+          startPos: line.startPos,
+        })),
+        paragraphs: paragraphRefs.map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns)),
+      },
+    }
+  }
 
   return {
     success: true,
     message: `已读取第 ${pageNumber} 页`,
     data: {
+      detail,
       page: pageNumber,
       pageCount: pagination.renderedPages.length,
       paragraphIndexes,
@@ -966,15 +1295,13 @@ function getPageContent(state: EditorState, pageNumber: number, includeTextRuns:
         ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
         : null,
       previewText: buildPageTextPreview(page.lines),
-      blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns)),
+      blocks: pageBlocks.map(block => buildBlockContentSnapshot(block)),
       lines: page.lines.map(line => ({
         blockIndex: line.blockIndex,
         lineIndex: line.lineIndex,
         text: line.text,
-        top: Math.round(line.top),
-        startPos: line.startPos,
       })),
-      paragraphs: pageParagraphs,
+      paragraphs: paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index)),
     },
   }
 }
@@ -1037,7 +1364,7 @@ function getPageStyleSummary(state: EditorState, pageNumber: number, options?: E
   }
 }
 
-function getParagraph(state: EditorState, index: number): ExecuteResult {
+function getParagraph(state: EditorState, index: number, detail: DetailMode): ExecuteResult {
   const paragraph = getParagraphAtIndex(state, index)
   if (!paragraph) {
     return { success: false, message: `未找到第 ${index + 1} 段` }
@@ -1045,8 +1372,10 @@ function getParagraph(state: EditorState, index: number): ExecuteResult {
 
   return {
     success: true,
-    message: `已读取第 ${index + 1} 段`,
-    data: buildParagraphSnapshot(paragraph),
+    message: detail === 'format' ? `已读取第 ${index + 1} 段（format）` : `已读取第 ${index + 1} 段`,
+    data: detail === 'format'
+      ? { detail, ...buildParagraphSnapshot(paragraph) }
+      : { detail, ...buildParagraphContentSnapshot(paragraph.node, paragraph.index) },
   }
 }
 
@@ -1248,6 +1577,7 @@ export async function executeTool(
           Object.entries(rawParaAttrs).filter(([, value]) => value !== undefined)
         )
         if (paraAttrs.listType === 'none') paraAttrs.listType = null
+        if (paraAttrs.headingLevel === 0 || paraAttrs.headingLevel === 'none') paraAttrs.headingLevel = null
         tr = applyParagraphStyle(state, tr, range, paraAttrs, options?.selectionContext)
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
@@ -1320,6 +1650,34 @@ export async function executeTool(
         dispatch(inserted.tr)
         view.focus()
         return { success: true, message: '已插入分割线' }
+      }
+
+      case 'insert_table_of_contents': {
+        const afterParagraph = Number(params.afterParagraph ?? -1)
+        const minLevel = Math.min(6, Math.max(1, Number(params.minLevel ?? 1)))
+        const maxLevel = Math.min(6, Math.max(minLevel, Number(params.maxLevel ?? 3)))
+        const tocNode = schema.nodes.table_of_contents.create({
+          title: String(params.title ?? '目录') || '目录',
+          minLevel,
+          maxLevel,
+          hyperlink: params.hyperlink !== false,
+        })
+        const inserted = insertBlockAfterParagraph(state, afterParagraph, tocNode)
+        if (!inserted.success || !inserted.tr) return inserted
+        dispatch(inserted.tr)
+        view.focus()
+        return {
+          success: true,
+          message: `已插入 Word 自动目录（标题级别 ${minLevel}-${maxLevel}）`,
+          data: {
+            tableOfContents: {
+              title: tocNode.attrs.title,
+              minLevel,
+              maxLevel,
+              hyperlink: tocNode.attrs.hyperlink !== false,
+            },
+          },
+        }
       }
 
       case 'insert_table': {
@@ -1563,22 +1921,22 @@ export async function executeTool(
       }
 
       case 'get_document_info':
-        return getDocumentInfo(state, options)
+        return getDocumentInfo(state, params, options)
 
       case 'get_document_outline':
-        return getDocumentOutline(state, options)
+        return getDocumentOutline(state, params, options)
 
       case 'get_document_content':
         return getDocumentContent(state, params, options)
 
       case 'get_page_content':
-        return getPageContent(state, Number(params.page), params.includeTextRuns === true, options)
+        return getPageContent(state, params, options)
 
       case 'get_page_style_summary':
         return getPageStyleSummary(state, Number(params.page), options)
 
       case 'get_paragraph':
-        return getParagraph(state, Number(params.index))
+        return getParagraph(state, Number(params.index), resolveDetailMode(params.detail))
 
       case 'get_comments': {
         interface CommentEntry {
@@ -1602,12 +1960,12 @@ export async function executeTool(
               const commentMark = commentType.isInSet(inline.marks)
               if (commentMark && inline.isText) {
                 comments.push({
-                  id:             String(commentMark.attrs.id ?? ''),
-                  author:         String(commentMark.attrs.author ?? ''),
-                  date:           String(commentMark.attrs.date ?? ''),
-                  content:        String(commentMark.attrs.content ?? ''),
+                  id: String(commentMark.attrs.id ?? ''),
+                  author: String(commentMark.attrs.author ?? ''),
+                  date: String(commentMark.attrs.date ?? ''),
+                  content: String(commentMark.attrs.content ?? ''),
                   paragraphIndex: paraIdx,
-                  markedText:     inline.text ?? '',
+                  markedText: inline.text ?? '',
                 })
               }
             })
@@ -1626,13 +1984,21 @@ export async function executeTool(
         const rules = Array.isArray(params.rules) ? params.rules : []
         if (rules.length === 0) return { success: false, message: 'apply_style_batch 需要至少一条规则' }
 
+        const orderedRules = rules
+          .map((rule, index) => ({ rule, index }))
+          .sort((a, b) => {
+            const specificityDiff = getRangeSpecificity((a.rule as Record<string, unknown>).range as RangeSpec | undefined)
+              - getRangeSpecificity((b.rule as Record<string, unknown>).range as RangeSpec | undefined)
+            return specificityDiff !== 0 ? specificityDiff : a.index - b.index
+          })
+
         const allAffectedIndexes = new Set<number>()
         let currentTr = state.tr
 
-        for (let i = 0; i < rules.length; i++) {
-          const rule = rules[i] as Record<string, unknown>
+        for (let i = 0; i < orderedRules.length; i++) {
+          const rule = orderedRules[i]!.rule as Record<string, unknown>
           const range = rule.range as RangeSpec | undefined
-          const rangeCheck = validateRange(`apply_style_batch.rules[${i}]`, range)
+          const rangeCheck = validateRange(`apply_style_batch.rules[${orderedRules[i]!.index}]`, range)
           if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
 
           const resolved = resolveRange(state, range, options?.selectionContext)
@@ -1655,6 +2021,7 @@ export async function executeTool(
               Object.entries(paragraphStyle).filter(([, v]) => v !== undefined)
             )
             if (paraAttrs.listType === 'none') paraAttrs.listType = null
+            if (paraAttrs.headingLevel === 0 || paraAttrs.headingLevel === 'none') paraAttrs.headingLevel = null
             currentTr = applyParagraphStyle(state, currentTr, range, paraAttrs, options?.selectionContext)
           }
         }
@@ -1668,100 +2035,6 @@ export async function executeTool(
           success: true,
           message: `已批量应用 ${rules.length} 条样式规则，影响 ${affectedArr.length} 个段落`,
           data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedArr) },
-        }
-      }
-
-      case 'apply_document_preset': {
-        const presetName = String(params.preset ?? '')
-        const preset = presetStyles[presetName]
-        if (!preset) {
-          return { success: false, message: `未知预设: "${presetName}"，支持: ${Object.keys(presetStyles).join(', ')}` }
-        }
-
-        const applyPage = params.applyPageConfig !== false
-        if (applyPage && preset.page && options?.pageConfig && options.onPageConfigChange) {
-          applyPageConfig({
-            paperSize: preset.page.paperSize,
-            orientation: preset.page.orientation,
-            marginTop: preset.page.marginTop,
-            marginBottom: preset.page.marginBottom,
-            marginLeft: preset.page.marginLeft,
-            marginRight: preset.page.marginRight,
-          }, options)
-        }
-
-        const paragraphs = getParagraphs(state)
-        let currentTr = state.tr
-        const allIndexes: number[] = []
-
-        for (const p of paragraphs) {
-          allIndexes.push(p.index)
-          const text = p.node.textContent
-          const textLen = text.length
-          const repStyle = getRepresentativeTextStyle(p.node)
-          const pAttrs = p.node.attrs as Record<string, unknown>
-
-          // Heuristic: heading detection
-          const isLikelyHeading = textLen > 0 && textLen <= 50 && (
-            Boolean(repStyle.bold) ||
-            Number(repStyle.fontSize ?? 12) >= 14 ||
-            String(pAttrs.align ?? 'left') === 'center'
-          )
-
-          // Determine heading level based on font size / position
-          let headingLevel = 0
-          if (isLikelyHeading) {
-            const fontSize = Number(repStyle.fontSize ?? 12)
-            if (fontSize >= 18 || String(pAttrs.align ?? 'left') === 'center') headingLevel = 1
-            else if (fontSize >= 14) headingLevel = 2
-            else headingLevel = 3
-          }
-
-          // Apply styles based on role
-          const headingStyle = headingLevel === 1 ? preset.heading1
-            : headingLevel === 2 ? preset.heading2
-              : headingLevel === 3 ? preset.heading3
-                : null
-
-          if (headingStyle) {
-            const textAttrs: Record<string, unknown> = {}
-            if (headingStyle.fontFamily) textAttrs.fontFamily = mapFontFamily(headingStyle.fontFamily)
-            if (headingStyle.fontSize) textAttrs.fontSize = headingStyle.fontSize
-            if (headingStyle.bold !== undefined) textAttrs.bold = headingStyle.bold
-            const { from, to } = paragraphTextBounds(p)
-            currentTr = addTextMark(currentTr, state, from, to, textAttrs)
-
-            const paraAttrs: Record<string, unknown> = {}
-            if (headingStyle.align) paraAttrs.align = headingStyle.align
-            if (headingStyle.spaceBefore !== undefined) paraAttrs.spaceBefore = headingStyle.spaceBefore
-            if (headingStyle.spaceAfter !== undefined) paraAttrs.spaceAfter = headingStyle.spaceAfter
-            currentTr.setNodeMarkup(p.pos, undefined, { ...p.node.attrs, ...paraAttrs })
-          } else if (preset.body && textLen > 0) {
-            const body = preset.body
-            const textAttrs: Record<string, unknown> = {}
-            if (body.fontFamily) textAttrs.fontFamily = mapFontFamily(body.fontFamily)
-            if (body.fontSize) textAttrs.fontSize = body.fontSize
-            const { from, to } = paragraphTextBounds(p)
-            currentTr = addTextMark(currentTr, state, from, to, textAttrs)
-
-            const paraAttrs: Record<string, unknown> = {}
-            if (body.align) paraAttrs.align = body.align
-            if (body.firstLineIndent !== undefined) paraAttrs.firstLineIndent = body.firstLineIndent
-            if (body.lineHeight !== undefined) paraAttrs.lineHeight = body.lineHeight
-            if (body.spaceBefore !== undefined) paraAttrs.spaceBefore = body.spaceBefore
-            if (body.spaceAfter !== undefined) paraAttrs.spaceAfter = body.spaceAfter
-            currentTr.setNodeMarkup(p.pos, undefined, { ...p.node.attrs, ...paraAttrs })
-          }
-        }
-
-        dispatch(currentTr)
-        options?.onDocumentStyleMutation?.()
-        view.focus()
-
-        return {
-          success: true,
-          message: `已应用"${presetName}"预设，影响 ${allIndexes.length} 个段落${applyPage && preset.page ? '，并更新页面配置' : ''}`,
-          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, allIndexes) },
         }
       }
 

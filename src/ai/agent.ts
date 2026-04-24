@@ -55,6 +55,16 @@ function parseCommand(message: string): ToolCall[] {
   const msg = message.trim()
   if (!msg) return []
 
+  if (
+    /(生成|创建|插入|添加).*(文档)?(自动)?目录/.test(msg) ||
+    /(文档)?(自动)?目录.*(生成|创建|插入|添加)/.test(msg)
+  ) {
+    return [{
+      name: 'insert_table_of_contents',
+      params: { afterParagraph: -1, title: '目录', minLevel: 1, maxLevel: 3, hyperlink: true },
+    }]
+  }
+
   // ── Table insertion ──
   const tableMatch = msg.match(
     /插入.*?(\d+)\s*行.*?(\d+)\s*列|(\d+)\s*行.*?(\d+)\s*列.*?表格|插入.*?(\d+)[×xX*](\d+)/
@@ -77,7 +87,7 @@ function parseCommand(message: string): ToolCall[] {
 
   // ── Page config ──
   if (msg.includes('纸张') || msg.includes('页边距') || msg.includes('横向') || msg.includes('纵向') ||
-      /[AB]\d纸|Letter纸/i.test(msg)) {
+    /[AB]\d纸|Letter纸/i.test(msg)) {
     const pageParams: Record<string, unknown> = {}
     if (msg.includes('A4')) pageParams.paperSize = 'A4'
     else if (msg.includes('A3')) pageParams.paperSize = 'A3'
@@ -220,6 +230,15 @@ function parseCommand(message: string): ToolCall[] {
 
   if (msg.includes('无序列表') || msg.includes('项目符号') || msg.includes('圆点列表')) paraAttrs.listType = 'bullet'
   if (msg.includes('有序列表') || msg.includes('编号列表') || msg.includes('数字列表')) paraAttrs.listType = 'ordered'
+  if (msg.includes('任务列表') || msg.includes('待办列表') || msg.includes('清单列表') || msg.includes('checklist')) paraAttrs.listType = 'task'
+  if (msg.includes('勾选') || msg.includes('完成任务') || msg.includes('标记完成') || msg.includes('已完成')) {
+    paraAttrs.listType = paraAttrs.listType ?? 'task'
+    paraAttrs.listChecked = true
+  }
+  if (msg.includes('取消勾选') || msg.includes('未完成') || msg.includes('标记未完成')) {
+    paraAttrs.listType = paraAttrs.listType ?? 'task'
+    paraAttrs.listChecked = false
+  }
   if (msg.includes('取消列表') || msg.includes('删除列表') || msg.includes('普通段落')) paraAttrs.listType = 'none'
 
   // Emit tool calls

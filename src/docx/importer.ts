@@ -33,6 +33,7 @@ interface ParagraphAttrs extends Record<string, unknown> {
   firstLineIndent: number
   indent: number
   rightIndent: number
+  headingLevel: number | null
   lineHeight: number
   spaceBefore: number
   spaceAfter: number
@@ -91,7 +92,7 @@ export interface DocxImportResult {
   typography: DocxTypographyConfig
 }
 
-type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'indent' | 'rightIndent' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'listType' | 'listLevel' | 'pageBreakBefore' | 'tabStops'>>
+type StyleAttrs = Partial<TextStyleAttrs & Pick<ParagraphAttrs, 'align' | 'firstLineIndent' | 'indent' | 'rightIndent' | 'headingLevel' | 'lineHeight' | 'spaceBefore' | 'spaceAfter' | 'listType' | 'listLevel' | 'pageBreakBefore' | 'tabStops'>>
 
 interface RawStyle {
   basedOn?: string
@@ -168,6 +169,7 @@ const DEFAULT_PARAGRAPH_ATTRS: ParagraphAttrs = {
   firstLineIndent: 0,
   indent: 0,
   rightIndent: 0,
+  headingLevel: null,
   lineHeight: 1.5,
   spaceBefore: 0,
   spaceAfter: 0,
@@ -491,6 +493,9 @@ function readParagraphStyle(
   const jc = getAttr(directChild(pPr, 'jc'), 'val')
   if (jc) attrs.align = alignMap[jc] ?? 'left'
 
+  const outlineLvl = parseNumber(getAttr(directChild(pPr, 'outlineLvl'), 'val'), -1)
+  if (outlineLvl >= 0 && outlineLvl <= 5) attrs.headingLevel = outlineLvl + 1
+
   const baseFontSize = inherited.fontSize ?? DEFAULT_TEXT_STYLE.fontSize
   const ind = directChild(pPr, 'ind')
   const leftIndent = parseNumber(getAttr(ind, 'left') || getAttr(ind, 'start'))
@@ -638,10 +643,15 @@ function parseStyles(
     }
 
     const basedOn = getAttr(directChild(styleEl, 'basedOn'), 'val') || undefined
+    const styleName = getAttr(directChild(styleEl, 'name'), 'val')
     const pPr = directChild(styleEl, 'pPr')
     const rPr = directChild(styleEl, 'rPr')
     const runAttrs = readRunStyle(rPr, {}, themeFonts)
     const paraAttrs = readParagraphStyle(pPr, runAttrs, null, numberingMap)
+    const headingLevel = getAttr(styleEl, 'type') === 'paragraph'
+      ? inferHeadingLevelFromStyle(styleId, styleName)
+      : null
+    if (headingLevel != null) paraAttrs.headingLevel = headingLevel
     rawStyles[styleId] = { basedOn, attrs: { ...runAttrs, ...paraAttrs } }
   }
 
@@ -673,6 +683,16 @@ function parseStyles(
       ? (resolved[defaultParagraphStyleId] ?? { ...docDefaults })
       : { ...docDefaults },
   }
+}
+
+function inferHeadingLevelFromStyle(styleId: string, styleName: string): number | null {
+  const normalized = `${styleId} ${styleName}`.replace(/\s+/g, '').toLowerCase()
+  const match = normalized.match(/(?:heading|标题)([1-6一二三四五六])/)
+  if (!match) return null
+  const raw = match[1]
+  const cjkMap: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6 }
+  const level = cjkMap[raw] ?? Number(raw)
+  return level >= 1 && level <= 6 ? level : null
 }
 
 interface CommentInfo {
@@ -1282,6 +1302,7 @@ async function parseParagraph(
     firstLineIndent: paragraphStyle.firstLineIndent ?? DEFAULT_PARAGRAPH_ATTRS.firstLineIndent,
     indent: paragraphStyle.indent ?? DEFAULT_PARAGRAPH_ATTRS.indent,
     rightIndent: paragraphStyle.rightIndent ?? DEFAULT_PARAGRAPH_ATTRS.rightIndent,
+    headingLevel: paragraphStyle.headingLevel ?? DEFAULT_PARAGRAPH_ATTRS.headingLevel,
     fontSizeHint: paragraphStyle.fontSize ?? null,
     fontFamilyHint: paragraphStyle.fontFamily ?? null,
     lineHeight: clampLineHeight(paragraphStyle.lineHeight ?? DEFAULT_PARAGRAPH_ATTRS.lineHeight),
@@ -1414,6 +1435,31 @@ async function parseTable(
   return { type: 'table', content: rows }
 }
 
+function parseTableOfContents(sdtEl: Element): PMNodeJSON | null {
+  const allText = Array.from(sdtEl.getElementsByTagName('*'))
+    .filter((element) => getLocalName(element) === 'instrText')
+    .map((element) => element.textContent ?? '')
+    .join(' ')
+  if (!/\bTOC\b/i.test(allText)) return null
+
+  const rangeMatch = allText.match(/\\o\s+"?([1-6])-([1-6])"?/i)
+  const minLevel = rangeMatch ? Number(rangeMatch[1]) : 1
+  const maxLevel = rangeMatch ? Number(rangeMatch[2]) : 3
+  const alias = findDescendant(sdtEl, 'alias')
+  const rawTitle = getAttr(alias, 'val')
+  const title = rawTitle && rawTitle !== 'Table of Contents' ? rawTitle : '目录'
+
+  return {
+    type: 'table_of_contents',
+    attrs: {
+      title,
+      minLevel,
+      maxLevel: Math.max(minLevel, maxLevel),
+      hyperlink: /\\h\b/i.test(allText),
+    },
+  }
+}
+
 async function parseDocument(
   documentXml: string,
   styleMap: StyleMap,
@@ -1457,6 +1503,10 @@ async function parseDocument(
     }
     if (localName === 'tbl') {
       content.push(await parseTable(child, styleMap, defaultParagraphStyle, themeFonts, docGridLinePitchPt, numberingMap, rels, zip, commentMap))
+    }
+    if (localName === 'sdt') {
+      const toc = parseTableOfContents(child)
+      if (toc) content.push(toc)
     }
   }
 

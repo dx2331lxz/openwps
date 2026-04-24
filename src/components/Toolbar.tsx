@@ -12,15 +12,19 @@ import {
 } from 'prosemirror-tables'
 import type { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
-import { TextSelection } from 'prosemirror-state'
-import { Fragment, type Mark } from 'prosemirror-model'
+import { NodeSelection, TextSelection } from 'prosemirror-state'
+import { Fragment, type Mark, type Node as PMNode } from 'prosemirror-model'
 import { undo, redo } from 'prosemirror-history'
 import { schema } from '../editor/schema'
 import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
+import type { PageConfig } from '../layout/paginator'
+import PageSettingsPanel, { type PageSettingsSection } from './PageSettingsPanel'
 
 interface ToolbarProps {
   view: EditorView | null
   editorState: EditorState | null
+  pageConfig: PageConfig
+  onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
   onToggleWorkspace?: () => void
@@ -46,7 +50,7 @@ const defaultTextFmt = {
 
 const defaultParaFmt = {
   align: 'left', firstLineIndent: 0, indent: 0, lineHeight: 1.5,
-  spaceBefore: 0, spaceAfter: 0, listType: null as string | null, pageBreakBefore: false,
+  spaceBefore: 0, spaceAfter: 0, listType: null as string | null, listChecked: false, pageBreakBefore: false,
 }
 
 function deriveFormats(state: EditorState) {
@@ -162,7 +166,7 @@ function clearFormatting(view: EditorView) {
     if (node.type.name === 'paragraph') {
       tr.setNodeMarkup(pos, undefined, {
         align: 'left', firstLineIndent: 0, indent: 0, lineHeight: 1.5,
-        spaceBefore: 0, spaceAfter: 0, listType: null, listLevel: 0, pageBreakBefore: false,
+        spaceBefore: 0, spaceAfter: 0, listType: null, listLevel: 0, listChecked: false, pageBreakBefore: false,
       })
     }
   })
@@ -170,7 +174,7 @@ function clearFormatting(view: EditorView) {
   view.focus()
 }
 
-function toggleList(view: EditorView, listType: 'bullet' | 'ordered') {
+function toggleList(view: EditorView, listType: 'bullet' | 'ordered' | 'task') {
   const { state, dispatch } = view
   const { selection, tr } = state
   let allHave = true
@@ -180,7 +184,11 @@ function toggleList(view: EditorView, listType: 'bullet' | 'ordered') {
   const newType = allHave ? null : listType
   state.doc.nodesBetween(selection.from, selection.to, (node, pos) => {
     if (node.type.name === 'paragraph') {
-      tr.setNodeMarkup(pos, undefined, { ...node.attrs, listType: newType })
+      tr.setNodeMarkup(pos, undefined, {
+        ...node.attrs,
+        listType: newType,
+        listChecked: newType === 'task' ? Boolean(node.attrs.listChecked) : false,
+      })
     }
   })
   dispatch(tr)
@@ -215,21 +223,67 @@ function getCurrentParagraphRef(state: EditorState) {
   return paragraphs[0] ?? null
 }
 
-function insertHR(view: EditorView) {
+function getTopLevelBlockIndex(doc: PMNode, blockPos: number) {
+  let match: number | null = null
+  doc.forEach((_node, pos, index) => {
+    if (pos === blockPos) match = index
+    return undefined
+  })
+  return match
+}
+
+function createParagraphLike(node: PMNode, content?: Fragment) {
+  if (content && content.size > 0) return schema.nodes.paragraph.create(node.attrs, content)
+  return schema.nodes.paragraph.create(node.attrs)
+}
+
+function insertHR(view: EditorView, attrs?: { lineStyle?: string; lineColor?: string }) {
   const { state, dispatch } = view
   const paragraph = getCurrentParagraphRef(state)
   if (!paragraph) return
 
-  const paragraphs = getParagraphRefs(state)
-  const nextParagraph = paragraphs[paragraph.index + 1]
-  const insertPos = paragraph.pos + paragraph.node.nodeSize
-  const hrNode = schema.nodes.horizontal_rule.create()
-  const tr = nextParagraph
-    ? state.tr.insert(insertPos, hrNode)
-    : state.tr.insert(insertPos, Fragment.fromArray([hrNode, schema.nodes.paragraph.create()]))
+  let tr = state.tr
+  if (!state.selection.empty) {
+    tr = tr.delete(state.selection.from, state.selection.to)
+  }
 
-  const selectionPos = nextParagraph ? nextParagraph.pos + hrNode.nodeSize + 1 : insertPos + hrNode.nodeSize + 1
-  tr.setSelection(TextSelection.create(tr.doc, selectionPos))
+  const mappedSelectionFrom = tr.mapping.map(state.selection.from, -1)
+  const mappedParagraphPos = tr.mapping.map(paragraph.pos, -1)
+  const currentParagraph = tr.doc.nodeAt(mappedParagraphPos)
+  if (!currentParagraph || currentParagraph.type.name !== 'paragraph') return
+
+  const hrNode = schema.nodes.horizontal_rule.create({
+    lineStyle: attrs?.lineStyle ?? 'solid',
+    lineColor: attrs?.lineColor ?? '#cbd5e1',
+  })
+  const resolvedPos = tr.doc.resolve(Math.max(mappedParagraphPos + 1, Math.min(mappedSelectionFrom, tr.doc.content.size)))
+  const rawOffset = resolvedPos.parent === currentParagraph ? resolvedPos.parentOffset : currentParagraph.content.size
+  const offset = Math.max(0, Math.min(rawOffset, currentParagraph.content.size))
+  const beforeContent = currentParagraph.content.cut(0, offset)
+  const afterContent = currentParagraph.content.cut(offset, currentParagraph.content.size)
+  const replacement: PMNode[] = []
+  let hrInsertPos = mappedParagraphPos
+
+  if (currentParagraph.content.size === 0) {
+    replacement.push(hrNode, schema.nodes.paragraph.create())
+  } else if (offset === 0) {
+    replacement.push(hrNode, createParagraphLike(currentParagraph, afterContent))
+  } else if (offset === currentParagraph.content.size) {
+    const currentIndex = getTopLevelBlockIndex(tr.doc, mappedParagraphPos)
+    replacement.push(createParagraphLike(currentParagraph, beforeContent), hrNode)
+    if (currentIndex === tr.doc.childCount - 1) replacement.push(schema.nodes.paragraph.create())
+    hrInsertPos = mappedParagraphPos + replacement[0]!.nodeSize
+  } else {
+    const beforeParagraph = createParagraphLike(currentParagraph, beforeContent)
+    const afterParagraph = createParagraphLike(currentParagraph, afterContent)
+    replacement.push(beforeParagraph, hrNode, afterParagraph)
+    hrInsertPos = mappedParagraphPos + beforeParagraph.nodeSize
+  }
+
+  if (replacement[0] === hrNode) hrInsertPos = mappedParagraphPos
+
+  tr = tr.replaceWith(mappedParagraphPos, mappedParagraphPos + currentParagraph.nodeSize, replacement)
+  tr.setSelection(NodeSelection.create(tr.doc, hrInsertPos))
 
   dispatch(tr)
   view.focus()
@@ -417,19 +471,31 @@ const TablePicker: React.FC<{
 
 const TEXT_COLORS = ['#000000', '#FF0000', '#E65C00', '#FFB300', '#1B8000', '#0066CC', '#7B00D4', '#FFFFFF']
 const HIGHLIGHT_COLORS = ['', '#FFFF00', '#99FF99', '#99CCFF', '#FF9999', '#FFB366', '#E0B3FF', '#CCCCCC']
+const HORIZONTAL_RULE_COLORS = ['#000000', '#4B5563', '#9CA3AF', '#EF4444', '#F59E0B', '#84CC16', '#2563EB', '#7C3AED']
+const HORIZONTAL_RULE_STYLE_OPTIONS = [
+  { value: 'solid', label: '实线' },
+  { value: 'dotted', label: '点线' },
+  { value: 'dashed', label: '虚线' },
+  { value: 'dash-dot', label: '点划线' },
+  { value: 'double', label: '双线' },
+] as const
 
 const ColorSwatch: React.FC<{
   colors: string[]
   current: string
+  anchorRect: DOMRect
   onChange: (c: string) => void
   onClose: () => void
-}> = ({ colors, current, onChange, onClose }) => (
-  <div style={{
-    display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 4, padding: 6,
-    background: 'white', border: '1px solid #ccc', borderRadius: 4,
-    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-    position: 'absolute', zIndex: 50, top: '100%', left: 0,
-  }}>
+}> = ({ colors, current, anchorRect, onChange, onClose }) => (
+  <div
+    onMouseDown={e => e.stopPropagation()}
+    style={{
+      display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 4, padding: 6,
+      background: 'white', border: '1px solid #ccc', borderRadius: 4,
+      boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+      position: 'fixed', zIndex: 9999, top: anchorRect.bottom + 4, left: anchorRect.left,
+    }}
+  >
     {colors.map((c, i) => (
       <button key={i} title={c || '无背景'} data-color={c || 'transparent'}
         onMouseDown={(e) => { e.preventDefault(); onChange(c); onClose() }}
@@ -520,11 +586,100 @@ const SpacingPopover: React.FC<{
   )
 }
 
+const PageSettingsPopover: React.FC<{
+  anchorRect: DOMRect
+  section: PageSettingsSection
+  pageConfig: PageConfig
+  onPageConfigChange: (cfg: PageConfig) => void
+  onClose: () => void
+}> = ({ anchorRect, section, pageConfig, onPageConfigChange, onClose }) => {
+  return (
+    <div
+      onMouseDown={e => e.stopPropagation()}
+      style={{
+        position: 'fixed',
+        top: anchorRect.bottom + 10,
+        left: Math.max(16, anchorRect.left),
+        zIndex: 9999,
+      }}
+    >
+      <PageSettingsPanel
+        pageConfig={pageConfig}
+        onPageConfigChange={(cfg) => {
+          onPageConfigChange(cfg)
+          onClose()
+        }}
+        saveLabel="应用"
+        section={section}
+        onOpenAllSettings={() => {
+          if (section !== 'all') {
+            const nextRect = new DOMRect(anchorRect.left, anchorRect.top, anchorRect.width, anchorRect.height)
+            requestAnimationFrame(() => {
+              const event = new CustomEvent('openwps:page-settings-open-all', {
+                detail: { rect: nextRect },
+              })
+              window.dispatchEvent(event)
+            })
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+function PageToolbarButton({
+  label,
+  icon,
+  active,
+  onMouseDown,
+}: {
+  label: string
+  icon: string
+  active: boolean
+  onMouseDown: React.MouseEventHandler<HTMLButtonElement>
+}) {
+  return (
+    <button
+      className={
+        'cursor-pointer select-none rounded text-sm font-medium ' +
+        (active ? 'bg-blue-100 text-blue-700' : 'text-gray-700 hover:bg-gray-100')
+      }
+      onMouseDown={onMouseDown}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '6px 12px',
+        borderRadius: 10,
+      }}
+    >
+      <span
+        style={{
+          width: 18,
+          height: 18,
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: active ? '#2563eb' : '#374151',
+          fontSize: 16,
+          lineHeight: 1,
+        }}
+      >
+        {icon}
+      </span>
+      <span style={{ fontSize: 13 }}>{label}</span>
+      <span style={{ fontSize: 11, color: active ? '#2563eb' : '#6b7280' }}>▾</span>
+    </button>
+  )
+}
+
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
 export const Toolbar: React.FC<ToolbarProps> = ({
   view,
   editorState,
+  pageConfig,
+  onPageConfigChange,
   onToggleSidebar,
   sidebarOpen,
   onToggleWorkspace,
@@ -539,9 +694,15 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onAddComment,
   onOpenTemplates,
 }) => {
-  const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | null>(null)
+  const [colorPickerOpen, setColorPickerOpen] = React.useState<'text' | 'bg' | 'hr-selected' | 'hr-insert' | null>(null)
+  const [colorPickerAnchor, setColorPickerAnchor] = React.useState<DOMRect | null>(null)
+  const [horizontalRuleInsertAttrs, setHorizontalRuleInsertAttrs] = React.useState({
+    lineStyle: 'solid',
+    lineColor: '#cbd5e1',
+  })
   const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
   const [activeTab, setActiveTab] = React.useState<'home' | 'insert' | 'page'>('home')
+  const [pagePopover, setPagePopover] = React.useState<{ section: PageSettingsSection; rect: DOMRect } | null>(null)
   const [tablePickerOpen, setTablePickerOpen] = React.useState(false)
   const tablePickerBtnRef = React.useRef<HTMLButtonElement | null>(null)
   const [collapsed, setCollapsed] = React.useState(false)
@@ -555,11 +716,38 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
   // Close spacing popover on outside click
   React.useEffect(() => {
+    if (!colorPickerOpen) return
+    const handler = () => {
+      setColorPickerOpen(null)
+      setColorPickerAnchor(null)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [colorPickerOpen])
+
+  React.useEffect(() => {
     if (!spacingPopover) return
     const handler = () => setSpacingPopover(null)
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [spacingPopover])
+
+  React.useEffect(() => {
+    if (!pagePopover) return
+    const handler = () => setPagePopover(null)
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [pagePopover])
+
+  React.useEffect(() => {
+    const handleOpenAll = (event: Event) => {
+      const customEvent = event as CustomEvent<{ rect: DOMRect }>
+      if (!customEvent.detail?.rect) return
+      setPagePopover({ section: 'all', rect: customEvent.detail.rect })
+    }
+    window.addEventListener('openwps:page-settings-open-all', handleOpenAll)
+    return () => window.removeEventListener('openwps:page-settings-open-all', handleOpenAll)
+  }, [])
 
   const updateScrollButtons = React.useCallback(() => {
     const el = scrollContainerRef.current
@@ -596,6 +784,15 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
   const selectionInTable = Boolean(editorState && isInTable(editorState))
+  const selectedHorizontalRule = editorState?.selection instanceof NodeSelection && editorState.selection.node.type.name === 'horizontal_rule'
+    ? {
+      pos: editorState.selection.from,
+      attrs: {
+        lineStyle: String(editorState.selection.node.attrs.lineStyle ?? 'solid'),
+        lineColor: String(editorState.selection.node.attrs.lineColor ?? '#cbd5e1'),
+      },
+    }
+    : null
   const fontSizeOptions = Array.from(new Set([
     8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72,
     Number(fmt.text.fontSize),
@@ -636,6 +833,19 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     const tr = state.tr.addMark(resolvedFrom, resolvedTo, schema.marks.textStyle.create({ ...existing, ...attrs }))
     const cursorPos = firstTextPos(tr.doc, resolvedFrom, resolvedTo)
     tr.setSelection(TextSelection.create(tr.doc, cursorPos, resolvedTo))
+    view.dispatch(tr)
+    view.focus()
+  }
+
+  const applyHorizontalRuleAttrs = (attrs: Record<string, unknown>) => {
+    if (!view || !selectedHorizontalRule) return
+    const node = view.state.doc.nodeAt(selectedHorizontalRule.pos)
+    if (!node || node.type.name !== 'horizontal_rule') return
+    const tr = view.state.tr.setNodeMarkup(selectedHorizontalRule.pos, undefined, {
+      ...node.attrs,
+      ...attrs,
+    })
+    tr.setSelection(NodeSelection.create(tr.doc, selectedHorizontalRule.pos))
     view.dispatch(tr)
     view.focus()
   }
@@ -777,6 +987,57 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
                 {sep}
 
+                {selectedHorizontalRule ? (
+                  <>
+                    <span style={{ fontSize: 13, color: '#374151', padding: '0 6px', whiteSpace: 'nowrap' }}>分割线</span>
+                    <select
+                      title="分割线样式"
+                      value={selectedHorizontalRule.attrs.lineStyle}
+                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      onChange={e => applyHorizontalRuleAttrs({ lineStyle: e.target.value })}
+                    >
+                      {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        title="分割线颜色"
+                        onMouseDown={e => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          if (colorPickerOpen === 'hr-selected') {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                            return
+                          }
+                          setColorPickerOpen('hr-selected')
+                          setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                        }}
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                        className={btn(false)}
+                      >
+                        <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                        <span style={{ height: 3, width: 16, background: selectedHorizontalRule.attrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
+                      </button>
+                      {colorPickerOpen === 'hr-selected' && colorPickerAnchor && (
+                        <ColorSwatch
+                          colors={HORIZONTAL_RULE_COLORS}
+                          current={selectedHorizontalRule.attrs.lineColor}
+                          anchorRect={colorPickerAnchor}
+                          onChange={c => { applyHorizontalRuleAttrs({ lineColor: c }) }}
+                          onClose={() => {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                          }}
+                        />
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+
                 {/* 字号 */}
                 <select
                   title="字号"
@@ -820,19 +1081,33 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 <div style={{ position: 'relative' }}>
                   <button
                     title="文字颜色"
-                    onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'text' ? null : 'text') }}
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      if (colorPickerOpen === 'text') {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                        return
+                      }
+                      setColorPickerOpen('text')
+                      setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                    }}
                     style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
                     className={btn(false)}
                   >
                     <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
                     <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
                   </button>
-                  {colorPickerOpen === 'text' && (
+                  {colorPickerOpen === 'text' && colorPickerAnchor && (
                     <ColorSwatch
                       colors={TEXT_COLORS}
                       current={fmt.text.color}
+                      anchorRect={colorPickerAnchor}
                       onChange={c => { if (view) applyTextStyle(view, { color: c }) }}
-                      onClose={() => setColorPickerOpen(null)}
+                      onClose={() => {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                      }}
                     />
                   )}
                 </div>
@@ -841,19 +1116,33 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 <div style={{ position: 'relative' }}>
                   <button
                     title="文字背景色（高亮）"
-                    onMouseDown={e => { e.preventDefault(); setColorPickerOpen(colorPickerOpen === 'bg' ? null : 'bg') }}
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      if (colorPickerOpen === 'bg') {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                        return
+                      }
+                      setColorPickerOpen('bg')
+                      setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                    }}
                     style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
                     className={btn(false)}
                   >
                     <span style={{ fontSize: 11 }}>🖍</span>
                     <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
                   </button>
-                  {colorPickerOpen === 'bg' && (
+                  {colorPickerOpen === 'bg' && colorPickerAnchor && (
                     <ColorSwatch
                       colors={HIGHLIGHT_COLORS}
                       current={fmt.text.backgroundColor}
+                      anchorRect={colorPickerAnchor}
                       onChange={c => { if (view) applyTextStyle(view, { backgroundColor: c }) }}
-                      onClose={() => setColorPickerOpen(null)}
+                      onClose={() => {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                      }}
                     />
                   )}
                 </div>
@@ -874,6 +1163,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 {/* 列表 */}
                 <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
                 <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
+                <button className={btn(fmt.para.listType === 'task')} title="任务列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'task') }}>☐</button>
 
                 {sep}
 
@@ -925,21 +1215,73 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 >
                   段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
                 </button>
+                  </>
+                )}
               </>
             )}
 
             {/* ══ 插入 Tab ══ */}
             {activeTab === 'insert' && (
               <>
+                {selectedHorizontalRule && (
+                  <>
+                    <span style={{ fontSize: 13, color: '#374151', padding: '0 6px', whiteSpace: 'nowrap' }}>分割线</span>
+                    <select
+                      title="分割线样式"
+                      value={selectedHorizontalRule.attrs.lineStyle}
+                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      onChange={e => applyHorizontalRuleAttrs({ lineStyle: e.target.value })}
+                    >
+                      {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        title="分割线颜色"
+                        onMouseDown={e => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          if (colorPickerOpen === 'hr-selected') {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                            return
+                          }
+                          setColorPickerOpen('hr-selected')
+                          setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                        }}
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                        className={btn(false)}
+                      >
+                        <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                        <span style={{ height: 3, width: 16, background: selectedHorizontalRule.attrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
+                      </button>
+                      {colorPickerOpen === 'hr-selected' && colorPickerAnchor && (
+                        <ColorSwatch
+                          colors={HORIZONTAL_RULE_COLORS}
+                          current={selectedHorizontalRule.attrs.lineColor}
+                          anchorRect={colorPickerAnchor}
+                          onChange={c => { applyHorizontalRuleAttrs({ lineColor: c }) }}
+                          onClose={() => {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                          }}
+                        />
+                      )}
+                    </div>
+                    {sep}
+                  </>
+                )}
+
                 {/* 文件操作 */}
                 <button
                   className={btn(false)}
-                  title="打开服务器文件"
+                  title="打开文档目录文件"
                   onMouseDown={e => { e.preventDefault(); void onOpenServerFile?.() }}
                 >📁 打开</button>
                 <button
                   className={btn(false)}
-                  title="保存到服务器文件"
+                  title="保存到文档目录"
                   onMouseDown={e => { e.preventDefault(); void onSaveServerFile?.() }}
                 >💾 保存</button>
                 <button
@@ -961,7 +1303,54 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 {sep}
 
                 {/* 插入内容 */}
-                <button className={btn(false)} title="插入水平分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view) }}>── 分割线</button>
+                <button className={btn(false)} title="插入水平分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view, horizontalRuleInsertAttrs) }}>── 分割线</button>
+                <select
+                  title="插入分割线样式"
+                  value={horizontalRuleInsertAttrs.lineStyle}
+                  style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                  onChange={e => {
+                    setHorizontalRuleInsertAttrs(current => ({ ...current, lineStyle: e.target.value }))
+                  }}
+                >
+                  {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                <div style={{ position: 'relative' }}>
+                  <button
+                    title="插入分割线颜色"
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      if (colorPickerOpen === 'hr-insert') {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                        return
+                      }
+                      setColorPickerOpen('hr-insert')
+                      setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                    }}
+                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                    className={btn(false)}
+                  >
+                    <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                    <span style={{ height: 3, width: 16, background: horizontalRuleInsertAttrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
+                  </button>
+                  {colorPickerOpen === 'hr-insert' && colorPickerAnchor && (
+                    <ColorSwatch
+                      colors={HORIZONTAL_RULE_COLORS}
+                      current={horizontalRuleInsertAttrs.lineColor}
+                      anchorRect={colorPickerAnchor}
+                      onChange={c => {
+                        setHorizontalRuleInsertAttrs(current => ({ ...current, lineColor: c }))
+                      }}
+                      onClose={() => {
+                        setColorPickerOpen(null)
+                        setColorPickerAnchor(null)
+                      }}
+                    />
+                  )}
+                </div>
                 <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞ 分页符</button>
                 <button
                   className={btn(false)}
@@ -1046,7 +1435,42 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
             {/* ══ 页面 Tab ══ */}
             {activeTab === 'page' && (
-              <span style={{ fontSize: 13, color: '#9ca3af', padding: '0 8px' }}>页面设置功能即将推出</span>
+              <>
+                <PageToolbarButton
+                  label="页边距"
+                  icon="▣"
+                  active={pagePopover?.section === 'margins'}
+                  onMouseDown={e => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setPagePopover(current => current?.section === 'margins' ? null : { section: 'margins', rect })
+                  }}
+                />
+                {sep}
+                <PageToolbarButton
+                  label="纸张方向"
+                  icon="↔"
+                  active={pagePopover?.section === 'orientation'}
+                  onMouseDown={e => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setPagePopover(current => current?.section === 'orientation' ? null : { section: 'orientation', rect })
+                  }}
+                />
+                <PageToolbarButton
+                  label="纸张大小"
+                  icon="⧉"
+                  active={pagePopover?.section === 'size'}
+                  onMouseDown={e => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    setPagePopover(current => current?.section === 'size' ? null : { section: 'size', rect })
+                  }}
+                />
+              </>
             )}
           </div>
 
@@ -1123,6 +1547,16 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           value={fmt.para.spaceAfter as number}
           onChange={v => { if (view) applyParaStyle(view, { spaceAfter: v }) }}
           onClose={() => setSpacingPopover(null)}
+        />
+      )}
+
+      {pagePopover && (
+        <PageSettingsPopover
+          anchorRect={pagePopover.rect}
+          section={pagePopover.section}
+          pageConfig={pageConfig}
+          onPageConfigChange={onPageConfigChange}
+          onClose={() => setPagePopover(null)}
         />
       )}
     </>

@@ -99,6 +99,8 @@ async function run() {
             '',
             '## 技术成就',
             '- **语言模型突破**：GPT-3（1750亿参数）和 GPT-4。',
+            '- [ ] 待完成事项',
+            '- [x] 已完成事项',
         ].join('\n')
 
         const importInput = page.locator('input[type="file"][accept*=".md"]')
@@ -121,6 +123,8 @@ async function run() {
         const result = await page.evaluate(() => {
             const paragraphs = Array.from(document.querySelectorAll('.ProseMirror p'))
             const targetParagraph = paragraphs.find((paragraph) => paragraph.textContent?.includes('语言模型突破'))
+            const pendingTask = paragraphs.find((paragraph) => paragraph.textContent?.includes('待完成事项'))
+            const completedTask = paragraphs.find((paragraph) => paragraph.textContent?.includes('已完成事项'))
             if (!targetParagraph) {
                 return { found: false }
             }
@@ -136,6 +140,22 @@ async function run() {
                 containsRawMarkdown: (targetParagraph.textContent ?? '').includes('**'),
                 boldText: span?.textContent ?? '',
                 fontWeight: weight,
+                pendingTask: pendingTask
+                    ? {
+                        className: pendingTask.className,
+                        listType: pendingTask.getAttribute('data-list-type'),
+                        checked: pendingTask.getAttribute('data-list-checked'),
+                        text: pendingTask.textContent ?? '',
+                    }
+                    : null,
+                completedTask: completedTask
+                    ? {
+                        className: completedTask.className,
+                        listType: completedTask.getAttribute('data-list-type'),
+                        checked: completedTask.getAttribute('data-list-checked'),
+                        text: completedTask.textContent ?? '',
+                    }
+                    : null,
             }
         })
 
@@ -143,6 +163,12 @@ async function run() {
         assert(!result.containsRawMarkdown, `正文仍包含 markdown 标记: ${result.text}`)
         assert(result.boldText === '语言模型突破', `粗体文本不符合预期: ${result.boldText}`)
         assert(result.fontWeight && (result.fontWeight === 'bold' || Number(result.fontWeight) >= 700), `粗体样式未生效: ${result.fontWeight}`)
+        assert(result.pendingTask?.listType === 'task', `未完成任务项类型异常: ${JSON.stringify(result.pendingTask)}`)
+        assert(result.pendingTask?.checked === 'false', `未完成任务项状态异常: ${JSON.stringify(result.pendingTask)}`)
+        assert(!result.pendingTask?.text.includes('[ ]'), `未完成任务项仍保留原始 markdown: ${result.pendingTask?.text}`)
+        assert(result.completedTask?.listType === 'task', `已完成任务项类型异常: ${JSON.stringify(result.completedTask)}`)
+        assert(result.completedTask?.checked === 'true', `已完成任务项状态异常: ${JSON.stringify(result.completedTask)}`)
+        assert(!result.completedTask?.text.includes('[x]'), `已完成任务项仍保留原始 markdown: ${result.completedTask?.text}`)
 
         console.log('✅ Markdown 导入列表粗体回归测试通过')
         if (consoleErrors.length === 0) {

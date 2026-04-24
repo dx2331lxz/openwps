@@ -25,6 +25,7 @@ import type {
   OcrConfigData,
 } from '../ai/providers'
 import { paginate, type PageConfig } from '../layout/paginator'
+import ModelPicker from './ModelPicker'
 
 type View = 'history' | 'chat'
 type AssistantMode = 'agent' | 'layout' | 'edit'
@@ -95,14 +96,29 @@ interface Message {
   attachments?: ChatAttachment[]
 }
 
-interface TodoItem {
+interface TaskItem {
   id: string
-  title: string
-  activeForm: string
+  subject: string
+  description: string
+  activeForm?: string
+  owner?: string
   status: 'pending' | 'in_progress' | 'completed'
+  blocks: string[]
+  blockedBy: string[]
+  metadata?: Record<string, unknown>
+}
+
+interface TaskListResponse {
+  tasks: TaskItem[]
+}
+
+interface TaskResponse {
+  task: TaskItem
 }
 
 type OcrTaskType = 'general_parse' | 'document_text' | 'table' | 'chart' | 'handwriting' | 'formula'
+
+const TASK_PANEL_HIDE_DELAY_MS = 5000
 
 interface OcrIntentMatch {
   taskType: OcrTaskType
@@ -475,7 +491,10 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   const target = describeToolTarget(toolCall.params)
   const description = TOOL_DESCRIPTIONS[toolCall.name]
 
-  if (toolCall.name === 'get_todo_list') return '读取当前任务计划状态'
+  if (toolCall.name === 'TaskCreate') return '创建 AI 内部任务'
+  if (toolCall.name === 'TaskGet') return '读取 AI 内部任务详情'
+  if (toolCall.name === 'TaskList') return '读取 AI 内部任务列表'
+  if (toolCall.name === 'TaskUpdate') return '更新 AI 内部任务状态'
   if (toolCall.name === 'get_document_info') return '读取当前文档的统计信息'
   if (toolCall.name === 'get_document_outline') return '读取整篇文档的分页概览和样式概览'
   if (toolCall.name === 'get_document_content') return target ? `读取${target}的内容和样式` : '读取全文内容和样式，辅助后续判断'
@@ -507,11 +526,6 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
     const ruleCount = Array.isArray(toolCall.params.rules) ? toolCall.params.rules.length : 0
     return ruleCount > 0 ? `批量应用 ${ruleCount} 条样式规则` : '批量应用样式规则'
   }
-  if (toolCall.name === 'apply_document_preset') {
-    const preset = String(toolCall.params.preset ?? '')
-    return preset ? `应用"${preset}"文档预设` : '应用文档预设模板'
-  }
-
   return description || '执行工具调用'
 }
 
@@ -520,6 +534,44 @@ function formatToolParams(params: Record<string, unknown>) {
     return JSON.stringify(params, null, 2)
   } catch {
     return String(params)
+  }
+}
+
+function sortTaskItems(tasks: TaskItem[]) {
+  return [...tasks].sort((left, right) => {
+    const leftNum = Number(left.id)
+    const rightNum = Number(right.id)
+    if (Number.isFinite(leftNum) && Number.isFinite(rightNum)) return leftNum - rightNum
+    return left.id.localeCompare(right.id)
+  })
+}
+
+function normalizeTaskItem(raw: unknown): TaskItem | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const status = String(value.status ?? 'pending')
+  if (!['pending', 'in_progress', 'completed'].includes(status)) return null
+  return {
+    id: String(value.id ?? ''),
+    subject: String(value.subject ?? ''),
+    description: String(value.description ?? ''),
+    activeForm: typeof value.activeForm === 'string' && value.activeForm.trim() ? value.activeForm : undefined,
+    owner: typeof value.owner === 'string' && value.owner.trim() ? value.owner : undefined,
+    status: status as TaskItem['status'],
+    blocks: Array.isArray(value.blocks) ? value.blocks.map(item => String(item)).filter(Boolean) : [],
+    blockedBy: Array.isArray(value.blockedBy) ? value.blockedBy.map(item => String(item)).filter(Boolean) : [],
+    metadata: value.metadata && typeof value.metadata === 'object' && !Array.isArray(value.metadata)
+      ? value.metadata as Record<string, unknown>
+      : undefined,
+  }
+}
+
+function buildTaskStats(tasks: TaskItem[]) {
+  return {
+    total: tasks.length,
+    completed: tasks.filter(task => task.status === 'completed').length,
+    pending: tasks.filter(task => task.status === 'pending').length,
+    inProgress: tasks.filter(task => task.status === 'in_progress').length,
   }
 }
 
@@ -969,12 +1021,78 @@ interface ToolPlanExecution {
   sourceToolCallIds: string[]
   mergeStrategy: string
   continueOnError: boolean
+  parallelGroup: string | null
 }
 
 interface ToolExecutionPlan {
   planId: string
   round: number
   executions: ToolPlanExecution[]
+}
+
+const PARALLEL_SAFE_TOOL_NAMES = new Set([
+  'TaskList',
+  'get_document_info',
+  'get_document_outline',
+  'get_document_content',
+  'get_page_content',
+  'get_page_style_summary',
+  'get_paragraph',
+  'get_comments',
+  'workspace_search',
+  'workspace_read',
+  'analyze_image_with_ocr',
+])
+
+function canRunToolInParallel(toolName: string) {
+  return PARALLEL_SAFE_TOOL_NAMES.has(toolName)
+}
+
+function buildExecutionBatches(executions: ToolPlanExecution[]): ToolPlanExecution[][] {
+  const batches: ToolPlanExecution[][] = []
+  let index = 0
+
+  while (index < executions.length) {
+    const current = executions[index]
+    if (!current) break
+
+    const explicitGroup = typeof current.parallelGroup === 'string' && current.parallelGroup.length > 0
+      ? current.parallelGroup
+      : null
+
+    if (explicitGroup) {
+      const batch: ToolPlanExecution[] = [current]
+      let nextIndex = index + 1
+      while (nextIndex < executions.length && executions[nextIndex]?.parallelGroup === explicitGroup) {
+        batch.push(executions[nextIndex]!)
+        nextIndex += 1
+      }
+      batches.push(batch)
+      index = nextIndex
+      continue
+    }
+
+    if (canRunToolInParallel(current.toolName)) {
+      const batch: ToolPlanExecution[] = [current]
+      let nextIndex = index + 1
+      while (nextIndex < executions.length) {
+        const nextExecution = executions[nextIndex]
+        if (!nextExecution) break
+        if (nextExecution.parallelGroup) break
+        if (!canRunToolInParallel(nextExecution.toolName)) break
+        batch.push(nextExecution)
+        nextIndex += 1
+      }
+      batches.push(batch)
+      index = nextIndex
+      continue
+    }
+
+    batches.push([current])
+    index += 1
+  }
+
+  return batches
 }
 
 type ReactMessagePayload =
@@ -1089,6 +1207,7 @@ function parseToolPlanEvent(event: Record<string, unknown>): ToolExecutionPlan |
           : [],
         mergeStrategy: typeof raw.mergeStrategy === 'string' ? raw.mergeStrategy : 'single',
         continueOnError: raw.continueOnError !== false,
+        parallelGroup: typeof raw.parallelGroup === 'string' && raw.parallelGroup.length > 0 ? raw.parallelGroup : null,
       }
     })
     .filter((execution): execution is ToolPlanExecution => Boolean(execution))
@@ -1111,6 +1230,7 @@ function buildFallbackToolPlan(round: number, toolCalls: ToolCallResult[]): Tool
       sourceToolCallIds: toolCall.id ? [toolCall.id] : [],
       mergeStrategy: 'single',
       continueOnError: true,
+      parallelGroup: null,
     })),
   }
 }
@@ -1483,8 +1603,8 @@ export default function AISidebar({
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [assistantMode, setAssistantMode] = useState<AssistantMode>('agent')
-  const [todos, setTodos] = useState<TodoItem[]>([])
-  const [isTodoPanelExpanded, setIsTodoPanelExpanded] = useState(false)
+  const [tasks, setTasks] = useState<TaskItem[]>([])
+  const [isTaskPanelExpanded, setIsTaskPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
   const [providers, setProviders] = useState<AIProviderSettings[]>([])
   const [modelName, setModelName] = useState('')
@@ -1506,7 +1626,8 @@ export default function AISidebar({
   const currentConversationIdRef = useRef<string | null>(null)
   const conversationMessagesRef = useRef<StoredMessage[]>([])
   const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
-  const todosRef = useRef<TodoItem[]>([])
+  const tasksRef = useRef<TaskItem[]>([])
+  const taskHideTimerRef = useRef<number | null>(null)
 
   const activeProvider = useMemo(
     () => providers.find(provider => provider.id === activeProviderId) ?? null,
@@ -1538,8 +1659,90 @@ export default function AISidebar({
   }, [currentConversationId])
 
   useEffect(() => {
-    todosRef.current = todos
-  }, [todos])
+    tasksRef.current = tasks
+  }, [tasks])
+
+  useEffect(() => () => {
+    if (taskHideTimerRef.current != null) {
+      window.clearTimeout(taskHideTimerRef.current)
+      taskHideTimerRef.current = null
+    }
+  }, [])
+
+  const clearTaskHideTimer = useCallback(() => {
+    if (taskHideTimerRef.current != null) {
+      window.clearTimeout(taskHideTimerRef.current)
+      taskHideTimerRef.current = null
+    }
+  }, [])
+
+  const applyTaskState = useCallback((nextTasks: TaskItem[], options?: { preserveExpanded?: boolean }) => {
+    const normalizedTasks = sortTaskItems(nextTasks)
+    clearTaskHideTimer()
+    setTasks(normalizedTasks)
+    tasksRef.current = normalizedTasks
+
+    if (normalizedTasks.length === 0) {
+      setIsTaskPanelExpanded(false)
+      return
+    }
+
+    const hasIncomplete = normalizedTasks.some(task => task.status !== 'completed')
+    if (hasIncomplete) {
+      setIsTaskPanelExpanded(prev => options?.preserveExpanded === true ? prev : (prev || normalizedTasks.length > 0))
+      return
+    }
+
+    setIsTaskPanelExpanded(prev => options?.preserveExpanded === true ? prev : (prev || normalizedTasks.length > 0))
+    const scheduledConversationId = currentConversationIdRef.current
+    if (!scheduledConversationId) return
+
+    taskHideTimerRef.current = window.setTimeout(async () => {
+      if (currentConversationIdRef.current !== scheduledConversationId) return
+      try {
+        const response = await fetch(`/api/conversations/${scheduledConversationId}/tasks/reset-completed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        if (currentConversationIdRef.current !== scheduledConversationId) return
+        setTasks([])
+        tasksRef.current = []
+        setIsTaskPanelExpanded(false)
+      } catch (error) {
+        console.error('[AISidebar] reset completed tasks failed', error)
+      } finally {
+        if (taskHideTimerRef.current != null) {
+          window.clearTimeout(taskHideTimerRef.current)
+          taskHideTimerRef.current = null
+        }
+      }
+    }, TASK_PANEL_HIDE_DELAY_MS)
+  }, [clearTaskHideTimer])
+
+  const fetchTasksForConversation = useCallback(async (conversationId: string, options?: { preserveExpanded?: boolean }) => {
+    const response = await fetch(`/api/conversations/${conversationId}/tasks`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json() as Partial<TaskListResponse>
+    const nextTasks = Array.isArray(payload.tasks)
+      ? payload.tasks.map(normalizeTaskItem).filter((task): task is TaskItem => task !== null)
+      : []
+    applyTaskState(nextTasks, options)
+    return nextTasks
+  }, [applyTaskState])
+
+  useEffect(() => {
+    if (!currentConversationId) {
+      applyTaskState([])
+      return
+    }
+    void fetchTasksForConversation(currentConversationId, { preserveExpanded: true }).catch(error => {
+      console.error('[AISidebar] load conversation tasks failed', error)
+      if (currentConversationIdRef.current === currentConversationId) {
+        applyTaskState([])
+      }
+    })
+  }, [applyTaskState, currentConversationId, fetchTasksForConversation])
 
   const autoResize = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = 'auto'
@@ -1960,9 +2163,7 @@ export default function AISidebar({
 
     const aiMessage = makeAiMessage('', true)
 
-    setTodos([])
-    todosRef.current = []
-    setIsTodoPanelExpanded(false)
+    if (shouldStartNewConversation) applyTaskState([])
     setInput('')
     setPendingAttachments([])
     setIncludeSelection(true)
@@ -2221,7 +2422,7 @@ export default function AISidebar({
           }
         }
 
-        for (const execution of plan.executions) {
+        const executePlannedTool = async (execution: ToolPlanExecution) => {
           const sourceToolCalls = execution.sourceToolCallIds
             .map(toolCallId => toolCallsById.get(toolCallId))
             .filter((toolCall): toolCall is ToolCallResult => toolCall !== undefined)
@@ -2236,48 +2437,92 @@ export default function AISidebar({
           const leaderToolCall = sourceToolCalls[0] ?? fallbackSourceCall
           const executedParams = serializeToolParamsWithSelection(execution.toolName, execution.params, selectionContext)
 
-          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
-
           let result: ExecuteResult
-          if (execution.toolName === 'update_todo_list') {
-            const rawTodos = Array.isArray(executedParams.todos) ? executedParams.todos : []
-            const nextTodos: TodoItem[] = rawTodos
-              .filter((t): t is Record<string, unknown> => t !== null && typeof t === 'object')
-              .map(t => ({
-                id: String(t.id ?? ''),
-                title: String(t.title ?? ''),
-                activeForm: String(t.activeForm ?? t.title ?? ''),
-                status: (['pending', 'in_progress', 'completed'].includes(String(t.status))
-                  ? t.status
-                  : 'pending') as TodoItem['status'],
-              }))
-
-            // Auto-clear when all todos are completed (Claude Code pattern)
-            const allCompleted = nextTodos.length > 0 && nextTodos.every(t => t.status === 'completed')
-            const finalTodos = allCompleted ? [] : nextTodos
-
-            setTodos(finalTodos)
-            todosRef.current = finalTodos
-            result = {
-              success: true,
-              message: allCompleted
-                ? '所有任务已完成，任务清单已自动清空。现在可以向用户总结完成情况。'
-                : 'todo list updated',
-              data: allCompleted
-                ? { cleared: true, completedCount: nextTodos.length }
-                : { todos: finalTodos, total: finalTodos.length },
+          if (execution.toolName === 'TaskCreate') {
+            if (!conversationId) {
+              result = { success: false, message: '当前会话尚未创建，无法创建任务' }
+            } else {
+              try {
+                const response = await fetch(`/api/conversations/${conversationId}/tasks`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(executedParams),
+                })
+                if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                const payload = await response.json() as Partial<TaskResponse>
+                const createdTask = normalizeTaskItem(payload.task)
+                const latestTasks = await fetchTasksForConversation(conversationId)
+                const stats = buildTaskStats(latestTasks)
+                result = createdTask
+                  ? {
+                    success: true,
+                    message: `任务 #${createdTask.id} 已创建：${createdTask.subject}`,
+                    data: { task: createdTask, tasks: latestTasks, ...stats },
+                  }
+                  : { success: false, message: '任务创建成功，但返回结果格式无效' }
+              } catch (error) {
+                result = { success: false, message: error instanceof Error ? error.message : String(error) }
+              }
             }
-          } else if (execution.toolName === 'get_todo_list') {
-            result = {
-              success: true,
-              message: todosRef.current.length > 0 ? `当前有 ${todosRef.current.length} 个任务` : '当前还没有任务计划',
-              data: {
-                todos: todosRef.current,
-                total: todosRef.current.length,
-                completed: todosRef.current.filter(todo => todo.status === 'completed').length,
-                pending: todosRef.current.filter(todo => todo.status === 'pending').length,
-                inProgress: todosRef.current.filter(todo => todo.status === 'in_progress').length,
-              },
+          } else if (execution.toolName === 'TaskGet') {
+            if (!conversationId) {
+              result = { success: false, message: '当前会话尚未创建，无法读取任务' }
+            } else {
+              try {
+                const taskId = String(executedParams.taskId ?? '').trim()
+                const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`)
+                if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                const payload = await response.json() as Partial<TaskResponse>
+                const task = normalizeTaskItem(payload.task)
+                result = task
+                  ? { success: true, message: `已读取任务 #${task.id}`, data: { task } }
+                  : { success: false, message: '任务读取成功，但返回结果格式无效' }
+              } catch (error) {
+                result = { success: false, message: error instanceof Error ? error.message : String(error) }
+              }
+            }
+          } else if (execution.toolName === 'TaskList') {
+            if (!conversationId) {
+              result = { success: false, message: '当前会话尚未创建，无法读取任务列表' }
+            } else {
+              try {
+                const latestTasks = await fetchTasksForConversation(conversationId)
+                const stats = buildTaskStats(latestTasks)
+                result = {
+                  success: true,
+                  message: latestTasks.length > 0 ? `当前有 ${latestTasks.length} 个任务` : '当前还没有任务计划',
+                  data: { tasks: latestTasks, ...stats },
+                }
+              } catch (error) {
+                result = { success: false, message: error instanceof Error ? error.message : String(error) }
+              }
+            }
+          } else if (execution.toolName === 'TaskUpdate') {
+            if (!conversationId) {
+              result = { success: false, message: '当前会话尚未创建，无法更新任务' }
+            } else {
+              try {
+                const taskId = String(executedParams.taskId ?? '').trim()
+                const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(executedParams),
+                })
+                if (!response.ok) throw new Error(`HTTP ${response.status}`)
+                const payload = await response.json() as Partial<TaskResponse>
+                const task = normalizeTaskItem(payload.task)
+                const latestTasks = await fetchTasksForConversation(conversationId)
+                const stats = buildTaskStats(latestTasks)
+                result = task
+                  ? {
+                    success: true,
+                    message: `任务 #${task.id} 已更新为 ${task.status}`,
+                    data: { task, tasks: latestTasks, ...stats },
+                  }
+                  : { success: false, message: '任务更新成功，但返回结果格式无效' }
+              } catch (error) {
+                result = { success: false, message: error instanceof Error ? error.message : String(error) }
+              }
             }
           } else if (execution.toolName === 'begin_streaming_write') {
             const beginResult = editorView
@@ -2325,71 +2570,107 @@ export default function AISidebar({
             console.error('[AISidebar] tool call failed', execution.toolName, executedParams, result.message)
           }
 
-          const mergedFollowerMessage = sourceToolCalls.length > 1
-            ? `${result.success ? '已合并到后端执行计划' : '后端执行计划失败'}：${execution.toolName} x${sourceToolCalls.length}`
-            : result.message
-          const leaderId = sourceToolCalls[0]?.id ?? leaderToolCall.id
+          return {
+            execution,
+            sourceToolCalls,
+            fallbackSourceCall,
+            leaderToolCall,
+            executedParams,
+            result,
+          }
+        }
 
-          updateMessage(message => {
-            let nextMessage = updateToolCallInMessage(
-              message,
-              currentToolCall => Boolean(currentToolCall.id && execution.sourceToolCallIds.includes(currentToolCall.id)),
-              currentToolCall => ({
-                ...currentToolCall,
-                params: currentToolCall.id === leaderId ? executedParams : currentToolCall.params,
-                status: result.success ? 'ok' : 'err',
-                message: currentToolCall.id === leaderId ? result.message : mergedFollowerMessage,
-                data: result.data,
-                isExpanded: false,
-              }),
-            )
+        for (const batch of buildExecutionBatches(plan.executions)) {
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
 
-            if (sourceToolCalls.length === 0) {
-              nextMessage = updateToolCallInMessage(
-                nextMessage,
-                (currentToolCall, index, array) => currentToolCall.name === execution.toolName && index === array.findIndex(item => item.name === execution.toolName),
+          if (batch.length > 1) {
+            updateMessage(message => ({
+              ...message,
+              activityLabel: `正在并行执行 ${batch.length} 个互不冲突的工具...`,
+            }))
+          }
+
+          const completedBatch = batch.length === 1
+            ? [await executePlannedTool(batch[0]!)]
+            : await Promise.all(batch.map(execution => executePlannedTool(execution)))
+
+          for (const completed of completedBatch) {
+            const {
+              execution,
+              sourceToolCalls,
+              fallbackSourceCall,
+              leaderToolCall,
+              executedParams,
+              result,
+            } = completed
+
+            const mergedFollowerMessage = sourceToolCalls.length > 1
+              ? `${result.success ? '已合并到后端执行计划' : '后端执行计划失败'}：${execution.toolName} x${sourceToolCalls.length}`
+              : result.message
+            const leaderId = sourceToolCalls[0]?.id ?? leaderToolCall.id
+
+            updateMessage(message => {
+              let nextMessage = updateToolCallInMessage(
+                message,
+                currentToolCall => Boolean(currentToolCall.id && execution.sourceToolCallIds.includes(currentToolCall.id)),
                 currentToolCall => ({
                   ...currentToolCall,
-                  params: executedParams,
+                  params: currentToolCall.id === leaderId ? executedParams : currentToolCall.params,
                   status: result.success ? 'ok' : 'err',
-                  message: result.message,
+                  message: currentToolCall.id === leaderId ? result.message : mergedFollowerMessage,
                   data: result.data,
                   isExpanded: false,
                 }),
               )
-            }
 
-            const activityLabel =
-              result.success === false
-                ? '正在调整执行方案...'
-                : execution.toolName === 'begin_streaming_write'
-                  ? '正在写入正文...'
-                  : '正在整理工具结果...'
-            return { ...nextMessage, activityLabel }
-          })
-          const persistedSourceCalls: ToolCallResult[] = sourceToolCalls.length > 0 ? sourceToolCalls : [fallbackSourceCall]
-          const sourceRecords = persistedSourceCalls.map(sourceToolCall => ({
-            id: sourceToolCall.id ?? execution.executionId,
-            name: sourceToolCall.name,
-            params: executedParams,
-            originalParams: normalizeToolParams(sourceToolCall.originalParams ?? sourceToolCall.params),
-            result,
-          }))
-          persistedToolResults.push(...sourceRecords)
-          executionResults.push({
-            execution_id: execution.executionId,
-            content: serializeToolResultPayload({
-              toolName: execution.toolName,
+              if (sourceToolCalls.length === 0) {
+                nextMessage = updateToolCallInMessage(
+                  nextMessage,
+                  (currentToolCall, index, array) => currentToolCall.name === execution.toolName && index === array.findIndex(item => item.name === execution.toolName),
+                  currentToolCall => ({
+                    ...currentToolCall,
+                    params: executedParams,
+                    status: result.success ? 'ok' : 'err',
+                    message: result.message,
+                    data: result.data,
+                    isExpanded: false,
+                  }),
+                )
+              }
+
+              const activityLabel =
+                result.success === false
+                  ? '正在调整执行方案...'
+                  : execution.toolName === 'begin_streaming_write'
+                    ? '正在写入正文...'
+                    : '正在整理工具结果...'
+              return { ...nextMessage, activityLabel }
+            })
+            const persistedSourceCalls: ToolCallResult[] = sourceToolCalls.length > 0 ? sourceToolCalls : [fallbackSourceCall]
+            const sourceRecords = persistedSourceCalls.map(sourceToolCall => ({
+              id: sourceToolCall.id ?? execution.executionId,
+              name: sourceToolCall.name,
+              params: executedParams,
+              originalParams: normalizeToolParams(sourceToolCall.originalParams ?? sourceToolCall.params),
               result,
-              executedParams,
-              originalParams: normalizeToolParams(leaderToolCall.originalParams ?? leaderToolCall.params),
-              extra: {
-                executionId: execution.executionId,
-                mergeStrategy: execution.mergeStrategy,
-                sourceToolCallIds: execution.sourceToolCallIds,
-              },
-            }),
-          })
+            }))
+            persistedToolResults.push(...sourceRecords)
+            executionResults.push({
+              execution_id: execution.executionId,
+              content: serializeToolResultPayload({
+                toolName: execution.toolName,
+                result,
+                executedParams,
+                originalParams: normalizeToolParams(leaderToolCall.originalParams ?? leaderToolCall.params),
+                extra: {
+                  executionId: execution.executionId,
+                  mergeStrategy: execution.mergeStrategy,
+                  sourceToolCallIds: execution.sourceToolCallIds,
+                  parallelGroup: execution.parallelGroup ?? null,
+                },
+              }),
+            })
+          }
         }
 
         persistRoundToolResults([...serverExecutedToolResults, ...persistedToolResults])
@@ -2759,7 +3040,6 @@ export default function AISidebar({
       setLoading(false)
       abortRef.current = null
       void loadConversations()
-      setTimeout(() => textareaRef.current?.focus(), 50)
     }
   }, [activeProviderId, activeTemplate, assistantMode, currentModelSupportsVision, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
 
@@ -2876,62 +3156,72 @@ export default function AISidebar({
               <div className="text-sm text-gray-400 text-center py-8">开始一段新的排版对话</div>
             )}
 
-            {/* Todo Panel */}
-            {todos.length > 0 && (
+            {/* Task Panel */}
+            {tasks.length > 0 && (
               <div className="sticky top-0 z-20 -mx-1 px-1 pb-1">
                 <div className="border border-blue-200 rounded-xl overflow-hidden bg-blue-50/95 backdrop-blur-sm shadow-sm flex-shrink-0">
                   {(() => {
-                    const activeTodo = todos.find(todo => todo.status === 'in_progress')
-                      ?? todos.find(todo => todo.status === 'pending')
-                      ?? todos.at(-1)
+                    const activeTask = tasks.find(task => task.status === 'in_progress')
+                      ?? tasks.find(task => task.status === 'pending')
+                      ?? tasks.at(-1)
+                    const taskStats = buildTaskStats(tasks)
                     return (
                       <>
                         <button
                           type="button"
-                          onClick={() => setIsTodoPanelExpanded(prev => !prev)}
+                          onClick={() => setIsTaskPanelExpanded(prev => !prev)}
                           className="w-full flex items-center justify-between px-3 py-2 bg-blue-100 hover:bg-blue-200 transition-colors text-left select-none"
                         >
                           <span className="min-w-0">
-                            <span className="text-xs font-semibold text-blue-700 tracking-wide">📋 任务计划</span>
-                            {!isTodoPanelExpanded && activeTodo && (
+                            <span className="text-xs font-semibold text-blue-700 tracking-wide">📋 内部任务</span>
+                            {!isTaskPanelExpanded && activeTask && (
                               <span className="mt-0.5 block truncate text-[11px] text-blue-600">
-                                {activeTodo.status === 'completed' ? '已完成' :
-                                  activeTodo.status === 'in_progress' ? '进行中' : '待处理'}：{activeTodo.title}
+                                {activeTask.status === 'completed' ? '已完成' :
+                                  activeTask.status === 'in_progress' ? '进行中' : '待处理'}：{activeTask.subject}
                               </span>
                             )}
                           </span>
                           <span className="text-xs text-blue-500 flex items-center gap-1.5">
                             <span>
-                              {todos.filter(t => t.status === 'completed').length}/{todos.length}
+                              {taskStats.completed}/{tasks.length}
                             </span>
-                            <span>{isTodoPanelExpanded ? '▲' : '▼'}</span>
+                            <span>{isTaskPanelExpanded ? '▲' : '▼'}</span>
                           </span>
                         </button>
-                        {isTodoPanelExpanded && (
+                        {isTaskPanelExpanded && (
                           <ul className="px-3 py-2 space-y-1.5">
-                            {todos.map(todo => (
-                              <li key={todo.id} className="flex items-start gap-2 text-xs">
+                            {tasks.map(task => (
+                              <li key={task.id} className="flex items-start gap-2 text-xs">
                                 <span className="flex-shrink-0 mt-px">
-                                  {todo.status === 'completed' ? '✅' :
-                                    todo.status === 'in_progress' ? '🔄' :
+                                  {task.status === 'completed' ? '✅' :
+                                    task.status === 'in_progress' ? '🔄' :
                                       '⬜'}
                                 </span>
-                                <span
-                                  className={
-                                    todo.status === 'completed'
-                                      ? 'text-gray-400 line-through'
-                                      : todo.status === 'in_progress'
-                                        ? 'text-blue-700 font-medium'
-                                        : 'text-gray-600'
-                                  }
-                                >
-                                  {todo.title}
-                                  {todo.status === 'in_progress' && (
-                                    <span
-                                      className="ml-1.5 inline-block text-blue-400"
-                                      style={{ animation: 'blink 1.2s step-end infinite' }}
-                                    >
-                                      …
+                                <span className="min-w-0">
+                                  <span
+                                    className={
+                                      task.status === 'completed'
+                                        ? 'text-gray-400 line-through'
+                                        : task.status === 'in_progress'
+                                          ? 'text-blue-700 font-medium'
+                                          : 'text-gray-600'
+                                    }
+                                  >
+                                    {task.subject}
+                                    {task.status === 'in_progress' && (
+                                      <span
+                                        className="ml-1.5 inline-block text-blue-400"
+                                        style={{ animation: 'blink 1.2s step-end infinite' }}
+                                      >
+                                        …
+                                      </span>
+                                    )}
+                                  </span>
+                                  {(task.owner || task.blockedBy.length > 0) && (
+                                    <span className="mt-0.5 block text-[11px] text-gray-400">
+                                      {task.owner ? `owner: ${task.owner}` : ''}
+                                      {task.owner && task.blockedBy.length > 0 ? ' · ' : ''}
+                                      {task.blockedBy.length > 0 ? `blockedBy: ${task.blockedBy.join(', ')}` : ''}
                                     </span>
                                   )}
                                 </span>
@@ -2945,7 +3235,7 @@ export default function AISidebar({
                 </div>
               </div>
             )}
-            {/* End Todo Panel */}
+            {/* End Task Panel */}
 
             {messages.map(message => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -3073,11 +3363,18 @@ export default function AISidebar({
                             const toolIndex = toolSegmentIndex
                             const toolCall = segment.toolCall
 
-                            // 生成紧凑摘要，特殊处理 update_todo_list
+                            // 生成紧凑摘要，特殊处理 TaskCreate / TaskUpdate
                             let summaryText = summarizeToolPurpose(toolCall)
-                            if (toolCall.name === 'update_todo_list') {
-                              const todoCount = Array.isArray(toolCall.params?.todos) ? toolCall.params.todos.length : 0
-                              summaryText = todoCount > 0 ? `更新任务计划（${todoCount} 个任务）` : '清空任务计划'
+                            if (toolCall.name === 'TaskCreate') {
+                              summaryText = typeof toolCall.params.subject === 'string'
+                                ? `创建内部任务：${toolCall.params.subject}`
+                                : '创建 AI 内部任务'
+                            } else if (toolCall.name === 'TaskUpdate') {
+                              const taskId = typeof toolCall.params.taskId === 'string' ? toolCall.params.taskId : ''
+                              const status = typeof toolCall.params.status === 'string' ? toolCall.params.status : ''
+                              summaryText = taskId
+                                ? `更新任务 #${taskId}${status ? ` → ${status}` : ''}`
+                                : '更新 AI 内部任务'
                             }
 
                             return (
@@ -3325,7 +3622,7 @@ export default function AISidebar({
 
                   <button
                     type="button"
-                    onClick={() => void handleSend(`请严格按照当前激活模板「${activeTemplate?.name ?? ''}」对全文进行排版。优先遵循模板中的 templateText 执行页面、结构、标题和正文样式，不要回退到通用预设。`)}
+                    onClick={() => void handleSend(`请严格按照当前激活模板「${activeTemplate?.name ?? ''}」对全文进行排版。优先遵循模板中的 templateText 执行页面、结构、标题和正文样式，并结合批量样式与页面设置完成排版。`)}
                     disabled={loading || !activeTemplate}
                     className="shrink-0 rounded-full bg-emerald-500 px-3 py-1.5 text-[11px] text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-slate-300"
                   >
@@ -3386,31 +3683,14 @@ export default function AISidebar({
                     ＋
                   </button>
 
-                  <label className="flex min-w-0 flex-1 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
-                    <span className="shrink-0">模型</span>
-                    <select
-                      value={selectedModel || modelName}
-                      onChange={event => setSelectedModel(event.target.value)}
-                      disabled={loading || modelsLoading || (availableModels.length === 0 && !modelName)}
-                      className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
-                      title={selectedModel || modelName || '未配置模型'}
-                    >
-                      {selectedModel && !availableModels.some(model => model.id === selectedModel) && (
-                        <option value={selectedModel}>{selectedModel}</option>
-                      )}
-                      {!selectedModel && modelName && !availableModels.some(model => model.id === modelName) && (
-                        <option value={modelName}>{modelName}</option>
-                      )}
-                      {availableModels.map(model => (
-                        <option key={model.id} value={model.id}>{model.supportsVision ? `${model.id} · 多模态` : model.id}</option>
-                      ))}
-                      {availableModels.length === 0 && (
-                        <option value={selectedModel || modelName || ''}>
-                          {modelsLoading ? '模型加载中...' : (selectedModel || modelName || '未配置模型')}
-                        </option>
-                      )}
-                    </select>
-                  </label>
+                  <ModelPicker
+                    models={availableModels}
+                    value={selectedModel || modelName || ''}
+                    onChange={setSelectedModel}
+                    disabled={loading || modelsLoading}
+                    loading={modelsLoading}
+                    placeholder={availableModels.length === 0 && !modelName ? '未配置模型' : modelName || '选择模型'}
+                  />
 
                   <label className="flex shrink-0 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
                     <span className="shrink-0">模式</span>

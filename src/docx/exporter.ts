@@ -4,6 +4,7 @@ import {
   DocumentGridType,
   ImageRun,
   ExternalHyperlink,
+  HeadingLevel,
   LevelFormat,
   LineRuleType,
   Packer,
@@ -12,6 +13,7 @@ import {
   ShadingType,
   Table,
   TableCell,
+  TableOfContents,
   TableRow,
   TextRun,
   UnderlineType,
@@ -21,7 +23,7 @@ import {
 import { saveAs } from 'file-saver'
 import JSZip from 'jszip'
 import type { Node as PMNode } from 'prosemirror-model'
-import type { PageConfig } from '../layout/paginator'
+import { DEFAULT_PAGE_CONFIG, paginate, type PageConfig, type PaginateResult } from '../layout/paginator'
 import type { DocxTypographyConfig } from './importer'
 import { toDocxFontName } from '../fonts'
 
@@ -138,6 +140,11 @@ async function convertInlineNode(node: PMNode): Promise<ParagraphChild> {
 
 async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions): Promise<Paragraph> {
   const children: ParagraphChild[] = []
+  const listType = String(node.attrs.listType ?? '')
+  const listChecked = Boolean(node.attrs.listChecked)
+  if (listType === 'task') {
+    children.push(new TextRun({ text: `${listChecked ? '☑' : '☐'} ` }))
+  }
   for (let index = 0; index < node.childCount; index += 1) {
     children.push(await convertInlineNode(node.child(index)))
   }
@@ -145,8 +152,21 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
   const lineHeight = Number(node.attrs.lineHeight ?? 1.5)
   const firstLineIndent = Number(node.attrs.firstLineIndent ?? 0)
   const indent = Number(node.attrs.indent ?? 0)
-  const listType = String(node.attrs.listType ?? '')
   const listLevel = Math.max(0, Number(node.attrs.listLevel ?? 0))
+  const headingLevel = Math.min(6, Math.max(0, Number(node.attrs.headingLevel ?? 0)))
+  const heading = headingLevel === 1
+    ? HeadingLevel.HEADING_1
+    : headingLevel === 2
+      ? HeadingLevel.HEADING_2
+      : headingLevel === 3
+        ? HeadingLevel.HEADING_3
+        : headingLevel === 4
+          ? HeadingLevel.HEADING_4
+          : headingLevel === 5
+            ? HeadingLevel.HEADING_5
+            : headingLevel === 6
+              ? HeadingLevel.HEADING_6
+              : undefined
 
   // 计算段落内实际字号（取最大字号作为基准）
   let baseFontSizePt = 0
@@ -180,20 +200,21 @@ async function convertParagraph(node: PMNode, exportOptions: DocxExportOptions):
     : undefined
 
   return new Paragraph({
+    heading,
     alignment: paragraphAlignment(node.attrs.align as string | undefined),
     pageBreakBefore: Boolean(node.attrs.pageBreakBefore),
     indent: firstLineTwip || hangingTwip || leftTwip
       ? {
-          firstLine: firstLineTwip,
-          hanging: hangingTwip,
-          left: leftTwip,
-        }
+        firstLine: firstLineTwip,
+        hanging: hangingTwip,
+        left: leftTwip,
+      }
       : undefined,
-    numbering: listType
+    numbering: listType && listType !== 'task'
       ? {
-          reference: listType === 'bullet' ? 'pm-bullet' : 'pm-ordered',
-          level: listLevel,
-        }
+        reference: listType === 'bullet' ? 'pm-bullet' : 'pm-ordered',
+        level: listLevel,
+      }
       : undefined,
     spacing: {
       line: exportedLineSpacing,
@@ -243,7 +264,81 @@ async function convertTable(node: PMNode, exportOptions: DocxExportOptions): Pro
   })
 }
 
-async function convertNode(node: PMNode, exportOptions: DocxExportOptions): Promise<Paragraph | Table> {
+interface TableOfContentsCachedEntry {
+  title: string
+  level: number
+  page?: number
+}
+
+function normalizeHeadingLevel(rawLevel: unknown) {
+  const level = Number(rawLevel ?? 0)
+  return Number.isInteger(level) && level >= 1 && level <= 6 ? level : null
+}
+
+function getTableOfContentsLevelRange(node: PMNode) {
+  const minLevel = Math.min(6, Math.max(1, Number(node.attrs.minLevel ?? 1)))
+  const maxLevel = Math.min(6, Math.max(minLevel, Number(node.attrs.maxLevel ?? 3)))
+  return { minLevel, maxLevel }
+}
+
+function collectTableOfContentsEntries(
+  pmDoc: PMNode,
+  pageConfig: PageConfig,
+  minLevel: number,
+  maxLevel: number,
+  pagination?: PaginateResult | null,
+): TableOfContentsCachedEntry[] {
+  const resolvedPagination = pagination ?? paginate(pmDoc, pageConfig)
+  const blockPageMap = new Map<number, number>()
+  resolvedPagination.renderedPages.forEach((page, pageIndex) => {
+    page.lines.forEach((line) => {
+      if (!blockPageMap.has(line.blockIndex)) blockPageMap.set(line.blockIndex, pageIndex + 1)
+    })
+  })
+
+  const entries: TableOfContentsCachedEntry[] = []
+  let blockIndex = 0
+  pmDoc.forEach((child) => {
+    if (child.type.name === 'paragraph') {
+      const level = normalizeHeadingLevel(child.attrs.headingLevel)
+      const title = child.textContent.trim()
+      if (level != null && level >= minLevel && level <= maxLevel && title) {
+        entries.push({
+          title,
+          level,
+          page: blockPageMap.get(blockIndex),
+        })
+      }
+    }
+    blockIndex += 1
+  })
+
+  return entries
+}
+
+function convertTableOfContents(
+  node: PMNode,
+  pmDoc: PMNode,
+  pageConfig: PageConfig,
+  pagination?: PaginateResult | null,
+): TableOfContents {
+  const { minLevel, maxLevel } = getTableOfContentsLevelRange(node)
+  const cachedEntries = collectTableOfContentsEntries(pmDoc, pageConfig, minLevel, maxLevel, pagination)
+  return new TableOfContents(String(node.attrs.title ?? '目录') || '目录', {
+    headingStyleRange: `${minLevel}-${maxLevel}`,
+    hyperlink: node.attrs.hyperlink !== false,
+    cachedEntries,
+  })
+}
+
+async function convertNode(
+  node: PMNode,
+  exportOptions: DocxExportOptions,
+  pmDoc: PMNode,
+  pageConfig: PageConfig,
+  pagination?: PaginateResult | null,
+): Promise<Paragraph | Table | TableOfContents> {
+  if (node.type.name === 'table_of_contents') return convertTableOfContents(node, pmDoc, pageConfig, pagination)
   if (node.type.name === 'table') return convertTable(node, exportOptions)
   return convertParagraph(node, exportOptions)
 }
@@ -452,13 +547,14 @@ async function patchDocxSettings(
 export async function buildDocxBlob(
   pmDoc: PMNode,
   pageConfig: PageConfig,
-  exportOptions: DocxExportOptions = {}
+  exportOptions: DocxExportOptions = {},
+  pagination?: PaginateResult | null,
 ) {
-  const children: (Paragraph | Table)[] = []
+  const children: (Paragraph | Table | TableOfContents)[] = []
   for (let index = 0; index < pmDoc.childCount; index += 1) {
     const child = pmDoc.child(index)
     if (child.type.name === 'floating_object') continue
-    children.push(await convertNode(child, exportOptions))
+    children.push(await convertNode(child, exportOptions, pmDoc, pageConfig, pagination))
   }
 
   const sections = [{
@@ -478,10 +574,10 @@ export async function buildDocxBlob(
       },
       grid: exportOptions.docGridLinePitchPt != null
         ? {
-            type: DocumentGridType.LINES,
-            linePitch: Math.round(exportOptions.docGridLinePitchPt * 20),
-            charSpace: 0,
-          }
+          type: DocumentGridType.LINES,
+          linePitch: Math.round(exportOptions.docGridLinePitchPt * 20),
+          charSpace: 0,
+        }
         : undefined,
     },
     children,
@@ -490,17 +586,17 @@ export async function buildDocxBlob(
   const doc = new Document({
     compatibility: exportOptions.typography
       ? {
-          version: 14,
-          spaceForUnderline: exportOptions.typography.spaceForUnderline,
-          balanceSingleByteDoubleByteWidth: exportOptions.typography.balanceSingleByteDoubleByteWidth,
-          doNotLeaveBackslashAlone: exportOptions.typography.doNotLeaveBackslashAlone,
-          underlineTrailingSpaces: exportOptions.typography.underlineTrailingSpaces,
-          doNotExpandShiftReturn: exportOptions.typography.doNotExpandShiftReturn,
-          adjustLineHeightInTable: exportOptions.typography.adjustLineHeightInTable,
-          doNotWrapTextWithPunctuation: exportOptions.typography.doNotWrapTextWithPunct,
-          doNotUseEastAsianBreakRules: exportOptions.typography.doNotUseEastAsianBreakRules,
-          useFELayout: exportOptions.typography.useFELayout,
-        }
+        version: 14,
+        spaceForUnderline: exportOptions.typography.spaceForUnderline,
+        balanceSingleByteDoubleByteWidth: exportOptions.typography.balanceSingleByteDoubleByteWidth,
+        doNotLeaveBackslashAlone: exportOptions.typography.doNotLeaveBackslashAlone,
+        underlineTrailingSpaces: exportOptions.typography.underlineTrailingSpaces,
+        doNotExpandShiftReturn: exportOptions.typography.doNotExpandShiftReturn,
+        adjustLineHeightInTable: exportOptions.typography.adjustLineHeightInTable,
+        doNotWrapTextWithPunctuation: exportOptions.typography.doNotWrapTextWithPunct,
+        doNotUseEastAsianBreakRules: exportOptions.typography.doNotUseEastAsianBreakRules,
+        useFELayout: exportOptions.typography.useFELayout,
+      }
       : undefined,
     numbering: {
       config: [
@@ -531,10 +627,13 @@ export async function buildDocxBlob(
 }
 
 export async function exportDocx(
-  pmDoc: PMNode,
-  pageConfig: PageConfig,
-  exportOptions: DocxExportOptions = {}
+  blobOrDoc: Blob | PMNode,
+  pageConfig?: PageConfig,
+  exportOptions: DocxExportOptions = {},
+  pagination?: PaginateResult | null,
 ) {
-  const blob = await buildDocxBlob(pmDoc, pageConfig, exportOptions)
+  const blob = blobOrDoc instanceof Blob
+    ? blobOrDoc
+    : await buildDocxBlob(blobOrDoc, pageConfig ?? DEFAULT_PAGE_CONFIG, exportOptions, pagination)
   saveAs(blob, 'document.docx')
 }

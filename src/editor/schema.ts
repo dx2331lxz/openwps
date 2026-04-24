@@ -1,15 +1,34 @@
 import { Schema } from 'prosemirror-model'
 import { DEFAULT_EDITOR_FONT_STACK } from '../fonts'
 
+const DEFAULT_HORIZONTAL_RULE_STYLE = 'solid'
+const DEFAULT_HORIZONTAL_RULE_COLOR = '#cbd5e1'
+
+function getHorizontalRuleDomStyle(lineStyle: string, lineColor: string) {
+  switch (lineStyle) {
+    case 'dotted':
+      return `border:none;height:2px;margin:8px 0;background-image:repeating-linear-gradient(to right, ${lineColor} 0 2px, transparent 2px 6px)`
+    case 'dashed':
+      return `border:none;height:2px;margin:8px 0;background-image:repeating-linear-gradient(to right, ${lineColor} 0 12px, transparent 12px 18px)`
+    case 'dash-dot':
+      return `border:none;height:2px;margin:8px 0;background-image:repeating-linear-gradient(to right, ${lineColor} 0 12px, transparent 12px 16px, ${lineColor} 16px 18px, transparent 18px 24px)`
+    case 'double':
+      return `border:none;border-top:1px solid ${lineColor};border-bottom:1px solid ${lineColor};height:5px;margin:8px 0;background:none`
+    default:
+      return `border:none;border-top:1px solid ${lineColor};height:0;margin:8px 0`
+  }
+}
+
 export const schema = new Schema({
   nodes: {
-    doc: { content: '(paragraph|horizontal_rule|table|floating_object)+' },
+    doc: { content: '(paragraph|table_of_contents|horizontal_rule|table|floating_object)+' },
     paragraph: {
       attrs: {
         align: { default: 'left' },
         firstLineIndent: { default: 0 },
         indent: { default: 0 },
         rightIndent: { default: 0 },
+        headingLevel: { default: null },
         fontSizeHint: { default: null },
         fontFamilyHint: { default: null },
         lineHeight: { default: 1.5 },
@@ -17,12 +36,26 @@ export const schema = new Schema({
         spaceAfter: { default: 0 },
         listType: { default: null },
         listLevel: { default: 0 },
+        listChecked: { default: false },
         pageBreakBefore: { default: false },
         tabStops: { default: [] },
       },
       content: 'inline*',
       group: 'block',
-      parseDOM: [{ tag: 'p' }],
+      parseDOM: [{
+        tag: 'p',
+        getAttrs: (dom) => {
+          const element = dom as HTMLElement
+          const rawListChecked = element.getAttribute('data-list-checked')
+          return {
+            listType: element.getAttribute('data-list-type') ?? null,
+            listLevel: element.getAttribute('data-list-level') ? Number(element.getAttribute('data-list-level')) : 0,
+            listChecked: rawListChecked === 'true',
+            headingLevel: element.getAttribute('data-heading-level') ? Number(element.getAttribute('data-heading-level')) : null,
+            pageBreakBefore: element.getAttribute('data-page-break') === 'true',
+          }
+        },
+      }],
       toDOM(node) {
         const style: string[] = []
         if (node.attrs.align !== 'left') style.push(`text-align:${node.attrs.align}`)
@@ -37,6 +70,8 @@ export const schema = new Schema({
         const cls: string[] = []
         if (node.attrs.listType === 'bullet') cls.push('list-bullet')
         if (node.attrs.listType === 'ordered') cls.push('list-ordered')
+        if (node.attrs.listType === 'task') cls.push('list-task')
+        if (node.attrs.listType === 'task' && node.attrs.listChecked) cls.push('list-task-checked')
         if (node.attrs.pageBreakBefore) cls.push('page-break-before')
 
         const domAttrs: Record<string, string | undefined> = {
@@ -45,9 +80,45 @@ export const schema = new Schema({
         }
         if (node.attrs.listType) domAttrs['data-list-type'] = node.attrs.listType
         if (node.attrs.listType) domAttrs['data-list-level'] = String(node.attrs.listLevel ?? 0)
+        if (node.attrs.listType === 'task') domAttrs['data-list-checked'] = String(Boolean(node.attrs.listChecked))
+        if (node.attrs.headingLevel) domAttrs['data-heading-level'] = String(node.attrs.headingLevel)
         if (node.attrs.pageBreakBefore) domAttrs['data-page-break'] = 'true'
 
         return ['p', domAttrs, 0]
+      },
+    },
+    table_of_contents: {
+      group: 'block',
+      atom: true,
+      selectable: true,
+      attrs: {
+        title: { default: '目录' },
+        minLevel: { default: 1 },
+        maxLevel: { default: 3 },
+        hyperlink: { default: true },
+      },
+      parseDOM: [{
+        tag: 'div[data-table-of-contents]',
+        getAttrs: (dom) => {
+          const element = dom as HTMLElement
+          return {
+            title: element.getAttribute('data-title') || '目录',
+            minLevel: element.getAttribute('data-min-level') ? Number(element.getAttribute('data-min-level')) : 1,
+            maxLevel: element.getAttribute('data-max-level') ? Number(element.getAttribute('data-max-level')) : 3,
+            hyperlink: element.getAttribute('data-hyperlink') !== 'false',
+          }
+        },
+      }],
+      toDOM(node) {
+        return ['div', {
+          'data-table-of-contents': 'true',
+          'data-title': node.attrs.title || '目录',
+          'data-min-level': node.attrs.minLevel ?? 1,
+          'data-max-level': node.attrs.maxLevel ?? 3,
+          'data-hyperlink': String(node.attrs.hyperlink !== false),
+          contenteditable: 'false',
+          style: 'border:1px dashed #94a3b8;padding:12px 16px;margin:8px 0;color:#475569;background:#f8fafc',
+        }, `${node.attrs.title || '目录'}（Word 自动目录）`]
       },
     },
     // ─── Table nodes ─────────────────────────────────────────────────────────
@@ -118,8 +189,31 @@ export const schema = new Schema({
     // ─────────────────────────────────────────────────────────────────────────
     horizontal_rule: {
       group: 'block',
-      parseDOM: [{ tag: 'hr' }],
-      toDOM() { return ['hr'] },
+      atom: true,
+      selectable: true,
+      attrs: {
+        lineStyle: { default: DEFAULT_HORIZONTAL_RULE_STYLE },
+        lineColor: { default: DEFAULT_HORIZONTAL_RULE_COLOR },
+      },
+      parseDOM: [{
+        tag: 'hr',
+        getAttrs: (dom) => {
+          const element = dom as HTMLElement
+          return {
+            lineStyle: element.getAttribute('data-line-style') ?? DEFAULT_HORIZONTAL_RULE_STYLE,
+            lineColor: element.getAttribute('data-line-color') ?? element.style.borderTopColor ?? DEFAULT_HORIZONTAL_RULE_COLOR,
+          }
+        },
+      }],
+      toDOM(node) {
+        const lineStyle = String(node.attrs.lineStyle ?? DEFAULT_HORIZONTAL_RULE_STYLE)
+        const lineColor = String(node.attrs.lineColor ?? DEFAULT_HORIZONTAL_RULE_COLOR)
+        return ['hr', {
+          'data-line-style': lineStyle,
+          'data-line-color': lineColor,
+          style: getHorizontalRuleDomStyle(lineStyle, lineColor),
+        }]
+      },
     },
     floating_object: {
       group: 'block',

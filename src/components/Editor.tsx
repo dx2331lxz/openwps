@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { EditorState, Plugin, TextSelection } from 'prosemirror-state'
+import { EditorState, NodeSelection, Plugin, TextSelection } from 'prosemirror-state'
 import { EditorView, Decoration, DecorationSet } from 'prosemirror-view'
 import { DOMParser as PMDOMParser } from 'prosemirror-model'
 import { keymap } from 'prosemirror-keymap'
@@ -13,11 +13,13 @@ import {
   DEFAULT_PAGE_CONFIG,
   type PageConfig,
   type PaginateResult,
+  type DomBlockMetric,
 } from '../layout/paginator'
 import { Toolbar } from './Toolbar'
 import AISidebar from './AISidebar'
 import WorkspacePanel from './WorkspacePanel'
 import FileManagerModal from './FileManagerModal'
+import type { DocumentFileSummary, DocumentSettings, DocumentSource } from './FileManagerModal'
 import SettingsModal from './SettingsModal'
 import { importDocx, type PMNodeJSON } from '../docx/importer'
 import { buildDocxBlob, exportDocx, type DocxExportOptions } from '../docx/exporter'
@@ -36,10 +38,10 @@ const PAGE_GAP = 32 // px gap between A4 cards
 const DOCX_PUNCTUATION_COMPRESSION_PX = -0.34
 const DEFAULT_SERVER_DOCUMENT_NAME = 'document.docx'
 
-interface ServerDocumentSummary {
-  name: string
-  size: number
-  updatedAt: string
+declare global {
+  interface Window {
+    __OPENWPS_TEST_EXPORT_DOCX__?: () => Promise<Blob>
+  }
 }
 
 interface TemplateUpdatePayload {
@@ -57,6 +59,15 @@ interface PendingCommentTarget {
 interface AISettingsSnapshot {
   activeProviderId?: string
   model?: string
+}
+
+const DEFAULT_DOCUMENT_SETTINGS: DocumentSettings = {
+  activeSource: 'internal',
+  wpsDirectory: '',
+  available: true,
+  errorMessage: null,
+  activeDirectory: '',
+  internalDirectory: '',
 }
 
 type TemplateExtractionStatus = 'idle' | 'preparing' | 'analyzing' | 'saving' | 'success' | 'error'
@@ -265,6 +276,19 @@ const PM_STYLES = `
   position: absolute;
   left: calc(var(--list-level, 0) * 2em + 0.5em);
 }
+.ProseMirror p.list-task {
+  padding-left: calc(2em + var(--list-level, 0) * 2em);
+  position: relative;
+}
+.ProseMirror p.list-task::before {
+  content: "☐";
+  position: absolute;
+  left: calc(var(--list-level, 0) * 2em);
+  color: #4b5563;
+}
+.ProseMirror p.list-task.list-task-checked::before {
+  content: "☑";
+}
 .ProseMirror {
   counter-reset: ol-counter;
 }
@@ -345,10 +369,17 @@ const PM_STYLES = `
 .pretext-driving-editor .ProseMirror table * {
   color: #111827 !important;
   -webkit-text-fill-color: #111827 !important;
-  caret-color: #111827 !important;
   text-decoration-color: currentColor !important;
   text-emphasis-color: currentColor !important;
   pointer-events: auto;
+}
+.pretext-driving-editor .ProseMirror table,
+.pretext-driving-editor .ProseMirror table * {
+  caret-color: #111827 !important;
+}
+.ProseMirror [data-pm-image-wrapper],
+.ProseMirror [data-pm-image-wrapper] * {
+  caret-color: transparent !important;
 }
 .pretext-driving-editor .ProseMirror table p,
 .pretext-driving-editor .ProseMirror table span {
@@ -361,8 +392,9 @@ const PM_STYLES = `
   -webkit-text-fill-color: currentColor !important;
 }
 .pretext-driving-editor .ProseMirror hr {
-  opacity: 1;
-  border-top-color: #cbd5e1;
+  opacity: 0;
+  border-top-color: transparent;
+  pointer-events: none;
 }
 .pretext-driving-editor .ProseMirror .pm-comment,
 .pretext-driving-editor .ProseMirror .pm-comment:hover {
@@ -504,6 +536,39 @@ function buildDecos(
   )
 }
 
+function waitForAnimationFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+function parseCssPx(value: string) {
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function collectDomBlockMetrics(view: EditorView): DomBlockMetric[] {
+  const metrics: DomBlockMetric[] = []
+
+  view.state.doc.forEach((node, offset, blockIndex) => {
+    if (node.type.name !== 'table') return
+    const dom = view.nodeDOM(offset)
+    const element = dom instanceof HTMLElement ? dom : null
+    if (!element) return
+
+    const rect = element.getBoundingClientRect()
+    const style = window.getComputedStyle(element)
+    metrics.push({
+      pos: offset,
+      blockIndex,
+      blockType: node.type.name,
+      height: rect.height,
+      marginTop: parseCssPx(style.marginTop),
+      marginBottom: parseCssPx(style.marginBottom),
+    })
+  })
+
+  return metrics
+}
+
 function transactionHasStyleMutation(tx: EditorState['tr']) {
   return tx.steps.some((step) => {
     const stepType = step.toJSON().stepType
@@ -549,6 +614,166 @@ function isCaretAtStartOfParagraphAfterTable(state: EditorState) {
   return previousNode.type.name === 'table'
 }
 
+function getParagraphAtPos(state: EditorState, pos: number) {
+  const candidatePositions = Array.from(new Set([
+    Math.max(0, Math.min(pos, state.doc.content.size)),
+    Math.max(0, Math.min(pos + 1, state.doc.content.size)),
+    Math.max(0, Math.min(pos - 1, state.doc.content.size)),
+  ]))
+
+  for (const candidatePos of candidatePositions) {
+    const $pos = state.doc.resolve(candidatePos)
+    for (let depth = $pos.depth; depth >= 0; depth -= 1) {
+      const node = $pos.node(depth)
+      if (node.type.name !== 'paragraph') continue
+      return {
+        node,
+        pos: depth > 0 ? $pos.before(depth) : 0,
+      }
+    }
+  }
+
+  return null
+}
+
+function clearTaskItemMarker(state: EditorState, dispatch?: (tr: import('prosemirror-state').Transaction) => void) {
+  const { $from, empty } = state.selection
+  if (!empty) return false
+  if ($from.parent.type.name !== 'paragraph') return false
+  if ($from.parent.attrs.listType !== 'task') return false
+  if ($from.parentOffset !== 0) return false
+
+  if (dispatch) {
+    const paragraphPos = $from.before($from.depth)
+    const tr = state.tr.setNodeMarkup(paragraphPos, undefined, {
+      ...$from.parent.attrs,
+      listType: null,
+      listLevel: 0,
+      listChecked: false,
+    })
+    dispatch(tr.scrollIntoView())
+  }
+
+  return true
+}
+
+function insertTaskItemAfter(state: EditorState, dispatch?: (tr: import('prosemirror-state').Transaction) => void) {
+  const { $from, empty } = state.selection
+  if (!empty) return false
+  if ($from.parent.type.name !== 'paragraph') return false
+  if ($from.parent.attrs.listType !== 'task') return false
+  if ($from.parentOffset !== $from.parent.content.size) return false
+
+  if (dispatch) {
+    const paragraphPos = $from.before($from.depth)
+    const insertPos = paragraphPos + $from.parent.nodeSize
+    const newParagraph = schema.nodes.paragraph.create({
+      ...$from.parent.attrs,
+      listType: 'task',
+      listChecked: false,
+    })
+    const tr = state.tr.insert(insertPos, newParagraph)
+    tr.setSelection(TextSelection.create(tr.doc, Math.min(insertPos + 1, tr.doc.content.size)))
+    dispatch(tr.scrollIntoView())
+  }
+
+  return true
+}
+
+function toggleTaskItemCheckedFromPoint(
+  view: EditorView,
+  pos: number,
+  clientX?: number,
+) {
+  if (typeof clientX !== 'number') return false
+
+  const paragraph = getParagraphAtPos(view.state, pos)
+  if (!paragraph || paragraph.node.attrs.listType !== 'task') return false
+
+  const textStartPos = Math.min(paragraph.pos + 1, view.state.doc.content.size)
+  const coords = view.coordsAtPos(textStartPos)
+  const checkboxLeft = coords.left - 24
+  const checkboxRight = coords.left + 4
+
+  if (clientX < checkboxLeft || clientX > checkboxRight) return false
+
+  const nextSelectionPos = Math.max(0, Math.min(pos, view.state.doc.content.size))
+  const tr = view.state.tr.setNodeMarkup(paragraph.pos, undefined, {
+    ...paragraph.node.attrs,
+    listChecked: !Boolean(paragraph.node.attrs.listChecked),
+  })
+  tr.setSelection(TextSelection.create(tr.doc, Math.min(nextSelectionPos, tr.doc.content.size)))
+
+  view.dispatch(tr.scrollIntoView())
+  view.focus()
+  return true
+}
+
+// 在图片相邻位置按 Backspace：仅删除"一个单位"，不要触发 joinBackward 把上一段并入本段。
+//   - 光标右邻是图片  → 删除该图片节点
+//   - 光标左邻是图片且本段尚未开始（parentOffset === 0）→ 在上一段末尾删除一个字符
+//     · 上一段为空段落 → 直接删除该空段
+//     · 上一段是 table 等非 textblock → 不处理（交给后续守卫）
+function deleteAroundImageBackward(state: EditorState, dispatch?: (tr: import('prosemirror-state').Transaction) => void) {
+  const { $from, empty } = state.selection
+  if (!empty) return false
+  const imageType = schema.nodes.image
+
+  const before = $from.nodeBefore
+  if (before && before.type === imageType) {
+    if (dispatch) {
+      const tr = state.tr.delete($from.pos - before.nodeSize, $from.pos)
+      dispatch(tr.scrollIntoView())
+    }
+    return true
+  }
+
+  const after = $from.nodeAfter
+  if (after && after.type === imageType && $from.parentOffset === 0 && $from.depth >= 1) {
+    const paragraphIndex = $from.index($from.depth - 1)
+    if (paragraphIndex === 0) return false
+    const parent = $from.node($from.depth - 1)
+    const prev = parent.maybeChild(paragraphIndex - 1)
+    if (!prev) return false
+    if (!prev.isTextblock) return false
+
+    // 当前段落开始 token 的位置（= 上一兄弟节点的结束位置）
+    const paragraphBefore = $from.before($from.depth)
+    // 上一段落 content 末尾位置（关闭 token 之前）
+    const prevContentEnd = paragraphBefore - 1
+
+    if (dispatch) {
+      let tr
+      if (prev.content.size === 0) {
+        // 删除整个空段
+        tr = state.tr.delete(paragraphBefore - prev.nodeSize, paragraphBefore)
+      } else {
+        // 仅删除上一段末尾一个位置（一个字符或一个 inline atom）
+        tr = state.tr.delete(prevContentEnd - 1, prevContentEnd)
+      }
+      dispatch(tr.scrollIntoView())
+    }
+    return true
+  }
+
+  return false
+}
+
+function deleteAroundImageForward(state: EditorState, dispatch?: (tr: import('prosemirror-state').Transaction) => void) {
+  const { $from, empty } = state.selection
+  if (!empty) return false
+  const imageType = schema.nodes.image
+  const after = $from.nodeAfter
+  if (after && after.type === imageType) {
+    if (dispatch) {
+      const tr = state.tr.delete($from.pos, $from.pos + after.nodeSize)
+      dispatch(tr.scrollIntoView())
+    }
+    return true
+  }
+  return false
+}
+
 function initState(): EditorState {
   const div = document.createElement('div')
   div.innerHTML = '<p>开始输入文字，当内容超过一页高度时将自动出现第二张 A4 白纸...</p>'
@@ -586,11 +811,22 @@ function initState(): EditorState {
         // On macOS, the physical Delete key maps to Backspace. At the start of
         // the paragraph after a table, deleting backward must never pull the
         // following line into the table above.
-        'Backspace': (state) => {
-          return isCaretAtStartOfParagraphAfterTable(state)
+        // 同时：在图片相邻位置只删除"一个单位"，不要把上一段并入本段。
+        'Backspace': (state, dispatch) => {
+          if (isCaretAtStartOfParagraphAfterTable(state)) return true
+          if (clearTaskItemMarker(state, dispatch)) return true
+          if (deleteAroundImageBackward(state, dispatch)) return true
+          return false
         },
-        'Delete': (state) => {
-          return isCaretAtStartOfParagraphAfterTable(state)
+        'Delete': (state, dispatch) => {
+          if (isCaretAtStartOfParagraphAfterTable(state)) return true
+          if (clearTaskItemMarker(state, dispatch)) return true
+          if (deleteAroundImageForward(state, dispatch)) return true
+          return false
+        },
+        'Enter': (state, dispatch) => {
+          if (insertTaskItemAfter(state, dispatch)) return true
+          return false
         },
         'Tab': (state, dispatch) => {
           if (isInTable(state)) return false
@@ -648,13 +884,17 @@ export const Editor: React.FC = () => {
   const docxExportOptionsRef = useRef<DocxExportOptions>({})
   const [pageCount, setPageCount] = useState(1)
   const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
+  const layoutResultRef = useRef<PaginateResult | null>(null)
+  const [layoutSettling, setLayoutSettling] = useState(false)
   const [editorFocused, setEditorFocused] = useState(false)
   const [editorComposing, setEditorComposing] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const docxLetterSpacingRef = useRef(0)
-  const [serverDocuments, setServerDocuments] = useState<ServerDocumentSummary[]>([])
-  const [serverDocumentsLoading, setServerDocumentsLoading] = useState(false)
-  const [serverDocumentsError, setServerDocumentsError] = useState<string | null>(null)
+  const [documentFiles, setDocumentFiles] = useState<DocumentFileSummary[]>([])
+  const [documentFilesLoading, setDocumentFilesLoading] = useState(false)
+  const [documentFilesError, setDocumentFilesError] = useState<string | null>(null)
+  const [documentSettings, setDocumentSettings] = useState<DocumentSettings>(DEFAULT_DOCUMENT_SETTINGS)
+  const [documentSettingsSaving, setDocumentSettingsSaving] = useState(false)
   const [currentDocumentName, setCurrentDocumentName] = useState(DEFAULT_SERVER_DOCUMENT_NAME)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [templateManagerOpen, setTemplateManagerOpen] = useState(false)
@@ -671,6 +911,7 @@ export const Editor: React.FC = () => {
   const [addCommentAnchor, setAddCommentAnchor] = useState<DOMRect | null>(null)
   const [pendingCommentTarget, setPendingCommentTarget] = useState<PendingCommentTarget | null>(null)
   const [visibleComments, setVisibleComments] = useState<SidebarCommentData[]>([])
+  const paginationRunRef = useRef(0)
 
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
   useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
@@ -744,19 +985,30 @@ export const Editor: React.FC = () => {
     setDocxLetterSpacingPx(nextDocxLetterSpacingPx)
   }, [])
 
-  const loadServerDocuments = useCallback(async () => {
-    setServerDocumentsLoading(true)
-    setServerDocumentsError(null)
+  const loadDocumentSettings = useCallback(async () => {
+    const response = await fetch('/api/documents/settings')
+    const data = await readJsonResponse<DocumentSettings>(response)
+    setDocumentSettings(data)
+    return data
+  }, [])
+
+  const loadDocumentFiles = useCallback(async (source?: DocumentSource) => {
+    setDocumentFilesLoading(true)
+    setDocumentFilesError(null)
     try {
-      const response = await fetch('/api/documents')
-      const data = await readJsonResponse<ServerDocumentSummary[]>(response)
-      setServerDocuments(data)
+      const searchParams = new URLSearchParams()
+      if (source) searchParams.set('source', source)
+      const response = await fetch(`/api/documents${searchParams.toString() ? `?${searchParams.toString()}` : ''}`)
+      const data = await readJsonResponse<DocumentFileSummary[]>(response)
+      setDocumentFiles(data)
+      return data
     } catch (error) {
-      console.error('[Editor] load server documents failed', error)
-      setServerDocuments([])
-      setServerDocumentsError(`读取文件列表失败：${error instanceof Error ? error.message : String(error)}`)
+      console.error('[Editor] load document files failed', error)
+      setDocumentFiles([])
+      setDocumentFilesError(`读取文件列表失败：${error instanceof Error ? error.message : String(error)}`)
+      return []
     } finally {
-      setServerDocumentsLoading(false)
+      setDocumentFilesLoading(false)
     }
   }, [])
 
@@ -937,51 +1189,56 @@ export const Editor: React.FC = () => {
     }
   }, [])
 
-  const updateLayoutSnapshot = useCallback((doc: EditorState['doc']) => {
-    const layout = paginate(doc, pageConfigRef.current)
+  const performRepagination = useCallback(async () => {
+    const runId = ++paginationRunRef.current
+    const v = viewRef.current
+    if (!v) return null
+
+    // 确保字体加载完成，防止 Pretext Canvas 和 DOM 表格度量口径不同步。
+    if (document.fonts?.ready) await document.fonts.ready
+    if (runId !== paginationRunRef.current) return null
+
+    // 先移除已有分页 decorations，再等待浏览器完成自然布局。
+    // 表格属于 DOM-owned block，必须读取未被 spacer 污染的真实盒模型。
+    if (pageBreakPlugin.getState(v.state)?.decos !== DecorationSet.empty) {
+      const clearTr = v.state.tr
+        .setMeta('pageBreakDecos', DecorationSet.empty)
+        .setMeta('addToHistory', false)
+      v.updateState(v.state.apply(clearTr))
+    }
+
+    await waitForAnimationFrame()
+    if (runId !== paginationRunRef.current) return null
+
+    const cfg = pageConfigRef.current
+    const doc = v.state.doc
+    const domBlockMetrics = collectDomBlockMetrics(v)
+    const layout = paginate(doc, cfg, { domBlockMetrics })
+    const { breaks } = layout
+    layoutResultRef.current = layout
     setLayoutResult(layout)
-    setPageCount(prev => layout.breaks.length + 1 !== prev ? layout.breaks.length + 1 : prev)
+    setPageCount(prev => breaks.length + 1 !== prev ? breaks.length + 1 : prev)
+
+    const pageBreakDecos = breaks.map((item, index) => {
+      const height = breakWidgetHeight(item.prevPageUsed, cfg)
+      console.log(
+        `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
+      )
+      return { pos: item.pos, height }
+    })
+    const decos = buildDecos(doc, pageBreakDecos)
+    const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
+    v.updateState(v.state.apply(tr))
+    setLayoutSettling(false)
     return layout
   }, [])
 
   const repaginate = useCallback(() => {
     if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(async () => {
-      const v = viewRef.current
-      if (!v) return
-
-      // 确保字体加载完成，防止 Pretext Canvas 测量失败
-      if (document.fonts?.ready) await document.fonts.ready
-
-      // 先移除已有分页 decorations，再基于浏览器的自然换行结果校准断点。
-      // 否则上一次分页插入的 spacer 会反过来影响本次真实行首的判定，造成断点漂移。
-      if (pageBreakPlugin.getState(v.state)?.decos !== DecorationSet.empty) {
-        const clearTr = v.state.tr
-          .setMeta('pageBreakDecos', DecorationSet.empty)
-          .setMeta('addToHistory', false)
-        v.updateState(v.state.apply(clearTr))
-        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-      }
-
-      const cfg = pageConfigRef.current
-      const doc = v.state.doc
-      const layout = paginate(doc, cfg)
-      const { breaks } = layout
-      setLayoutResult(layout)
-      setPageCount(prev => breaks.length + 1 !== prev ? breaks.length + 1 : prev)
-
-      const pageBreakDecos = breaks.map((item, index) => {
-        const height = breakWidgetHeight(item.prevPageUsed, cfg)
-        console.log(
-          `[editor] page break before page ${index + 2}: pos=${item.pos}, renderedUsed=${item.prevPageUsed.toFixed(0)}px, widgetH=${height.toFixed(0)}px`
-        )
-        return { pos: item.pos, height }
-      })
-      const decos = buildDecos(doc, pageBreakDecos)
-      const tr = v.state.tr.setMeta('pageBreakDecos', decos).setMeta('addToHistory', false)
-      v.updateState(v.state.apply(tr))
+    timerRef.current = setTimeout(() => {
+      void performRepagination()
     }, 150)
-  }, [])
+  }, [performRepagination])
 
   useEffect(() => {
     if (!mountRef.current) return
@@ -994,7 +1251,16 @@ export const Editor: React.FC = () => {
     const editorView = new EditorView(mountRef.current, {
       state,
       nodeViews: {
-        image: createImageNodeViewFactory(repaginate),
+        image: createImageNodeViewFactory(
+          () => {
+            const cfg = pageConfigRef.current
+            return {
+              maxWidth: Math.max(20, cfg.pageWidth - cfg.marginLeft - cfg.marginRight),
+              maxHeight: Math.max(20, cfg.pageHeight - cfg.marginTop - cfg.marginBottom),
+            }
+          },
+          repaginate,
+        ),
       },
       handleDOMEvents: {
         keydown: (view, event) => {
@@ -1047,13 +1313,13 @@ export const Editor: React.FC = () => {
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
         setEditorState(next)
-        if (tx.docChanged && document.fonts?.status === 'loaded') {
-          updateLayoutSnapshot(next.doc)
-        }
         if (tx.docChanged && !applyingImportedDocxRef.current && transactionHasStyleMutation(tx)) {
           clearImportedDocxCompatibility()
         }
-        if (tx.docChanged) repaginate()
+        if (tx.docChanged) {
+          setLayoutSettling(true)
+          repaginate()
+        }
       },
     })
 
@@ -1067,11 +1333,32 @@ export const Editor: React.FC = () => {
       editorView.destroy()
       document.head.removeChild(styleEl)
     }
-  }, [clearImportedDocxCompatibility, repaginate, updateLayoutSnapshot])
+  }, [clearImportedDocxCompatibility, repaginate])
 
   useEffect(() => {
     if (viewRef.current) repaginate()
   }, [docxLetterSpacingPx, repaginate])
+
+  const buildCurrentDocxBlob = useCallback(async () => {
+    const editorView = viewRef.current
+    if (!editorView) throw new Error('EditorView is not ready')
+    if (timerRef.current) clearTimeout(timerRef.current)
+    const layout = await performRepagination()
+    return buildDocxBlob(
+      editorView.state.doc,
+      pageConfigRef.current,
+      docxExportOptionsRef.current,
+      layout ?? layoutResultRef.current ?? undefined,
+    )
+  }, [performRepagination])
+
+  useEffect(() => {
+    if (!['127.0.0.1', 'localhost'].includes(window.location.hostname)) return undefined
+    window.__OPENWPS_TEST_EXPORT_DOCX__ = buildCurrentDocxBlob
+    return () => {
+      delete window.__OPENWPS_TEST_EXPORT_DOCX__
+    }
+  }, [buildCurrentDocxBlob])
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -1141,9 +1428,10 @@ export const Editor: React.FC = () => {
     await handleImportDocx(file)
   }, [handleImportDocx, handleImportMarkdown])
 
-  const handleOpenServerDocument = useCallback(async (name: string) => {
+  const handleOpenDocument = useCallback(async (name: string) => {
     try {
-      const response = await fetch(`/api/documents/${encodeURIComponent(name)}`)
+      const searchParams = new URLSearchParams({ source: documentSettings.activeSource })
+      const response = await fetch(`/api/documents/${encodeURIComponent(name)}?${searchParams.toString()}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const blob = await response.blob()
       const file = new File([blob], name, {
@@ -1152,22 +1440,23 @@ export const Editor: React.FC = () => {
       await handleImportDocx(file)
       setCurrentDocumentName(name)
       setFileModalMode(null)
-      await loadServerDocuments()
-      window.alert('服务器文档打开成功')
+      await loadDocumentFiles(documentSettings.activeSource)
+      window.alert(`${documentSettings.activeSource === 'wps_directory' ? 'WPS 目录' : '服务器文档'}打开成功`)
     } catch (error) {
-      console.error('[Editor] open server document failed', error)
+      console.error('[Editor] open document failed', error)
       const message = error instanceof Error ? error.message : String(error)
-      window.alert(`服务器文档打开失败：${message}`)
+      window.alert(`打开文档失败：${message}`)
     }
-  }, [handleImportDocx, loadServerDocuments])
+  }, [documentSettings.activeSource, handleImportDocx, loadDocumentFiles])
 
-  const handleSaveServerDocument = useCallback(async (name?: string) => {
+  const handleSaveDocument = useCallback(async (name?: string) => {
     const editorView = viewRef.current
     if (!editorView) return
     const targetName = (name ?? currentDocumentName).trim() || DEFAULT_SERVER_DOCUMENT_NAME
     try {
-      const blob = await buildDocxBlob(editorView.state.doc, pageConfigRef.current, docxExportOptionsRef.current)
-      const response = await fetch(`/api/documents/${encodeURIComponent(targetName)}`, {
+      const blob = await buildCurrentDocxBlob()
+      const searchParams = new URLSearchParams({ source: documentSettings.activeSource })
+      const response = await fetch(`/api/documents/${encodeURIComponent(targetName)}?${searchParams.toString()}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -1177,46 +1466,103 @@ export const Editor: React.FC = () => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       setCurrentDocumentName(targetName.toLowerCase().endsWith('.docx') ? targetName : `${targetName}.docx`)
       setFileModalMode(null)
-      await loadServerDocuments()
-      window.alert('服务器文档保存成功')
+      await loadDocumentFiles(documentSettings.activeSource)
+      window.alert(`${documentSettings.activeSource === 'wps_directory' ? 'WPS 目录' : '服务器文档'}保存成功`)
     } catch (error) {
-      console.error('[Editor] save server document failed', error)
+      console.error('[Editor] save document failed', error)
       const message = error instanceof Error ? error.message : String(error)
-      window.alert(`服务器文档保存失败：${message}`)
+      window.alert(`保存文档失败：${message}`)
     }
-  }, [currentDocumentName, loadServerDocuments])
+  }, [buildCurrentDocxBlob, currentDocumentName, documentSettings.activeSource, loadDocumentFiles])
 
-  const handleDeleteServerDocument = useCallback(async (name: string) => {
+  const handleDeleteDocument = useCallback(async (name: string) => {
     try {
-      const response = await fetch(`/api/documents/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      const searchParams = new URLSearchParams({ source: documentSettings.activeSource })
+      const response = await fetch(`/api/documents/${encodeURIComponent(name)}?${searchParams.toString()}`, { method: 'DELETE' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       if (currentDocumentName === name) {
         setCurrentDocumentName(DEFAULT_SERVER_DOCUMENT_NAME)
       }
-      await loadServerDocuments()
+      await loadDocumentFiles(documentSettings.activeSource)
     } catch (error) {
-      console.error('[Editor] delete server document failed', error)
+      console.error('[Editor] delete document failed', error)
       const message = error instanceof Error ? error.message : String(error)
-      window.alert(`删除服务器文档失败：${message}`)
+      window.alert(`删除文档失败：${message}`)
     }
-  }, [currentDocumentName, loadServerDocuments])
+  }, [currentDocumentName, documentSettings.activeSource, loadDocumentFiles])
+
+  const handleChangeDocumentSource = useCallback(async (source: DocumentSource) => {
+    setDocumentSettingsSaving(true)
+    try {
+      const response = await fetch('/api/documents/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ activeSource: source }),
+      })
+      const data = await readJsonResponse<DocumentSettings>(response)
+      setDocumentSettings(data)
+      await loadDocumentFiles(data.activeSource)
+    } catch (error) {
+      console.error('[Editor] change document source failed', error)
+      window.alert(`切换文档来源失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setDocumentSettingsSaving(false)
+    }
+  }, [loadDocumentFiles])
+
+  const handleUpdateWpsDirectory = useCallback(async (path: string) => {
+    setDocumentSettingsSaving(true)
+    try {
+      const response = await fetch('/api/documents/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wpsDirectory: path }),
+      })
+      const data = await readJsonResponse<DocumentSettings>(response)
+      setDocumentSettings(data)
+      if (data.activeSource === 'wps_directory') {
+        await loadDocumentFiles('wps_directory')
+      }
+      window.alert('WPS 目录配置已更新')
+    } catch (error) {
+      console.error('[Editor] update wps directory failed', error)
+      window.alert(`更新 WPS 目录失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setDocumentSettingsSaving(false)
+    }
+  }, [loadDocumentFiles])
 
   const openServerFileModal = useCallback(async () => {
     setFileModalMode('open')
-    await loadServerDocuments()
-  }, [loadServerDocuments])
+    try {
+      const settings = await loadDocumentSettings()
+      await loadDocumentFiles(settings.activeSource)
+    } catch (error) {
+      console.error('[Editor] open file modal failed', error)
+      setDocumentFiles([])
+      setDocumentFilesError(`读取文档设置失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [loadDocumentFiles, loadDocumentSettings])
 
   const openSaveFileModal = useCallback(async () => {
     setFileModalMode('save')
-    await loadServerDocuments()
-  }, [loadServerDocuments])
+    try {
+      const settings = await loadDocumentSettings()
+      await loadDocumentFiles(settings.activeSource)
+    } catch (error) {
+      console.error('[Editor] open save modal failed', error)
+      setDocumentFiles([])
+      setDocumentFilesError(`读取文档设置失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [loadDocumentFiles, loadDocumentSettings])
 
   const handleExportDocx = useCallback(async () => {
     const editorView = viewRef.current
     if (!editorView) return
 
     try {
-      await exportDocx(editorView.state.doc, pageConfigRef.current, docxExportOptionsRef.current)
+      const blob = await buildCurrentDocxBlob()
+      await exportDocx(blob)
       window.alert('DOCX 导出成功')
     } catch (error) {
       console.error('[Editor] DOCX export failed', error)
@@ -1341,6 +1687,11 @@ export const Editor: React.FC = () => {
     const clampedPos = Math.max(0, Math.min(pos, editorView.state.doc.content.size))
     editorView.focus()
 
+    if (toggleTaskItemCheckedFromPoint(editorView, clampedPos, clientX)) {
+      setActiveComment(null)
+      return
+    }
+
     // Check if there's a comment mark at this position — if so, show the popover
     // (This path is hit when PretextPageRenderer handles the click, not ProseMirror DOM)
     const $pos = editorView.state.doc.resolve(clampedPos)
@@ -1375,9 +1726,71 @@ export const Editor: React.FC = () => {
     editorView.dispatch(tr)
   }, [])
 
+  const handleRequestNodeSelection = useCallback((pos: number) => {
+    const editorView = viewRef.current
+    if (!editorView) return
+
+    const maxPos = editorView.state.doc.content.size
+    const clampedPos = Math.max(0, Math.min(pos, maxPos))
+    editorView.focus()
+    setActiveComment(null)
+    const selection = NodeSelection.create(editorView.state.doc, clampedPos)
+    const tr = editorView.state.tr.setSelection(selection).setMeta('addToHistory', false)
+    editorView.dispatch(tr)
+  }, [])
+
   // Canvas height = all A4 cards stacked with gaps
   const cfg = pageConfig  // ← 用 state 而非 ref，确保 React 重渲染时拿到最新值
   const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
+  const selectedNodePos = React.useMemo(() => {
+    if (!(editorState?.selection instanceof NodeSelection)) return null
+    return editorState.selection.node.type.name === 'horizontal_rule'
+      || editorState.selection.node.type.name === 'table_of_contents'
+      ? editorState.selection.from
+      : null
+  }, [editorState])
+  const editorInTable = Boolean(editorState && isInTable(editorState))
+  const pretextVisualActive = Boolean(layoutResult && !layoutSettling && !editorComposing && !editorInTable)
+  const visualCaretRect = React.useMemo(() => {
+    if (!layoutResult || !editorState?.selection.empty) return null
+
+    const editorView = viewRef.current
+    const canvas = canvasRef.current
+    if (!editorView || !canvas) return null
+
+    try {
+      const { $head } = editorState.selection
+      const imageType = schema.nodes.image
+      let imagePos: number | null = null
+      let imageEdge: 'left' | 'right' | null = null
+
+      if ($head.nodeAfter?.type === imageType) {
+        imagePos = $head.pos
+        imageEdge = 'left'
+      } else if ($head.nodeBefore?.type === imageType) {
+        imagePos = $head.pos - $head.nodeBefore.nodeSize
+        imageEdge = 'right'
+      }
+
+      const canvasRect = canvas.getBoundingClientRect()
+
+      if (imagePos != null && imageEdge) {
+        const imageDom = editorView.nodeDOM(imagePos)
+        if (imageDom instanceof HTMLElement) {
+          const imageRect = imageDom.getBoundingClientRect()
+          return {
+            left: (imageEdge === 'left' ? imageRect.left : imageRect.right) - canvasRect.left,
+            top: imageRect.top - canvasRect.top,
+            height: Math.max(1, imageRect.height),
+          }
+        }
+      }
+
+      return null
+    } catch {
+      return null
+    }
+  }, [editorState, layoutResult])
 
   return (
     <div className="flex h-screen" style={{ background: '#e8e8e8' }}>
@@ -1392,6 +1805,12 @@ export const Editor: React.FC = () => {
           <Toolbar
             view={view}
             editorState={editorState}
+            pageConfig={pageConfig}
+            onPageConfigChange={(newCfg) => {
+              setPageConfig(newCfg)
+              pageConfigRef.current = newCfg
+              repaginate()
+            }}
             onToggleSidebar={() => setSidebarOpen(o => !o)}
             sidebarOpen={sidebarOpen}
             onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
@@ -1466,7 +1885,7 @@ export const Editor: React.FC = () => {
             ))}
 
             {/* ── Layer 2: Pretext page renderer ── */}
-            {layoutResult && !(editorComposing && !(editorState && isInTable(editorState))) && (
+            {pretextVisualActive && layoutResult && (
               <PretextPageRenderer
                 pages={layoutResult.renderedPages}
                 pageConfig={cfg}
@@ -1474,17 +1893,19 @@ export const Editor: React.FC = () => {
                 caretPos={editorState?.selection.head ?? null}
                 selectionFrom={editorState?.selection.from ?? null}
                 selectionTo={editorState?.selection.to ?? null}
-                showCaret={editorFocused && Boolean(editorState?.selection.empty) && !(editorState && isInTable(editorState))}
-                showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty) && !(editorState && isInTable(editorState))}
+                selectedNodePos={selectedNodePos}
+                showCaret={!visualCaretRect && editorFocused && Boolean(editorState?.selection.empty)}
+                showSelection={editorFocused && Boolean(editorState && !editorState.selection.empty)}
                 onRequestCaretPos={handleRequestCaretPos}
                 onRequestSelectionRange={handleRequestSelectionRange}
+                onRequestNodeSelection={handleRequestNodeSelection}
               />
             )}
 
             {/* ── Layer 3: ProseMirror editor ── */}
             <div
               ref={mountRef}
-              className={layoutResult && !(editorComposing && !(editorState && isInTable(editorState))) ? 'pretext-driving-editor' : undefined}
+              className={pretextVisualActive ? 'pretext-driving-editor' : undefined}
               style={{
                 position: 'absolute',
                 top: cfg.marginTop,
@@ -1494,6 +1915,24 @@ export const Editor: React.FC = () => {
                 zIndex: 2,
               }}
             />
+
+            {pretextVisualActive && visualCaretRect && editorFocused && editorState?.selection.empty && (
+              <div
+                aria-hidden="true"
+                style={{
+                  position: 'absolute',
+                  left: visualCaretRect.left,
+                  top: visualCaretRect.top,
+                  width: 1.5,
+                  height: visualCaretRect.height,
+                  background: '#111',
+                  borderRadius: 1,
+                  zIndex: 4,
+                  pointerEvents: 'none',
+                  animation: 'openwps-caret-blink 1.05s steps(1) infinite',
+                }}
+              />
+            )}
 
             <CommentSidebar
               comments={visibleComments}
@@ -1552,14 +1991,19 @@ export const Editor: React.FC = () => {
       {fileModalMode && (
         <FileManagerModal
           mode={fileModalMode}
-          files={serverDocuments}
-          loading={serverDocumentsLoading}
-          error={serverDocumentsError}
+          files={documentFiles}
+          loading={documentFilesLoading}
+          error={documentFilesError}
+          settings={documentSettings}
+          settingsSaving={documentSettingsSaving}
           initialName={currentDocumentName || DEFAULT_SERVER_DOCUMENT_NAME}
           onClose={() => setFileModalMode(null)}
-          onOpen={handleOpenServerDocument}
-          onSave={handleSaveServerDocument}
-          onDelete={handleDeleteServerDocument}
+          onOpen={handleOpenDocument}
+          onSave={handleSaveDocument}
+          onDelete={handleDeleteDocument}
+          onRefresh={async () => { await loadDocumentFiles(documentSettings.activeSource) }}
+          onChangeSource={handleChangeDocumentSource}
+          onUpdateWpsDirectory={handleUpdateWpsDirectory}
         />
       )}
 
@@ -1611,8 +2055,6 @@ export const Editor: React.FC = () => {
       {/* Settings modal */}
       {settingsOpen && (
         <SettingsModal
-          pageConfig={pageConfig}
-          onPageConfigChange={(newCfg) => { setPageConfig(newCfg); pageConfigRef.current = newCfg; repaginate() }}
           onClose={() => setSettingsOpen(false)}
         />
       )}

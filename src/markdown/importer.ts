@@ -7,11 +7,13 @@ const DEFAULT_PARAGRAPH_ATTRS = {
   align: 'left',
   firstLineIndent: 0,
   indent: 0,
+  headingLevel: null,
   lineHeight: 1.5,
   spaceBefore: 0,
   spaceAfter: 0,
   listType: null,
   listLevel: 0,
+  listChecked: false,
   pageBreakBefore: false,
 } as const
 
@@ -25,6 +27,13 @@ interface InlineContext {
 interface BlockContext {
   baseParagraphAttrs?: ParagraphAttrs
   paragraphOverrides?: ParagraphAttrs
+}
+
+function parseFallbackTaskState(raw: string | undefined) {
+  if (!raw) return null
+  const match = raw.match(/^\s*(?:[-+*]|\d+\.)\s+\[([ xX])\]\s*$/)
+  if (!match) return null
+  return match[1].toLowerCase() === 'x'
 }
 
 function normalizeMarkdown(markdown: string) {
@@ -211,7 +220,17 @@ function blocksFromTokens(tokens: Token[], context: BlockContext): PMNode[] {
       case 'heading': {
         const heading = token as Tokens.Heading
         const fontSize = heading.depth <= 1 ? 22 : heading.depth === 2 ? 18 : heading.depth === 3 ? 16 : 14
-        return [createParagraph(heading.tokens, context, { textStyle: { bold: true, fontSize } })]
+        return [createParagraph(
+          heading.tokens,
+          {
+            ...context,
+            paragraphOverrides: {
+              ...(context.paragraphOverrides ?? {}),
+              headingLevel: Math.min(6, Math.max(1, heading.depth)),
+            },
+          },
+          { textStyle: { bold: true, fontSize } },
+        )]
       }
       case 'hr':
         return [schema.nodes.horizontal_rule.create()]
@@ -243,26 +262,41 @@ function blocksFromTokens(tokens: Token[], context: BlockContext): PMNode[] {
           ? Number(context.paragraphOverrides.listLevel ?? 0) + 1
           : 0
         return list.items.flatMap(item => {
+          const fallbackTaskChecked = parseFallbackTaskState(item.raw)
+          const isTaskItem = item.task || fallbackTaskChecked != null
+          const taskChecked = item.task ? Boolean(item.checked) : Boolean(fallbackTaskChecked)
           const itemBlocks = blocksFromTokens(item.tokens ?? [], {
             ...context,
             paragraphOverrides: {
               ...(context.paragraphOverrides ?? {}),
-              listType: list.ordered ? 'ordered' : 'bullet',
+              listType: isTaskItem ? 'task' : list.ordered ? 'ordered' : 'bullet',
               listLevel: currentLevel,
+              listChecked: isTaskItem ? taskChecked : false,
             },
           })
-
-          if (!item.task || itemBlocks.length === 0) return itemBlocks
-          const first = itemBlocks[0]
-          if (first?.type.name !== 'paragraph') return itemBlocks
-
-          const prefix = createTextNode(item.checked ? '[x] ' : '[ ] ', {})
-          if (!prefix) return itemBlocks
-
-          return [
-            schema.nodes.paragraph.create(first.attrs, [prefix, ...first.content.content]),
-            ...itemBlocks.slice(1),
-          ]
+          if (isTaskItem && itemBlocks.length === 1 && itemBlocks[0]?.type.name === 'paragraph' && itemBlocks[0].textContent === '[ ]') {
+            return [schema.nodes.paragraph.create(
+              {
+                ...itemBlocks[0].attrs,
+                listType: 'task',
+                listLevel: currentLevel,
+                listChecked: taskChecked,
+              },
+            )]
+          }
+          return itemBlocks.map((block, index) => {
+            if (block.type.name !== 'paragraph') return block
+            if (!isTaskItem) return block
+            return schema.nodes.paragraph.create(
+              {
+                ...block.attrs,
+                listType: 'task',
+                listLevel: currentLevel,
+                listChecked: index === 0 ? taskChecked : false,
+              },
+              block.content,
+            )
+          })
         })
       }
       case 'table': {

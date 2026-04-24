@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, AsyncGenerator, TypedDict
@@ -312,7 +312,7 @@ def _build_context_block(context: dict) -> str:
     if active_template and isinstance(active_template, dict):
         parts.append("")
         parts.append("context.activeTemplate = " + json.dumps(active_template, ensure_ascii=False, indent=2))
-        parts.append("以上是当前激活模板。若用户要求按模板排版，优先遵循其中的 templateText，不要先回退到通用预设。")
+        parts.append("以上是当前激活模板。若用户要求按模板排版，优先遵循其中的 templateText，并结合页面设置与批量样式完成排版。")
 
     available_templates = context.get("availableTemplates")
     if available_templates and isinstance(available_templates, list):
@@ -2172,7 +2172,7 @@ MAX_RETRIES_PER_ROUND = 2
 MAX_FORCED_FOLLOW_UPS = 3
 MAX_OUTPUT_CONTINUATIONS = 3
 MAX_MULTIMODAL_IMAGES = 5
-TODO_REMINDER_INTERVAL = 10  # turns between todo reminders (Claude Code pattern)
+TODO_REMINDER_INTERVAL = 10  # turns between task reminders (Claude Code pattern)
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 RETRY_DELAYS = [1.0, 2.0, 4.0]
@@ -2237,7 +2237,7 @@ class LoopState:
     consecutive_empty_content: int = 0
     tool_failure_counts: dict[str, int] = field(default_factory=dict)
     requires_content_verification: bool = False
-    requires_todo_check: bool = False
+    requires_task_check: bool = False
     last_mutation_tools: list[str] = field(default_factory=list)
     round_budget_warning_level: int = 0
     last_token_budget_warning_tier: int = 0
@@ -2250,8 +2250,8 @@ class LoopState:
     previous_workspace_docs: list[dict] = field(default_factory=list)
     previous_template: dict | None = None
     injected_dynamic_boundary: bool = False
-    # Todo reminder tracking
-    rounds_since_last_todo_update: int = 0
+    # Task reminder tracking
+    rounds_since_last_task_update: int = 0
 
 
 # ─── Stop Hooks ────────────────────────────────────────────────────────────────
@@ -2280,7 +2280,7 @@ class CompletionEvaluation:
     decision: CompletionDecision
     reason: str = ""
     hint: str = ""
-    pending_todo_count: int = 0
+    pending_task_count: int = 0
 
 
 @dataclass
@@ -2306,7 +2306,7 @@ class RoundDecision:
     reason: str
     hint_to_model: str = ""
     client_message: str = ""
-    pending_todo_count: int = 0
+    pending_task_count: int = 0
     finish_reason: str = ""
     error_message: str = ""
     budget_evaluation: BudgetEvaluation | None = None
@@ -2328,6 +2328,7 @@ class PlannedToolExecution:
     source_calls: list[SourceToolCall]
     merge_strategy: str = "single"
     continue_on_error: bool = True
+    parallel_group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2335,6 +2336,52 @@ class ToolExecutionPlan:
     plan_id: str
     round: int
     executions: list[PlannedToolExecution]
+
+
+PARALLEL_SAFE_TOOL_NAMES = {
+    "TaskList",
+    "get_document_info",
+    "get_document_outline",
+    "get_document_content",
+    "get_page_content",
+    "get_page_style_summary",
+    "get_paragraph",
+    "get_comments",
+    "workspace_search",
+    "workspace_read",
+    "analyze_image_with_ocr",
+}
+
+
+def _is_parallel_safe_execution(execution: PlannedToolExecution) -> bool:
+    return execution.tool_name in PARALLEL_SAFE_TOOL_NAMES
+
+
+def _assign_parallel_groups(executions: list[PlannedToolExecution]) -> list[PlannedToolExecution]:
+    if len(executions) < 2:
+        return executions
+
+    grouped: list[PlannedToolExecution] = []
+    pending_parallel: list[PlannedToolExecution] = []
+
+    def flush_pending() -> None:
+        nonlocal pending_parallel
+        if len(pending_parallel) > 1:
+            group_id = f"parallel_{uuid.uuid4().hex[:8]}"
+            grouped.extend(replace(item, parallel_group=group_id) for item in pending_parallel)
+        else:
+            grouped.extend(pending_parallel)
+        pending_parallel = []
+
+    for execution in executions:
+        if _is_parallel_safe_execution(execution):
+            pending_parallel.append(execution)
+            continue
+        flush_pending()
+        grouped.append(execution)
+
+    flush_pending()
+    return grouped
 
 
 @dataclass(frozen=True)
@@ -2439,7 +2486,7 @@ def _parse_tool_result_payload(content: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _extract_todos_from_payload(payload: dict[str, Any]) -> list[dict[str, str]] | None:
+def _extract_tasks_from_payload(payload: dict[str, Any]) -> list[dict[str, str]] | None:
     candidates = [
         payload.get("data"),
         payload.get("executedParams"),
@@ -2448,38 +2495,38 @@ def _extract_todos_from_payload(payload: dict[str, Any]) -> list[dict[str, str]]
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        raw_todos = candidate.get("todos")
-        if not isinstance(raw_todos, list):
+        raw_tasks = candidate.get("tasks")
+        if not isinstance(raw_tasks, list):
             continue
-        todos: list[dict[str, str]] = []
-        for item in raw_todos:
+        tasks: list[dict[str, str]] = []
+        for item in raw_tasks:
             if not isinstance(item, dict):
                 continue
-            todos.append({
+            tasks.append({
                 "id": str(item.get("id", "")).strip(),
-                "title": str(item.get("title", "")).strip(),
-                "activeForm": str(item.get("activeForm", item.get("title", ""))).strip(),
+                "subject": str(item.get("subject", item.get("title", ""))).strip(),
+                "activeForm": str(item.get("activeForm", item.get("subject", item.get("title", "")))).strip(),
                 "status": str(item.get("status", "pending")).strip().lower(),
             })
-        return todos
+        return tasks
     return None
 
 
-def _get_latest_todos(messages: list[BaseMessage]) -> list[dict[str, str]]:
+def _get_latest_tasks(messages: list[BaseMessage]) -> list[dict[str, str]]:
     for message in reversed(messages):
         if not isinstance(message, ToolMessage):
             continue
         payload = _parse_tool_result_payload(message.content)
-        todos = _extract_todos_from_payload(payload)
-        if todos is not None:
-            return todos
+        tasks = _extract_tasks_from_payload(payload)
+        if tasks is not None:
+            return tasks
     return []
 
 
-def _get_incomplete_todos(messages: list[BaseMessage]) -> list[dict[str, str]]:
+def _get_incomplete_tasks(messages: list[BaseMessage]) -> list[dict[str, str]]:
     return [
-        todo for todo in _get_latest_todos(messages)
-        if todo.get("status") in {"pending", "in_progress"}
+        task for task in _get_latest_tasks(messages)
+        if task.get("status") in {"pending", "in_progress"}
     ]
 
 
@@ -2496,8 +2543,8 @@ def _tool_results_started_streaming_write(tool_results: list[dict[str, str]]) ->
 def _build_follow_up_hint(
     needs_write_follow_up: bool,
     needs_content_verification: bool,
-    needs_todo_check: bool,
-    incomplete_todos: list[dict[str, str]],
+    needs_task_check: bool,
+    incomplete_tasks: list[dict[str, str]],
 ) -> tuple[str, str]:
     parts: list[str] = []
     reasons: list[str] = []
@@ -2512,22 +2559,22 @@ def _build_follow_up_hint(
         parts.append("你最近执行了正文修改工具，但还没有在修改后调用 get_document_content 或 get_paragraph 进行验证。")
         parts.append("现在必须先读取并确认正文结果是否正确，再决定是否继续或结束。")
 
-    if needs_todo_check:
-        reasons.append("todo_status_unchecked")
-        parts.append("你最近更新过任务计划，但还没有再次调用 get_todo_list 核对最终状态。")
-        parts.append("结束前必须先确认当前 todo 列表，不能直接假设任务已经全部完成。")
+    if needs_task_check:
+        reasons.append("task_status_unchecked")
+        parts.append("你最近更新过内部任务，但还没有再次调用 TaskList 核对最终状态。")
+        parts.append("结束前必须先确认当前任务列表，不能直接假设任务已经全部完成。")
 
-    if incomplete_todos:
-        reasons.append("todo_incomplete")
-        preview_titles = [todo.get("title", "") for todo in incomplete_todos if todo.get("title")][:3]
+    if incomplete_tasks:
+        reasons.append("task_incomplete")
+        preview_titles = [task.get("subject", "") for task in incomplete_tasks if task.get("subject")][:3]
         title_text = f" 未完成项示例：{'；'.join(preview_titles)}。" if preview_titles else ""
         parts.append(
-            f"当前任务计划仍有 {len(incomplete_todos)} 个未完成项（pending / in_progress）。{title_text}"
+            f"当前任务列表仍有 {len(incomplete_tasks)} 个未完成项（pending / in_progress）。{title_text}"
         )
     else:
-        parts.append("如果本轮没有 todo，也至少先调用验证工具确认写入结果，再决定是否结束。")
+        parts.append("如果本轮没有内部任务，也至少先调用验证工具确认写入结果，再决定是否结束。")
 
-    parts.append("只有在验证完成，且 get_todo_list 显示不存在 pending / in_progress 后，才能结束并向用户总结。")
+    parts.append("只有在验证完成，且 TaskList 显示不存在 pending / in_progress 后，才能结束并向用户总结。")
     return "\n".join(parts), reasons[0] if reasons else "continue_required"
 
 
@@ -2546,8 +2593,8 @@ CONTENT_VERIFICATION_TOOLS = {
     "get_paragraph",
 }
 
-TODO_UPDATE_TOOLS = {"update_todo_list"}
-TODO_CHECK_TOOLS = {"get_todo_list"}
+TASK_MUTATION_TOOLS = {"TaskCreate", "TaskUpdate"}
+TASK_CHECK_TOOLS = {"TaskList"}
 
 
 def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str, str]]) -> None:
@@ -2570,54 +2617,54 @@ def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str,
             state.last_mutation_tools.clear()
             continue
 
-        if tool_name in TODO_UPDATE_TOOLS:
-            state.requires_todo_check = True
-            state.rounds_since_last_todo_update = 0
+        if tool_name in TASK_MUTATION_TOOLS:
+            state.requires_task_check = True
+            state.rounds_since_last_task_update = 0
             continue
 
-        if tool_name in TODO_CHECK_TOOLS:
-            state.requires_todo_check = False
-            state.rounds_since_last_todo_update = 0
+        if tool_name in TASK_CHECK_TOOLS:
+            state.requires_task_check = False
+            state.rounds_since_last_task_update = 0
 
 
 def _needs_forced_continuation(state: LoopState, messages: list[BaseMessage]) -> tuple[bool, list[dict[str, str]]]:
-    incomplete_todos = _get_incomplete_todos(messages)
+    incomplete_tasks = _get_incomplete_tasks(messages)
     needs_continue = any([
         state.pending_write_follow_up,
         state.requires_content_verification,
-        state.requires_todo_check,
-        bool(incomplete_todos),
+        state.requires_task_check,
+        bool(incomplete_tasks),
     ])
-    return needs_continue, incomplete_todos
+    return needs_continue, incomplete_tasks
 
 
 def _evaluate_completion_policy(state: LoopState, messages: list[BaseMessage]) -> CompletionEvaluation:
-    needs_continue, incomplete_todos = _needs_forced_continuation(state, messages)
+    needs_continue, incomplete_tasks = _needs_forced_continuation(state, messages)
     if not needs_continue:
         return CompletionEvaluation(
             decision=CompletionDecision.COMPLETE,
             reason="completed",
-            pending_todo_count=0,
+            pending_task_count=0,
         )
 
     if state.forced_follow_up_attempts >= MAX_FORCED_FOLLOW_UPS:
         return CompletionEvaluation(
             decision=CompletionDecision.FAIL,
             reason="forced_follow_up_limit_reached",
-            pending_todo_count=len(incomplete_todos),
+            pending_task_count=len(incomplete_tasks),
         )
 
     hint, reason = _build_follow_up_hint(
         state.pending_write_follow_up,
         state.requires_content_verification,
-        state.requires_todo_check,
-        incomplete_todos,
+        state.requires_task_check,
+        incomplete_tasks,
     )
     return CompletionEvaluation(
         decision=CompletionDecision.CONTINUE_WITH_HINT,
         reason=reason,
         hint=hint,
-        pending_todo_count=len(incomplete_todos),
+        pending_task_count=len(incomplete_tasks),
     )
 
 
@@ -2635,7 +2682,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             hint=(
                 f"自动执行轮次仅剩 {remaining_rounds} 轮，且最近 {stagnant_rounds + 1} 轮没有缩小未完成状态。"
                 f"下一轮只能执行直接收口动作：如果还未验证正文，立刻调用 get_document_content 或 get_paragraph；"
-                f"如果 todo 还未核对，立刻调用 get_todo_list；随后输出最终总结。"
+                f"如果任务列表还未核对，立刻调用 TaskList；随后输出最终总结。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -2655,7 +2702,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             reason="budget_stagnation",
             hint=(
                 f"最近 {stagnant_rounds + 1} 轮没有缩小未完成状态。"
-                f"后续必须放弃新的探索，只做能直接清空 completion gate 的动作：正文验证、todo 核对、最终总结。"
+                f"后续必须放弃新的探索，只做能直接清空 completion gate 的动作：正文验证、TaskList 核对、最终总结。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -2668,7 +2715,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             reason="critical_round_budget",
             hint=(
                 f"自动执行轮次仅剩 {remaining_rounds} 轮。后续必须收敛到最小动作："
-                f"优先完成验证、get_todo_list 核对和最终总结，不要再扩散任务或重新读取大段内容。"
+                f"优先完成验证、TaskList 核对和最终总结，不要再扩散任务或重新读取大段内容。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -2681,7 +2728,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             reason="compressed_context_budget",
             hint=(
                 f"上下文已进入压缩阶段（级别 {state.compression_tier}）。"
-                f"接下来只执行必要动作：优先验证、todo 核对和总结，不要再扩展新的探索步骤。"
+                f"接下来只执行必要动作：优先验证、TaskList 核对和总结，不要再扩展新的探索步骤。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -2694,7 +2741,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             reason="low_round_budget",
             hint=(
                 f"自动执行轮次接近上限，还剩 {remaining_rounds} 轮。"
-                f"后续请保持最小化，只做必要验证、todo 核对和收尾。"
+                f"后续请保持最小化，只做必要验证、TaskList 核对和收尾。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -2729,12 +2776,12 @@ def _mark_budget_warning_emitted(state: LoopState, evaluation: BudgetEvaluation)
 
 
 def _build_budget_progress_signature(state: LoopState, messages: list[BaseMessage]) -> str:
-    incomplete_todos = _get_incomplete_todos(messages)
+    incomplete_tasks = _get_incomplete_tasks(messages)
     return json.dumps(
         {
             "requiresContentVerification": state.requires_content_verification,
-            "requiresTodoCheck": state.requires_todo_check,
-            "incompleteTodoCount": len(incomplete_todos),
+            "requiresTaskCheck": state.requires_task_check,
+            "incompleteTaskCount": len(incomplete_tasks),
             "lastMutationTools": list(state.last_mutation_tools),
         },
         ensure_ascii=False,
@@ -2839,7 +2886,7 @@ def _decide_text_round(state: LoopState, messages: list[BaseMessage]) -> RoundDe
             if completion_evaluation.reason == "post_write_follow_up"
             else "任务计划尚未完成，继续执行后续步骤..."
         ),
-        pending_todo_count=completion_evaluation.pending_todo_count,
+        pending_task_count=completion_evaluation.pending_task_count,
         budget_evaluation=budget_evaluation if budget_evaluation.should_warn else None,
     )
 
@@ -2879,12 +2926,12 @@ def _decide_tool_round(
 
 
 def _snapshot_completion_gate(state: LoopState, messages: list[BaseMessage]) -> dict[str, Any]:
-    incomplete_todos = _get_incomplete_todos(messages)
+    incomplete_tasks = _get_incomplete_tasks(messages)
     return {
         "pendingWriteFollowUp": state.pending_write_follow_up,
         "requiresContentVerification": state.requires_content_verification,
-        "requiresTodoCheck": state.requires_todo_check,
-        "incompleteTodoCount": len(incomplete_todos),
+        "requiresTaskCheck": state.requires_task_check,
+        "incompleteTaskCount": len(incomplete_tasks),
         "lastMutationTools": list(state.last_mutation_tools),
         "forcedFollowUpAttempts": state.forced_follow_up_attempts,
         "stagnantBudgetRounds": state.stagnant_budget_rounds,
@@ -3376,6 +3423,8 @@ def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -
         ))
         index += 1
 
+    executions = _assign_parallel_groups(executions)
+
     return ToolExecutionPlan(
         plan_id=f"plan_{uuid.uuid4().hex[:10]}",
         round=round_number,
@@ -3396,6 +3445,7 @@ def _serialize_execution_plan(plan: ToolExecutionPlan) -> dict[str, Any]:
                 "sourceToolCallIds": [source.id for source in execution.source_calls],
                 "mergeStrategy": execution.merge_strategy,
                 "continueOnError": execution.continue_on_error,
+                "parallelGroup": execution.parallel_group,
             }
             for execution in plan.executions
         ],
@@ -3705,7 +3755,7 @@ def _build_checkpoint_round_summary(
         reason = str(checkpoint.get("reason", "")).strip()
         assistant_preview = _truncate_preview(checkpoint.get("assistantPreview", ""), 60)
         completion_gate = checkpoint.get("completionGate") if isinstance(checkpoint.get("completionGate"), dict) else {}
-        todo_count = int(completion_gate.get("incompleteTodoCount", 0) or 0)
+        task_count = int(completion_gate.get("incompleteTaskCount", 0) or 0)
 
         if compact:
             part = f"R{round_number}:"
@@ -3714,8 +3764,8 @@ def _build_checkpoint_round_summary(
                 part += f"->{transition}"
             if failure_count:
                 part += f" fail={failure_count}"
-            if todo_count:
-                part += f" todo={todo_count}"
+            if task_count:
+                part += f" task={task_count}"
             summary_parts.append(part)
             continue
 
@@ -3728,8 +3778,8 @@ def _build_checkpoint_round_summary(
             part += f" transition={transition}"
         if reason:
             part += f" reason={reason}"
-        if todo_count:
-            part += f" incompleteTodo={todo_count}"
+        if task_count:
+            part += f" incompleteTask={task_count}"
         if assistant_preview:
             part += f' text="{assistant_preview}"'
         summary_parts.append(part)
@@ -4557,13 +4607,13 @@ class QueryCoordinator:
                             "round_complete",
                             round=self.state.round,
                             reason=round_decision.reason,
-                            pendingTodoCount=round_decision.pending_todo_count,
+                            pendingTaskCount=round_decision.pending_task_count,
                         )
                         yield {
                             "type": "round_complete",
                             "reason": round_decision.reason,
                             "message": round_decision.client_message,
-                            "pendingTodoCount": round_decision.pending_todo_count,
+                            "pendingTaskCount": round_decision.pending_task_count,
                             "attempt": self.state.forced_follow_up_attempts,
                         }
                         continue
@@ -4783,23 +4833,24 @@ class QueryCoordinator:
                 for delta_msg in delta_messages:
                     self.session.messages.append(HumanMessage(content=delta_msg))
 
-                # Todo reminder: inject reminder if no todo update for TODO_REMINDER_INTERVAL rounds
-                self.state.rounds_since_last_todo_update += 1
-                if self.state.rounds_since_last_todo_update >= TODO_REMINDER_INTERVAL:
-                    current_todos = _get_latest_todos(self.session.messages)
-                    todo_summary = ""
-                    if current_todos:
+                # Task reminder: inject reminder if task tools haven't been used recently
+                self.state.rounds_since_last_task_update += 1
+                if self.state.rounds_since_last_task_update >= TODO_REMINDER_INTERVAL:
+                    current_tasks = _get_latest_tasks(self.session.messages)
+                    task_summary = ""
+                    if current_tasks:
                         lines = []
-                        for t in current_todos:
-                            status_icon = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}.get(t.get("status", "pending"), "⬜")
-                            lines.append(f"{status_icon} {t.get('title', '?')}")
-                        todo_summary = "\n当前任务列表：\n" + "\n".join(lines)
+                        for task in current_tasks:
+                            status_icon = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}.get(task.get("status", "pending"), "⬜")
+                            lines.append(f"{status_icon} {task.get('subject', '?')}")
+                        task_summary = "\n当前任务列表：\n" + "\n".join(lines)
                     reminder = (
                         f"<system-reminder>\n"
-                        f"TodoWrite 工具已经 {self.state.rounds_since_last_todo_update} 轮未使用。"
-                        f"如果你正在处理多步骤任务，建议使用 update_todo_list 跟踪进度。\n"
-                        f"标记每个任务为 completed 后立即继续下一步，不要批量更新。\n"
-                        f"确保始终至少有一个任务处于 in_progress 状态。{todo_summary}\n"
+                        f"TaskCreate / TaskUpdate 已经 {self.state.rounds_since_last_task_update} 轮未使用。"
+                        f"如果你正在处理多步骤任务，可自行决定是否使用 TaskCreate 建立内部任务，并用 TaskUpdate 跟踪进度。"
+                        f"不要因为用户提到任务列表而使用它；用户提示中的任务列表默认指文档正文任务列表。\n"
+                        f"开始执行前把当前任务标记为 in_progress，完成后立即标记为 completed。"
+                        f"每完成一个任务后优先调用 TaskList 查看剩余任务。{task_summary}\n"
                         f"</system-reminder>"
                     )
                     self.session.messages.append(HumanMessage(content=reminder))
