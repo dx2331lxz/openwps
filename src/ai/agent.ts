@@ -49,6 +49,15 @@ const COLOR_NAMES: Record<string, string> = {
   灰色: '#808080',
 }
 
+function extractTextStyleTarget(message: string) {
+  const match = message.match(
+    /(?:所有|全部)(?:的)?["“”']?(.+?)["“”']?(?:变成|变为|改成|改为|设为|设置为|标成|标为|加粗|粗体|斜体|倾斜|下划线|删除线|红色|蓝色|绿色|黄色|橙色|紫色|黑色|白色|灰色|#)/,
+  )
+  const target = match?.[1]?.trim().replace(/[，,。；;：:\s]+$/g, '')
+  if (!target || /^(全文|所有段落|全部段落|整篇|整个文档)$/.test(target)) return null
+  return target
+}
+
 // ─── Local keyword parser ─────────────────────────────────────────────────────
 
 function parseCommand(message: string): ToolCall[] {
@@ -243,6 +252,10 @@ function parseCommand(message: string): ToolCall[] {
 
   // Emit tool calls
   if (Object.keys(textAttrs).length > 0) {
+    const textStyleTarget = extractTextStyleTarget(msg)
+    if (textStyleTarget && range.type !== 'paragraph' && range.type !== 'paragraphs') {
+      range = { type: 'contains_text', text: textStyleTarget, textOccurrence: 'all' }
+    }
     calls.push({ name: 'set_text_style', params: { ...textAttrs, range } })
   }
   if (Object.keys(paraAttrs).length > 0) {

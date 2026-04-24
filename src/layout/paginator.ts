@@ -1216,7 +1216,7 @@ function measureBlock(
           lineColor: String(node.attrs.lineColor ?? '#cbd5e1'),
         }],
         totalHeight: 20,
-    }
+      }
     case 'table_of_contents': {
       const { minLevel, maxLevel } = getTableOfContentsLevelRange(node)
       const tocEntries = getTableOfContentsEntries(node, headings)

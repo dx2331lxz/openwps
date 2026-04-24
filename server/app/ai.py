@@ -39,6 +39,75 @@ from .delta_injection import compute_all_deltas, build_initial_context_attachmen
 logger = logging.getLogger("uvicorn.error")
 
 
+def _looks_like_tool_result_json_leak(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return (
+            re.search(r'"success"\s*:\s*(true|false)', text) is not None
+            and re.search(r'"message"\s*:', text) is not None
+            and re.search(r'("data"|"toolName"|"executedParams"|"originalParams"|"paramsRepaired")\s*:', text) is not None
+        )
+    if not isinstance(payload, dict):
+        return False
+    return (
+        isinstance(payload.get("success"), bool)
+        and isinstance(payload.get("message"), str)
+        and any(key in payload for key in ("data", "toolName", "executedParams", "originalParams", "paramsRepaired"))
+    )
+
+
+def _strip_tool_result_json_leaks(text: str) -> str:
+    result: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("{", cursor)
+        if start < 0:
+            result.append(text[cursor:])
+            break
+
+        result.append(text[cursor:start])
+        depth = 0
+        in_string = False
+        escaped = False
+        end = -1
+
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string and escaped:
+                escaped = False
+                continue
+            if in_string and char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+
+        if end < 0:
+            tail = text[start:]
+            if _looks_like_tool_result_json_leak(tail):
+                break
+            result.append(tail)
+            break
+
+        candidate = text[start:end]
+        if not _looks_like_tool_result_json_leak(candidate):
+            result.append(candidate)
+        cursor = end
+
+    return re.sub(r"[ \t]+\n", "\n", "".join(result))
+
+
 OCR_ANALYSIS_SYSTEM_PROMPT = """你是 openwps 的 OCR 与样式分析器。你的任务不是聊天，而是把图片里的文档内容和样式线索提取成稳定 JSON。
 
 返回严格 JSON，对象字段必须包含：
@@ -4060,7 +4129,7 @@ async def run_chat(body: ChatRequest) -> dict[str, Any]:
         graph = build_graph(llm)
         result = await graph.ainvoke({"messages": build_messages(prepared_body)})
         response: AIMessage = result["response"]
-        reply = _stringify_content(response.content)
+        reply = _strip_tool_result_json_leaks(_stringify_content(response.content))
         tool_calls = _tool_calls_from_ai_message(response)
 
         if tool_calls and not reply:
@@ -4099,7 +4168,7 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
             if reasoning:
                 yield {"type": "thinking", "content": reasoning}
 
-            content = _stringify_content(chunk.content)
+            content = _strip_tool_result_json_leaks(_stringify_content(chunk.content))
             if content:
                 yield {"type": "content", "content": content}
 
@@ -4221,7 +4290,7 @@ async def _run_llm_round(
             if reasoning:
                 yield {"type": "thinking", "content": reasoning}
 
-            content = _stringify_content(chunk.content)
+            content = _strip_tool_result_json_leaks(_stringify_content(chunk.content))
             if content:
                 assistant_content += content
                 yield {"type": "content", "content": content}

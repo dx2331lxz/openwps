@@ -10,6 +10,7 @@
     "test:markdown-import": "node scripts/test-markdown-import.cjs",
     "test:docx-toc": "node scripts/test-docx-toc.cjs",
     "test:task-list": "node scripts/test-task-list.cjs",
+    "test:ai-text-search-style": "node scripts/test-ai-text-search-style.cjs",
     "test:table-layout": "node scripts/test-table-layout.cjs",
     "test:table-boundary-delete": "node scripts/test-table-boundary-delete.cjs",
     "preview": "vite preview",

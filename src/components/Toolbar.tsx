@@ -1038,183 +1038,183 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 ) : (
                   <>
 
-                {/* 字号 */}
-                <select
-                  title="字号"
-                  value={String(fmt.text.fontSize)}
-                  style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-                  onMouseDown={saveSelection}
-                  onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
-                >
-                  {fontSizeOptions.map(v => (
-                    <option key={v} value={String(v)}>{v}pt</option>
-                  ))}
-                </select>
+                    {/* 字号 */}
+                    <select
+                      title="字号"
+                      value={String(fmt.text.fontSize)}
+                      style={{ width: 58, fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      onMouseDown={saveSelection}
+                      onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
+                    >
+                      {fontSizeOptions.map(v => (
+                        <option key={v} value={String(v)}>{v}pt</option>
+                      ))}
+                    </select>
 
-                {/* 字体 */}
-                <select
-                  title="字体"
-                  value={fmt.text.fontFamily}
-                  style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-                  onMouseDown={saveSelection}
-                  onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
-                >
-                  <option value={FONT_STACKS.song}>宋体</option>
-                  <option value={FONT_STACKS.hei}>黑体</option>
-                  <option value={FONT_STACKS.kai}>楷体</option>
-                  <option value={FONT_STACKS.fang}>仿宋</option>
-                  <option value={FONT_STACKS.arial}>Arial</option>
-                  <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
-                </select>
+                    {/* 字体 */}
+                    <select
+                      title="字体"
+                      value={fmt.text.fontFamily}
+                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      onMouseDown={saveSelection}
+                      onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
+                    >
+                      <option value={FONT_STACKS.song}>宋体</option>
+                      <option value={FONT_STACKS.hei}>黑体</option>
+                      <option value={FONT_STACKS.kai}>楷体</option>
+                      <option value={FONT_STACKS.fang}>仿宋</option>
+                      <option value={FONT_STACKS.arial}>Arial</option>
+                      <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
+                    </select>
 
-                {sep}
+                    {sep}
 
-                {/* B I U S X² X₂ */}
-                <button className={btn(fmt.text.bold)} title="加粗 (Ctrl+B)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }}><b>B</b></button>
-                <button className={btn(fmt.text.italic)} title="斜体 (Ctrl+I)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }}><i>I</i></button>
-                <button className={btn(fmt.text.underline)} title="下划线 (Ctrl+U)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }}><u>U</u></button>
-                <button className={btn(fmt.text.strikethrough)} title="删除线" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }}><s>S</s></button>
-                <button className={btn(fmt.text.superscript)} title="上标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }}>X²</button>
-                <button className={btn(fmt.text.subscript)} title="下标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }}>X₂</button>
+                    {/* B I U S X² X₂ */}
+                    <button className={btn(fmt.text.bold)} title="加粗 (Ctrl+B)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }}><b>B</b></button>
+                    <button className={btn(fmt.text.italic)} title="斜体 (Ctrl+I)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }}><i>I</i></button>
+                    <button className={btn(fmt.text.underline)} title="下划线 (Ctrl+U)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }}><u>U</u></button>
+                    <button className={btn(fmt.text.strikethrough)} title="删除线" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }}><s>S</s></button>
+                    <button className={btn(fmt.text.superscript)} title="上标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }}>X²</button>
+                    <button className={btn(fmt.text.subscript)} title="下标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }}>X₂</button>
 
-                {/* 文字颜色 */}
-                <div style={{ position: 'relative' }}>
-                  <button
-                    title="文字颜色"
-                    onMouseDown={e => {
-                      e.preventDefault()
-                      e.stopPropagation()
-                      if (colorPickerOpen === 'text') {
-                        setColorPickerOpen(null)
-                        setColorPickerAnchor(null)
-                        return
-                      }
-                      setColorPickerOpen('text')
-                      setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
-                    }}
-                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                    className={btn(false)}
-                  >
-                    <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
-                    <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
-                  </button>
-                  {colorPickerOpen === 'text' && colorPickerAnchor && (
-                    <ColorSwatch
-                      colors={TEXT_COLORS}
-                      current={fmt.text.color}
-                      anchorRect={colorPickerAnchor}
-                      onChange={c => { if (view) applyTextStyle(view, { color: c }) }}
-                      onClose={() => {
-                        setColorPickerOpen(null)
-                        setColorPickerAnchor(null)
+                    {/* 文字颜色 */}
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        title="文字颜色"
+                        onMouseDown={e => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          if (colorPickerOpen === 'text') {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                            return
+                          }
+                          setColorPickerOpen('text')
+                          setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                        }}
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                        className={btn(false)}
+                      >
+                        <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
+                        <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
+                      </button>
+                      {colorPickerOpen === 'text' && colorPickerAnchor && (
+                        <ColorSwatch
+                          colors={TEXT_COLORS}
+                          current={fmt.text.color}
+                          anchorRect={colorPickerAnchor}
+                          onChange={c => { if (view) applyTextStyle(view, { color: c }) }}
+                          onClose={() => {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                          }}
+                        />
+                      )}
+                    </div>
+
+                    {/* 背景色 */}
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        title="文字背景色（高亮）"
+                        onMouseDown={e => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          if (colorPickerOpen === 'bg') {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                            return
+                          }
+                          setColorPickerOpen('bg')
+                          setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
+                        }}
+                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
+                        className={btn(false)}
+                      >
+                        <span style={{ fontSize: 11 }}>🖍</span>
+                        <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
+                      </button>
+                      {colorPickerOpen === 'bg' && colorPickerAnchor && (
+                        <ColorSwatch
+                          colors={HIGHLIGHT_COLORS}
+                          current={fmt.text.backgroundColor}
+                          anchorRect={colorPickerAnchor}
+                          onChange={c => { if (view) applyTextStyle(view, { backgroundColor: c }) }}
+                          onClose={() => {
+                            setColorPickerOpen(null)
+                            setColorPickerAnchor(null)
+                          }}
+                        />
+                      )}
+                    </div>
+
+                    {/* 清除格式 */}
+                    <button className={btn(false)} title="清除格式" onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }}>✕</button>
+
+                    {sep}
+
+                    {/* 对齐 */}
+                    <button className={btn(fmt.para.align === 'left')} title="左对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }}>≡L</button>
+                    <button className={btn(fmt.para.align === 'center')} title="居中" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }}>≡C</button>
+                    <button className={btn(fmt.para.align === 'right')} title="右对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }}>≡R</button>
+                    <button className={btn(fmt.para.align === 'justify')} title="两端对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }}>≡J</button>
+
+                    {sep}
+
+                    {/* 列表 */}
+                    <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
+                    <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
+                    <button className={btn(fmt.para.listType === 'task')} title="任务列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'task') }}>☐</button>
+
+                    {sep}
+
+                    {/* 首行缩进 */}
+                    <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
+                    <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
+                    {/* 整体缩进 */}
+                    <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
+                    <button className={btn(false)} title="减少缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }}>⇤</button>
+
+                    {sep}
+
+                    {/* 行距 */}
+                    <select
+                      title="行距"
+                      value={fmt.para.lineHeight}
+                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
+                    >
+                      {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+
+                    {/* 段前间距 */}
+                    <button
+                      title="段前间距"
+                      className={btn(spacingPopover?.which === 'before')}
+                      style={{ minWidth: 52, fontSize: 12 }}
+                      onMouseDown={e => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
+                        setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
                       }}
-                    />
-                  )}
-                </div>
+                    >
+                      段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
+                    </button>
 
-                {/* 背景色 */}
-                <div style={{ position: 'relative' }}>
-                  <button
-                    title="文字背景色（高亮）"
-                    onMouseDown={e => {
-                      e.preventDefault()
-                      e.stopPropagation()
-                      if (colorPickerOpen === 'bg') {
-                        setColorPickerOpen(null)
-                        setColorPickerAnchor(null)
-                        return
-                      }
-                      setColorPickerOpen('bg')
-                      setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
-                    }}
-                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                    className={btn(false)}
-                  >
-                    <span style={{ fontSize: 11 }}>🖍</span>
-                    <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
-                  </button>
-                  {colorPickerOpen === 'bg' && colorPickerAnchor && (
-                    <ColorSwatch
-                      colors={HIGHLIGHT_COLORS}
-                      current={fmt.text.backgroundColor}
-                      anchorRect={colorPickerAnchor}
-                      onChange={c => { if (view) applyTextStyle(view, { backgroundColor: c }) }}
-                      onClose={() => {
-                        setColorPickerOpen(null)
-                        setColorPickerAnchor(null)
+                    {/* 段后间距 */}
+                    <button
+                      title="段后间距"
+                      className={btn(spacingPopover?.which === 'after')}
+                      style={{ minWidth: 52, fontSize: 12 }}
+                      onMouseDown={e => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
+                        setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
                       }}
-                    />
-                  )}
-                </div>
-
-                {/* 清除格式 */}
-                <button className={btn(false)} title="清除格式" onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }}>✕</button>
-
-                {sep}
-
-                {/* 对齐 */}
-                <button className={btn(fmt.para.align === 'left')} title="左对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }}>≡L</button>
-                <button className={btn(fmt.para.align === 'center')} title="居中" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }}>≡C</button>
-                <button className={btn(fmt.para.align === 'right')} title="右对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }}>≡R</button>
-                <button className={btn(fmt.para.align === 'justify')} title="两端对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }}>≡J</button>
-
-                {sep}
-
-                {/* 列表 */}
-                <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
-                <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
-                <button className={btn(fmt.para.listType === 'task')} title="任务列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'task') }}>☐</button>
-
-                {sep}
-
-                {/* 首行缩进 */}
-                <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
-                <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
-                {/* 整体缩进 */}
-                <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
-                <button className={btn(false)} title="减少缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }}>⇤</button>
-
-                {sep}
-
-                {/* 行距 */}
-                <select
-                  title="行距"
-                  value={fmt.para.lineHeight}
-                  style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
-                  onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
-                >
-                  {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
-                </select>
-
-                {/* 段前间距 */}
-                <button
-                  title="段前间距"
-                  className={btn(spacingPopover?.which === 'before')}
-                  style={{ minWidth: 52, fontSize: 12 }}
-                  onMouseDown={e => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
-                    setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
-                  }}
-                >
-                  段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
-                </button>
-
-                {/* 段后间距 */}
-                <button
-                  title="段后间距"
-                  className={btn(spacingPopover?.which === 'after')}
-                  style={{ minWidth: 52, fontSize: 12 }}
-                  onMouseDown={e => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
-                    setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
-                  }}
-                >
-                  段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
-                </button>
+                    >
+                      段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
+                    </button>
                   </>
                 )}
               </>

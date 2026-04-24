@@ -171,6 +171,8 @@ def _get_strategy_section(mode: str | None) -> str:
 ### 4. 排版格式
 - 多范围批量设置 → apply_style_batch（rules 数组，一次调用，返回值含快照）
 - 精细调整单段/选区 → set_text_style / set_paragraph_style（返回值含快照）
+- 只改某个词/短语本身（如“所有杨梅变红/加粗/高亮”）→ set_text_style range={"type":"contains_text","text":"杨梅","textOccurrence":"all"}；不要把包含该词的整段设为样式，除非用户明确说“这些段落”
+- 需要精确锁定某几处、处理大小写（caseSensitive=false 为包容大小写，true 为严格大小写）、或避免匹配到词内子串 → 先 search_text(text, matchMode='exact' 或 'contains')，再把返回的 range/lockedRange 传给 set_text_style
 - 页面设置 → set_page_config
 - 换页 → set_paragraph_style(pageBreakBefore=true) 或 insert_page_break
 - 目录 → 使用 insert_table_of_contents 插入 DOCX 自动目录字段；必要时先用 set_paragraph_style/apply_style_batch 给章节段落设置 headingLevel，不要输出“标题……页码”的正文目录
@@ -193,6 +195,8 @@ def _get_tool_selection_section(mode: str | None) -> str:
 - 无激活模板的全文统一样式 → set_page_config + apply_style_batch
 - 多范围批量设置 → apply_style_batch（一次调用，rules 数组，返回值已含快照）
 - 单段/选区精细调整 → set_text_style / set_paragraph_style
+- 只改匹配文字本身 → set_text_style + range.type=contains_text + textOccurrence='all'；set_paragraph_style + contains_text 才代表改包含该文字的整段
+- 需要先定位文字、指定第几处、区分/包容大小写或避免误改相似词 → search_text，随后使用返回的 range/lockedRange 调用 set_text_style 或 clear_formatting
 - 文档目录 → insert_table_of_contents；若章节还不是真实标题，先给标题段落设置 headingLevel
 - 用户提示词中的“任务列表 / 待办列表 / checklist”一律理解为文档正文里的任务列表，使用 set_paragraph_style(listType='task') 或 apply_style_batch
 - set_text_style / set_paragraph_style / clear_formatting 返回值已含受影响段落快照，无需额外 get_document_content 验证
@@ -205,6 +209,8 @@ def _get_tool_selection_section(mode: str | None) -> str:
 **工具选择**：
 - 全文排版 → 先 set_page_config，再用 apply_style_batch 批量覆盖标题与正文
 - 多范围批量 → apply_style_batch（比多次 set_text_style 效率高 10x）
+- 只改匹配文字本身 → set_text_style + range.type=contains_text + textOccurrence='all'；set_paragraph_style + contains_text 才代表改包含该文字的整段
+- 精确定位文字 → search_text 返回 matchIndex、段内 offset 和 text_ranges；按这些锁定范围改样式，避免因段落含词而误改整段
 - 目录 → insert_table_of_contents 是唯一正确工具；不得用 begin_streaming_write 或 insert_paragraph_after 写带点线和页码的文字目录
 - 用户提示词中的“任务列表 / 待办列表 / checklist”一律指正文里的任务列表，使用 set_paragraph_style(listType='task') / apply_style_batch
 - begin_streaming_write 只在准备好直接输出正文时调用，调用后立刻输出内容，不要再思考
@@ -289,9 +295,9 @@ def _get_reply_section(mode: str | None = None) -> str:
     """Reply guidelines."""
     if mode == "edit":
         return """## 回复
-操作完成后简短说明变更，不编造段落内容。"""
+操作完成后简短说明变更，不编造段落内容。不要把工具调用参数、工具返回 JSON、段落快照或内部执行日志直接输出给用户。"""
     return """## 回复
-操作完成后简短说明变更内容，不编造段落内容。"""
+操作完成后简短说明变更内容，不编造段落内容。不要把工具调用参数、工具返回 JSON、段落快照或内部执行日志直接输出给用户。"""
 
 
 # ─── Static Section Assembly ───────────────────────────────────────────────────

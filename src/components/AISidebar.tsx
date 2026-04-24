@@ -501,6 +501,7 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'get_page_content') return target ? `查看${target}的分页快照` : '查看指定页面的排版快照'
   if (toolCall.name === 'get_page_style_summary') return target ? `查看${target}的样式摘要` : '查看指定页面的样式摘要'
   if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
+  if (toolCall.name === 'search_text') return target ? `搜索${target}的精确文字位置` : '搜索文字并锁定匹配位置'
   if (toolCall.name === 'web_search') return '联网搜索最新网页、新闻或外部资料'
   if (toolCall.name === 'set_page_config') return '调整纸张大小、方向或页边距'
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
@@ -936,11 +937,12 @@ function makeUserMessage(text: string, sidebarWidth: number, attachments: ChatAt
 }
 
 function makeAiMessage(text = '', streaming = false): Message {
+  const visibleText = stripToolResultJsonLeaks(text)
   return {
     id: newId(),
     role: 'ai',
-    text,
-    segments: text ? [{ id: newId(), type: 'content', text }] : [],
+    text: visibleText,
+    segments: visibleText ? [{ id: newId(), type: 'content', text: visibleText }] : [],
     thinking: '',
     isThinkingExpanded: false,
     toolCalls: [],
@@ -964,15 +966,119 @@ function appendThinkingChunk(message: Message, chunk: string): Message {
   return { ...message, thinking: nextThinking, segments: nextSegments }
 }
 
+function looksLikeToolResultJson(text: string) {
+  try {
+    const parsed = JSON.parse(text) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+    const payload = parsed as Record<string, unknown>
+    const hasToolResultShape = typeof payload.success === 'boolean' && typeof payload.message === 'string'
+    return hasToolResultShape && (
+      'data' in payload ||
+      'toolName' in payload ||
+      'executedParams' in payload ||
+      'originalParams' in payload ||
+      'paramsRepaired' in payload
+    )
+  } catch {
+    return /"success"\s*:\s*(true|false)/.test(text)
+      && /"message"\s*:/.test(text)
+      && /("data"|"toolName"|"executedParams"|"originalParams"|"paramsRepaired")\s*:/.test(text)
+  }
+}
+
+function stripToolResultJsonLeaks(text: string) {
+  let result = ''
+  let cursor = 0
+
+  while (cursor < text.length) {
+    const start = text.indexOf('{', cursor)
+    if (start === -1) {
+      result += text.slice(cursor)
+      break
+    }
+
+    result += text.slice(cursor, start)
+    let depth = 0
+    let inString = false
+    let escaped = false
+    let end = -1
+
+    for (let index = start; index < text.length; index++) {
+      const char = text[index]
+      if (inString && escaped) {
+        escaped = false
+        continue
+      }
+      if (inString && char === '\\') {
+        escaped = true
+        continue
+      }
+      if (char === '"') {
+        inString = !inString
+        continue
+      }
+      if (inString) continue
+      if (char === '{') depth += 1
+      if (char === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end = index + 1
+          break
+        }
+      }
+    }
+
+    if (end === -1) {
+      const tail = text.slice(start)
+      if (looksLikeToolResultJson(tail)) break
+      result += tail
+      break
+    }
+
+    const candidate = text.slice(start, end)
+    if (!looksLikeToolResultJson(candidate)) {
+      result += candidate
+    }
+    cursor = end
+  }
+
+  return result.replace(/[ \t]+\n/g, '\n')
+}
+
+function buildContentSegments(message: Message, text: string): MessageSegment[] {
+  const contentIndex = message.segments.findIndex(segment => segment.type === 'content')
+  const nonContentSegments = message.segments.filter(segment => segment.type !== 'content')
+  if (!text) return nonContentSegments
+
+  const contentSegment: MessageSegment = { id: newId(), type: 'content', text }
+  if (contentIndex === -1) return [...nonContentSegments, contentSegment]
+
+  const insertIndex = Math.min(contentIndex, nonContentSegments.length)
+  return [
+    ...nonContentSegments.slice(0, insertIndex),
+    contentSegment,
+    ...nonContentSegments.slice(insertIndex),
+  ]
+}
+
 function appendContentChunk(message: Message, chunk: string, replace = false): Message {
-  const nextText = replace ? chunk : message.text + chunk
+  const rawNextText = replace ? chunk : message.text + chunk
+  const nextText = stripToolResultJsonLeaks(rawNextText)
+
+  if (replace || nextText !== rawNextText || !nextText.startsWith(message.text)) {
+    return { ...message, text: nextText, segments: buildContentSegments(message, nextText) }
+  }
+
+  const visibleChunk = nextText.slice(message.text.length)
+  if (!visibleChunk) return { ...message, text: nextText }
+
   const nextSegments = [...message.segments]
   const lastSegment = nextSegments.at(-1)
 
-  if (lastSegment?.type === 'content' && !replace) {
-    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + chunk }
+  if (lastSegment?.type === 'content') {
+    nextSegments[nextSegments.length - 1] = { ...lastSegment, text: lastSegment.text + visibleChunk }
   } else if (nextText) {
-    nextSegments.push({ id: newId(), type: 'content', text: nextText })
+    nextSegments.push({ id: newId(), type: 'content', text: visibleChunk })
   }
 
   return { ...message, text: nextText, segments: nextSegments }
@@ -1038,6 +1144,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
   'get_page_content',
   'get_page_style_summary',
   'get_paragraph',
+  'search_text',
   'get_comments',
   'workspace_search',
   'workspace_read',
@@ -2752,14 +2859,18 @@ export default function AISidebar({
               break
 
             case 'content': {
-              const chunk = String(event.content ?? '')
-              roundAssistantText += chunk
-              persistedAssistantText += chunk
-              if (activeStreamingWriteRef.current && editorView) {
+              const rawChunk = String(event.content ?? '')
+              const nextRoundAssistantText = stripToolResultJsonLeaks(roundAssistantText + rawChunk)
+              const chunk = nextRoundAssistantText.startsWith(roundAssistantText)
+                ? nextRoundAssistantText.slice(roundAssistantText.length)
+                : ''
+              roundAssistantText = nextRoundAssistantText
+              persistedAssistantText = stripToolResultJsonLeaks(persistedAssistantText + rawChunk)
+              if (activeStreamingWriteRef.current && editorView && chunk) {
                 queueStreamingWrite(chunk)
               }
               updateMessage(message => ({
-                ...appendContentChunk(message, chunk),
+                ...appendContentChunk(message, rawChunk),
                 activityLabel: activeStreamingWriteRef.current ? '正在写入正文...' : '正在生成回复...',
               }))
               break

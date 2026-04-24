@@ -75,10 +75,27 @@ type RangeType =
   | 'paragraph_indexes'
   | 'selection'
   | 'contains_text'
+  | 'text_ranges'
   | 'first_paragraph'
   | 'last_paragraph'
   | 'odd_paragraphs'
   | 'even_paragraphs'
+
+type TextMatchMode = 'contains' | 'exact'
+
+interface TextRangeSpec {
+  paragraphIndex?: number
+  startOffset?: number
+  endOffset?: number
+  text?: string
+}
+
+interface NormalizedTextRange {
+  paragraphIndex: number
+  startOffset: number
+  endOffset: number
+  text?: string
+}
 
 interface RangeSpec {
   type?: RangeType
@@ -87,6 +104,11 @@ interface RangeSpec {
   to?: number
   paragraphIndexes?: number[]
   text?: string
+  textOccurrence?: 'all' | 'first'
+  caseSensitive?: boolean
+  matchMode?: TextMatchMode
+  occurrenceIndexes?: number[]
+  textRanges?: TextRangeSpec[]
   selectionFrom?: number
   selectionTo?: number
 }
@@ -95,6 +117,16 @@ interface ParagraphRef {
   node: PMNode
   pos: number
   index: number
+}
+
+interface TextMatchRef {
+  paragraph: ParagraphRef
+  from: number
+  to: number
+  matchText: string
+  startOffset: number
+  endOffset: number
+  matchIndex: number
 }
 
 interface BlockRef {
@@ -133,7 +165,11 @@ function describeRange(range?: RangeSpec) {
     case 'selection':
       return '当前选区'
     case 'contains_text':
-      return `包含“${range.text ?? ''}”的段落`
+      return `文字“${range.text ?? ''}”`
+    case 'text_ranges':
+      return Array.isArray(range.textRanges) && range.textRanges.length > 0
+        ? `${range.textRanges.length} 个锁定文字范围`
+        : '锁定文字范围'
     case 'first_paragraph':
       return '第一段'
     case 'last_paragraph':
@@ -192,6 +228,39 @@ function normalizeParagraphIndexes(value: unknown): number[] {
   return [...new Set(indexes)].sort((a, b) => a - b)
 }
 
+function normalizeOccurrenceIndexes(value: unknown): number[] {
+  if (!Array.isArray(value)) return []
+  const indexes = value
+    .map(item => Number(item))
+    .filter(index => Number.isInteger(index) && index >= 0)
+  return [...new Set(indexes)].sort((a, b) => a - b)
+}
+
+function normalizeTextRanges(value: unknown): NormalizedTextRange[] {
+  if (!Array.isArray(value)) return []
+  const ranges: NormalizedTextRange[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const record = item as Record<string, unknown>
+    const paragraphIndex = Number(record.paragraphIndex)
+    const startOffset = Number(record.startOffset)
+    const endOffset = Number(record.endOffset)
+    if (
+      !Number.isInteger(paragraphIndex) ||
+      !Number.isInteger(startOffset) ||
+      !Number.isInteger(endOffset) ||
+      paragraphIndex < 0 ||
+      startOffset < 0 ||
+      endOffset <= startOffset
+    ) {
+      continue
+    }
+    const text = typeof record.text === 'string' ? record.text : undefined
+    ranges.push(text == null ? { paragraphIndex, startOffset, endOffset } : { paragraphIndex, startOffset, endOffset, text })
+  }
+  return ranges
+}
+
 function getParagraphAtIndex(state: EditorState, index: number): ParagraphRef | undefined {
   if (!Number.isInteger(index) || index < 0) return undefined
   return getParagraphs(state).find(paragraph => paragraph.index === index)
@@ -226,10 +295,14 @@ function resolveRange(
   const results: ParagraphRef[] = []
   const paragraphs = getParagraphs(state)
   const selectionBounds = getSelectionBounds(state, range, selectionContext)
+  const textRangeParagraphIndexes = range?.type === 'text_ranges'
+    ? new Set(normalizeTextRanges(range.textRanges).map(item => item.paragraphIndex))
+    : null
+  const containsTextParagraphIndexes = range?.type === 'contains_text'
+    ? new Set(resolveContainsTextMatches(state, range).map(match => match.paragraph.index))
+    : null
 
   for (const paragraph of paragraphs) {
-    const text = paragraph.node.textContent
-
     switch (range?.type) {
       case 'all':
         results.push(paragraph)
@@ -251,7 +324,10 @@ function resolveRange(
       case 'last_paragraph':
         break
       case 'contains_text':
-        if (text.includes(range.text ?? '')) results.push(paragraph)
+        if (containsTextParagraphIndexes?.has(paragraph.index)) results.push(paragraph)
+        break
+      case 'text_ranges':
+        if (textRangeParagraphIndexes?.has(paragraph.index)) results.push(paragraph)
         break
       case 'odd_paragraphs':
         if (paragraph.index % 2 === 0) results.push(paragraph)
@@ -291,18 +367,154 @@ function paragraphOffsetToDocPos(paragraph: ParagraphRef, offset: number) {
   const normalizedOffset = Math.max(0, offset)
   let consumed = 0
   let resolvedPos = paragraph.pos + 1
+  let found = false
 
   paragraph.node.forEach((child, childOffset) => {
+    if (found) return
     if (!child.isText) return
     const text = child.text ?? ''
     const nextConsumed = consumed + text.length
-    if (normalizedOffset <= nextConsumed) {
+    if (normalizedOffset >= consumed && normalizedOffset <= nextConsumed) {
       resolvedPos = paragraph.pos + 1 + childOffset + (normalizedOffset - consumed)
+      consumed = nextConsumed
+      found = true
+      return
     }
     consumed = nextConsumed
   })
 
   return Math.min(paragraph.pos + paragraph.node.nodeSize - 1, resolvedPos)
+}
+
+function isTextSearchBoundary(char: string | undefined) {
+  return !char || !/[\p{L}\p{N}_]/u.test(char)
+}
+
+function textMatchesExpected(actual: string, expected: string, caseSensitive: boolean) {
+  return caseSensitive
+    ? actual === expected
+    : actual.toLocaleLowerCase() === expected.toLocaleLowerCase()
+}
+
+function isParagraphInTextSearchScope(paragraph: ParagraphRef, range: RangeSpec) {
+  if (Number.isInteger(range.paragraphIndex) && paragraph.index !== range.paragraphIndex) return false
+  const paragraphIndexes = normalizeParagraphIndexes(range.paragraphIndexes)
+  if (paragraphIndexes.length > 0 && !paragraphIndexes.includes(paragraph.index)) return false
+  if (Number.isInteger(range.from) && paragraph.index < Number(range.from)) return false
+  if (Number.isInteger(range.to) && paragraph.index > Number(range.to)) return false
+  return true
+}
+
+function resolveContainsTextMatches(state: EditorState, range: RangeSpec): TextMatchRef[] {
+  const needle = String(range.text ?? '')
+  if (!needle) return []
+  const caseSensitive = range.caseSensitive === true
+  const matchMode: TextMatchMode = range.matchMode === 'exact' ? 'exact' : 'contains'
+  const occurrence = range.textOccurrence === 'first' ? 'first' : 'all'
+  const requestedOccurrences = normalizeOccurrenceIndexes(range.occurrenceIndexes)
+  const requestedOccurrenceSet = new Set(requestedOccurrences)
+  const normalizedNeedle = caseSensitive ? needle : needle.toLocaleLowerCase()
+  const matches: TextMatchRef[] = []
+  let matchIndex = 0
+
+  for (const paragraph of getParagraphs(state)) {
+    if (!isParagraphInTextSearchScope(paragraph, range)) continue
+    const sourceText = paragraph.node.textContent
+    const haystack = caseSensitive ? sourceText : sourceText.toLocaleLowerCase()
+    let searchFrom = 0
+    while (searchFrom <= haystack.length) {
+      const found = haystack.indexOf(normalizedNeedle, searchFrom)
+      if (found === -1) break
+      const endOffset = found + needle.length
+      const isAccepted = matchMode === 'contains'
+        || (isTextSearchBoundary(sourceText[found - 1]) && isTextSearchBoundary(sourceText[endOffset]))
+      if (isAccepted) {
+        const currentMatchIndex = matchIndex++
+        if (requestedOccurrences.length === 0 || requestedOccurrenceSet.has(currentMatchIndex)) {
+          matches.push({
+            paragraph,
+            from: paragraphOffsetToDocPos(paragraph, found),
+            to: paragraphOffsetToDocPos(paragraph, endOffset),
+            matchText: sourceText.slice(found, endOffset),
+            startOffset: found,
+            endOffset,
+            matchIndex: currentMatchIndex,
+          })
+          if (occurrence === 'first') return matches
+        }
+      }
+      searchFrom = found + Math.max(needle.length, 1)
+    }
+  }
+
+  return matches
+}
+
+function resolveLockedTextRanges(state: EditorState, range: RangeSpec): TextMatchRef[] {
+  const caseSensitive = range.caseSensitive === true
+  const matches: TextMatchRef[] = []
+
+  for (const [index, textRange] of normalizeTextRanges(range.textRanges).entries()) {
+    const paragraph = getParagraphAtIndex(state, textRange.paragraphIndex)
+    if (!paragraph) continue
+    const sourceText = paragraph.node.textContent
+    if (textRange.endOffset > sourceText.length) continue
+    const matchText = sourceText.slice(textRange.startOffset, textRange.endOffset)
+    if (textRange.text != null && !textMatchesExpected(matchText, textRange.text, caseSensitive)) continue
+    matches.push({
+      paragraph,
+      from: paragraphOffsetToDocPos(paragraph, textRange.startOffset),
+      to: paragraphOffsetToDocPos(paragraph, textRange.endOffset),
+      matchText,
+      startOffset: textRange.startOffset,
+      endOffset: textRange.endOffset,
+      matchIndex: index,
+    })
+  }
+
+  return matches
+}
+
+function resolveTextMatches(
+  state: EditorState,
+  range?: RangeSpec,
+  selectionContext?: ExecuteOptions['selectionContext'],
+): TextMatchRef[] {
+  if (range?.type === 'selection') {
+    const bounds = getSelectionBounds(state, range, selectionContext)
+    if (!bounds) return []
+    const paragraph = resolveRange(state, range, selectionContext)[0]
+    return [{
+      paragraph: paragraph ?? { node: state.doc, pos: 0, index: -1 },
+      from: bounds.from,
+      to: bounds.to,
+      matchText: state.doc.textBetween(bounds.from, bounds.to, '\n'),
+      startOffset: 0,
+      endOffset: Math.max(0, bounds.to - bounds.from),
+      matchIndex: 0,
+    }]
+  }
+
+  if (range?.type === 'text_ranges') {
+    return resolveLockedTextRanges(state, range)
+  }
+
+  if (range?.type !== 'contains_text') {
+    return resolveRange(state, range, selectionContext).map((paragraph, index) => {
+      const bounds = paragraphTextBounds(paragraph)
+      return {
+        paragraph,
+        from: bounds.from,
+        to: bounds.to,
+        matchText: paragraph.node.textContent,
+        startOffset: 0,
+        endOffset: paragraph.node.textContent.length,
+        matchIndex: index,
+      }
+    })
+  }
+
+  return resolveContainsTextMatches(state, range)
 }
 
 function tryResolveSelectionInParagraph(
@@ -419,15 +631,8 @@ function applyTextStyle(
   attrs: Record<string, unknown>,
   selectionContext?: ExecuteOptions['selectionContext'],
 ) {
-  if (range?.type === 'selection') {
-    const bounds = getSelectionBounds(state, range, selectionContext)
-    if (!bounds) return tr
-    return addTextMark(tr, state, bounds.from, bounds.to, attrs)
-  }
-
-  for (const paragraph of resolveRange(state, range)) {
-    const { from, to } = paragraphTextBounds(paragraph)
-    tr = addTextMark(tr, state, from, to, attrs)
+  for (const match of resolveTextMatches(state, range, selectionContext)) {
+    tr = addTextMark(tr, state, match.from, match.to, attrs)
   }
 
   return tr
@@ -455,10 +660,9 @@ function clearFormatting(
   clearParagraphStyles = true,
 ) {
   if (clearTextStyles) {
-    if (range?.type === 'selection') {
-      const bounds = getSelectionBounds(state, range, selectionContext)
-      if (bounds) {
-        tr = tr.removeMark(bounds.from, bounds.to, schema.marks.textStyle)
+    if (range?.type === 'selection' || range?.type === 'contains_text') {
+      for (const match of resolveTextMatches(state, range, selectionContext)) {
+        tr = tr.removeMark(match.from, match.to, schema.marks.textStyle)
       }
     } else {
       for (const paragraph of resolveRange(state, range, selectionContext)) {
@@ -571,7 +775,7 @@ function buildCompactParagraphSnapshot(state: EditorState, paragraphIndexes: num
 
 const VALID_RANGE_TYPES = new Set<string>([
   'all', 'paragraph', 'paragraphs', 'paragraph_indexes', 'selection',
-  'contains_text', 'first_paragraph', 'last_paragraph', 'odd_paragraphs', 'even_paragraphs',
+  'contains_text', 'text_ranges', 'first_paragraph', 'last_paragraph', 'odd_paragraphs', 'even_paragraphs',
 ])
 
 function validateRange(toolName: string, range: unknown): { valid: true } | { valid: false; error: string } {
@@ -584,6 +788,12 @@ function validateRange(toolName: string, range: unknown): { valid: true } | { va
   }
   if (rangeObj.type && !VALID_RANGE_TYPES.has(String(rangeObj.type))) {
     return { valid: false, error: `${toolName} 的 range.type="${rangeObj.type}" 无效，支持的类型: ${[...VALID_RANGE_TYPES].join(', ')}` }
+  }
+  if (rangeObj.type === 'contains_text' && !String(rangeObj.text ?? '').trim()) {
+    return { valid: false, error: `${toolName} 的 range.type=contains_text 时必须提供非空 text` }
+  }
+  if (rangeObj.type === 'text_ranges' && normalizeTextRanges(rangeObj.textRanges).length === 0) {
+    return { valid: false, error: `${toolName} 的 range.type=text_ranges 时必须提供非空 textRanges，包含 paragraphIndex/startOffset/endOffset` }
   }
   return { valid: true }
 }
@@ -1531,16 +1741,83 @@ export async function executeTool(
 
   try {
     switch (toolName) {
+      case 'search_text': {
+        const text = String(params.text ?? '')
+        if (!text) return { success: false, message: 'search_text 需要提供非空 text' }
+        const maxResults = Math.max(1, Math.min(200, Number(params.maxResults ?? 80) || 80))
+        const searchRange: RangeSpec = {
+          type: 'contains_text',
+          text,
+          caseSensitive: params.caseSensitive === true,
+          matchMode: params.matchMode === 'exact' ? 'exact' : 'contains',
+          textOccurrence: 'all',
+          paragraphIndex: Number.isInteger(params.paragraphIndex) ? Number(params.paragraphIndex) : undefined,
+          from: Number.isInteger(params.fromParagraph) ? Number(params.fromParagraph) : undefined,
+          to: Number.isInteger(params.toParagraph) ? Number(params.toParagraph) : undefined,
+          paragraphIndexes: normalizeParagraphIndexes(params.paragraphIndexes),
+        }
+        const matches = resolveTextMatches(state, searchRange, options?.selectionContext)
+        const returnedMatches = matches.slice(0, maxResults).map((match) => {
+          const paragraphText = match.paragraph.node.textContent
+          const before = paragraphText.slice(Math.max(0, match.startOffset - 24), match.startOffset)
+          const after = paragraphText.slice(match.endOffset, Math.min(paragraphText.length, match.endOffset + 24))
+          const textRange = {
+            paragraphIndex: match.paragraph.index,
+            startOffset: match.startOffset,
+            endOffset: match.endOffset,
+            text: match.matchText,
+          }
+          return {
+            matchIndex: match.matchIndex,
+            paragraphIndex: match.paragraph.index,
+            startOffset: match.startOffset,
+            endOffset: match.endOffset,
+            text: match.matchText,
+            before,
+            after,
+            range: {
+              type: 'text_ranges',
+              caseSensitive: true,
+              textRanges: [textRange],
+            },
+          }
+        })
+        return {
+          success: true,
+          message: matches.length > 0 ? `找到 ${matches.length} 处匹配文字` : `未找到文字“${text}”`,
+          data: {
+            query: text,
+            matchCount: matches.length,
+            returnedCount: returnedMatches.length,
+            caseSensitive: searchRange.caseSensitive,
+            matchMode: searchRange.matchMode,
+            matches: returnedMatches,
+            lockedRange: {
+              type: 'text_ranges',
+              caseSensitive: true,
+              textRanges: returnedMatches.map(match => ({
+                paragraphIndex: match.paragraphIndex,
+                startOffset: match.startOffset,
+                endOffset: match.endOffset,
+                text: match.text,
+              })),
+            },
+          },
+        }
+      }
+
       case 'set_text_style': {
         const range = params.range as RangeSpec | undefined
         const rangeCheck = validateRange('set_text_style', range)
         if (!rangeCheck.valid) return { success: false, message: rangeCheck.error }
-        if (range!.type === 'selection' && !getSelectionBounds(state, range, options?.selectionContext)) {
-          return { success: false, message: '当前没有可用的选区，无法按 selection 修改文字样式' }
-        }
-        const resolved = resolveRange(state, range, options?.selectionContext)
-        if (range!.type !== 'selection' && resolved.length === 0) {
-          return { success: false, message: `未找到可设置文字样式的范围：${describeRange(range)}` }
+        const textMatches = resolveTextMatches(state, range, options?.selectionContext)
+        if (textMatches.length === 0) {
+          return {
+            success: false,
+            message: range!.type === 'selection'
+              ? '当前没有可用的选区，无法按 selection 修改文字样式'
+              : `未找到可设置文字样式的范围：${describeRange(range)}`,
+          }
         }
         const { range: _range, ...rawStyleAttrs } = params
         const styleAttrs = Object.fromEntries(
@@ -1553,11 +1830,14 @@ export async function executeTool(
         dispatch(tr)
         options?.onDocumentStyleMutation?.()
         view.focus()
-        const affectedIndexes = resolved.map(p => p.index)
+        const affectedIndexes = [...new Set(textMatches.map(match => match.paragraph.index).filter(index => index >= 0))]
         return {
           success: true,
           message: `文字样式已更新（${describeRange(range)}）`,
-          data: { affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedIndexes) },
+          data: {
+            matchedTextCount: textMatches.length,
+            affectedParagraphs: buildCompactParagraphSnapshot(view.state, affectedIndexes),
+          },
         }
       }
 
@@ -2006,6 +2286,10 @@ export async function executeTool(
 
           const textStyle = rule.textStyle as Record<string, unknown> | undefined
           if (textStyle && typeof textStyle === 'object') {
+            const textMatches = resolveTextMatches(state, range, options?.selectionContext)
+            for (const match of textMatches) {
+              if (match.paragraph.index >= 0) allAffectedIndexes.add(match.paragraph.index)
+            }
             const styleAttrs = Object.fromEntries(
               Object.entries(textStyle).filter(([, v]) => v !== undefined)
             )

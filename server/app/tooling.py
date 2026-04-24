@@ -15,6 +15,7 @@ RANGE_SPEC = {
                 "paragraph_indexes",
                 "selection",
                 "contains_text",
+                "text_ranges",
                 "first_paragraph",
                 "last_paragraph",
                 "odd_paragraphs",
@@ -29,7 +30,46 @@ RANGE_SPEC = {
             "description": "非连续段落索引列表（range.type=paragraph_indexes 时使用）",
             "items": {"type": "integer"},
         },
-        "text": {"type": "string", "description": "匹配的文字（range.type=contains_text 时使用）"},
+        "text": {
+            "type": "string",
+            "description": (
+                "匹配的文字（range.type=contains_text 时使用）。set_text_style 只作用于匹配到的文字片段；"
+                "set_paragraph_style 才作用于包含该文字的整段。"
+            ),
+        },
+        "textOccurrence": {
+            "type": "string",
+            "enum": ["all", "first"],
+            "description": "匹配次数（range.type=contains_text 时使用）：all=全部匹配，first=只匹配第一个。默认 all。",
+        },
+        "occurrenceIndexes": {
+            "type": "array",
+            "description": "按 search_text 返回的 matchIndex 精确选择匹配项（range.type=contains_text 时使用）。例如 [0,2] 只修改第 1 和第 3 处。",
+            "items": {"type": "integer"},
+        },
+        "caseSensitive": {
+            "type": "boolean",
+            "description": "匹配文字时是否区分大小写，默认 false；false 表示包容大小写差异。",
+        },
+        "matchMode": {
+            "type": "string",
+            "enum": ["contains", "exact"],
+            "description": "匹配模式：contains=子串匹配；exact=精确词/短语匹配，要求匹配项两侧不是字母、数字、下划线或中文字符。默认 contains。",
+        },
+        "textRanges": {
+            "type": "array",
+            "description": "精确锁定文字范围（range.type=text_ranges 时使用），通常直接使用 search_text 返回的 range/lockedRange，避免偏移漂移。",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "paragraphIndex": {"type": "integer", "description": "段落索引"},
+                    "startOffset": {"type": "integer", "description": "段内起始字符偏移，包含"},
+                    "endOffset": {"type": "integer", "description": "段内结束字符偏移，不包含"},
+                    "text": {"type": "string", "description": "该范围当前应匹配的文字；提供后会校验，防止坐标过期误改"},
+                },
+                "required": ["paragraphIndex", "startOffset", "endOffset"],
+            },
+        },
         "selectionFrom": {"type": "integer", "description": "选区起始文档位置（range.type=selection 时使用）"},
         "selectionTo": {"type": "integer", "description": "选区结束文档位置（range.type=selection 时使用）"},
     },
@@ -192,6 +232,35 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_text",
+            "description": "在当前文档正文中搜索文字，返回可直接用于 set_text_style/clear_formatting 的精确锁定 range。支持大小写包容、区分大小写、子串匹配和精确词/短语匹配。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要搜索的文字"},
+                    "caseSensitive": {"type": "boolean", "description": "是否区分大小写，默认 false；false 表示包容大小写差异"},
+                    "matchMode": {
+                        "type": "string",
+                        "enum": ["contains", "exact"],
+                        "description": "contains=子串匹配；exact=精确词/短语匹配，要求匹配项两侧不是字母、数字、下划线或中文字符。默认 contains。",
+                    },
+                    "paragraphIndex": {"type": "integer", "description": "只搜索指定段落，可选"},
+                    "fromParagraph": {"type": "integer", "description": "搜索起始段落索引（包含），可选"},
+                    "toParagraph": {"type": "integer", "description": "搜索结束段落索引（包含），可选"},
+                    "paragraphIndexes": {
+                        "type": "array",
+                        "description": "只搜索这些段落索引，可选",
+                        "items": {"type": "integer"},
+                    },
+                    "maxResults": {"type": "integer", "description": "最多返回多少条匹配详情，默认 80，最大 200"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_comments",
             "description": "获取文档中所有批注，返回批注内容、作者、日期以及被批注文字所在的段落索引和具体文字",
             "parameters": {
@@ -233,7 +302,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "set_text_style",
-            "description": "设置指定范围内文字的样式（字体、字号、颜色、粗体、斜体等）",
+            "description": "设置指定范围内文字的样式（字体、字号、颜色、粗体、斜体等）。当 range.type=contains_text 时，只修改匹配到的文字本身，不修改整段。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -714,6 +783,7 @@ LAYOUT_TOOL_NAMES = {
     "get_page_content",
     "get_page_style_summary",
     "get_paragraph",
+    "search_text",
     "get_comments",
     "set_text_style",
     "set_paragraph_style",
@@ -733,6 +803,7 @@ EDIT_TOOL_NAMES = {
     "get_page_content",
     "get_page_style_summary",
     "get_paragraph",
+    "search_text",
     "get_comments",
     "begin_streaming_write",
     "insert_text",
