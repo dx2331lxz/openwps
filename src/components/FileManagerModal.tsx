@@ -80,11 +80,13 @@ export default function FileManagerModal({
   const isWpsSource = settings.activeSource === 'wps_directory'
 
   useEffect(() => {
-    setName(initialName)
+    const timer = window.setTimeout(() => setName(initialName), 0)
+    return () => window.clearTimeout(timer)
   }, [initialName, mode])
 
   useEffect(() => {
-    setWpsDirectoryDraft(settings.wpsDirectory)
+    const timer = window.setTimeout(() => setWpsDirectoryDraft(settings.wpsDirectory), 0)
+    return () => window.clearTimeout(timer)
   }, [settings.wpsDirectory])
 
   useEffect(() => {

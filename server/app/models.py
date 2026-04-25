@@ -87,6 +87,8 @@ class ProviderSettings(BaseModel):
     apiKey: Optional[str] = None
     isPreset: bool = False
     supportsVision: bool = False
+    promptCacheMode: str = "off"
+    promptCacheRetention: str = "in_memory"
 
 
 class SettingsUpdate(BaseModel):
@@ -121,6 +123,7 @@ class ToolResultItem(BaseModel):
 class ToolResultsRequest(BaseModel):
     plan_id: Optional[str] = None
     round: Optional[int] = None
+    agent_id: Optional[str] = None
     results: list[ToolResultItem] = Field(default_factory=list)
     stop: bool = False
     context: Optional[dict[str, Any]] = None  # Frontend sends latest context each round

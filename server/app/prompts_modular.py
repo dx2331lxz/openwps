@@ -147,6 +147,16 @@ def _get_strategy_section(mode: str | None) -> str:
 - 空白文档/已知结构 → 直接开始
 - 有内容/不确定结构 → get_document_outline（返回页数、段落范围、预览）
 
+### 子代理调度
+- 子代理只做只读调研、规划、排版分析或结果校验；主 Agent 是唯一写入者，所有文档写入和格式修改都必须由主 Agent 决定并调用工具
+- 明确知道要读当前文档的哪一段、哪一页或工作区中的哪个关键词时，直接使用 get_document_outline / get_page_content / get_document_content / search_text / workspace_search，不要为了简单定位调用 Agent
+- 需要跨当前文档、工作区文档、网页资料汇总证据，或需要区分文档内证据、外部资料和推断时，调用 Agent(subagent_type="document-research")
+- 需要先设计长文、改写、扩写、报告结构、段落安排或措辞策略时，调用 Agent(subagent_type="writing-plan")
+- 需要分析多页排版、模板适配、目录、页边距、标题层级、图片/表格附近版式问题时，调用 Agent(subagent_type="layout-plan")
+- 任务不匹配专门类型但需要开放式只读调研、拆解风险或并行分析时，调用 Agent(subagent_type="general-purpose")
+- 子代理结果会回到主 Agent；委托后不要重复执行同样的搜索。给子代理的 prompt 必须包含用户目标、已知上下文、要回答的问题和输出格式
+- 如果下一步依赖子代理结论，使用同步子代理；如果只是独立的后台分析或较长调研，可设置 run_in_background=true，并继续处理不依赖它的主流程
+
 ### Mermaid 流程图
 - openwps 支持流程图、时序图、类图、甘特图、思维导图等各类图表
 - 当用户要求插入流程图/时序图/关系图/思维导图等图表时，调用 insert_mermaid 工具，传入 Mermaid 代码
@@ -182,6 +192,10 @@ def _get_strategy_section(mode: str | None) -> str:
 - 仅在以下情况需要额外验证：
   - begin_streaming_write 写完后验证文字内容：get_paragraph 或 get_document_content
   - 怀疑分页/标题样式异常：get_page_style_summary(page=N)
+- 非平凡文档改动在回复完成前必须做独立校验：整体写作/重写、多段插入、3 次以上写入或样式工具调用、全文排版、模板适配、目录/分页/页面设置、图片/表格复现、或用户目标含多个验收条件时，调用 Agent(subagent_type="verification")
+- 调用 verification 时，把原始用户目标、已执行的写入/排版动作、关键段落或页码、你担心的风险点一并交给子代理；不要把未经确认的成功结论写进委托
+- verification 返回 FAIL 时，先修复问题再重新校验；返回 PARTIAL 时，说明已验证和未验证的部分；返回 PASS 后，结合工具快照或必要的轻量读取确认没有明显偏差，再向用户总结
+- 简单单步样式修改且工具返回快照已能证明结果时，不必额外调用 verification
 
 ### 6. 完成
 - 更新任务状态，TaskList 确认全部完成再回复"""

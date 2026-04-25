@@ -45,6 +45,8 @@ function slugify(value: string) {
 function toEditableProvider(provider: AIProviderSettings): EditableProvider {
   return {
     ...provider,
+    promptCacheMode: provider.promptCacheMode ?? (provider.id === 'openai' ? 'openai_auto' : 'off'),
+    promptCacheRetention: provider.promptCacheRetention ?? 'in_memory',
     apiKey: '',
     apiKeyChanged: false,
     models: provider.defaultModel ? [{ id: provider.defaultModel, label: provider.defaultModel }] : [],
@@ -263,6 +265,8 @@ export default function SettingsModal({ onClose }: Props) {
       defaultModel: provider.defaultModel.trim(),
       isPreset: provider.isPreset,
       supportsVision: Boolean(provider.supportsVision),
+      promptCacheMode: provider.promptCacheMode === 'openai_auto' ? 'openai_auto' : 'off',
+      promptCacheRetention: provider.promptCacheRetention === '24h' ? '24h' : 'in_memory',
       ...(provider.apiKeyChanged ? { apiKey: provider.apiKey.trim() } : {}),
     }))
 
@@ -498,6 +502,39 @@ export default function SettingsModal({ onClose }: Props) {
                         autoComplete="off"
                       />
                     </label>
+
+                    <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-3 space-y-3">
+                      <div>
+                        <div className="text-xs font-medium text-emerald-700">Prompt Cache</div>
+                        <div className="text-[11px] text-emerald-600 mt-1">使用 OpenAI-compatible 的 prompt_cache_key 让稳定 system prompt 前缀更容易命中缓存。未知网关建议保持关闭。</div>
+                      </div>
+                      <label className="flex items-center gap-2 text-xs text-gray-700">
+                        <input
+                          type="checkbox"
+                          checked={selectedProvider.promptCacheMode === 'openai_auto'}
+                          onChange={event => updateProvider(selectedProvider.id, current => ({
+                            ...current,
+                            promptCacheMode: event.target.checked ? 'openai_auto' : 'off',
+                          }))}
+                        />
+                        <span>启用 OpenAI 自动 Prompt Cache 参数</span>
+                      </label>
+                      <label className="block">
+                        <span className="block text-xs font-medium text-gray-500 mb-1">缓存保留策略</span>
+                        <select
+                          className="w-full text-sm border border-emerald-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-emerald-300 disabled:bg-gray-100 disabled:text-gray-400"
+                          value={selectedProvider.promptCacheRetention ?? 'in_memory'}
+                          disabled={selectedProvider.promptCacheMode !== 'openai_auto'}
+                          onChange={event => updateProvider(selectedProvider.id, current => ({
+                            ...current,
+                            promptCacheRetention: event.target.value === '24h' ? '24h' : 'in_memory',
+                          }))}
+                        >
+                          <option value="in_memory">in_memory</option>
+                          <option value="24h">24h</option>
+                        </select>
+                      </label>
+                    </div>
 
                     <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-3">
                       <div className="flex items-center justify-between gap-3">

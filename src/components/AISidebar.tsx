@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent as ReactClipboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
@@ -114,6 +114,21 @@ interface TaskListResponse {
 
 interface TaskResponse {
   task: TaskItem
+}
+
+interface AgentRunItem {
+  id: string
+  agentType: string
+  description: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  result?: string
+  error?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+interface AgentRunsResponse {
+  agents: AgentRunItem[]
 }
 
 type OcrTaskType = 'general_parse' | 'document_text' | 'table' | 'chart' | 'handwriting' | 'formula'
@@ -567,6 +582,26 @@ function normalizeTaskItem(raw: unknown): TaskItem | null {
   }
 }
 
+function normalizeAgentRunItem(raw: unknown): AgentRunItem | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const status = String(value.status ?? 'running')
+  if (!['running', 'completed', 'failed', 'cancelled'].includes(status)) return null
+  const id = String(value.id ?? '')
+  const agentType = String(value.agentType ?? '')
+  if (!id || !agentType) return null
+  return {
+    id,
+    agentType,
+    description: String(value.description ?? ''),
+    status: status as AgentRunItem['status'],
+    result: typeof value.result === 'string' ? value.result : undefined,
+    error: typeof value.error === 'string' ? value.error : undefined,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : undefined,
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : undefined,
+  }
+}
+
 function buildTaskStats(tasks: TaskItem[]) {
   return {
     total: tasks.length,
@@ -814,15 +849,26 @@ const MermaidBlock: React.FC<{
   const [svgContent, setSvgContent] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [codeExpanded, setCodeExpanded] = useState(false)
-  const idRef = useRef(`mermaid-${Math.random().toString(36).slice(2)}`)
+  const mermaidId = `mermaid-${useId().replace(/:/g, '')}`
 
   useEffect(() => {
-    setSvgContent(null)
-    setError(null)
-    mermaid.render(idRef.current, code)
-      .then(({ svg }) => setSvgContent(svg))
-      .catch(err => setError(String(err)))
-  }, [code])
+    let active = true
+    const timer = window.setTimeout(() => {
+      setSvgContent(null)
+      setError(null)
+      mermaid.render(mermaidId, code)
+        .then(({ svg }) => {
+          if (active) setSvgContent(svg)
+        })
+        .catch(err => {
+          if (active) setError(String(err))
+        })
+    }, 0)
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
+  }, [code, mermaidId])
 
   const handleInsert = () => {
     if (!svgContent || !onInsertToEditor) return
@@ -1128,31 +1174,22 @@ interface ToolPlanExecution {
   mergeStrategy: string
   continueOnError: boolean
   parallelGroup: string | null
+  executorLocation: 'client' | 'server'
+  readOnly: boolean
+  allowedForAgent: boolean
+  parallelSafe: boolean
 }
 
 interface ToolExecutionPlan {
   planId: string
   round: number
   executions: ToolPlanExecution[]
+  agentId?: string
+  agentType?: string
 }
 
-const PARALLEL_SAFE_TOOL_NAMES = new Set([
-  'TaskList',
-  'get_document_info',
-  'get_document_outline',
-  'get_document_content',
-  'get_page_content',
-  'get_page_style_summary',
-  'get_paragraph',
-  'search_text',
-  'get_comments',
-  'workspace_search',
-  'workspace_read',
-  'analyze_image_with_ocr',
-])
-
-function canRunToolInParallel(toolName: string) {
-  return PARALLEL_SAFE_TOOL_NAMES.has(toolName)
+function canRunToolInParallel(execution: ToolPlanExecution) {
+  return execution.parallelSafe
 }
 
 function buildExecutionBatches(executions: ToolPlanExecution[]): ToolPlanExecution[][] {
@@ -1179,14 +1216,14 @@ function buildExecutionBatches(executions: ToolPlanExecution[]): ToolPlanExecuti
       continue
     }
 
-    if (canRunToolInParallel(current.toolName)) {
+    if (canRunToolInParallel(current)) {
       const batch: ToolPlanExecution[] = [current]
       let nextIndex = index + 1
       while (nextIndex < executions.length) {
         const nextExecution = executions[nextIndex]
         if (!nextExecution) break
         if (nextExecution.parallelGroup) break
-        if (!canRunToolInParallel(nextExecution.toolName)) break
+        if (!canRunToolInParallel(nextExecution)) break
         batch.push(nextExecution)
         nextIndex += 1
       }
@@ -1315,6 +1352,10 @@ function parseToolPlanEvent(event: Record<string, unknown>): ToolExecutionPlan |
         mergeStrategy: typeof raw.mergeStrategy === 'string' ? raw.mergeStrategy : 'single',
         continueOnError: raw.continueOnError !== false,
         parallelGroup: typeof raw.parallelGroup === 'string' && raw.parallelGroup.length > 0 ? raw.parallelGroup : null,
+        executorLocation: raw.executorLocation === 'server' ? 'server' : 'client',
+        readOnly: raw.readOnly === true,
+        allowedForAgent: raw.allowedForAgent === true,
+        parallelSafe: raw.parallelSafe === true,
       }
     })
     .filter((execution): execution is ToolPlanExecution => Boolean(execution))
@@ -1323,6 +1364,8 @@ function parseToolPlanEvent(event: Record<string, unknown>): ToolExecutionPlan |
     planId,
     round,
     executions,
+    agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
+    agentType: typeof event.agentType === 'string' ? event.agentType : undefined,
   }
 }
 
@@ -1338,6 +1381,10 @@ function buildFallbackToolPlan(round: number, toolCalls: ToolCallResult[]): Tool
       mergeStrategy: 'single',
       continueOnError: true,
       parallelGroup: null,
+      executorLocation: 'client',
+      readOnly: false,
+      allowedForAgent: false,
+      parallelSafe: false,
     })),
   }
 }
@@ -1712,6 +1759,8 @@ export default function AISidebar({
   const [assistantMode, setAssistantMode] = useState<AssistantMode>('agent')
   const [tasks, setTasks] = useState<TaskItem[]>([])
   const [isTaskPanelExpanded, setIsTaskPanelExpanded] = useState(false)
+  const [agentRuns, setAgentRuns] = useState<AgentRunItem[]>([])
+  const [isAgentPanelExpanded, setIsAgentPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
   const [providers, setProviders] = useState<AIProviderSettings[]>([])
   const [modelName, setModelName] = useState('')
@@ -1838,9 +1887,23 @@ export default function AISidebar({
     return nextTasks
   }, [applyTaskState])
 
+  const fetchAgentRunsForConversation = useCallback(async (conversationId: string) => {
+    const response = await fetch(`/api/conversations/${conversationId}/agents`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json() as Partial<AgentRunsResponse>
+    const nextAgentRuns = Array.isArray(payload.agents)
+      ? payload.agents.map(normalizeAgentRunItem).filter((agentRun): agentRun is AgentRunItem => agentRun !== null)
+      : []
+    setAgentRuns(nextAgentRuns)
+    setIsAgentPanelExpanded(prev => prev || nextAgentRuns.some(agentRun => agentRun.status === 'running'))
+    return nextAgentRuns
+  }, [])
+
   useEffect(() => {
     if (!currentConversationId) {
       applyTaskState([])
+      setAgentRuns([])
+      setIsAgentPanelExpanded(false)
       return
     }
     void fetchTasksForConversation(currentConversationId, { preserveExpanded: true }).catch(error => {
@@ -1849,7 +1912,26 @@ export default function AISidebar({
         applyTaskState([])
       }
     })
-  }, [applyTaskState, currentConversationId, fetchTasksForConversation])
+    void fetchAgentRunsForConversation(currentConversationId).catch(error => {
+      console.error('[AISidebar] load conversation agents failed', error)
+      if (currentConversationIdRef.current === currentConversationId) {
+        setAgentRuns([])
+        setIsAgentPanelExpanded(false)
+      }
+    })
+  }, [applyTaskState, currentConversationId, fetchAgentRunsForConversation, fetchTasksForConversation])
+
+  useEffect(() => {
+    if (!currentConversationId || !agentRuns.some(agentRun => agentRun.status === 'running')) return
+    const timer = window.setInterval(() => {
+      const conversationId = currentConversationIdRef.current
+      if (!conversationId) return
+      void fetchAgentRunsForConversation(conversationId).catch(error => {
+        console.error('[AISidebar] refresh conversation agents failed', error)
+      })
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [agentRuns, currentConversationId, fetchAgentRunsForConversation])
 
   const autoResize = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = 'auto'
@@ -2270,7 +2352,11 @@ export default function AISidebar({
 
     const aiMessage = makeAiMessage('', true)
 
-    if (shouldStartNewConversation) applyTaskState([])
+    if (shouldStartNewConversation) {
+      applyTaskState([])
+      setAgentRuns([])
+      setIsAgentPanelExpanded(false)
+    }
     setInput('')
     setPendingAttachments([])
     setIncludeSelection(true)
@@ -2415,7 +2501,9 @@ export default function AISidebar({
     }
 
     const serverExecutedToolResults: ToolCallRecord[] = []
-    let persistRoundToolResults = (_toolResults: ToolCallRecord[]) => { }
+    let persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
+      void toolResults
+    }
 
     try {
       if (!conversationId) {
@@ -2501,6 +2589,8 @@ export default function AISidebar({
       let roundThinkingText = ''
       let roundNumber = 0
       const pendingToolCalls: ToolCallResult[] = []
+      const pendingAgentToolCalls = new Map<string, ToolCallResult[]>()
+      const currentAgentToolPlans = new Map<string, ToolExecutionPlan>()
       let roundToolResultsPersisted = false
 
       persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
@@ -2518,18 +2608,78 @@ export default function AISidebar({
       }
 
       // Helper: execute pending tool calls and POST results back to session
-      const executeAndPostToolResults = async (plan: ToolExecutionPlan) => {
+      const executeAndPostToolResults = async (plan: ToolExecutionPlan, sourceToolCallsOverride?: ToolCallResult[]) => {
+        const isAgentPlan = typeof plan.agentId === 'string' && plan.agentId.length > 0
         const persistedToolResults: ToolCallRecord[] = []
         const executionResults: Array<{ execution_id: string; content: string }> = []
         const selectionContext = extractSelectionContext(context)
         const toolCallsById = new Map<string, ToolCallResult>()
-        for (const toolCall of pendingToolCalls) {
+        const sourceToolCallsForPlan = sourceToolCallsOverride ?? pendingToolCalls
+        for (const toolCall of sourceToolCallsForPlan) {
           if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
             toolCallsById.set(toolCall.id, toolCall)
           }
         }
 
         const executePlannedTool = async (execution: ToolPlanExecution) => {
+          if (execution.executorLocation !== 'client') {
+            const rejectedResult: ExecuteResult = {
+              success: false,
+              message: `前端拒绝执行服务端工具：${execution.toolName}`,
+            }
+            return {
+              execution,
+              sourceToolCalls: [],
+              fallbackSourceCall: {
+                id: execution.executionId,
+                name: execution.toolName,
+                params: execution.params,
+                originalParams: execution.params,
+                status: 'pending' as const,
+                isExpanded: false,
+              },
+              leaderToolCall: {
+                id: execution.executionId,
+                name: execution.toolName,
+                params: execution.params,
+                originalParams: execution.params,
+                status: 'pending' as const,
+                isExpanded: false,
+              },
+              executedParams: normalizeToolParams(execution.params),
+              result: rejectedResult,
+            }
+          }
+
+          if (isAgentPlan && !execution.allowedForAgent) {
+            const rejectedResult: ExecuteResult = {
+              success: false,
+              message: `子代理只允许执行只读工具，已拒绝：${execution.toolName}`,
+            }
+            return {
+              execution,
+              sourceToolCalls: [],
+              fallbackSourceCall: {
+                id: execution.executionId,
+                name: execution.toolName,
+                params: execution.params,
+                originalParams: execution.params,
+                status: 'pending' as const,
+                isExpanded: false,
+              },
+              leaderToolCall: {
+                id: execution.executionId,
+                name: execution.toolName,
+                params: execution.params,
+                originalParams: execution.params,
+                status: 'pending' as const,
+                isExpanded: false,
+              },
+              executedParams: normalizeToolParams(execution.params),
+              result: rejectedResult,
+            }
+          }
+
           const sourceToolCalls = execution.sourceToolCallIds
             .map(toolCallId => toolCallsById.get(toolCallId))
             .filter((toolCall): toolCall is ToolCallResult => toolCall !== undefined)
@@ -2780,7 +2930,9 @@ export default function AISidebar({
           }
         }
 
-        persistRoundToolResults([...serverExecutedToolResults, ...persistedToolResults])
+        if (!isAgentPlan) {
+          persistRoundToolResults([...serverExecutedToolResults, ...persistedToolResults])
+        }
 
         if (sessionId) {
           // Get latest context for delta injection (selection may have changed, etc.)
@@ -2804,6 +2956,7 @@ export default function AISidebar({
             body: JSON.stringify({
               plan_id: plan.planId,
               round: plan.round,
+              agent_id: plan.agentId,
               results: executionResults,
               stop: false,
               context: latestContext,
@@ -2812,9 +2965,14 @@ export default function AISidebar({
           if (!toolResultsResponse.ok) throw new Error(`HTTP ${toolResultsResponse.status}`)
         }
 
-        pendingToolCalls.length = 0
-        serverExecutedToolResults.length = 0
-        currentToolPlan = null
+        if (isAgentPlan && plan.agentId) {
+          pendingAgentToolCalls.delete(plan.agentId)
+          currentAgentToolPlans.delete(plan.agentId)
+        } else {
+          pendingToolCalls.length = 0
+          serverExecutedToolResults.length = 0
+          currentToolPlan = null
+        }
       }
 
       // ── Read SSE events from the single long-lived connection ──
@@ -2901,6 +3059,122 @@ export default function AISidebar({
               break
             }
 
+            case 'agent_start': {
+              const agentType = String(event.agentType ?? 'general-purpose')
+              const description = String(event.description ?? '子代理任务')
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `子代理 ${agentType} 正在处理：${description}`,
+              }))
+              break
+            }
+
+            case 'agent_progress': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              const agentType = String(event.agentType ?? 'agent')
+              const phase = String(event.phase ?? '')
+              if (phase === 'awaiting_tool_results' && agentId) {
+                const agentPlan = currentAgentToolPlans.get(agentId)
+                const agentCalls = pendingAgentToolCalls.get(agentId) ?? []
+                if (agentPlan) {
+                  await executeAndPostToolResults(agentPlan, agentCalls)
+                }
+                break
+              }
+              updateMessage(message => ({
+                ...message,
+                activityLabel: phase === 'thinking'
+                  ? `子代理 ${agentType} 正在推理...`
+                  : phase === 'content'
+                    ? `子代理 ${agentType} 正在汇总结论...`
+                    : `子代理 ${agentType} 正在执行...`,
+              }))
+              break
+            }
+
+            case 'agent_tool_call': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              if (!agentId) break
+              const toolCall: ToolCallResult = {
+                id: typeof event.id === 'string' ? event.id : undefined,
+                name: String(event.name ?? ''),
+                params: normalizeToolParams(event.params),
+                originalParams: normalizeToolParams(event.params),
+                status: 'pending',
+                isExpanded: true,
+              }
+              const calls = pendingAgentToolCalls.get(agentId) ?? []
+              calls.push(toolCall)
+              pendingAgentToolCalls.set(agentId, calls)
+              updateMessage(message => ({
+                ...appendToolSegment(message, toolCall),
+                activityLabel: `子代理正在读取：${toolCall.name}`,
+              }))
+              break
+            }
+
+            case 'agent_tool_plan': {
+              const agentPlan = parseToolPlanEvent(event)
+              if (agentPlan?.agentId) {
+                currentAgentToolPlans.set(agentPlan.agentId, agentPlan)
+                updateMessage(message => ({
+                  ...message,
+                  activityLabel: `子代理已生成 ${agentPlan.executions.length} 个只读执行步骤`,
+                }))
+              }
+              break
+            }
+
+            case 'agent_tool_result': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '子代理已收到工具结果，继续分析...',
+              }))
+              break
+            }
+
+            case 'agent_done': {
+              const agentType = String(event.agentType ?? 'agent')
+              const agentId = String(event.agentId ?? '')
+              const result = String(event.result ?? '').trim()
+              if (agentId) {
+                setAgentRuns(prev => prev.map(agentRun => agentRun.id === agentId
+                  ? { ...agentRun, status: 'completed', result }
+                  : agentRun))
+              }
+              updateMessage(message => ({
+                ...appendContentChunk(
+                  message,
+                  `${message.text ? '\n\n' : ''}[${agentType} 子代理结果]\n${result}`,
+                ),
+                activityLabel: `子代理 ${agentType} 已完成，主 Agent 正在继续...`,
+              }))
+              break
+            }
+
+            case 'agent_background_launched': {
+              const agentType = String(event.agentType ?? 'agent')
+              const agentId = String(event.agentId ?? '')
+              const description = String(event.description ?? '后台任务')
+              if (agentId) {
+                setAgentRuns(prev => [{
+                  id: agentId,
+                  agentType,
+                  description,
+                  status: 'running',
+                }, ...prev.filter(agentRun => agentRun.id !== agentId)])
+                setIsAgentPanelExpanded(true)
+              }
+              updateMessage(message => ({
+                ...appendContentChunk(
+                  message,
+                  `${message.text ? '\n\n' : ''}[${agentType} 后台子代理已启动] ${description}`,
+                ),
+                activityLabel: '后台子代理已启动，主 Agent 正在继续...',
+              }))
+              break
+            }
+
             case 'tool_plan': {
               const nextToolPlan = parseToolPlanEvent(event)
               currentToolPlan = nextToolPlan
@@ -2912,6 +3186,18 @@ export default function AISidebar({
                     : '后端已生成工具执行计划',
                 }))
               }
+              break
+            }
+
+            case 'tooling_delta': {
+              const loadedCount = Number(event.loadedDeferredToolCount ?? 0)
+              const deferredCount = Number(event.deferredToolCount ?? 0)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: loadedCount > 0
+                  ? `已加载 ${loadedCount} 个延迟工具，剩余 ${deferredCount} 个`
+                  : `已同步工具摘要，延迟工具 ${deferredCount} 个`,
+              }))
               break
             }
 
@@ -3152,7 +3438,7 @@ export default function AISidebar({
       abortRef.current = null
       void loadConversations()
     }
-  }, [activeProviderId, activeTemplate, assistantMode, currentModelSupportsVision, editorState, editorView, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
+  }, [activeProviderId, activeTemplate, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
 
@@ -3347,6 +3633,74 @@ export default function AISidebar({
               </div>
             )}
             {/* End Task Panel */}
+
+            {/* Agent Panel */}
+            {agentRuns.length > 0 && (
+              <div className="sticky top-0 z-10 -mx-1 px-1 pb-1">
+                <div className="border border-emerald-200 rounded-xl overflow-hidden bg-emerald-50/95 backdrop-blur-sm shadow-sm flex-shrink-0">
+                  {(() => {
+                    const runningCount = agentRuns.filter(agentRun => agentRun.status === 'running').length
+                    const activeAgent = agentRuns.find(agentRun => agentRun.status === 'running') ?? agentRuns[0]
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setIsAgentPanelExpanded(prev => !prev)}
+                          className="w-full flex items-center justify-between px-3 py-2 bg-emerald-100 hover:bg-emerald-200 transition-colors text-left select-none"
+                        >
+                          <span className="min-w-0">
+                            <span className="text-xs font-semibold text-emerald-700 tracking-wide">Agent 子代理</span>
+                            {!isAgentPanelExpanded && activeAgent && (
+                              <span className="mt-0.5 block truncate text-[11px] text-emerald-600">
+                                {activeAgent.status === 'running' ? '运行中' :
+                                  activeAgent.status === 'completed' ? '已完成' :
+                                    activeAgent.status === 'cancelled' ? '已取消' : '失败'}：{activeAgent.description || activeAgent.agentType}
+                              </span>
+                            )}
+                          </span>
+                          <span className="text-xs text-emerald-500 flex items-center gap-1.5">
+                            <span>{runningCount > 0 ? `${runningCount} 运行中` : `${agentRuns.length} 个`}</span>
+                            <span>{isAgentPanelExpanded ? '▲' : '▼'}</span>
+                          </span>
+                        </button>
+                        {isAgentPanelExpanded && (
+                          <ul className="px-3 py-2 space-y-1.5">
+                            {agentRuns.map(agentRun => (
+                              <li key={agentRun.id} className="flex items-start gap-2 text-xs">
+                                <span className="flex-shrink-0 mt-px">
+                                  {agentRun.status === 'completed' ? '✓' :
+                                    agentRun.status === 'running' ? '…' :
+                                      agentRun.status === 'cancelled' ? '×' : '!'}
+                                </span>
+                                <span className="min-w-0">
+                                  <span
+                                    className={
+                                      agentRun.status === 'completed'
+                                        ? 'text-gray-500'
+                                        : agentRun.status === 'running'
+                                          ? 'text-emerald-700 font-medium'
+                                          : 'text-red-600'
+                                    }
+                                  >
+                                    {agentRun.agentType}：{agentRun.description || agentRun.id}
+                                  </span>
+                                  {(agentRun.result || agentRun.error) && (
+                                    <span className="mt-0.5 block text-[11px] text-gray-500 line-clamp-2">
+                                      {agentRun.error || agentRun.result}
+                                    </span>
+                                  )}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    )
+                  })()}
+                </div>
+              </div>
+            )}
+            {/* End Agent Panel */}
 
             {messages.map(message => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>

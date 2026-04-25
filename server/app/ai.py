@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -31,10 +32,35 @@ from .config import (
     get_provider,
     read_config,
 )
+from .agents import (
+    AgentDefinition,
+    AgentRunRecord,
+    get_agent_definition,
+    new_agent_run_id,
+    register_background_task,
+    resolve_agent_tool_names,
+    save_agent_run,
+    unregister_background_task,
+)
 from .models import ChatMessage, ChatRequest, CompletionRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
-from .prompts import assemble_system_prompt, get_system_prompt
-from .tooling import get_tools
-from .delta_injection import compute_all_deltas, build_initial_context_attachment
+from .tool_registry import TOOL_SEARCH_NAME
+from .tooling import (
+    build_tooling_delta_attachment,
+    get_deferred_tool_definitions,
+    get_model_tools,
+    get_tool_metadata_payload,
+    get_tools,
+    search_deferred_tool_definitions,
+)
+from .content import (
+    build_delta_content,
+    build_initial_context_content,
+    build_subagent_content,
+    build_system_content,
+    build_task_reminder_content,
+    build_user_content,
+    format_text_attachments_for_model,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -176,8 +202,6 @@ OCR_TASK_ALIASES = {
 
 OCR_BACKEND_COMPAT_CHAT = "compat_chat"
 OCR_BACKEND_PADDLEOCR_SERVICE = "paddleocr_service"
-SERVER_SIDE_TOOL_NAMES = {"web_search"}
-
 
 class AgentState(TypedDict):
     messages: list[BaseMessage]
@@ -2141,30 +2165,7 @@ def _format_ocr_results_for_model(ocr_results: list[dict[str, Any]]) -> str:
 
 
 def _format_text_attachments_for_model(attachments: list[dict[str, Any]] | None) -> str:
-    if not attachments:
-        return ""
-
-    parts = ["[文件附件]"]
-    total_chars = 0
-    max_total_chars = 24000
-    for index, attachment in enumerate(attachments, start=1):
-        if not isinstance(attachment, dict):
-            continue
-        text_content = _stringify_content(attachment.get("textContent")).strip()
-        if not text_content:
-            continue
-        name = str(attachment.get("name") or f"attachment-{index}").strip() or f"attachment-{index}"
-        text_format = str(attachment.get("textFormat") or "text").strip() or "text"
-        remaining = max_total_chars - total_chars
-        if remaining <= 0:
-            parts.append("其余附件内容因长度限制已省略。")
-            break
-        clipped = text_content[:remaining]
-        total_chars += len(clipped)
-        suffix = "\n[后续内容已截断]" if len(clipped) < len(text_content) else ""
-        parts.append(f"附件 {index}: {name} ({text_format})\n{clipped}{suffix}")
-
-    return "\n\n".join(parts) if len(parts) > 1 else ""
+    return str(format_text_attachments_for_model(attachments).content or "")
 
 
 async def prepare_chat_request(body: ChatRequest) -> ChatRequest:
@@ -2185,33 +2186,14 @@ def _build_human_content(
     ocr_results: list[dict[str, Any]] | None = None,
     image_processing_mode: str = DEFAULT_IMAGE_PROCESSING_MODE,
 ) -> str | list[dict[str, Any]]:
-    user_text = _normalize_user_text(message, context_block)
-    attachment_block = _format_text_attachments_for_model(attachments)
-    if attachment_block:
-        user_text = f"{user_text}\n\n{attachment_block}" if user_text else attachment_block
-    if not images:
-        return user_text
-
-    user_text = (
-        user_text
-        + f"\n\n[图片输入]\n本轮附带了 {len(images)} 张图片。"
-          + (
-              "当前路径是直接多模态模式。请直接根据图片内容和样式线索复现到当前文档中。"
-              if image_processing_mode == DEFAULT_IMAGE_PROCESSING_MODE
-              else "请根据图片内容复现到当前文档中。"
-          )
-    )
-
-    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-    for image in images:
-        url = image.get("dataUrl")
-        if not isinstance(url, str) or not url:
-            continue
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": url},
-        })
-    return content
+    return build_user_content(
+        message,
+        context_block,
+        images,
+        attachments,
+        ocr_results,
+        image_processing_mode,
+    ).content
 
 def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> None:
     last_user = next(
@@ -2398,6 +2380,10 @@ class PlannedToolExecution:
     merge_strategy: str = "single"
     continue_on_error: bool = True
     parallel_group: str | None = None
+    executor_location: str = "client"
+    read_only: bool = False
+    allowed_for_agent: bool = False
+    parallel_safe: bool = False
 
 
 @dataclass(frozen=True)
@@ -2407,23 +2393,8 @@ class ToolExecutionPlan:
     executions: list[PlannedToolExecution]
 
 
-PARALLEL_SAFE_TOOL_NAMES = {
-    "TaskList",
-    "get_document_info",
-    "get_document_outline",
-    "get_document_content",
-    "get_page_content",
-    "get_page_style_summary",
-    "get_paragraph",
-    "get_comments",
-    "workspace_search",
-    "workspace_read",
-    "analyze_image_with_ocr",
-}
-
-
 def _is_parallel_safe_execution(execution: PlannedToolExecution) -> bool:
-    return execution.tool_name in PARALLEL_SAFE_TOOL_NAMES
+    return execution.parallel_safe
 
 
 def _assign_parallel_groups(executions: list[PlannedToolExecution]) -> list[PlannedToolExecution]:
@@ -2477,6 +2448,7 @@ class SessionTrace:
     created_at: str
     events: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    content_events: list[dict[str, Any]] = field(default_factory=list)
     final_state: dict[str, Any] = field(default_factory=dict)
 
 
@@ -3017,6 +2989,18 @@ def _record_trace_event(session: "ReactSession", event_type: str, **data: Any) -
     })
 
 
+def _record_content_event(session: "ReactSession", event: dict[str, Any]) -> None:
+    session.trace.content_events.append({
+        "at": _now_iso(),
+        **event,
+    })
+
+
+def _record_content_events(session: "ReactSession", events: list[dict[str, Any]]) -> None:
+    for event in events:
+        _record_content_event(session, event)
+
+
 def _record_round_checkpoint(
     session: "ReactSession",
     *,
@@ -3072,6 +3056,10 @@ def _stable_stringify(value: Any) -> str:
             for key, item in items
         ) + "}"
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _stable_short_hash(value: Any) -> str:
+    return hashlib.sha256(_stable_stringify(value).encode("utf-8")).hexdigest()[:16]
 
 
 def _normalize_paragraph_index_list(value: Any) -> list[int]:
@@ -3149,7 +3137,45 @@ def _extract_delete_paragraph_indexes(params: dict[str, Any]) -> list[int] | Non
 
 
 def _is_server_side_tool(tool_name: str) -> bool:
-    return tool_name in SERVER_SIDE_TOOL_NAMES
+    return get_tool_metadata_payload(tool_name).get("executorLocation") == "server"
+
+
+def _select_model_tools_by_names(
+    tool_names: list[str],
+    *,
+    loaded_deferred_tools: set[str],
+    agent_type: str | None = None,
+) -> list[dict[str, Any]]:
+    requested = set(tool_names)
+    selected: list[dict[str, Any]] = []
+    for tool in get_model_tools("agent", loaded_deferred_tools, agent_type=agent_type):
+        name = str(tool.get("function", {}).get("name", ""))
+        if name in requested or name == TOOL_SEARCH_NAME:
+            selected.append(tool)
+    return selected
+
+
+def _make_planned_execution(
+    *,
+    tool_name: str,
+    params: dict[str, Any],
+    source_calls: list[SourceToolCall],
+    merge_strategy: str = "single",
+    continue_on_error: bool = True,
+) -> PlannedToolExecution:
+    metadata = get_tool_metadata_payload(tool_name)
+    return PlannedToolExecution(
+        execution_id=f"exec_{uuid.uuid4().hex[:10]}",
+        tool_name=tool_name,
+        params=params,
+        source_calls=source_calls,
+        merge_strategy=merge_strategy,
+        continue_on_error=continue_on_error,
+        executor_location=str(metadata.get("executorLocation") or "client"),
+        read_only=bool(metadata.get("readOnly")),
+        allowed_for_agent=bool(metadata.get("allowedForAgent")),
+        parallel_safe=bool(metadata.get("parallelSafe")),
+    )
 
 
 def _split_execution_plan(plan: ToolExecutionPlan) -> tuple[list[PlannedToolExecution], list[PlannedToolExecution]]:
@@ -3391,6 +3417,67 @@ async def _run_web_search_tool(params: dict[str, Any]) -> str:
     )
 
 
+def _run_tool_search_tool(
+    params: dict[str, Any],
+    *,
+    mode: str | None,
+    loaded_deferred_tools: set[str],
+) -> str:
+    query = _stringify_content(params.get("query")).strip()
+    if not query:
+        return _serialize_tool_result_payload(
+            tool_name=TOOL_SEARCH_NAME,
+            success=False,
+            message="ToolSearch 缺少 query 参数",
+            executed_params=params,
+            original_params=params,
+        )
+
+    matches = search_deferred_tool_definitions(mode, query, loaded_deferred_tools)
+    loaded_names = [definition.name for definition in matches]
+    loaded_deferred_tools.update(loaded_names)
+    schemas = [definition.to_openai_tool() for definition in matches]
+    if not schemas:
+        return _serialize_tool_result_payload(
+            tool_name=TOOL_SEARCH_NAME,
+            success=True,
+            message=f"没有找到匹配的延迟工具：{query}",
+            executed_params={"query": query},
+            original_params=params,
+            data={
+                "query": query,
+                "loadedToolNames": [],
+                "functions": [],
+                "remainingDeferredTools": [
+                    definition.to_deferred_summary()
+                    for definition in get_deferred_tool_definitions(mode, loaded_deferred_tools)
+                ],
+            },
+        )
+
+    functions_block = json.dumps(schemas, ensure_ascii=False, sort_keys=True)
+    return _serialize_tool_result_payload(
+        tool_name=TOOL_SEARCH_NAME,
+        success=True,
+        message=(
+            f"已加载 {len(schemas)} 个延迟工具：{', '.join(loaded_names)}。\n"
+            f"<functions>\n{functions_block}\n</functions>\n"
+            "下一轮可以直接调用这些工具。"
+        ),
+        executed_params={"query": query},
+        original_params=params,
+        data={
+            "query": query,
+            "loadedToolNames": loaded_names,
+            "functions": schemas,
+            "remainingDeferredTools": [
+                definition.to_deferred_summary()
+                for definition in get_deferred_tool_definitions(mode, loaded_deferred_tools)
+            ],
+        },
+    )
+
+
 def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -> ToolExecutionPlan:
     executions: list[PlannedToolExecution] = []
     mergeable_style_tools = {"set_text_style", "set_paragraph_style", "clear_formatting"}
@@ -3436,8 +3523,7 @@ def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -
 
                 merged_range = _build_range_from_paragraph_indexes(merged_indexes)
                 merged_params = {**current_attrs, "range": merged_range} if merged_range else current_params
-                executions.append(PlannedToolExecution(
-                    execution_id=f"exec_{uuid.uuid4().hex[:10]}",
+                executions.append(_make_planned_execution(
                     tool_name=current_name,
                     params=merged_params,
                     source_calls=source_calls,
@@ -3474,8 +3560,7 @@ def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -
                     if len(normalized_indexes) == 1
                     else {"indices": normalized_indexes}
                 )
-                executions.append(PlannedToolExecution(
-                    execution_id=f"exec_{uuid.uuid4().hex[:10]}",
+                executions.append(_make_planned_execution(
                     tool_name=current_name,
                     params=merged_params,
                     source_calls=source_calls,
@@ -3484,8 +3569,7 @@ def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -
                 index = next_index
                 continue
 
-        executions.append(PlannedToolExecution(
-            execution_id=f"exec_{uuid.uuid4().hex[:10]}",
+        executions.append(_make_planned_execution(
             tool_name=current_name,
             params=current_params,
             source_calls=[current_source],
@@ -3515,10 +3599,22 @@ def _serialize_execution_plan(plan: ToolExecutionPlan) -> dict[str, Any]:
                 "mergeStrategy": execution.merge_strategy,
                 "continueOnError": execution.continue_on_error,
                 "parallelGroup": execution.parallel_group,
+                "executorLocation": execution.executor_location,
+                "readOnly": execution.read_only,
+                "allowedForAgent": execution.allowed_for_agent,
+                "parallelSafe": execution.parallel_safe,
             }
             for execution in plan.executions
         ],
     }
+
+
+def _serialize_agent_execution_plan(agent_id: str, agent_type: str, plan: ToolExecutionPlan) -> dict[str, Any]:
+    payload = _serialize_execution_plan(plan)
+    payload["type"] = "agent_tool_plan"
+    payload["agentId"] = agent_id
+    payload["agentType"] = agent_type
+    return payload
 
 
 def _decorate_tool_result_content(
@@ -3551,6 +3647,7 @@ class ReactSession:
     __slots__ = (
         "session_id", "body", "messages", "tool_result_queue",
         "state", "finished", "expected_plan", "trace", "latest_context",
+        "agent_tool_result_queues", "agent_expected_plans", "loaded_deferred_tools",
     )
 
     def __init__(self, session_id: str, body: ChatRequest, messages: list[BaseMessage]):
@@ -3562,6 +3659,9 @@ class ReactSession:
         self.finished = False
         self.expected_plan: ToolExecutionPlan | None = None
         self.latest_context: dict[str, Any] = body.context or {}  # Updated each round
+        self.agent_tool_result_queues: dict[str, asyncio.Queue[PostedToolResults | None]] = {}
+        self.agent_expected_plans: dict[str, ToolExecutionPlan] = {}
+        self.loaded_deferred_tools: set[str] = set()
         self.trace = SessionTrace(
             session_id=session_id,
             conversation_id=body.conversationId,
@@ -3580,8 +3680,10 @@ MAX_COMPLETED_REACT_TRACES = 50
 
 def create_react_session(body: ChatRequest) -> ReactSession:
     session_id = uuid.uuid4().hex[:12]
-    messages = build_messages(body)
+    content_events: list[dict[str, Any]] = []
+    messages = build_messages(body, content_events=content_events)
     session = ReactSession(session_id, body, messages)
+    _record_content_events(session, content_events)
     _active_sessions[session_id] = session
     return session
 
@@ -3604,6 +3706,7 @@ def _serialize_trace(session: ReactSession) -> dict[str, Any]:
         "createdAt": session.trace.created_at,
         "events": list(session.trace.events),
         "checkpoints": list(session.trace.checkpoints),
+        "contentEvents": list(session.trace.content_events),
         "finalState": dict(session.trace.final_state),
     }
 
@@ -3667,6 +3770,68 @@ def list_conversation_react_traces(conversation_id: str) -> list[dict[str, Any]]
 
 
 def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -> None:
+    agent_id = str(body.agent_id or "").strip()
+    if agent_id:
+        if body.stop:
+            queue = session.agent_tool_result_queues.get(agent_id)
+            if queue is None:
+                raise HTTPException(status_code=409, detail="当前 Agent 不在等待工具结果")
+            queue.put_nowait(None)
+            return
+
+        if body.context is not None:
+            session.latest_context = body.context
+
+        expected_plan = session.agent_expected_plans.get(agent_id)
+        if expected_plan is None:
+            raise HTTPException(status_code=409, detail="当前 Agent 不在等待工具结果")
+        if body.plan_id and body.plan_id != expected_plan.plan_id:
+            raise HTTPException(status_code=409, detail="Agent tool result planId 与当前执行计划不匹配")
+        if body.round is not None and body.round != expected_plan.round:
+            raise HTTPException(status_code=409, detail="Agent tool result round 与当前轮次不匹配")
+        if not body.results:
+            raise HTTPException(status_code=400, detail="results 不能为空")
+
+        valid_execution_ids = {execution.execution_id for execution in expected_plan.executions}
+        seen_execution_ids: set[str] = set()
+        posted_results: list[PostedToolResult] = []
+        for item in body.results:
+            execution_id = str(item.execution_id or item.tool_call_id or "").strip()
+            if not execution_id:
+                raise HTTPException(status_code=400, detail="每条 tool result 都必须包含 execution_id")
+            if execution_id not in valid_execution_ids:
+                raise HTTPException(status_code=409, detail=f"未知 Agent execution_id: {execution_id}")
+            if execution_id in seen_execution_ids:
+                raise HTTPException(status_code=409, detail=f"重复的 Agent execution_id: {execution_id}")
+            seen_execution_ids.add(execution_id)
+            posted_results.append(PostedToolResult(
+                execution_id=execution_id,
+                content=item.content,
+            ))
+        missing_execution_ids = valid_execution_ids - seen_execution_ids
+        if missing_execution_ids:
+            missing_text = ", ".join(sorted(missing_execution_ids))
+            raise HTTPException(status_code=409, detail=f"缺少 Agent execution result: {missing_text}")
+
+        queue = session.agent_tool_result_queues.get(agent_id)
+        if queue is None:
+            raise HTTPException(status_code=409, detail="当前 Agent 结果队列不存在")
+        queue.put_nowait(PostedToolResults(
+            plan_id=body.plan_id,
+            round=body.round,
+            results=posted_results,
+            stop=False,
+        ))
+        _record_trace_event(
+            session,
+            "agent_tool_results_posted",
+            agentId=agent_id,
+            planId=body.plan_id,
+            round=body.round,
+            executionCount=len(posted_results),
+        )
+        return
+
     if body.stop:
         _record_trace_event(session, "client_stop_requested")
         session.tool_result_queue.put_nowait(None)
@@ -4052,14 +4217,53 @@ def _determine_compression_tier(messages: list[BaseMessage], current_tier: int) 
     return current_tier
 
 
-def build_messages(body: ChatRequest) -> list[BaseMessage]:
-    # Static system prompt only (context injected as delta attachment)
-    system_prompt = get_system_prompt(body.mode)
-    messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+def _record_tooling_delta_message(
+    messages: list[BaseMessage],
+    *,
+    mode: str | None,
+    loaded_deferred_tools: set[str],
+    content_events: list[dict[str, Any]] | None = None,
+) -> None:
+    attachment = build_tooling_delta_attachment(mode, loaded_deferred_tools)
+    deferred_count = len(get_deferred_tool_definitions(mode, loaded_deferred_tools))
+    if content_events is not None:
+        content_events.append({
+            "type": "tooling_delta",
+            "mode": mode or "layout",
+            "deferredToolCount": deferred_count,
+            "loadedDeferredToolCount": len(loaded_deferred_tools),
+            "contentChars": len(attachment),
+        })
+    if attachment:
+        messages.append(HumanMessage(content=attachment))
+
+
+def build_messages(
+    body: ChatRequest,
+    content_events: list[dict[str, Any]] | None = None,
+    loaded_deferred_tools: set[str] | None = None,
+) -> list[BaseMessage]:
+    provider, _ = _resolve_provider_and_model(body)
+    loaded = set(loaded_deferred_tools or set())
+    selected_tools = get_model_tools(body.mode, loaded)
+    system_content = build_system_content(
+        body.mode,
+        provider,
+        selected_tools,
+        deferred_tool_count=len(get_deferred_tool_definitions(body.mode, loaded)),
+        loaded_deferred_tool_count=len(loaded),
+    )
+    messages: list[BaseMessage] = [SystemMessage(content=system_content.prompt)]
+    if content_events is not None:
+        content_events.append(system_content.trace)
+    _record_tooling_delta_message(messages, mode=body.mode, loaded_deferred_tools=loaded, content_events=content_events)
 
     # Inject initial context as delta attachment (full state announcement)
     context = body.context or {}
-    initial_attachment = build_initial_context_attachment(context)
+    initial_context = build_initial_context_content(context)
+    initial_attachment = str(initial_context.content or "")
+    if content_events is not None:
+        content_events.append(initial_context.trace)
     if initial_attachment:
         messages.append(HumanMessage(content=initial_attachment))
 
@@ -4067,46 +4271,71 @@ def build_messages(body: ChatRequest) -> list[BaseMessage]:
         for i, item in enumerate(body.reactMessages):
             raw = dict(item)
             original = _stringify_content(raw.get("content"))
-            messages.append(HumanMessage(content=_build_human_content(
+            user_content = build_user_content(
                 original,
                 "",  # context now injected as delta attachment
                 body.images,
                 body.attachments,
                 body.ocrResults,
                 body.imageProcessingMode,
-            )))
+                source=f"react_message_{i}",
+            )
+            if content_events is not None:
+                content_events.append(user_content.trace)
+            messages.append(HumanMessage(content=user_content.content))
         _log_final_user_message(body, messages)
         return messages
 
     for item in body.history[-10:]:
         messages.append(_to_langchain_message(item))
 
-    messages.append(HumanMessage(content=_build_human_content(
+    user_content = build_user_content(
         body.message,
         "",  # context now injected as delta attachment
         body.images,
         body.attachments,
         body.ocrResults,
         body.imageProcessingMode,
-    )))
+        source="current_user",
+    )
+    if content_events is not None:
+        content_events.append(user_content.trace)
+    messages.append(HumanMessage(content=user_content.content))
     _log_final_user_message(body, messages)
     return messages
 
 
-def build_llm(streaming: bool, body: ChatRequest) -> Runnable:
+def build_llm(
+    streaming: bool,
+    body: ChatRequest,
+    tools: list[dict[str, Any]] | None = None,
+    loaded_deferred_tools: set[str] | None = None,
+    agent_type: str | None = None,
+) -> Runnable:
     provider, model = _resolve_provider_and_model(body)
     api_key = str(provider.get("apiKey", "") or "")
     endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
     if not model:
         model = "Qwen/Qwen2.5-72B-Instruct"
+    selected_tools = tools if tools is not None else get_model_tools(body.mode, loaded_deferred_tools or set(), agent_type=agent_type)
+    system_content = build_system_content(
+        body.mode,
+        provider,
+        selected_tools,
+        deferred_tool_count=len(get_deferred_tool_definitions(body.mode, loaded_deferred_tools or set())),
+        loaded_deferred_tool_count=len(loaded_deferred_tools or set()),
+    )
+    model_kwargs = dict(system_content.prompt_cache.get("modelKwargs") or {})
 
-    return ChatOpenAI(
+    llm = ChatOpenAI(
         model=model,
         api_key=api_key or "not-needed",
         base_url=endpoint,
         temperature=0.3,
         streaming=streaming,
-    ).bind_tools(get_tools(body.mode))
+        **({"model_kwargs": model_kwargs} if model_kwargs else {}),
+    )
+    return llm.bind_tools(selected_tools) if selected_tools else llm
 
 
 COMPLETION_ACTIVITY_CONFIG = {
@@ -4626,7 +4855,6 @@ class QueryCoordinator:
     def __init__(self, session: ReactSession):
         self.session = session
         self.state = session.state
-        self.llm = build_llm(streaming=True, body=session.body)
 
     def _summarize_execution_results(
         self,
@@ -4669,7 +4897,12 @@ class QueryCoordinator:
             round_content = ""
             round_tool_calls = []
             round_finish_reason = ""
-            graph = build_graph(self.llm)
+            llm = build_llm(
+                streaming=True,
+                body=self.session.body,
+                loaded_deferred_tools=self.session.loaded_deferred_tools,
+            )
+            graph = build_graph(llm)
 
             try:
                 async for event in _run_llm_round(graph, messages, self.session.body, self.state.round):
@@ -4759,14 +4992,31 @@ class QueryCoordinator:
                     tool_call_id=source_call.id,
                 ))
 
+        _record_content_event(self.session, {
+            "type": "tool_results",
+            "source": "frontend",
+            "planId": plan.plan_id,
+            "round": plan.round,
+            "executionCount": len(execution_results),
+            "contentChars": sum(len(item["content"]) for item in execution_results),
+        })
         return execution_results
 
     async def _execute_server_execution(
         self,
         execution: PlannedToolExecution,
     ) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
-        if execution.tool_name == "web_search":
+        if execution.tool_name == TOOL_SEARCH_NAME:
+            before_loaded = set(self.session.loaded_deferred_tools)
+            content = _run_tool_search_tool(
+                execution.params,
+                mode=self.session.body.mode,
+                loaded_deferred_tools=self.session.loaded_deferred_tools,
+            )
+            newly_loaded = sorted(self.session.loaded_deferred_tools - before_loaded)
+        elif execution.tool_name == "web_search":
             content = await _run_web_search_tool(execution.params)
+            newly_loaded = []
         else:
             content = _serialize_tool_result_payload(
                 tool_name=execution.tool_name,
@@ -4798,17 +5048,445 @@ class QueryCoordinator:
             ))
             events.append(_build_tool_result_event(execution, source_call, payload))
 
+        _record_content_event(self.session, {
+            "type": "tool_results",
+            "source": "server",
+            "toolName": execution.tool_name,
+            "executionCount": 1,
+            "sourceToolCallCount": len(execution.source_calls),
+            "contentChars": len(content),
+        })
+        if execution.tool_name == TOOL_SEARCH_NAME:
+            _record_content_event(self.session, {
+                "type": "tooling_delta",
+                "mode": self.session.body.mode or "layout",
+                "source": "ToolSearch",
+                "loadedToolNamesHash": _stable_short_hash(newly_loaded),
+                "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
+                "deferredToolCount": len(get_deferred_tool_definitions(self.session.body.mode, self.session.loaded_deferred_tools)),
+            })
+            events.append({
+                "type": "tooling_delta",
+                "loadedToolNames": newly_loaded,
+                "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
+                "deferredToolCount": len(get_deferred_tool_definitions(self.session.body.mode, self.session.loaded_deferred_tools)),
+            })
         return result, summary, events
+
+    async def _run_subagent(
+        self,
+        *,
+        agent_id: str,
+        agent: AgentDefinition,
+        description: str,
+        prompt: str,
+        model_override: str | None = None,
+        background: bool = False,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        available_tool_names = {
+            str(tool.get("function", {}).get("name", ""))
+            for tool in get_tools("agent")
+        }
+        tool_names = resolve_agent_tool_names(agent, available_tool_names, background=background)
+        child_loaded_deferred_tools: set[str] = set()
+        body_data = self.session.body.model_dump()
+        selected_model = str(model_override or agent.model or self.session.body.model or "").strip()
+        if selected_model:
+            body_data["model"] = selected_model
+        child_body = ChatRequest(**body_data)
+        subagent_content = build_subagent_content(
+            agent=agent,
+            tool_names=tool_names,
+            description=description,
+            prompt=prompt,
+            context=self.session.latest_context or {},
+            background=background,
+        )
+        _record_content_event(self.session, subagent_content.trace)
+        subagent_payload = dict(subagent_content.content)
+        child_messages: list[BaseMessage] = [
+            SystemMessage(content=str(subagent_payload.get("systemPrompt") or ""))
+        ]
+        child_messages.append(HumanMessage(content=str(subagent_payload.get("userPrompt") or "")))
+
+        yield {
+            "type": "agent_start",
+            "agentId": agent_id,
+            "agentType": agent.agent_type,
+            "description": description,
+            "runMode": "background" if background else "sync",
+            "tools": tool_names,
+            "maxTurns": agent.max_turns,
+        }
+
+        final_text = ""
+        for child_round in range(1, agent.max_turns + 1):
+            yield {
+                "type": "agent_progress",
+                "agentId": agent_id,
+                "agentType": agent.agent_type,
+                "phase": "round_start",
+                "round": child_round,
+            }
+
+            round_content = ""
+            round_tool_calls: list[dict[str, Any]] = []
+            child_tools = _select_model_tools_by_names(
+                tool_names,
+                loaded_deferred_tools=child_loaded_deferred_tools,
+                agent_type=agent.agent_type,
+            )
+            graph = build_graph(build_llm(
+                streaming=True,
+                body=child_body,
+                tools=child_tools,
+                loaded_deferred_tools=child_loaded_deferred_tools,
+                agent_type=agent.agent_type,
+            ))
+            async for event in _run_llm_round(graph, child_messages, child_body, child_round):
+                event_type = event["type"]
+                if event_type == "_round_result":
+                    round_content = event["content"]
+                    round_tool_calls = event["tool_calls"]
+                    continue
+                if event_type == "content":
+                    yield {
+                        "type": "agent_progress",
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "phase": "content",
+                        "content": event.get("content", ""),
+                    }
+                    continue
+                if event_type == "thinking":
+                    yield {
+                        "type": "agent_progress",
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "phase": "thinking",
+                        "content": event.get("content", ""),
+                    }
+                    continue
+                if event_type == "tool_call":
+                    yield {
+                        "type": "agent_tool_call",
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "id": event.get("id"),
+                        "name": event.get("name"),
+                        "params": event.get("params"),
+                    }
+
+            if not round_tool_calls:
+                final_text = round_content.strip()
+                child_messages.append(AIMessage(content=round_content))
+                break
+
+            child_messages.append(AIMessage(
+                content=round_content,
+                tool_calls=[
+                    {"id": tool_call["id"], "name": tool_call["name"], "args": tool_call["params"], "type": "tool_call"}
+                    for tool_call in round_tool_calls
+                ],
+            ))
+
+            execution_plan = _build_execution_plan(child_round, round_tool_calls)
+            server_executions, client_executions = _split_execution_plan(execution_plan)
+
+            for server_execution in server_executions:
+                if server_execution.tool_name == "Agent":
+                    content = _serialize_tool_result_payload(
+                        tool_name="Agent",
+                        success=False,
+                        message="子代理不能再启动子代理",
+                        executed_params=server_execution.params,
+                        original_params=server_execution.params,
+                    )
+                    for source_call in server_execution.source_calls:
+                        child_messages.append(ToolMessage(
+                            content=_decorate_tool_result_content(content, server_execution, source_call),
+                            tool_call_id=source_call.id,
+                        ))
+                    continue
+                if server_execution.tool_name == TOOL_SEARCH_NAME:
+                    server_content = _run_tool_search_tool(
+                        server_execution.params,
+                        mode="agent",
+                        loaded_deferred_tools=child_loaded_deferred_tools,
+                    )
+                elif server_execution.tool_name == "web_search":
+                    server_content = await _run_web_search_tool(server_execution.params)
+                else:
+                    server_content = _serialize_tool_result_payload(
+                        tool_name=server_execution.tool_name,
+                        success=False,
+                        message=f"子代理不能执行服务端工具：{server_execution.tool_name}",
+                        executed_params=server_execution.params,
+                        original_params=server_execution.params,
+                    )
+                server_payload = _parse_tool_result_payload(server_content)
+                for source_call in server_execution.source_calls:
+                    child_messages.append(ToolMessage(
+                        content=_decorate_tool_result_content(server_content, server_execution, source_call),
+                        tool_call_id=source_call.id,
+                    ))
+                    yield {
+                        "type": "agent_tool_result",
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "toolResult": _build_tool_result_event(server_execution, source_call, server_payload),
+                    }
+
+            if client_executions:
+                if background:
+                    for client_execution in client_executions:
+                        content = _serialize_tool_result_payload(
+                            tool_name=client_execution.tool_name,
+                            success=False,
+                            message="后台子代理不能请求前端实时工具；请改用同步子代理或基于上下文快照分析。",
+                            executed_params=client_execution.params,
+                            original_params=client_execution.params,
+                        )
+                        for source_call in client_execution.source_calls:
+                            child_messages.append(ToolMessage(
+                                content=_decorate_tool_result_content(content, client_execution, source_call),
+                                tool_call_id=source_call.id,
+                            ))
+                    continue
+
+                client_plan = ToolExecutionPlan(
+                    plan_id=execution_plan.plan_id,
+                    round=execution_plan.round,
+                    executions=client_executions,
+                )
+                self.session.agent_expected_plans[agent_id] = client_plan
+                self.session.agent_tool_result_queues[agent_id] = asyncio.Queue()
+                yield _serialize_agent_execution_plan(agent_id, agent.agent_type, client_plan)
+                yield {
+                    "type": "agent_progress",
+                    "agentId": agent_id,
+                    "agentType": agent.agent_type,
+                    "phase": "awaiting_tool_results",
+                    "round": client_plan.round,
+                    "planId": client_plan.plan_id,
+                    "count": len(client_plan.executions),
+                }
+
+                try:
+                    posted_results = await asyncio.wait_for(
+                        self.session.agent_tool_result_queues[agent_id].get(),
+                        timeout=TOOL_RESULT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    self.session.agent_expected_plans.pop(agent_id, None)
+                    self.session.agent_tool_result_queues.pop(agent_id, None)
+                    raise HTTPException(status_code=504, detail="等待子代理工具结果超时")
+                finally:
+                    self.session.agent_expected_plans.pop(agent_id, None)
+                    self.session.agent_tool_result_queues.pop(agent_id, None)
+
+                if posted_results is None:
+                    final_text = "子代理已被用户停止。"
+                    break
+
+                results_by_execution = {
+                    item.execution_id: item
+                    for item in posted_results.results
+                }
+                for client_execution in client_plan.executions:
+                    posted = results_by_execution[client_execution.execution_id]
+                    for source_call in client_execution.source_calls:
+                        child_messages.append(ToolMessage(
+                            content=_decorate_tool_result_content(posted.content, client_execution, source_call),
+                            tool_call_id=source_call.id,
+                        ))
+
+        if not final_text:
+            final_text = f"子代理 {agent.agent_type} 已达到最大轮次，未形成完整结论。"
+        _record_content_event(self.session, {
+            "type": "subagent_result",
+            "agentType": agent.agent_type,
+            "runMode": "background" if background else "sync",
+            "resultChars": len(final_text),
+        })
+        yield {
+            "type": "_subagent_result",
+            "agentId": agent_id,
+            "agentType": agent.agent_type,
+            "content": final_text,
+        }
+
+    async def _run_background_agent_lifecycle(
+        self,
+        record: AgentRunRecord,
+        agent: AgentDefinition,
+        model_override: str | None,
+    ) -> None:
+        try:
+            async for event in self._run_subagent(
+                agent_id=record.id,
+                agent=agent,
+                description=record.description,
+                prompt=record.prompt,
+                model_override=model_override,
+                background=True,
+            ):
+                if event["type"] == "_subagent_result":
+                    record.status = "completed"
+                    record.result = str(event.get("content") or "")
+                else:
+                    record.trace.append(event)
+                save_agent_run(record)
+        except asyncio.CancelledError:
+            record.status = "cancelled"
+            record.error = "用户取消"
+            save_agent_run(record)
+        except Exception as exc:
+            logger.exception("[openwps.ai] background agent %s failed", record.id)
+            record.status = "failed"
+            record.error = _stringify_content(exc)
+            save_agent_run(record)
+        finally:
+            unregister_background_task(record.id)
+
+    async def _execute_agent_execution(
+        self,
+        execution: PlannedToolExecution,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        params = dict(execution.params or {})
+        description = _stringify_content(params.get("description")).strip() or "子代理任务"
+        prompt = _stringify_content(params.get("prompt")).strip()
+        subagent_type = _stringify_content(params.get("subagent_type")).strip() or "general-purpose"
+        model_override = _stringify_content(params.get("model")).strip() or None
+        run_in_background = bool(params.get("run_in_background"))
+
+        if not prompt:
+            content = _serialize_tool_result_payload(
+                tool_name="Agent",
+                success=False,
+                message="Agent 缺少 prompt 参数",
+                executed_params=params,
+                original_params=params,
+            )
+            payload = _parse_tool_result_payload(content)
+            for source_call in execution.source_calls:
+                self.session.messages.append(ToolMessage(
+                    content=_decorate_tool_result_content(content, execution, source_call),
+                    tool_call_id=source_call.id,
+                ))
+                yield _build_tool_result_event(execution, source_call, payload)
+            yield {"type": "_server_execution_result", "result": {"execution_id": execution.execution_id, "content": content}, "summary": {
+                "executionId": execution.execution_id,
+                "toolName": execution.tool_name,
+                "success": False,
+                "message": "Agent 缺少 prompt 参数",
+                "mergeStrategy": execution.merge_strategy,
+                "sourceToolCallCount": len(execution.source_calls),
+            }}
+            return
+
+        agent = get_agent_definition(subagent_type)
+        agent_id = new_agent_run_id()
+        if run_in_background or agent.background:
+            conversation_id = self.session.body.conversationId or self.session.session_id
+            record = AgentRunRecord(
+                id=agent_id,
+                conversation_id=conversation_id,
+                agent_type=agent.agent_type,
+                description=description,
+                prompt=prompt,
+                run_mode="background",
+            )
+            save_agent_run(record)
+            task = asyncio.create_task(self._run_background_agent_lifecycle(record, agent, model_override))
+            register_background_task(agent_id, task)
+            content = _serialize_tool_result_payload(
+                tool_name="Agent",
+                success=True,
+                message=f"后台子代理已启动：{description}",
+                executed_params=params,
+                original_params=params,
+                data={
+                    "agentId": agent_id,
+                    "agentType": agent.agent_type,
+                    "status": "background_launched",
+                    "conversationId": conversation_id,
+                },
+            )
+            payload = _parse_tool_result_payload(content)
+            yield {
+                "type": "agent_background_launched",
+                "agentId": agent_id,
+                "agentType": agent.agent_type,
+                "description": description,
+                "conversationId": conversation_id,
+            }
+        else:
+            final_content = ""
+            async for event in self._run_subagent(
+                agent_id=agent_id,
+                agent=agent,
+                description=description,
+                prompt=prompt,
+                model_override=model_override,
+                background=False,
+            ):
+                if event["type"] == "_subagent_result":
+                    final_content = str(event.get("content") or "")
+                else:
+                    yield event
+            content = _serialize_tool_result_payload(
+                tool_name="Agent",
+                success=True,
+                message=f"子代理 {agent.agent_type} 已完成：{description}",
+                executed_params=params,
+                original_params=params,
+                data={
+                    "agentId": agent_id,
+                    "agentType": agent.agent_type,
+                    "result": final_content,
+                },
+            )
+            payload = _parse_tool_result_payload(content)
+            yield {
+                "type": "agent_done",
+                "agentId": agent_id,
+                "agentType": agent.agent_type,
+                "description": description,
+                "result": final_content,
+            }
+
+        result = {
+            "execution_id": execution.execution_id,
+            "content": content,
+        }
+        summary = {
+            "executionId": execution.execution_id,
+            "toolName": execution.tool_name,
+            "success": payload.get("success") is True,
+            "message": _truncate_preview(payload.get("message", ""), 120),
+            "mergeStrategy": execution.merge_strategy,
+            "sourceToolCallCount": len(execution.source_calls),
+        }
+        for source_call in execution.source_calls:
+            self.session.messages.append(ToolMessage(
+                content=_decorate_tool_result_content(content, execution, source_call),
+                tool_call_id=source_call.id,
+            ))
+            yield _build_tool_result_event(execution, source_call, payload)
+        _record_content_event(self.session, {
+            "type": "tool_results",
+            "source": "agent",
+            "toolName": execution.tool_name,
+            "executionCount": 1,
+            "sourceToolCallCount": len(execution.source_calls),
+            "contentChars": len(content),
+        })
+        yield {"type": "_server_execution_result", "result": result, "summary": summary}
 
     async def stream(self) -> AsyncGenerator[dict[str, Any], None]:
         _record_trace_event(self.session, "session_created")
         yield {"type": "session_created", "sessionId": self.session.session_id}
-
-        # Inject initial context as attachment (full state announcement)
-        context = self.session.latest_context
-        initial_attachment = build_initial_context_attachment(context)
-        if initial_attachment:
-            self.session.messages.append(HumanMessage(content=initial_attachment))
 
         try:
             while self.state.round < MAX_REACT_ROUNDS and not self.session.finished:
@@ -5022,11 +5700,40 @@ class QueryCoordinator:
                     sourceToolCallCount=len(round_tool_calls),
                 )
                 for execution in server_executions:
-                    server_result, server_summary, server_events = await self._execute_server_execution(execution)
+                    if execution.tool_name == "Agent":
+                        server_result = None
+                        server_summary = None
+                        async for agent_event in self._execute_agent_execution(execution):
+                            if agent_event["type"] == "_server_execution_result":
+                                server_result = agent_event["result"]
+                                server_summary = agent_event["summary"]
+                            else:
+                                yield agent_event
+                        if server_result is None or server_summary is None:
+                            server_result = {
+                                "execution_id": execution.execution_id,
+                                "content": _serialize_tool_result_payload(
+                                    tool_name="Agent",
+                                    success=False,
+                                    message="Agent 执行未返回结果",
+                                    executed_params=execution.params,
+                                    original_params=execution.params,
+                                ),
+                            }
+                            server_summary = {
+                                "executionId": execution.execution_id,
+                                "toolName": execution.tool_name,
+                                "success": False,
+                                "message": "Agent 执行未返回结果",
+                                "mergeStrategy": execution.merge_strategy,
+                                "sourceToolCallCount": len(execution.source_calls),
+                            }
+                    else:
+                        server_result, server_summary, server_events = await self._execute_server_execution(execution)
+                        for server_event in server_events:
+                            yield server_event
                     server_execution_results.append(server_result)
                     server_execution_summary.append(server_summary)
-                    for server_event in server_events:
-                        yield server_event
 
                 execution_results = list(server_execution_results)
                 execution_summary = list(server_execution_summary)
@@ -5173,7 +5880,9 @@ class QueryCoordinator:
                 # Use latest_context (updated by frontend each round) instead of body.context (frozen at session start)
                 context = self.session.latest_context
                 force_delta = compression_outcome.source != "none"
-                delta_messages = compute_all_deltas(context, self.session.messages, force_full=force_delta)
+                delta_content = build_delta_content(context, self.session.messages, force_full=force_delta)
+                delta_messages = list(delta_content.content or [])
+                _record_content_event(self.session, delta_content.trace)
                 for delta_msg in delta_messages:
                     self.session.messages.append(HumanMessage(content=delta_msg))
 
@@ -5181,23 +5890,9 @@ class QueryCoordinator:
                 self.state.rounds_since_last_task_update += 1
                 if self.state.rounds_since_last_task_update >= TODO_REMINDER_INTERVAL:
                     current_tasks = _get_latest_tasks(self.session.messages)
-                    task_summary = ""
-                    if current_tasks:
-                        lines = []
-                        for task in current_tasks:
-                            status_icon = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}.get(task.get("status", "pending"), "⬜")
-                            lines.append(f"{status_icon} {task.get('subject', '?')}")
-                        task_summary = "\n当前任务列表：\n" + "\n".join(lines)
-                    reminder = (
-                        f"<system-reminder>\n"
-                        f"TaskCreate / TaskUpdate 已经 {self.state.rounds_since_last_task_update} 轮未使用。"
-                        f"如果你正在处理多步骤任务，可自行决定是否使用 TaskCreate 建立内部任务，并用 TaskUpdate 跟踪进度。"
-                        f"不要因为用户提到任务列表而使用它；用户提示中的任务列表默认指文档正文任务列表。\n"
-                        f"开始执行前把当前任务标记为 in_progress，完成后立即标记为 completed。"
-                        f"每完成一个任务后优先调用 TaskList 查看剩余任务。{task_summary}\n"
-                        f"</system-reminder>"
-                    )
-                    self.session.messages.append(HumanMessage(content=reminder))
+                    reminder_content = build_task_reminder_content(self.state.rounds_since_last_task_update, current_tasks)
+                    _record_content_event(self.session, reminder_content.trace)
+                    self.session.messages.append(HumanMessage(content=str(reminder_content.content or "")))
 
             if self.state.round >= MAX_REACT_ROUNDS and not self.session.finished:
                 self.state.transition = Transition.MAX_ROUNDS

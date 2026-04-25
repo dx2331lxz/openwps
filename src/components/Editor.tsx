@@ -1335,7 +1335,7 @@ function toggleTaskItemCheckedFromPoint(
   const nextSelectionPos = Math.max(0, Math.min(pos, view.state.doc.content.size))
   const tr = view.state.tr.setNodeMarkup(paragraph.pos, undefined, {
     ...paragraph.node.attrs,
-    listChecked: !Boolean(paragraph.node.attrs.listChecked),
+    listChecked: !paragraph.node.attrs.listChecked,
   })
   tr.setSelection(TextSelection.create(tr.doc, Math.min(nextSelectionPos, tr.doc.content.size)))
 
@@ -2371,7 +2371,7 @@ export const Editor: React.FC = () => {
       const message = error instanceof Error ? error.message : String(error)
       window.alert(`DOCX 导出失败：${message}`)
     }
-  }, [])
+  }, [buildCurrentDocxBlob])
 
   const handleInsertImage = useCallback((file: File) => {
     const editorView = viewRef.current
@@ -2970,7 +2970,7 @@ export const Editor: React.FC = () => {
   const pretextVisualActive = Boolean(layoutResult && !layoutSettling && !editorComposing && !editorInTable)
   const aiCopilotDocTextFingerprint = React.useMemo(
     () => (editorState ? getAICopilotDocTextFingerprint(editorState.doc) : ''),
-    [editorState?.doc],
+    [editorState],
   )
   const visualCaretRect = React.useMemo(() => {
     if (!layoutResult || !editorState?.selection.empty) return null

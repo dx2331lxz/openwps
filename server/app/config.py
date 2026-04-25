@@ -11,6 +11,8 @@ CONVERSATIONS_DIR = BASE_DIR / "data" / "conversations"
 DOCUMENTS_DIR = BASE_DIR / "data" / "documents"
 DOCUMENT_SETTINGS_PATH = BASE_DIR / "data" / "document_settings.json"
 TASKS_DIR = BASE_DIR / "data" / "tasks"
+AGENTS_DIR = BASE_DIR / "data" / "agents"
+AGENT_RUNS_DIR = BASE_DIR / "data" / "agent_runs"
 TEMPLATES_DIR = BASE_DIR / "data" / "templates"
 TEMPLATE_SOURCES_DIR = TEMPLATES_DIR / "sources"
 DIST_DIR = BASE_DIR.parent / "dist"
@@ -19,6 +21,8 @@ CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
+AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+AGENT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATE_SOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -40,6 +44,8 @@ PRESET_PROVIDERS = [
         "apiKey": "",
         "isPreset": True,
         "supportsVision": True,
+        "promptCacheMode": "openai_auto",
+        "promptCacheRetention": "in_memory",
     },
     {
         "id": "openrouter",
@@ -106,6 +112,20 @@ def _normalize_endpoint(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+def _normalize_prompt_cache_mode(value: Any, provider_id: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized == "openai_auto":
+        return "openai_auto"
+    if normalized == "off":
+        return "off"
+    return "openai_auto" if provider_id == "openai" else "off"
+
+
+def _normalize_prompt_cache_retention(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"in_memory", "24h"} else "in_memory"
+
+
 def _normalize_image_processing_mode(value: Any) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
     if normalized in {"ocr", "ocr_text"}:
@@ -146,6 +166,7 @@ def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -
     provider_id = str(raw.get("id") or fallback_id).strip() or fallback_id
     label = str(raw.get("label") or raw.get("name") or ("自定义服务商" if not is_preset else provider_id)).strip()
     default_model = str(raw.get("defaultModel") or raw.get("model") or "").strip()
+    prompt_cache_mode = _normalize_prompt_cache_mode(raw.get("promptCacheMode"), provider_id)
     return {
         "id": provider_id,
         "label": label,
@@ -154,6 +175,8 @@ def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -
         "apiKey": str(raw.get("apiKey") or "").strip(),
         "isPreset": bool(raw.get("isPreset", is_preset)),
         "supportsVision": bool(raw.get("supportsVision", False)),
+        "promptCacheMode": prompt_cache_mode,
+        "promptCacheRetention": _normalize_prompt_cache_retention(raw.get("promptCacheRetention")),
     }
 
 
@@ -229,6 +252,8 @@ def _merge_providers(saved: list[dict[str, Any]] | None) -> list[dict[str, Any]]
                 defaultModel=saved_item["defaultModel"] or current["defaultModel"],
                 apiKey=saved_item["apiKey"],
                 label=saved_item["label"] or current["label"],
+                promptCacheMode=saved_item["promptCacheMode"],
+                promptCacheRetention=saved_item["promptCacheRetention"],
             )
         providers.append(current)
 
@@ -245,6 +270,8 @@ def _merge_providers(saved: list[dict[str, Any]] | None) -> list[dict[str, Any]]
                 "label": item["label"] or f"自定义服务商 {custom_index}",
                 "isPreset": False,
                 "supportsVision": bool(item.get("supportsVision", False)),
+                "promptCacheMode": _normalize_prompt_cache_mode(item.get("promptCacheMode"), provider_id),
+                "promptCacheRetention": _normalize_prompt_cache_retention(item.get("promptCacheRetention")),
             }
         )
 
@@ -353,6 +380,8 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
                 "hasApiKey": bool(provider.get("apiKey")),
                 "isPreset": bool(provider.get("isPreset")),
                 "supportsVision": bool(provider.get("supportsVision")),
+                "promptCacheMode": _normalize_prompt_cache_mode(provider.get("promptCacheMode"), provider["id"]),
+                "promptCacheRetention": _normalize_prompt_cache_retention(provider.get("promptCacheRetention")),
             }
             for provider in normalized["providers"]
         ],
@@ -378,4 +407,6 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
         "model": active_provider["defaultModel"],
         "hasApiKey": bool(active_provider.get("apiKey")),
         "supportsVision": bool(active_provider.get("supportsVision")),
+        "promptCacheMode": _normalize_prompt_cache_mode(active_provider.get("promptCacheMode"), active_provider["id"]),
+        "promptCacheRetention": _normalize_prompt_cache_retention(active_provider.get("promptCacheRetention")),
     }

@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
+from .tool_registry import (
+    TOOL_SEARCH_DEFINITION,
+    TOOL_SEARCH_NAME,
+    ToolDefinition,
+    build_tool_definitions,
+    definition_available_in_mode,
+)
+
 SUPPORTED_AI_FONTS = ["宋体", "黑体", "楷体", "仿宋", "Arial", "Times New Roman"]
 
 RANGE_SPEC = {
@@ -151,6 +162,30 @@ TOOLS = [
                     },
                 },
                 "required": ["taskId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Agent",
+            "description": (
+                "启动一个只读子代理处理调研、写作规划、排版分析或结果校验。"
+                "子代理不会直接修改文档；它会把证据、计划或校验结论返回给当前主 Agent。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "子代理任务的简短标题，用于进度展示"},
+                    "prompt": {"type": "string", "description": "交给子代理的完整任务说明"},
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Agent 类型，如 general-purpose、document-research、writing-plan、layout-plan、verification",
+                    },
+                    "model": {"type": "string", "description": "可选模型名；不填则继承当前会话模型或 Agent 默认模型"},
+                    "run_in_background": {"type": "boolean", "description": "是否后台运行；后台 Agent 使用当前上下文快照和服务端工具"},
+                },
+                "required": ["description", "prompt"],
             },
         },
     },
@@ -821,17 +856,173 @@ AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {
     "TaskGet",
     "TaskList",
     "TaskUpdate",
+    "Agent",
     "analyze_image_with_ocr",
     "workspace_search",
     "workspace_read",
     "web_search",
 }
 
-def get_tools(mode: str | None) -> list[dict]:
+TOOL_DEFINITIONS: dict[str, ToolDefinition] = build_tool_definitions(TOOLS)
+
+
+def _selected_names_for_mode(mode: str | None) -> set[str]:
     if mode == "edit":
-        selected_names = EDIT_TOOL_NAMES
-    elif mode == "agent":
-        selected_names = AGENT_TOOL_NAMES
-    else:
-        selected_names = LAYOUT_TOOL_NAMES
-    return [tool for tool in TOOLS if tool["function"]["name"] in selected_names]
+        return EDIT_TOOL_NAMES
+    if mode == "agent":
+        return AGENT_TOOL_NAMES
+    return LAYOUT_TOOL_NAMES
+
+
+def get_tool_definitions(mode: str | None) -> list[ToolDefinition]:
+    selected_names = _selected_names_for_mode(mode)
+    return [
+        definition
+        for name, definition in TOOL_DEFINITIONS.items()
+        if name in selected_names and definition_available_in_mode(definition, mode)
+    ]
+
+
+def get_tools(mode: str | None) -> list[dict[str, Any]]:
+    return [
+        definition.to_openai_tool()
+        for definition in get_tool_definitions(mode)
+    ]
+
+
+def get_deferred_tool_definitions(
+    mode: str | None,
+    loaded_deferred_tools: set[str] | None = None,
+) -> list[ToolDefinition]:
+    loaded = set(loaded_deferred_tools or set())
+    return [
+        definition
+        for definition in get_tool_definitions(mode)
+        if definition.should_defer() and definition.name not in loaded
+    ]
+
+
+def get_model_tools(
+    mode: str | None,
+    loaded_deferred_tools: set[str] | None = None,
+    *,
+    agent_type: str | None = None,
+) -> list[dict[str, Any]]:
+    loaded = set(loaded_deferred_tools or set())
+    definitions = get_tool_definitions(mode)
+    has_deferred = any(definition.should_defer() for definition in definitions)
+    selected = [
+        definition
+        for definition in definitions
+        if not definition.should_defer() or definition.name in loaded
+    ]
+    tools = [definition.to_openai_tool(agent_type=agent_type) for definition in selected]
+    if has_deferred:
+        tools.append(TOOL_SEARCH_DEFINITION.to_openai_tool(agent_type=agent_type))
+    return tools
+
+
+def get_tool_definition(tool_name: str) -> ToolDefinition | None:
+    if tool_name == TOOL_SEARCH_NAME:
+        return TOOL_SEARCH_DEFINITION
+    return TOOL_DEFINITIONS.get(tool_name)
+
+
+def get_tool_metadata_payload(tool_name: str) -> dict[str, Any]:
+    definition = get_tool_definition(tool_name)
+    if definition is None:
+        return {
+            "executorLocation": "client",
+            "readOnly": False,
+            "parallelSafe": False,
+            "allowedForAgent": False,
+        }
+    return {
+        "executorLocation": definition.metadata.executor_location,
+        "readOnly": definition.is_read_only(),
+        "parallelSafe": definition.is_parallel_safe(),
+        "allowedForAgent": definition.is_read_only() and definition.metadata.subagent_ok,
+    }
+
+
+def get_deferred_tool_summaries(mode: str | None, loaded_deferred_tools: set[str] | None = None) -> list[dict[str, Any]]:
+    return [
+        definition.to_deferred_summary()
+        for definition in get_deferred_tool_definitions(mode, loaded_deferred_tools)
+    ]
+
+
+def search_deferred_tool_definitions(
+    mode: str | None,
+    query: str,
+    loaded_deferred_tools: set[str] | None = None,
+) -> list[ToolDefinition]:
+    deferred = get_deferred_tool_definitions(mode, loaded_deferred_tools)
+    text = str(query or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("select:"):
+        selected = {
+            item.strip()
+            for item in text.split(":", 1)[1].split(",")
+            if item.strip()
+        }
+        return [definition for definition in deferred if definition.name in selected]
+    terms = [term for term in lowered.replace("_", " ").split() if term]
+    if not terms:
+        return []
+
+    matches: list[ToolDefinition] = []
+    for definition in deferred:
+        haystack = " ".join([
+            definition.name,
+            definition.metadata.category,
+            definition.metadata.search_hint,
+            definition.metadata.use_when,
+            definition.metadata.avoid_when,
+        ]).lower()
+        if all(term in haystack for term in terms):
+            matches.append(definition)
+    return matches[:8]
+
+
+def build_tooling_delta_attachment(
+    mode: str | None,
+    loaded_deferred_tools: set[str] | None = None,
+) -> str:
+    loaded = sorted(set(loaded_deferred_tools or set()))
+    deferred = get_deferred_tool_summaries(mode, set(loaded))
+    available = [
+        {
+            "name": definition.name,
+            "category": definition.metadata.category,
+            "readOnly": definition.is_read_only(),
+            "executorLocation": definition.metadata.executor_location,
+            "deferred": definition.should_defer(),
+            "loaded": definition.name in loaded,
+        }
+        for definition in get_tool_definitions(mode)
+    ]
+    if not deferred and not loaded:
+        return ""
+    payload = {
+        "type": "tooling_delta",
+        "mode": mode or "layout",
+        "availableToolCount": len(available),
+        "deferredTools": deferred,
+        "loadedDeferredTools": loaded,
+        "mcpInstructionsDelta": [],
+        "skillDiscoveryDelta": [],
+    }
+    lines = [
+        "[系统附件] type=tooling_delta",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    ]
+    if deferred:
+        lines.append("")
+        lines.append("[延迟工具摘要]")
+        lines.extend(
+            f"- {item['name']} ({item['category']}): {item.get('searchHint') or item.get('description')}"
+            for item in deferred
+        )
+        lines.append("需要其中任一工具时，先调用 ToolSearch 加载完整 schema。")
+    return "\n".join(lines)

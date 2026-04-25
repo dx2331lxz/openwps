@@ -51,8 +51,8 @@ export default function ModelPicker({
   // Measure and position dropdown when opening
   useEffect(() => {
     if (!isOpen) {
-      setDropdownPos(null)
-      return
+      const timer = window.setTimeout(() => setDropdownPos(null), 0)
+      return () => window.clearTimeout(timer)
     }
     const measure = () => {
       const rect = containerRef.current?.getBoundingClientRect()
@@ -81,7 +81,8 @@ export default function ModelPicker({
 
   // Reset highlight when filtered list changes
   useEffect(() => {
-    setHighlightedIndex(0)
+    const timer = window.setTimeout(() => setHighlightedIndex(0), 0)
+    return () => window.clearTimeout(timer)
   }, [filteredModels.length])
 
   // Focus input when opening
@@ -89,7 +90,8 @@ export default function ModelPicker({
     if (isOpen) {
       setTimeout(() => inputRef.current?.focus(), 0)
     } else {
-      setQuery('')
+      const timer = window.setTimeout(() => setQuery(''), 0)
+      return () => window.clearTimeout(timer)
     }
   }, [isOpen])
 

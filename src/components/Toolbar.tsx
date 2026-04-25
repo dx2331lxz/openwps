@@ -586,11 +586,10 @@ const TablePicker: React.FC<{
   anchorRef: React.RefObject<HTMLElement | null>
 }> = ({ onSelect, onClose, anchorRef }) => {
   const [hovered, setHovered] = React.useState({ rows: 0, cols: 0 })
+  const [anchorRect, setAnchorRect] = React.useState<DOMRect | null>(null)
   const MAX_ROWS = 8
   const MAX_COLS = 8
   const pickerRef = React.useRef<HTMLDivElement>(null)
-
-  const rect = anchorRef.current?.getBoundingClientRect()
 
   // Close on outside click — delay attaching the listener by one tick so the
   // click that opened the picker doesn't immediately close it.
@@ -609,13 +608,26 @@ const TablePicker: React.FC<{
     }
   }, [onClose])
 
+  React.useEffect(() => {
+    const updateAnchorRect = () => {
+      setAnchorRect(anchorRef.current?.getBoundingClientRect() ?? null)
+    }
+    updateAnchorRect()
+    window.addEventListener('resize', updateAnchorRect)
+    window.addEventListener('scroll', updateAnchorRect, true)
+    return () => {
+      window.removeEventListener('resize', updateAnchorRect)
+      window.removeEventListener('scroll', updateAnchorRect, true)
+    }
+  }, [anchorRef])
+
   return (
     <div
       ref={pickerRef}
       style={{
         position: 'fixed',
-        top: rect ? rect.bottom + 4 : 60,
-        left: rect ? rect.left : 0,
+        top: anchorRect ? anchorRect.bottom + 4 : 60,
+        left: anchorRect ? anchorRect.left : 0,
         zIndex: 9999,
         background: 'white',
         border: '1px solid #d1d5db',
@@ -1262,6 +1274,29 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const imageInputRef = React.useRef<HTMLInputElement>(null)
 
+  type FileMenuAction = 'open' | 'save' | 'import' | 'export' | 'templates'
+  const fileMenuItems: Array<{ title: string; label: string; icon: typeof FolderOpen; action: FileMenuAction }> = [
+    { title: '打开文档目录文件', label: '打开', icon: FolderOpen, action: 'open' },
+    { title: '保存到文档目录', label: '保存', icon: Save, action: 'save' },
+    { title: '导入 .docx / .md', label: '导入', icon: FileInput, action: 'import' },
+    { title: '导出 .docx', label: '导出', icon: FileOutput, action: 'export' },
+    { title: '打开模板库', label: '模板', icon: BookOpen, action: 'templates' },
+  ]
+
+  const handleFileMenuAction = (action: FileMenuAction) => {
+    if (action === 'open') {
+      void onOpenServerFile?.()
+    } else if (action === 'save') {
+      void onSaveServerFile?.()
+    } else if (action === 'import') {
+      fileInputRef.current?.click()
+    } else if (action === 'export') {
+      void onExportDocx?.()
+    } else {
+      void onOpenTemplates?.()
+    }
+  }
+
   const fmt = editorState ? deriveFormats(editorState) : { text: defaultTextFmt, para: defaultParaFmt }
   const selectionInTable = Boolean(editorState && isInTable(editorState))
   const selectedHorizontalRule = editorState?.selection instanceof NodeSelection && editorState.selection.node.type.name === 'horizontal_rule'
@@ -1500,13 +1535,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
           }}
         >
-          {[
-            { title: '打开文档目录文件', label: '打开', icon: FolderOpen, action: () => { void onOpenServerFile?.() } },
-            { title: '保存到文档目录', label: '保存', icon: Save, action: () => { void onSaveServerFile?.() } },
-            { title: '导入 .docx / .md', label: '导入', icon: FileInput, action: () => fileInputRef.current?.click() },
-            { title: '导出 .docx', label: '导出', icon: FileOutput, action: () => { void onExportDocx?.() } },
-            { title: '打开模板库', label: '模板', icon: BookOpen, action: () => { void onOpenTemplates?.() } },
-          ].map(item => {
+          {fileMenuItems.map(item => {
             const ItemIcon = item.icon
             return (
               <button
@@ -1515,7 +1544,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 title={item.title}
                 onMouseDown={event => {
                   event.preventDefault()
-                  item.action()
+                  handleFileMenuAction(item.action)
                   setFileMenu(null)
                 }}
                 style={{

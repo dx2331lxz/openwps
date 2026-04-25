@@ -29,6 +29,8 @@ export interface AIProviderSettings {
   hasApiKey: boolean
   isPreset: boolean
   supportsVision?: boolean
+  promptCacheMode?: 'off' | 'openai_auto'
+  promptCacheRetention?: 'in_memory' | '24h'
 }
 
 export interface AISettingsData {
@@ -41,6 +43,8 @@ export interface AISettingsData {
   model: string
   hasApiKey: boolean
   supportsVision?: boolean
+  promptCacheMode?: 'off' | 'openai_auto'
+  promptCacheRetention?: 'in_memory' | '24h'
 }
 
 export interface ModelOption {

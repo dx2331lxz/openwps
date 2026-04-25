@@ -60,7 +60,8 @@ export default function PageSettingsPanel({
     const [draft, setDraft] = useState({ ...pageConfig })
 
     useEffect(() => {
-        setDraft({ ...pageConfig })
+        const timer = window.setTimeout(() => setDraft({ ...pageConfig }), 0)
+        return () => window.clearTimeout(timer)
     }, [pageConfig])
 
     const labelClassName = 'block text-xs font-medium text-gray-500 mb-1'

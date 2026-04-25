@@ -63,13 +63,16 @@ export default function TemplateManagerModal({
   const [draftTemplateText, setDraftTemplateText] = useState('')
 
   useEffect(() => {
-    setSelectedId((current) => {
-      if (extractionState.resultTemplateId && templates.some((item) => item.id === extractionState.resultTemplateId)) {
-        return extractionState.resultTemplateId
-      }
-      if (current && templates.some((item) => item.id === current)) return current
-      return activeTemplateId ?? templates[0]?.id ?? null
-    })
+    const timer = window.setTimeout(() => {
+      setSelectedId((current) => {
+        if (extractionState.resultTemplateId && templates.some((item) => item.id === extractionState.resultTemplateId)) {
+          return extractionState.resultTemplateId
+        }
+        if (current && templates.some((item) => item.id === current)) return current
+        return activeTemplateId ?? templates[0]?.id ?? null
+      })
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [activeTemplateId, extractionState.resultTemplateId, templates])
 
   const selectedTemplate = useMemo(
@@ -80,22 +83,32 @@ export default function TemplateManagerModal({
   useEffect(() => {
     let active = true
     if (!selectedId) {
-      setDetailLoading(false)
-      setSelectedTemplateDetail(null)
+      const timer = window.setTimeout(() => {
+        if (!active) return
+        setDetailLoading(false)
+        setSelectedTemplateDetail(null)
+      }, 0)
       return () => {
         active = false
+        window.clearTimeout(timer)
       }
     }
 
     if (activeTemplate?.id === selectedId) {
-      setDetailLoading(false)
-      setSelectedTemplateDetail(activeTemplate)
+      const timer = window.setTimeout(() => {
+        if (!active) return
+        setDetailLoading(false)
+        setSelectedTemplateDetail(activeTemplate)
+      }, 0)
       return () => {
         active = false
+        window.clearTimeout(timer)
       }
     }
 
-    setDetailLoading(true)
+    const loadingTimer = window.setTimeout(() => {
+      if (active) setDetailLoading(true)
+    }, 0)
     void onLoadDetail(selectedId)
       .then((detail) => {
         if (!active) return
@@ -112,14 +125,18 @@ export default function TemplateManagerModal({
 
     return () => {
       active = false
+      window.clearTimeout(loadingTimer)
     }
   }, [activeTemplate, onLoadDetail, selectedId])
 
   useEffect(() => {
-    setDraftName(selectedTemplateDetail?.name ?? selectedTemplate?.name ?? '')
-    setDraftNote(selectedTemplateDetail?.note ?? selectedTemplate?.note ?? '')
-    const rawText = selectedTemplateDetail?.templateText ?? ''
-    setDraftTemplateText(rawText.replace(/\\n/g, '\n').replace(/\\r/g, ''))
+    const timer = window.setTimeout(() => {
+      setDraftName(selectedTemplateDetail?.name ?? selectedTemplate?.name ?? '')
+      setDraftNote(selectedTemplateDetail?.note ?? selectedTemplate?.note ?? '')
+      const rawText = selectedTemplateDetail?.templateText ?? ''
+      setDraftTemplateText(rawText.replace(/\\n/g, '\n').replace(/\\r/g, ''))
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [selectedTemplate, selectedTemplateDetail])
 
   useEffect(() => {

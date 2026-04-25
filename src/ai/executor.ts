@@ -1825,7 +1825,8 @@ export async function executeTool(
               : `未找到可设置文字样式的范围：${describeRange(range)}`,
           }
         }
-        const { range: _range, ...rawStyleAttrs } = params
+        const rawStyleAttrs = { ...params }
+        delete rawStyleAttrs.range
         const styleAttrs = Object.fromEntries(
           Object.entries(rawStyleAttrs).filter(([, value]) => value !== undefined)
         )
@@ -1858,7 +1859,8 @@ export async function executeTool(
         if (resolved.length === 0) {
           return { success: false, message: `未找到可设置段落格式的范围：${describeRange(range)}` }
         }
-        const { range: _range, ...rawParaAttrs } = params
+        const rawParaAttrs = { ...params }
+        delete rawParaAttrs.range
         const paraAttrs = Object.fromEntries(
           Object.entries(rawParaAttrs).filter(([, value]) => value !== undefined)
         )

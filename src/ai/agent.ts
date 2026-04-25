@@ -274,7 +274,7 @@ function parseCommand(message: string): ToolCall[] {
 
 /** Local rule-based agent — no network required */
 export class LocalAgent implements AIAgent {
-  async process(userMessage: string, _context: DocumentContext): Promise<ToolCall[]> {
+  async process(userMessage: string): Promise<ToolCall[]> {
     return parseCommand(userMessage)
   }
 }
@@ -284,7 +284,7 @@ export class ClaudeAgent implements AIAgent {
   private apiKey: string
   constructor(apiKey: string) { this.apiKey = apiKey }
 
-  async process(_userMessage: string, _context: DocumentContext): Promise<ToolCall[]> {
+  async process(): Promise<ToolCall[]> {
     void this.apiKey
     throw new Error('Claude API 未配置，请先设置 API Key')
   }
@@ -295,7 +295,7 @@ export class GPTAgent implements AIAgent {
   private apiKey: string
   constructor(apiKey: string) { this.apiKey = apiKey }
 
-  async process(_userMessage: string, _context: DocumentContext): Promise<ToolCall[]> {
+  async process(): Promise<ToolCall[]> {
     void this.apiKey
     throw new Error('OpenAI API 未配置，请先设置 API Key')
   }

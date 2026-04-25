@@ -31,6 +31,7 @@ from .conversations import (
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
 from .documents import get_document_settings, update_document_settings
+from .agents import cancel_agent_run, list_agent_definitions, list_agent_runs, read_agent_run
 from .models import (
     AppendMessagesRequest,
     ChatRequest,
@@ -161,6 +162,10 @@ def create_api_router() -> APIRouter:
         models = await list_models(endpoint, api_key, body.providerId)
         return {"models": models}
 
+    @router.get("/ai/agents")
+    def get_agents():
+        return {"agents": [agent.to_public_dict() for agent in list_agent_definitions()]}
+
     @router.get("/conversations")
     def get_conversations():
         return list_conversations()
@@ -190,6 +195,18 @@ def create_api_router() -> APIRouter:
     @router.get("/conversations/{conv_id}/tasks")
     def get_conversation_tasks(conv_id: str):
         return {"tasks": list_tasks(conv_id)}
+
+    @router.get("/conversations/{conv_id}/agents")
+    def get_conversation_agents(conv_id: str):
+        return {"agents": list_agent_runs(conv_id)}
+
+    @router.get("/conversations/{conv_id}/agents/{agent_id}")
+    def get_conversation_agent(conv_id: str, agent_id: str):
+        return {"agent": read_agent_run(conv_id, agent_id)}
+
+    @router.post("/conversations/{conv_id}/agents/{agent_id}/cancel")
+    def post_cancel_conversation_agent(conv_id: str, agent_id: str):
+        return {"agent": cancel_agent_run(conv_id, agent_id)}
 
     @router.post("/conversations/{conv_id}/tasks")
     def post_conversation_task(conv_id: str, body: TaskCreateRequest):
