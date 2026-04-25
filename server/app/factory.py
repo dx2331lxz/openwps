@@ -17,6 +17,7 @@ from .ai import (
     list_models,
     prepare_chat_request,
     run_chat,
+    run_completion,
     stream_react_session,
     submit_react_tool_results,
 )
@@ -33,6 +34,7 @@ from .documents import get_document_settings, update_document_settings
 from .models import (
     AppendMessagesRequest,
     ChatRequest,
+    CompletionRequest,
     DocumentSettingsUpdateRequest,
     ModelDiscoveryRequest,
     SettingsUpdate,
@@ -297,6 +299,10 @@ def create_api_router() -> APIRouter:
     @router.post("/ai/chat")
     async def chat(body: ChatRequest):
         return await run_chat(body)
+
+    @router.post("/ai/complete")
+    async def complete(body: CompletionRequest):
+        return await run_completion(body)
 
     @router.post("/ai/ocr")
     async def analyze_ocr(body: OCRCommandRequest):

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { Check, X } from 'lucide-react'
 import { EditorState, NodeSelection, Plugin, Selection, TextSelection } from 'prosemirror-state'
 import { EditorView, Decoration, DecorationSet } from 'prosemirror-view'
 import { DOMParser as PMDOMParser, type Node as PMNode } from 'prosemirror-model'
@@ -25,7 +26,7 @@ import {
   type PaginateResult,
   type DomBlockMetric,
 } from '../layout/paginator'
-import { Toolbar } from './Toolbar'
+import { Toolbar, type AICopilotActivity } from './Toolbar'
 import AISidebar from './AISidebar'
 import WorkspacePanel from './WorkspacePanel'
 import FileManagerModal from './FileManagerModal'
@@ -85,7 +86,49 @@ interface BlockAIPopoverState {
   error: string | null
 }
 
+interface AICopilotContext {
+  anchor: number
+  cursorPos: number
+  prefixText: string
+  suffixText: string
+  paragraphText: string
+  previousParagraphText: string
+  nextParagraphText: string
+  wordCount: number
+  pageCount: number
+  paragraphCount: number
+  maxChars: number
+  doc: PMNode
+  docTextFingerprint: string
+}
+
+interface AICopilotPreview {
+  anchor: number
+  completions: string[]
+  activeIndex: number
+  doc: PMNode
+  docTextFingerprint: string
+}
+
+type AICopilotState =
+  | { status: 'idle' }
+  | { status: 'loading'; anchor: number }
+  | { status: 'preview'; preview: AICopilotPreview }
+  | { status: 'error'; message: string }
+
+interface AICopilotCompletionResponse {
+  completion?: string
+  completions?: string[]
+  model?: string
+}
+
 type WpsParagraphStyleLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
+
+const AI_COPILOT_STORAGE_KEY = 'openwps.aiCopilot.enabled'
+const AI_COPILOT_ACTIVITY_STORAGE_KEY = 'openwps.aiCopilot.activity'
+const AI_COPILOT_CANDIDATE_COUNT_STORAGE_KEY = 'openwps.aiCopilot.candidateCount'
+const AI_COPILOT_DEBOUNCE_MS = 800
+const AI_COPILOT_MAX_CHARS = 80
 
 const WPS_PARAGRAPH_STYLES: Record<WpsParagraphStyleLevel, {
   headingLevel: WpsParagraphStyleLevel
@@ -915,6 +958,126 @@ function stripAIReply(text: string) {
     .trim()
 }
 
+function getInitialAICopilotEnabled() {
+  try {
+    return window.localStorage.getItem(AI_COPILOT_STORAGE_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function getInitialAICopilotActivity(): AICopilotActivity {
+  try {
+    const value = window.localStorage.getItem(AI_COPILOT_ACTIVITY_STORAGE_KEY)
+    return value === 'conservative' || value === 'active' ? value : 'standard'
+  } catch {
+    return 'standard'
+  }
+}
+
+function getInitialAICopilotCandidateCount() {
+  try {
+    const value = Number(window.localStorage.getItem(AI_COPILOT_CANDIDATE_COUNT_STORAGE_KEY) || 1)
+    return Math.max(1, Math.min(Number.isFinite(value) ? Math.round(value) : 1, 3))
+  } catch {
+    return 1
+  }
+}
+
+function getActiveAICopilotCompletion(preview: AICopilotPreview) {
+  return preview.completions[preview.activeIndex] ?? preview.completions[0] ?? ''
+}
+
+function sanitizeAICopilotCompletion(text: string, context: AICopilotContext) {
+  let cleaned = text
+    .replace(/^```(?:\w+)?\s*/u, '')
+    .replace(/\s*```$/u, '')
+    .replace(/^(?:补全|续写|建议|输出|回答)[:：]\s*/u, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  const prefixTail = context.prefixText.trim().slice(-80)
+  if (prefixTail && cleaned.startsWith(prefixTail)) {
+    cleaned = cleaned.slice(prefixTail.length).trimStart()
+  }
+
+  const suffixHead = context.suffixText.trim().slice(0, 80)
+  if (suffixHead && cleaned.endsWith(suffixHead)) {
+    cleaned = cleaned.slice(0, -suffixHead.length).trimEnd()
+  }
+
+  const sentenceMatch = cleaned.match(new RegExp(`^[\\s\\S]{1,${AI_COPILOT_MAX_CHARS}}?[。！？!?；;]`, 'u'))
+  if (sentenceMatch) cleaned = sentenceMatch[0]
+  else if (cleaned.length > AI_COPILOT_MAX_CHARS) cleaned = cleaned.slice(0, AI_COPILOT_MAX_CHARS).trimEnd()
+
+  return cleaned
+}
+
+function getPlainTextBetween(doc: PMNode, from: number, to: number) {
+  if (to <= from) return ''
+  return doc.textBetween(from, to, '\n', '\n')
+}
+
+function getAICopilotDocTextFingerprint(doc: PMNode) {
+  return doc.textBetween(0, doc.content.size, '\n', '\n')
+}
+
+function buildAICopilotContext(state: EditorState, pageCount: number): AICopilotContext | null {
+  if (!state.selection.empty) return null
+  if (isInTable(state)) return null
+
+  const { $from } = state.selection
+  if ($from.depth !== 1 || $from.parent.type.name !== 'paragraph') return null
+  if ($from.nodeBefore?.type.name === 'image' || $from.nodeAfter?.type.name === 'image') return null
+
+  const paragraphPos = $from.before(1)
+  const paragraph = $from.parent
+  let hasInlineAtom = false
+  paragraph.forEach((child) => {
+    if (!child.isText && child.type.name !== 'hard_break') hasInlineAtom = true
+  })
+  if (hasInlineAtom) return null
+
+  const paragraphStart = paragraphPos + 1
+  const paragraphEnd = paragraphPos + paragraph.nodeSize - 1
+  const prefixText = getPlainTextBetween(state.doc, paragraphStart, state.selection.from)
+  const suffixText = getPlainTextBetween(state.doc, state.selection.from, paragraphEnd)
+  const paragraphText = paragraph.textContent
+
+  let currentParagraphIndex = -1
+  let paragraphCount = 0
+  const paragraphs: string[] = []
+  state.doc.forEach((node, pos) => {
+    if (node.type.name !== 'paragraph') return
+    if (pos === paragraphPos) currentParagraphIndex = paragraphCount
+    paragraphs.push(node.textContent)
+    paragraphCount += 1
+  })
+
+  const previousParagraphText = currentParagraphIndex > 0 ? paragraphs[currentParagraphIndex - 1] ?? '' : ''
+  const nextParagraphText = currentParagraphIndex >= 0 ? paragraphs[currentParagraphIndex + 1] ?? '' : ''
+  const wordCount = state.doc.textContent.replace(/\s+/g, '').length
+
+  if (!prefixText.trim() && !previousParagraphText.trim() && !paragraphText.trim()) return null
+
+  return {
+    anchor: state.selection.from,
+    cursorPos: state.selection.from,
+    prefixText,
+    suffixText,
+    paragraphText,
+    previousParagraphText,
+    nextParagraphText,
+    wordCount,
+    pageCount,
+    paragraphCount,
+    maxChars: AI_COPILOT_MAX_CHARS,
+    doc: state.doc,
+    docTextFingerprint: getAICopilotDocTextFingerprint(state.doc),
+  }
+}
+
 function transactionHasStyleMutation(tx: EditorState['tr']) {
   return tx.steps.some((step) => {
     const stepType = step.toJSON().stepType
@@ -1358,6 +1521,7 @@ export const Editor: React.FC = () => {
   const [blockAIPopover, setBlockAIPopover] = useState<BlockAIPopoverState | null>(null)
   const [layoutSettling, setLayoutSettling] = useState(false)
   const [editorFocused, setEditorFocused] = useState(false)
+  const editorFocusedRef = useRef(false)
   const [editorComposing, setEditorComposing] = useState(false)
   const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
   const docxLetterSpacingRef = useRef(0)
@@ -1372,10 +1536,20 @@ export const Editor: React.FC = () => {
   const [activeTemplate, setActiveTemplate] = useState<TemplateRecord | null>(null)
   const [currentAIProviderId, setCurrentAIProviderId] = useState<string | null>(null)
   const [currentAIModel, setCurrentAIModel] = useState<string | null>(null)
+  const [aiCopilotEnabled, setAiCopilotEnabled] = useState(getInitialAICopilotEnabled)
+  const [aiCopilotActivity, setAiCopilotActivity] = useState<AICopilotActivity>(getInitialAICopilotActivity)
+  const [aiCopilotCandidateCount, setAiCopilotCandidateCount] = useState(getInitialAICopilotCandidateCount)
+  const [aiCopilotState, setAICopilotState] = useState<AICopilotState>({ status: 'idle' })
   const [templateExtractionState, setTemplateExtractionState] = useState<TemplateExtractionState>(IDLE_TEMPLATE_EXTRACTION_STATE)
   const [templateNotice, setTemplateNotice] = useState<TemplateNotice | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const templateManagerOpenRef = useRef(false)
+  const aiCopilotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const aiCopilotAbortRef = useRef<AbortController | null>(null)
+  const aiCopilotRequestIdRef = useRef(0)
+  const aiCopilotPreviewRef = useRef<AICopilotPreview | null>(null)
+  const aiCopilotEnabledRef = useRef(aiCopilotEnabled)
+  const editorStateRef = useRef<EditorState | null>(null)
 
   // ── Comment state ───────────────────────────────────────────────────────────
   const [activeComment, setActiveComment] = useState<CommentData | null>(null)
@@ -1387,6 +1561,12 @@ export const Editor: React.FC = () => {
   useEffect(() => { pageConfigRef.current = pageConfig }, [pageConfig])
   useEffect(() => { docxLetterSpacingRef.current = docxLetterSpacingPx }, [docxLetterSpacingPx])
   useEffect(() => { templateManagerOpenRef.current = templateManagerOpen }, [templateManagerOpen])
+  useEffect(() => { aiCopilotEnabledRef.current = aiCopilotEnabled }, [aiCopilotEnabled])
+  useEffect(() => { editorStateRef.current = editorState }, [editorState])
+  useEffect(() => { editorFocusedRef.current = editorFocused }, [editorFocused])
+  useEffect(() => {
+    aiCopilotPreviewRef.current = aiCopilotState.status === 'preview' ? aiCopilotState.preview : null
+  }, [aiCopilotState])
 
   const isTemplateExtractionRunning = ['preparing', 'analyzing', 'saving'].includes(templateExtractionState.status)
 
@@ -1711,6 +1891,136 @@ export const Editor: React.FC = () => {
     }, 150)
   }, [performRepagination])
 
+  const cancelAICopilot = useCallback(() => {
+    if (aiCopilotTimerRef.current) {
+      clearTimeout(aiCopilotTimerRef.current)
+      aiCopilotTimerRef.current = null
+    }
+    aiCopilotAbortRef.current?.abort()
+    aiCopilotAbortRef.current = null
+    aiCopilotPreviewRef.current = null
+    setAICopilotState({ status: 'idle' })
+  }, [])
+
+  const clearAICopilotTimer = useCallback(() => {
+    if (aiCopilotTimerRef.current) {
+      clearTimeout(aiCopilotTimerRef.current)
+      aiCopilotTimerRef.current = null
+    }
+  }, [])
+
+  const clearAICopilotPreview = useCallback(() => {
+    aiCopilotPreviewRef.current = null
+    setAICopilotState((current) => current.status === 'preview' ? { status: 'idle' } : current)
+  }, [])
+
+  const acceptAICopilot = useCallback((candidateIndex?: number) => {
+    const editorView = viewRef.current
+    const preview = aiCopilotPreviewRef.current
+    const completion = preview
+      ? typeof candidateIndex === 'number'
+        ? preview.completions[candidateIndex] ?? ''
+        : getActiveAICopilotCompletion(preview)
+      : ''
+    if (!editorView || !preview || !completion) return false
+
+    const { state } = editorView
+    if (!state.selection.empty || state.selection.from !== preview.anchor) return false
+    if (getAICopilotDocTextFingerprint(state.doc) !== preview.docTextFingerprint) return false
+
+    const tr = state.tr.insertText(completion, preview.anchor, preview.anchor)
+    tr.setSelection(TextSelection.create(tr.doc, preview.anchor + completion.length))
+    tr.setMeta('openwpsAiCopilot', true)
+    editorView.dispatch(tr.scrollIntoView())
+    editorView.focus()
+    cancelAICopilot()
+    return true
+  }, [cancelAICopilot])
+
+  const requestAICopilotCompletion = useCallback(async (context: AICopilotContext) => {
+    aiCopilotAbortRef.current?.abort()
+    const requestId = ++aiCopilotRequestIdRef.current
+    const controller = new AbortController()
+    aiCopilotAbortRef.current = controller
+    setAICopilotState({ status: 'loading', anchor: context.anchor })
+
+    try {
+      let providerId = currentAIProviderId
+      let model = currentAIModel
+      if (!providerId || !model) {
+        const settingsResponse = await fetch('/api/ai/settings', { signal: controller.signal })
+        const settings = await readJsonResponse<AISettingsSnapshot>(settingsResponse)
+        providerId = providerId || settings.activeProviderId || null
+        model = model || settings.model || null
+      }
+      if (!providerId || !model) {
+        throw new Error('当前 AI 未配置完成，请先在右侧 AI 面板选择服务商和模型。')
+      }
+
+      const response = await fetch('/api/ai/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          providerId,
+          model,
+          activity: aiCopilotActivity,
+          candidateCount: aiCopilotCandidateCount,
+          cursorPos: context.cursorPos,
+          prefixText: context.prefixText,
+          suffixText: context.suffixText,
+          paragraphText: context.paragraphText,
+          previousParagraphText: context.previousParagraphText,
+          nextParagraphText: context.nextParagraphText,
+          wordCount: context.wordCount,
+          pageCount: context.pageCount,
+          paragraphCount: context.paragraphCount,
+          maxChars: context.maxChars,
+        }),
+      })
+      const data = await readJsonResponse<AICopilotCompletionResponse>(response)
+      if (requestId !== aiCopilotRequestIdRef.current || controller.signal.aborted) return
+
+      const rawCompletions = Array.isArray(data.completions) && data.completions.length > 0
+        ? data.completions
+        : [data.completion ?? '']
+      const seenCompletions = new Set<string>()
+      const completions = rawCompletions
+        .map((item) => sanitizeAICopilotCompletion(String(item ?? ''), context))
+        .filter((item) => {
+          if (!item || seenCompletions.has(item)) return false
+          seenCompletions.add(item)
+          return true
+        })
+      const currentView = viewRef.current
+      if (
+        completions.length === 0 ||
+        !currentView ||
+        getAICopilotDocTextFingerprint(currentView.state.doc) !== context.docTextFingerprint ||
+        currentView.state.selection.from !== context.anchor ||
+        !currentView.state.selection.empty
+      ) {
+        setAICopilotState({ status: 'idle' })
+        return
+      }
+
+      const preview = {
+        anchor: context.anchor,
+        completions,
+        activeIndex: 0,
+        doc: context.doc,
+        docTextFingerprint: context.docTextFingerprint,
+      }
+      aiCopilotPreviewRef.current = preview
+      setAICopilotState({ status: 'preview', preview })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      setAICopilotState({ status: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      if (aiCopilotAbortRef.current === controller) aiCopilotAbortRef.current = null
+    }
+  }, [aiCopilotActivity, aiCopilotCandidateCount, currentAIModel, currentAIProviderId])
+
   useEffect(() => {
     if (!mountRef.current) return
 
@@ -1735,6 +2045,14 @@ export const Editor: React.FC = () => {
       },
       handleDOMEvents: {
         keydown: (view, event) => {
+          if (event.key === 'Tab' && acceptAICopilot()) {
+            event.preventDefault()
+            return true
+          }
+          if (event.key === 'Escape') {
+            cancelAICopilot()
+            return false
+          }
           if ((event.key === 'Backspace' || event.key === 'Delete') && isCaretAtStartOfParagraphAfterTable(view.state)) {
             event.preventDefault()
             return true
@@ -1748,10 +2066,12 @@ export const Editor: React.FC = () => {
         blur: () => {
           setEditorFocused(false)
           setEditorComposing(false)
+          clearAICopilotTimer()
           return false
         },
         compositionstart: () => {
           setEditorComposing(true)
+          clearAICopilotTimer()
           return false
         },
         compositionend: () => {
@@ -1781,11 +2101,16 @@ export const Editor: React.FC = () => {
         },
       },
       dispatchTransaction(tx) {
+        const previousTextFingerprint = getAICopilotDocTextFingerprint(editorView.state.doc)
         const next = editorView.state.apply(tx)
         editorView.updateState(next)
         setEditorState(next)
         if (tx.selectionSet && !tx.getMeta('openwpsBlockSelection')) {
           setSelectedBlockPos(null)
+        }
+        const textChanged = tx.docChanged && previousTextFingerprint !== getAICopilotDocTextFingerprint(next.doc)
+        if (textChanged) {
+          cancelAICopilot()
         }
         if (tx.docChanged && !applyingImportedDocxRef.current && transactionHasStyleMutation(tx)) {
           clearImportedDocxCompatibility()
@@ -1807,7 +2132,7 @@ export const Editor: React.FC = () => {
       editorView.destroy()
       document.head.removeChild(styleEl)
     }
-  }, [clearImportedDocxCompatibility, repaginate])
+  }, [acceptAICopilot, cancelAICopilot, clearAICopilotTimer, clearImportedDocxCompatibility, repaginate])
 
   useEffect(() => {
     if (viewRef.current) repaginate()
@@ -2640,6 +2965,10 @@ export const Editor: React.FC = () => {
   )
   const editorInTable = Boolean(editorState && isInTable(editorState))
   const pretextVisualActive = Boolean(layoutResult && !layoutSettling && !editorComposing && !editorInTable)
+  const aiCopilotDocTextFingerprint = React.useMemo(
+    () => (editorState ? getAICopilotDocTextFingerprint(editorState.doc) : ''),
+    [editorState?.doc],
+  )
   const visualCaretRect = React.useMemo(() => {
     if (!layoutResult || !editorState?.selection.empty) return null
 
@@ -2691,6 +3020,188 @@ export const Editor: React.FC = () => {
     [activeBlockPos, blockDescriptors],
   )
   const visibleBlockControls = activeBlock ? [activeBlock] : []
+  const ghostCompletion = React.useMemo(() => {
+    if (aiCopilotState.status !== 'preview') return null
+    if (!editorState || getAICopilotDocTextFingerprint(editorState.doc) !== aiCopilotState.preview.docTextFingerprint) return null
+    if (!layoutResult || layoutSettling) return null
+
+    try {
+      const preview = aiCopilotState.preview
+      const completion = getActiveAICopilotCompletion(preview)
+      if (!completion) return null
+      const selection = TextSelection.create(editorState.doc, preview.anchor)
+      const tr = editorState.tr.setSelection(selection).insertText(completion)
+      const domBlockMetrics = viewRef.current ? collectDomBlockMetrics(viewRef.current) : []
+      const layout = paginate(tr.doc, cfg, { domBlockMetrics })
+      const from = preview.anchor
+      const to = preview.anchor + completion.length
+      let popupLeft = cfg.marginLeft
+      let popupTop = cfg.marginTop + 28
+      let firstGhostTop: number | null = null
+      let firstGhostPageContentTop: number | null = null
+      let lastGhostBottom: number | null = null
+      for (let pageIndex = 0; pageIndex < layout.renderedPages.length; pageIndex += 1) {
+        const page = layout.renderedPages[pageIndex]
+        for (const line of page.lines) {
+          const remainingWidth = Math.max(0, line.availableWidth - line.renderedWidth)
+          const justifyEnabled = line.align === 'justify' && !line.isLastLineOfParagraph && line.units.length > 1
+          const justifyExtra = justifyEnabled ? remainingWidth / Math.max(1, line.units.length - 1) : 0
+          const lineLeft = cfg.marginLeft + line.xOffset + (
+            line.align === 'center'
+              ? remainingWidth / 2
+              : line.align === 'right'
+                ? remainingWidth
+                : 0
+          )
+          let cursorX = 0
+          let firstGhostOffset: number | null = null
+          for (let unitIndex = 0; unitIndex < line.units.length; unitIndex += 1) {
+            const unit = line.units[unitIndex]
+            const isLastUnit = unitIndex === line.units.length - 1
+            const boxWidth = unit.renderWidth + (justifyEnabled && !isLastUnit ? justifyExtra : 0)
+            const unitOffset = typeof unit.offsetX === 'number' ? unit.offsetX : cursorX
+            if (
+              typeof unit.startPos === 'number' &&
+              typeof unit.endPos === 'number' &&
+              unit.endPos > from &&
+              unit.startPos < to &&
+              firstGhostOffset == null
+            ) {
+              firstGhostOffset = unitOffset
+            }
+            cursorX += boxWidth
+          }
+          if (firstGhostOffset == null) continue
+
+          const pageTop = pageIndex * (cfg.pageHeight + PAGE_GAP)
+          const lineTop = pageTop + cfg.marginTop + line.top
+          if (firstGhostTop == null) {
+            popupLeft = lineLeft + firstGhostOffset
+            firstGhostTop = lineTop
+            firstGhostPageContentTop = pageTop + cfg.marginTop
+          }
+          lastGhostBottom = lineTop + line.lineHeight
+        }
+      }
+
+      if (firstGhostTop != null) {
+        const popupHeight = 30
+        const popupGap = 8
+        const aboveTop = firstGhostTop - popupHeight - popupGap
+        popupTop = aboveTop >= (firstGhostPageContentTop ?? cfg.marginTop)
+          ? aboveTop
+          : (lastGhostBottom ?? firstGhostTop) + popupGap
+      }
+      return {
+        pages: layout.renderedPages,
+        from,
+        to,
+        popupLeft,
+        popupTop,
+      }
+    } catch {
+      return null
+    }
+  }, [aiCopilotState, cfg, editorState, layoutResult, layoutSettling])
+
+  const handleToggleAICopilot = useCallback(() => {
+    setAiCopilotEnabled((current) => {
+      const next = !current
+      try {
+        window.localStorage.setItem(AI_COPILOT_STORAGE_KEY, next ? 'true' : 'false')
+      } catch {
+        // ignore storage failures
+      }
+      if (!next) cancelAICopilot()
+      return next
+    })
+  }, [cancelAICopilot])
+
+  const handleAICopilotActivityChange = useCallback((activity: AICopilotActivity) => {
+    setAiCopilotActivity(activity)
+    try {
+      window.localStorage.setItem(AI_COPILOT_ACTIVITY_STORAGE_KEY, activity)
+    } catch {
+      // ignore storage failures
+    }
+    cancelAICopilot()
+  }, [cancelAICopilot])
+
+  const handleAICopilotCandidateCountChange = useCallback((count: number) => {
+    const nextCount = Math.max(1, Math.min(Math.round(count), 3))
+    setAiCopilotCandidateCount(nextCount)
+    try {
+      window.localStorage.setItem(AI_COPILOT_CANDIDATE_COUNT_STORAGE_KEY, String(nextCount))
+    } catch {
+      // ignore storage failures
+    }
+    cancelAICopilot()
+  }, [cancelAICopilot])
+
+  const handleAICopilotCandidateSelect = useCallback((candidateIndex: number) => {
+    setAICopilotState((current) => {
+      if (current.status !== 'preview') return current
+      const total = current.preview.completions.length
+      const activeIndex = Math.max(0, Math.min(candidateIndex, total - 1))
+      return { status: 'preview', preview: { ...current.preview, activeIndex } }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!aiCopilotEnabled) {
+      cancelAICopilot()
+      return undefined
+    }
+
+    const currentEditorState = editorStateRef.current
+    if (!currentEditorState || !editorFocusedRef.current || editorComposing || blockAIPopover) {
+      cancelAICopilot()
+      return undefined
+    }
+
+    if (layoutSettling || !pretextVisualActive) {
+      clearAICopilotTimer()
+      return undefined
+    }
+
+    const context = buildAICopilotContext(currentEditorState, pageCount)
+    if (!context) {
+      cancelAICopilot()
+      return undefined
+    }
+
+    const currentPreview = aiCopilotPreviewRef.current
+    if (currentPreview?.anchor === context.anchor && currentPreview.docTextFingerprint === context.docTextFingerprint) {
+      return undefined
+    }
+
+    if (aiCopilotTimerRef.current) clearTimeout(aiCopilotTimerRef.current)
+    aiCopilotTimerRef.current = setTimeout(() => {
+      void requestAICopilotCompletion(context)
+    }, AI_COPILOT_DEBOUNCE_MS)
+
+    return () => {
+      if (aiCopilotTimerRef.current) {
+        clearTimeout(aiCopilotTimerRef.current)
+        aiCopilotTimerRef.current = null
+      }
+    }
+  }, [
+    aiCopilotEnabled,
+    aiCopilotDocTextFingerprint,
+    blockAIPopover,
+    cancelAICopilot,
+    clearAICopilotTimer,
+    editorComposing,
+    layoutSettling,
+    pageCount,
+    pretextVisualActive,
+    requestAICopilotCompletion,
+  ])
+
+  useEffect(() => {
+    cancelAICopilot()
+  }, [aiCopilotActivity, aiCopilotCandidateCount, cancelAICopilot, currentAIModel, currentAIProviderId])
 
   return (
     <div className="flex h-screen" style={{ background: '#e8e8e8' }}>
@@ -2713,6 +3224,12 @@ export const Editor: React.FC = () => {
             }}
             onToggleSidebar={() => setSidebarOpen(o => !o)}
             sidebarOpen={sidebarOpen}
+            aiCopilotEnabled={aiCopilotEnabled}
+            aiCopilotActivity={aiCopilotActivity}
+            aiCopilotCandidateCount={aiCopilotCandidateCount}
+            onToggleAICopilot={handleToggleAICopilot}
+            onAICopilotActivityChange={handleAICopilotActivityChange}
+            onAICopilotCandidateCountChange={handleAICopilotCandidateCountChange}
             onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
             workspaceOpen={workspaceOpen}
             onOpenServerFile={openServerFileModal}
@@ -2799,7 +3316,166 @@ export const Editor: React.FC = () => {
                 onRequestCaretPos={handleRequestCaretPos}
                 onRequestSelectionRange={handleRequestSelectionRange}
                 onRequestNodeSelection={handleRequestNodeSelection}
+                ghostCompletion={ghostCompletion}
               />
+            )}
+
+            {aiCopilotState.status === 'preview' && ghostCompletion && (
+              aiCopilotState.preview.completions.length > 1 ? (
+                <div
+                  data-openwps-ai-candidates="true"
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  style={{
+                    position: 'absolute',
+                    left: Math.min(
+                      Math.max(ghostCompletion.popupLeft, 8),
+                      Math.max(8, cfg.pageWidth - Math.min(420, Math.max(280, cfg.pageWidth - 16)) - 8),
+                    ),
+                    top: ghostCompletion.popupTop,
+                    zIndex: 6,
+                    width: Math.min(420, Math.max(280, cfg.pageWidth - 16)),
+                    maxHeight: 184,
+                    padding: 6,
+                    border: '1px solid #dbe4f0',
+                    borderRadius: 8,
+                    background: '#ffffff',
+                    boxShadow: '0 10px 28px rgba(15, 23, 42, 0.16)',
+                    color: '#334155',
+                    fontSize: 12,
+                    userSelect: 'none',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, height: 24, padding: '0 2px 4px 4px', color: '#64748b', fontSize: 12 }}>
+                    <span style={{ fontVariantNumeric: 'tabular-nums' }}>{aiCopilotState.preview.activeIndex + 1}/{aiCopilotState.preview.completions.length}</span>
+                    <button
+                      type="button"
+                      title="关闭伴写候选"
+                      data-openwps-ai-candidate-close="true"
+                      onMouseDown={(event) => {
+                        event.preventDefault()
+                        clearAICopilotPreview()
+                      }}
+                      style={{ width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', borderRadius: 6, background: 'transparent', color: '#64748b', cursor: 'pointer' }}
+                    >
+                      <X size={14} strokeWidth={2} />
+                    </button>
+                  </div>
+                  <div style={{ display: 'grid', gap: 4 }}>
+                    {aiCopilotState.preview.completions.map((completion, index) => {
+                      const active = index === aiCopilotState.preview.activeIndex
+                      return (
+                        <div
+                          key={`${index}-${completion}`}
+                          data-openwps-ai-candidate-item={index + 1}
+                          onMouseEnter={() => handleAICopilotCandidateSelect(index)}
+                          onMouseDown={(event) => {
+                            event.preventDefault()
+                            handleAICopilotCandidateSelect(index)
+                          }}
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '24px minmax(0, 1fr) 28px',
+                            alignItems: 'center',
+                            gap: 8,
+                            minHeight: 44,
+                            padding: '6px 6px 6px 4px',
+                            border: `1px solid ${active ? '#bfdbfe' : '#e5e7eb'}`,
+                            borderLeft: `3px solid ${active ? '#2563eb' : 'transparent'}`,
+                            borderRadius: 7,
+                            background: active ? '#eff6ff' : '#ffffff',
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <span style={{ color: active ? '#2563eb' : '#64748b', textAlign: 'center', fontVariantNumeric: 'tabular-nums', fontWeight: active ? 600 : 500 }}>
+                            {index + 1}
+                          </span>
+                          <span
+                            title={completion}
+                            style={{
+                              minWidth: 0,
+                              color: '#1f2937',
+                              lineHeight: '18px',
+                              overflow: 'hidden',
+                              display: '-webkit-box',
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: 'vertical',
+                            }}
+                          >
+                            {completion}
+                          </span>
+                          <button
+                            type="button"
+                            title={`接受第 ${index + 1} 条伴写候选`}
+                            data-openwps-ai-candidate-accept={index + 1}
+                            onMouseDown={(event) => {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              acceptAICopilot(index)
+                            }}
+                            style={{ width: 26, height: 26, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', borderRadius: 6, background: active ? '#dbeafe' : '#f1f5f9', color: '#2563eb', cursor: 'pointer' }}
+                          >
+                            <Check size={14} strokeWidth={2.3} />
+                          </button>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <div
+                  data-openwps-ai-candidates="true"
+                  onMouseDown={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  style={{
+                    position: 'absolute',
+                    left: Math.min(Math.max(ghostCompletion.popupLeft, 8), Math.max(8, cfg.pageWidth - 98)),
+                    top: ghostCompletion.popupTop,
+                    zIndex: 6,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    height: 30,
+                    padding: '3px 5px',
+                    border: '1px solid #dbe4f0',
+                    borderRadius: 8,
+                    background: '#ffffff',
+                    boxShadow: '0 8px 22px rgba(15, 23, 42, 0.14)',
+                    color: '#334155',
+                    fontSize: 12,
+                    userSelect: 'none',
+                  }}
+                >
+                  <button
+                    type="button"
+                    title="接受当前伴写候选"
+                    data-openwps-ai-candidate-accept="true"
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      acceptAICopilot()
+                    }}
+                    style={{ width: 24, height: 24, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', borderRadius: 6, background: '#e8f1ff', color: '#2563eb', cursor: 'pointer' }}
+                  >
+                    <Check size={15} strokeWidth={2.3} />
+                  </button>
+                  <button
+                    type="button"
+                    title="关闭伴写候选"
+                    data-openwps-ai-candidate-close="true"
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      clearAICopilotPreview()
+                    }}
+                    style={{ width: 24, height: 24, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', border: 'none', borderRadius: 6, background: 'transparent', color: '#64748b', cursor: 'pointer' }}
+                  >
+                    <X size={15} strokeWidth={2} />
+                  </button>
+                </div>
+              )
             )}
 
             {/* ── Layer 3: ProseMirror editor ── */}

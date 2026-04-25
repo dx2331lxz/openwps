@@ -1,5 +1,60 @@
 import React from 'react'
 import {
+  ALargeSmall,
+  AlignCenter,
+  AlignJustify,
+  AlignLeft,
+  AlignRight,
+  BetweenHorizontalEnd,
+  BetweenHorizontalStart,
+  Bold,
+  Bot,
+  BookOpen,
+  Brush,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  Cloud,
+  Eraser,
+  Expand,
+  FileInput,
+  FileOutput,
+  FolderOpen,
+  Highlighter,
+  Home,
+  Image,
+  IndentDecrease,
+  IndentIncrease,
+  Italic,
+  List,
+  ListChecks,
+  ListOrdered,
+  Menu,
+  MessageSquarePlus,
+  PanelLeft,
+  Plus,
+  Redo2,
+  Ruler,
+  Save,
+  SeparatorHorizontal,
+  Share2,
+  Shrink,
+  SlidersHorizontal,
+  Sparkles,
+  SquarePlus,
+  Star,
+  Strikethrough,
+  Subscript,
+  Superscript,
+  Table,
+  TextQuote,
+  Type,
+  Underline,
+  Undo2,
+} from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
+import {
   addColumnAfter,
   addColumnBefore,
   addRowAfter,
@@ -27,6 +82,12 @@ interface ToolbarProps {
   onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
+  aiCopilotEnabled?: boolean
+  aiCopilotActivity?: AICopilotActivity
+  aiCopilotCandidateCount?: number
+  onToggleAICopilot?: () => void
+  onAICopilotActivityChange?: (activity: AICopilotActivity) => void
+  onAICopilotCandidateCountChange?: (count: number) => void
   onToggleWorkspace?: () => void
   workspaceOpen?: boolean
   onOpenServerFile?: () => void | Promise<void>
@@ -39,6 +100,8 @@ interface ToolbarProps {
   onAddComment?: () => void
   onOpenTemplates?: () => void | Promise<void>
 }
+
+export type AICopilotActivity = 'conservative' | 'standard' | 'active'
 
 // ─── Format derivation ────────────────────────────────────────────────────────
 
@@ -857,6 +920,151 @@ const ParagraphStyleDropdown: React.FC<{
   </div>
 )
 
+const toolbarButtonBaseStyle: React.CSSProperties = {
+  height: 34,
+  minWidth: 34,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 6,
+  padding: '0 8px',
+  border: 'none',
+  borderRadius: 8,
+  background: 'transparent',
+  color: '#1f2937',
+  cursor: 'pointer',
+  fontSize: 14,
+  lineHeight: 1,
+  whiteSpace: 'nowrap',
+}
+
+const TOOLBAR_LAYER_HEIGHT = 48
+
+function IconButton({
+  title,
+  icon: Icon,
+  label,
+  active = false,
+  disabled = false,
+  children,
+  onMouseDown,
+  onClick,
+  style,
+}: {
+  title: string
+  icon?: LucideIcon
+  label?: string
+  active?: boolean
+  disabled?: boolean
+  children?: React.ReactNode
+  onMouseDown?: React.MouseEventHandler<HTMLButtonElement>
+  onClick?: React.MouseEventHandler<HTMLButtonElement>
+  style?: React.CSSProperties
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onMouseDown={onMouseDown}
+      onClick={onClick}
+      style={{
+        ...toolbarButtonBaseStyle,
+        background: active ? '#e5e7eb' : 'transparent',
+        color: disabled ? '#c4c7cc' : active ? '#111827' : '#1f2937',
+        cursor: disabled ? 'default' : 'pointer',
+        ...style,
+      }}
+      onMouseEnter={event => {
+        if (!disabled && !active) event.currentTarget.style.background = '#f1f3f5'
+      }}
+      onMouseLeave={event => {
+        if (!active) event.currentTarget.style.background = 'transparent'
+      }}
+    >
+      {Icon && <Icon size={18} strokeWidth={2} />}
+      {children}
+      {label && <span style={{ fontSize: 14, lineHeight: '18px' }}>{label}</span>}
+    </button>
+  )
+}
+
+function ToolbarSelect({
+  title,
+  children,
+  style,
+  ...props
+}: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <select
+      title={title}
+      style={{
+        height: 34,
+        minWidth: 66,
+        border: 'none',
+        borderRadius: 8,
+        padding: '0 28px 0 10px',
+        background: '#ffffff',
+        color: '#111827',
+        cursor: 'pointer',
+        fontSize: 14,
+        outline: 'none',
+        appearance: 'auto',
+        ...style,
+      }}
+      {...props}
+    >
+      {children}
+    </select>
+  )
+}
+
+function ToolbarSeparator() {
+  return <div style={{ width: 1, height: 26, background: '#d8dde3', margin: '0 5px', flexShrink: 0 }} />
+}
+
+function TopBarAction({
+  title,
+  icon: Icon,
+  label,
+  active = false,
+  primary = false,
+  onMouseDown,
+}: {
+  title: string
+  icon: LucideIcon
+  label: string
+  active?: boolean
+  primary?: boolean
+  onMouseDown?: React.MouseEventHandler<HTMLButtonElement>
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onMouseDown={onMouseDown}
+      style={{
+        height: 34,
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 7,
+        border: primary ? 'none' : '1px solid transparent',
+        borderRadius: primary ? 8 : 7,
+        padding: primary ? '0 14px' : '0 9px',
+        background: primary ? '#2563eb' : active ? '#e8f1ff' : 'transparent',
+        color: primary ? '#ffffff' : active ? '#2563eb' : '#1f2937',
+        cursor: 'pointer',
+        fontSize: 14,
+        fontWeight: primary ? 600 : 500,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <Icon size={primary ? 17 : 18} strokeWidth={2} />
+      <span>{label}</span>
+    </button>
+  )
+}
+
 function PageToolbarButton({
   label,
   icon,
@@ -864,41 +1072,33 @@ function PageToolbarButton({
   onMouseDown,
 }: {
   label: string
-  icon: string
+  icon: LucideIcon
   active: boolean
   onMouseDown: React.MouseEventHandler<HTMLButtonElement>
 }) {
+  const Icon = icon
   return (
     <button
-      className={
-        'cursor-pointer select-none rounded text-sm font-medium ' +
-        (active ? 'bg-blue-100 text-blue-700' : 'text-gray-700 hover:bg-gray-100')
-      }
+      type="button"
       onMouseDown={onMouseDown}
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 8,
-        padding: '6px 12px',
-        borderRadius: 10,
+        gap: 7,
+        height: 34,
+        padding: '0 11px',
+        border: 'none',
+        borderRadius: 8,
+        background: active ? '#e8f1ff' : 'transparent',
+        color: active ? '#2563eb' : '#1f2937',
+        cursor: 'pointer',
+        fontWeight: 500,
+        whiteSpace: 'nowrap',
       }}
     >
-      <span
-        style={{
-          width: 18,
-          height: 18,
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          color: active ? '#2563eb' : '#374151',
-          fontSize: 16,
-          lineHeight: 1,
-        }}
-      >
-        {icon}
-      </span>
+      <Icon size={18} strokeWidth={2} />
       <span style={{ fontSize: 13 }}>{label}</span>
-      <span style={{ fontSize: 11, color: active ? '#2563eb' : '#6b7280' }}>▾</span>
+      <ChevronDown size={14} strokeWidth={2} />
     </button>
   )
 }
@@ -912,6 +1112,12 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onPageConfigChange,
   onToggleSidebar,
   sidebarOpen,
+  aiCopilotEnabled,
+  aiCopilotActivity = 'standard',
+  aiCopilotCandidateCount = 1,
+  onToggleAICopilot,
+  onAICopilotActivityChange,
+  onAICopilotCandidateCountChange,
   onToggleWorkspace,
   workspaceOpen,
   onOpenServerFile,
@@ -932,6 +1138,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   })
   const [spacingPopover, setSpacingPopover] = React.useState<{ which: 'before' | 'after'; rect: DOMRect } | null>(null)
   const [styleDropdown, setStyleDropdown] = React.useState<{ rect: DOMRect } | null>(null)
+  const [fileMenu, setFileMenu] = React.useState<{ rect: DOMRect } | null>(null)
+  const [aiCopilotMenu, setAiCopilotMenu] = React.useState<{ rect: DOMRect } | null>(null)
   const [activeTab, setActiveTab] = React.useState<'home' | 'insert' | 'page'>('home')
   const [pagePopover, setPagePopover] = React.useState<{ section: PageSettingsSection; rect: DOMRect } | null>(null)
   const [tablePickerOpen, setTablePickerOpen] = React.useState(false)
@@ -969,6 +1177,20 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
   }, [styleDropdown])
+
+  React.useEffect(() => {
+    if (!fileMenu) return
+    const handler = () => setFileMenu(null)
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [fileMenu])
+
+  React.useEffect(() => {
+    if (!aiCopilotMenu) return
+    const handler = () => setAiCopilotMenu(null)
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [aiCopilotMenu])
 
   React.useEffect(() => {
     if (!pagePopover) return
@@ -1038,11 +1260,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const activeParagraphStyleId = getCurrentParagraphStyleId(fmt.para)
   const activeParagraphStyle = PARAGRAPH_STYLE_OPTIONS.find(option => option.id === activeParagraphStyleId) ?? PARAGRAPH_STYLE_OPTIONS[0]!
 
-  const btn = (active: boolean) =>
-    'px-3 py-2 rounded text-base font-medium cursor-pointer select-none ' +
-    (active ? 'bg-blue-100 text-blue-700' : 'hover:bg-gray-100 text-gray-700')
-
-  const sep = <div style={{ width: 1, height: 30, background: '#e5e7eb', margin: '0 6px' }} />
+  const sep = <ToolbarSeparator />
 
   /** Call before a <select> opens so we can restore the selection on change */
   const saveSelection = () => {
@@ -1092,33 +1310,69 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
   return (
     <>
-      {/* ── 顶部行：标签 + 右侧操作按钮 ── */}
+      {/* ── 顶部应用栏：入口 + 标签 + 右侧操作按钮 ── */}
       <div style={{
         display: 'flex',
         alignItems: 'center',
-        background: 'white',
-        borderBottom: collapsed ? '1px solid #e5e7eb' : undefined,
+        height: TOOLBAR_LAYER_HEIGHT,
+        minHeight: TOOLBAR_LAYER_HEIGHT,
+        background: '#f3f4f6',
+        borderBottom: '1px solid #dfe3e8',
+        padding: '0 10px',
+        gap: 14,
       }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: '1 1 260px' }}>
+          <IconButton title="主页" icon={Home} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
+          <IconButton title="新建" icon={Plus} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
+          <ToolbarSeparator />
+          <IconButton
+            title="文件菜单"
+            icon={Menu}
+            active={Boolean(fileMenu)}
+            onMouseDown={event => {
+              event.preventDefault()
+              event.stopPropagation()
+              const rect = event.currentTarget.getBoundingClientRect()
+              setFileMenu(current => current ? null : { rect })
+            }}
+            style={{ width: 32, height: 32, minWidth: 32, padding: 0 }}
+          />
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            minWidth: 0,
+            color: '#111827',
+            fontSize: 15,
+            fontWeight: 600,
+          }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 180 }}>OpenWPS</span>
+            <Star size={17} strokeWidth={1.8} color="#6b7280" />
+            <ChevronDown size={15} strokeWidth={2} color="#6b7280" />
+          </div>
+        </div>
+
         {/* 标签区 */}
-        <div style={{ display: 'flex', alignItems: 'stretch', flex: 1 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 26, flex: '0 0 auto' }}>
           {(['home', 'insert', 'page'] as const).map(tab => {
             const label = tab === 'home' ? '开始' : tab === 'insert' ? '插入' : '页面'
             const active = activeTab === tab
             return (
               <button
+                type="button"
                 key={tab}
                 onMouseDown={e => { e.preventDefault(); setActiveTab(tab) }}
                 style={{
-                  padding: '0 22px',
-                  fontSize: 16,
+                  height: TOOLBAR_LAYER_HEIGHT,
+                  padding: '0 2px',
+                  fontSize: 15,
                   fontWeight: active ? 600 : 400,
                   cursor: 'pointer',
                   border: 'none',
-                  borderBottom: active ? '2px solid #2563eb' : '2px solid transparent',
-                  background: active ? '#f0f7ff' : 'transparent',
+                  borderBottom: active ? '3px solid #2563eb' : '3px solid transparent',
+                  background: 'transparent',
                   color: active ? '#2563eb' : '#374151',
                   borderRadius: 0,
-                  transition: 'background 0.1s',
                   whiteSpace: 'nowrap',
                 }}
               >
@@ -1129,63 +1383,254 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </div>
 
         {/* 右侧操作区 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '0 8px', flexShrink: 0, borderLeft: '1px solid #e5e7eb' }}>
-          <button
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, minWidth: 0, flex: '1 1 300px' }}>
+          <TopBarAction
             title="工作区"
+            icon={FolderOpen}
+            label="工作区"
+            active={Boolean(workspaceOpen)}
             onMouseDown={e => { e.preventDefault(); onToggleWorkspace?.() }}
-            style={{
-              padding: '6px 14px', fontSize: 15, borderRadius: 6, cursor: 'pointer',
-              background: workspaceOpen ? '#2563eb' : '#f3f4f6',
-              color: workspaceOpen ? 'white' : '#374151',
-              border: '1px solid #d1d5db',
-            }}
-          >
-            📁 工作区
-          </button>
-          <button
+          />
+          <TopBarAction
             title="AI 助手"
+            icon={Bot}
+            label="WPS AI"
+            active={Boolean(sidebarOpen)}
             onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
-            style={{
-              padding: '6px 14px', fontSize: 15, borderRadius: 6, cursor: 'pointer',
-              background: sidebarOpen ? '#2563eb' : '#f3f4f6',
-              color: sidebarOpen ? 'white' : '#374151',
-              border: '1px solid #d1d5db',
-            }}
-          >
-            ★ AI
-          </button>
-          {collapsed && (
+          />
+          <div style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 8, background: aiCopilotEnabled ? '#e8f1ff' : 'transparent' }}>
+            <TopBarAction
+              title={aiCopilotEnabled ? '关闭 AI 伴写' : '开启 AI 伴写'}
+              icon={Sparkles}
+              label="伴写"
+              active={Boolean(aiCopilotEnabled)}
+              onMouseDown={e => { e.preventDefault(); onToggleAICopilot?.() }}
+            />
             <button
-              title="展开工具栏"
-              onClick={() => setCollapsed(false)}
+              type="button"
+              title="AI 伴写设置"
+              data-openwps-ai-copilot-settings="true"
+              onMouseDown={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                const rect = event.currentTarget.getBoundingClientRect()
+                setAiCopilotMenu(current => current ? null : { rect })
+              }}
               style={{
-                fontSize: 12, cursor: 'pointer', border: 'none', background: 'transparent',
-                color: '#6b7280', padding: '2px 4px',
+                width: 28,
+                height: 34,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                border: 'none',
+                borderLeft: aiCopilotEnabled ? '1px solid #cfe0ff' : '1px solid transparent',
+                borderRadius: '0 8px 8px 0',
+                background: aiCopilotMenu ? '#dbeafe' : 'transparent',
+                color: aiCopilotEnabled || aiCopilotMenu ? '#2563eb' : '#374151',
+                cursor: 'pointer',
               }}
             >
-              ∨ 展开
+              <SlidersHorizontal size={15} strokeWidth={2} />
             </button>
-          )}
-          <button
+          </div>
+          <TopBarAction
             title={isFullscreen ? '退出全屏 (F11)' : '全屏模式 (F11)'}
+            icon={isFullscreen ? Shrink : Expand}
+            label={isFullscreen ? '退出全屏' : '全屏'}
             onMouseDown={e => { e.preventDefault(); onToggleFullscreen?.() }}
-            className={btn(false)}
-            style={{ fontSize: 15, lineHeight: 1 }}
-          >
-            {isFullscreen ? '⊡' : '⛶'}
-          </button>
+          />
+          <IconButton title="云同步状态" icon={Cloud} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
+          {collapsed && (
+            <IconButton
+              title="展开工具栏"
+              icon={ChevronDown}
+              label="展开"
+              onClick={() => setCollapsed(false)}
+              style={{ height: 32 }}
+            />
+          )}
+          <TopBarAction
+            title="分享"
+            icon={Share2}
+            label="分享"
+            primary
+            onMouseDown={e => e.preventDefault()}
+          />
         </div>
       </div>
+
+      {fileMenu && (
+        <div
+          onMouseDown={event => event.stopPropagation()}
+          style={{
+            position: 'fixed',
+            top: fileMenu.rect.bottom + 6,
+            left: fileMenu.rect.left,
+            zIndex: 9999,
+            width: 188,
+            padding: '6px',
+            border: '1px solid #e5e7eb',
+            borderRadius: 10,
+            background: '#ffffff',
+            boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
+          }}
+        >
+          {[
+            { title: '打开文档目录文件', label: '打开', icon: FolderOpen, action: () => { void onOpenServerFile?.() } },
+            { title: '保存到文档目录', label: '保存', icon: Save, action: () => { void onSaveServerFile?.() } },
+            { title: '导入 .docx / .md', label: '导入', icon: FileInput, action: () => fileInputRef.current?.click() },
+            { title: '导出 .docx', label: '导出', icon: FileOutput, action: () => { void onExportDocx?.() } },
+            { title: '打开模板库', label: '模板', icon: BookOpen, action: () => { void onOpenTemplates?.() } },
+          ].map(item => {
+            const ItemIcon = item.icon
+            return (
+              <button
+                key={item.label}
+                type="button"
+                title={item.title}
+                onMouseDown={event => {
+                  event.preventDefault()
+                  item.action()
+                  setFileMenu(null)
+                }}
+                style={{
+                  width: '100%',
+                  height: 36,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  padding: '0 10px',
+                  border: 'none',
+                  borderRadius: 7,
+                  background: 'transparent',
+                  color: '#111827',
+                  cursor: 'pointer',
+                  fontSize: 14,
+                  textAlign: 'left',
+                }}
+                onMouseEnter={event => { event.currentTarget.style.background = '#f3f4f6' }}
+                onMouseLeave={event => { event.currentTarget.style.background = 'transparent' }}
+              >
+                <ItemIcon size={17} strokeWidth={2} color="#374151" />
+                <span>{item.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {aiCopilotMenu && (
+        <div
+          data-openwps-ai-copilot-menu="true"
+          onMouseDown={event => event.stopPropagation()}
+          style={{
+            position: 'fixed',
+            top: aiCopilotMenu.rect.bottom + 6,
+            left: Math.max(8, aiCopilotMenu.rect.left - 156),
+            zIndex: 9999,
+            width: 240,
+            padding: 10,
+            border: '1px solid #e5e7eb',
+            borderRadius: 10,
+            background: '#ffffff',
+            boxShadow: '0 18px 40px rgba(15, 23, 42, 0.16)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, color: '#111827', fontSize: 14, fontWeight: 600 }}>
+            <Sparkles size={16} strokeWidth={2} color="#2563eb" />
+            <span>AI 伴写设置</span>
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>活跃程度</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
+              {([
+                ['conservative', '保守'],
+                ['standard', '标准'],
+                ['active', '积极'],
+              ] as const).map(([value, label]) => {
+                const active = aiCopilotActivity === value
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    data-openwps-ai-activity={value}
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      onAICopilotActivityChange?.(value)
+                    }}
+                    style={{
+                      height: 30,
+                      border: `1px solid ${active ? '#2563eb' : '#d1d5db'}`,
+                      borderRadius: 7,
+                      background: active ? '#e8f1ff' : '#ffffff',
+                      color: active ? '#2563eb' : '#374151',
+                      cursor: 'pointer',
+                      fontSize: 13,
+                    }}
+                  >
+                    {label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 6 }}>候选数量</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
+              {[1, 2, 3].map((count) => {
+                const active = aiCopilotCandidateCount === count
+                return (
+                  <button
+                    key={count}
+                    type="button"
+                    data-openwps-ai-candidate-count={count}
+                    onMouseDown={(event) => {
+                      event.preventDefault()
+                      onAICopilotCandidateCountChange?.(count)
+                    }}
+                    style={{
+                      height: 30,
+                      border: `1px solid ${active ? '#2563eb' : '#d1d5db'}`,
+                      borderRadius: 7,
+                      background: active ? '#e8f1ff' : '#ffffff',
+                      color: active ? '#2563eb' : '#374151',
+                      cursor: 'pointer',
+                      fontSize: 13,
+                    }}
+                  >
+                    {count}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── 工具栏行（可折叠） ── */}
       {!collapsed && (
         <div style={{
           display: 'flex',
           alignItems: 'stretch',
-          background: 'white',
+          background: '#f3f4f6',
           borderBottom: '1px solid #e5e7eb',
-          minHeight: 52,
+          height: TOOLBAR_LAYER_HEIGHT,
+          minHeight: TOOLBAR_LAYER_HEIGHT,
+          boxSizing: 'border-box',
+          padding: '4px 5px',
         }}>
+          <div style={{
+            flex: 1,
+            minWidth: 0,
+            display: 'flex',
+            alignItems: 'center',
+            height: '100%',
+            minHeight: 0,
+            borderRadius: 10,
+            background: '#ffffff',
+            boxShadow: '0 1px 2px rgba(15, 23, 42, 0.08)',
+            overflow: 'hidden',
+          }}>
           {/* 左滚动箭头 */}
           {showScrollLeft && (
             <button
@@ -1193,13 +1638,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               style={{
                 flexShrink: 0, width: 28,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                cursor: 'pointer', border: 'none', borderRight: '1px solid #e5e7eb',
-                background: '#f9fafb', color: '#6b7280', fontSize: 16,
+                cursor: 'pointer', border: 'none',
+                background: 'transparent', color: '#6b7280', fontSize: 16,
                 userSelect: 'none',
               }}
               title="向左滚动"
             >
-              ‹
+              <ChevronLeft size={18} strokeWidth={2} />
             </button>
           )}
 
@@ -1209,9 +1654,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             className="toolbar-row"
             style={{
               flex: 1,
+              minWidth: 0,
               display: 'flex',
               alignItems: 'center',
-              gap: 2,
+              gap: 3,
+              minHeight: 0,
+              height: '100%',
+              margin: '0 0 0 0',
               padding: '0 10px',
               overflowX: 'auto',
               overflowY: 'hidden',
@@ -1222,27 +1671,27 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             {activeTab === 'home' && (
               <>
                 {/* 撤销 / 重做 */}
-                <button className={btn(false)} title="撤销 (Ctrl+Z)" onMouseDown={e => { e.preventDefault(); if (view) undo(view.state, view.dispatch) }}>↩</button>
-                <button className={btn(false)} title="重做 (Ctrl+Y)" onMouseDown={e => { e.preventDefault(); if (view) redo(view.state, view.dispatch) }}>↪</button>
+                <IconButton title="撤销 (Ctrl+Z)" icon={Undo2} onMouseDown={e => { e.preventDefault(); if (view) undo(view.state, view.dispatch) }} />
+                <IconButton title="重做 (Ctrl+Y)" icon={Redo2} onMouseDown={e => { e.preventDefault(); if (view) redo(view.state, view.dispatch) }} />
 
                 {sep}
 
                 {selectedHorizontalRule ? (
                   <>
                     <span style={{ fontSize: 13, color: '#374151', padding: '0 6px', whiteSpace: 'nowrap' }}>分割线</span>
-                    <select
+                    <ToolbarSelect
                       title="分割线样式"
                       value={selectedHorizontalRule.attrs.lineStyle}
-                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ minWidth: 84 }}
                       onChange={e => applyHorizontalRuleAttrs({ lineStyle: e.target.value })}
                     >
                       {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
                         <option key={option.value} value={option.value}>{option.label}</option>
                       ))}
-                    </select>
+                    </ToolbarSelect>
 
                     <div style={{ position: 'relative' }}>
-                      <button
+                      <IconButton
                         title="分割线颜色"
                         onMouseDown={e => {
                           e.preventDefault()
@@ -1255,12 +1704,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                           setColorPickerOpen('hr-selected')
                           setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
                         }}
-                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                        className={btn(false)}
                       >
-                        <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                        <SeparatorHorizontal size={18} strokeWidth={2} />
                         <span style={{ height: 3, width: 16, background: selectedHorizontalRule.attrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
-                      </button>
+                      </IconButton>
                       {colorPickerOpen === 'hr-selected' && colorPickerAnchor && (
                         <ColorSwatch
                           colors={HORIZONTAL_RULE_COLORS}
@@ -1279,6 +1726,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   <>
                     {/* 段落样式 */}
                     <button
+                      type="button"
                       title="段落样式"
                       data-openwps-style-button="true"
                       onMouseDown={event => {
@@ -1287,44 +1735,31 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                         setStyleDropdown(current => current ? null : { rect: event.currentTarget.getBoundingClientRect() })
                       }}
                       style={{
-                        minWidth: 118,
-                        height: 38,
+                        minWidth: 104,
+                        height: 34,
                         display: 'inline-flex',
                         alignItems: 'center',
                         justifyContent: 'space-between',
-                        gap: 10,
-                        padding: '0 14px',
-                        border: '1px solid #ddd',
-                        borderRadius: 4,
+                        gap: 8,
+                        padding: '0 10px',
+                        border: 'none',
+                        borderRadius: 8,
                         background: '#ffffff',
                         color: '#111827',
                         cursor: 'pointer',
-                        fontSize: 17,
+                        fontSize: 14,
                         whiteSpace: 'nowrap',
                       }}
                     >
                       <span>{activeParagraphStyle.label}</span>
-                      <span style={{ color: '#6b7280', fontSize: 12 }}>▾</span>
+                      <ChevronDown size={14} color="#6b7280" strokeWidth={2} />
                     </button>
 
-                    {/* 字号 */}
-                    <select
-                      title="字号"
-                      value={String(fmt.text.fontSize)}
-                      style={{ width: 76, height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 8px', cursor: 'pointer' }}
-                      onMouseDown={saveSelection}
-                      onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
-                    >
-                      {fontSizeOptions.map(v => (
-                        <option key={v} value={String(v)}>{v}pt</option>
-                      ))}
-                    </select>
-
                     {/* 字体 */}
-                    <select
+                    <ToolbarSelect
                       title="字体"
                       value={fmt.text.fontFamily}
-                      style={{ height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
+                      style={{ minWidth: 96 }}
                       onMouseDown={saveSelection}
                       onChange={e => applyTextStyleWithSaved({ fontFamily: e.target.value })}
                     >
@@ -1334,21 +1769,34 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                       <option value={FONT_STACKS.fang}>仿宋</option>
                       <option value={FONT_STACKS.arial}>Arial</option>
                       <option value={FONT_STACKS.timesNewRoman}>Times New Roman</option>
-                    </select>
+                    </ToolbarSelect>
+
+                    {/* 字号 */}
+                    <ToolbarSelect
+                      title="字号"
+                      value={String(fmt.text.fontSize)}
+                      style={{ minWidth: 72 }}
+                      onMouseDown={saveSelection}
+                      onChange={e => applyTextStyleWithSaved({ fontSize: Number(e.target.value) })}
+                    >
+                      {fontSizeOptions.map(v => (
+                        <option key={v} value={String(v)}>{v}pt</option>
+                      ))}
+                    </ToolbarSelect>
 
                     {sep}
 
                     {/* B I U S X² X₂ */}
-                    <button className={btn(fmt.text.bold)} title="加粗 (Ctrl+B)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }}><b>B</b></button>
-                    <button className={btn(fmt.text.italic)} title="斜体 (Ctrl+I)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }}><i>I</i></button>
-                    <button className={btn(fmt.text.underline)} title="下划线 (Ctrl+U)" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }}><u>U</u></button>
-                    <button className={btn(fmt.text.strikethrough)} title="删除线" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }}><s>S</s></button>
-                    <button className={btn(fmt.text.superscript)} title="上标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }}>X²</button>
-                    <button className={btn(fmt.text.subscript)} title="下标" onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }}>X₂</button>
+                    <IconButton title="加粗 (Ctrl+B)" icon={Bold} active={fmt.text.bold} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { bold: !fmt.text.bold }) }} />
+                    <IconButton title="斜体 (Ctrl+I)" icon={Italic} active={fmt.text.italic} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { italic: !fmt.text.italic }) }} />
+                    <IconButton title="下划线 (Ctrl+U)" icon={Underline} active={fmt.text.underline} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { underline: !fmt.text.underline }) }} />
+                    <IconButton title="删除线" icon={Strikethrough} active={fmt.text.strikethrough} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { strikethrough: !fmt.text.strikethrough }) }} />
+                    <IconButton title="上标" icon={Superscript} active={fmt.text.superscript} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { superscript: !fmt.text.superscript }) }} />
+                    <IconButton title="下标" icon={Subscript} active={fmt.text.subscript} onMouseDown={e => { e.preventDefault(); if (view) applyTextStyle(view, { subscript: !fmt.text.subscript }) }} />
 
                     {/* 文字颜色 */}
                     <div style={{ position: 'relative' }}>
-                      <button
+                      <IconButton
                         title="文字颜色"
                         onMouseDown={e => {
                           e.preventDefault()
@@ -1361,12 +1809,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                           setColorPickerOpen('text')
                           setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
                         }}
-                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                        className={btn(false)}
                       >
-                        <span style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>A</span>
+                        <Type size={18} strokeWidth={2} />
                         <span style={{ height: 3, width: 16, background: fmt.text.color, border: '1px solid #ccc', borderRadius: 1 }} />
-                      </button>
+                      </IconButton>
                       {colorPickerOpen === 'text' && colorPickerAnchor && (
                         <ColorSwatch
                           colors={TEXT_COLORS}
@@ -1383,7 +1829,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
                     {/* 背景色 */}
                     <div style={{ position: 'relative' }}>
-                      <button
+                      <IconButton
                         title="文字背景色（高亮）"
                         onMouseDown={e => {
                           e.preventDefault()
@@ -1396,12 +1842,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                           setColorPickerOpen('bg')
                           setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
                         }}
-                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                        className={btn(false)}
                       >
-                        <span style={{ fontSize: 11 }}>🖍</span>
+                        <Highlighter size={18} strokeWidth={2} />
                         <span style={{ height: 3, width: 16, background: fmt.text.backgroundColor || 'transparent', border: '1px solid #ccc', borderRadius: 1 }} />
-                      </button>
+                      </IconButton>
                       {colorPickerOpen === 'bg' && colorPickerAnchor && (
                         <ColorSwatch
                           colors={HIGHLIGHT_COLORS}
@@ -1417,73 +1861,73 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     </div>
 
                     {/* 清除格式 */}
-                    <button className={btn(false)} title="清除格式" onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }}>✕</button>
+                    <IconButton title="清除格式" icon={Eraser} onMouseDown={e => { e.preventDefault(); if (view) clearFormatting(view) }} />
 
                     {sep}
 
                     {/* 对齐 */}
-                    <button className={btn(fmt.para.align === 'left')} title="左对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }}>≡L</button>
-                    <button className={btn(fmt.para.align === 'center')} title="居中" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }}>≡C</button>
-                    <button className={btn(fmt.para.align === 'right')} title="右对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }}>≡R</button>
-                    <button className={btn(fmt.para.align === 'justify')} title="两端对齐" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }}>≡J</button>
+                    <IconButton title="左对齐" icon={AlignLeft} active={fmt.para.align === 'left'} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'left' }) }} />
+                    <IconButton title="居中" icon={AlignCenter} active={fmt.para.align === 'center'} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'center' }) }} />
+                    <IconButton title="右对齐" icon={AlignRight} active={fmt.para.align === 'right'} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'right' }) }} />
+                    <IconButton title="两端对齐" icon={AlignJustify} active={fmt.para.align === 'justify'} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { align: 'justify' }) }} />
 
                     {sep}
 
                     {/* 列表 */}
-                    <button className={btn(fmt.para.listType === 'bullet')} title="无序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }}>• =</button>
-                    <button className={btn(fmt.para.listType === 'ordered')} title="有序列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }}>1.</button>
-                    <button className={btn(fmt.para.listType === 'task')} title="任务列表" onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'task') }}>☐</button>
+                    <IconButton title="无序列表" icon={List} active={fmt.para.listType === 'bullet'} onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'bullet') }} />
+                    <IconButton title="有序列表" icon={ListOrdered} active={fmt.para.listType === 'ordered'} onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'ordered') }} />
+                    <IconButton title="任务列表" icon={ListChecks} active={fmt.para.listType === 'task'} onMouseDown={e => { e.preventDefault(); if (view) toggleList(view, 'task') }} />
 
                     {sep}
 
                     {/* 首行缩进 */}
-                    <button className={btn(false)} title="增加首行缩进 (Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }}>⇥首</button>
-                    <button className={btn(false)} title="减少首行缩进 (Shift+Tab)" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }}>⇤首</button>
+                    <IconButton title="增加首行缩进 (Tab)" icon={BetweenHorizontalStart} label="首" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) + 2) }) }} />
+                    <IconButton title="减少首行缩进 (Shift+Tab)" icon={BetweenHorizontalEnd} label="首" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { firstLineIndent: Math.max(0, (fmt.para.firstLineIndent as number) - 2) }) }} />
                     {/* 整体缩进 */}
-                    <button className={btn(false)} title="增加缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }}>⇥</button>
-                    <button className={btn(false)} title="减少缩进" onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }}>⇤</button>
+                    <IconButton title="增加缩进" icon={IndentIncrease} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: (fmt.para.indent as number || 0) + 1 }) }} />
+                    <IconButton title="减少缩进" icon={IndentDecrease} onMouseDown={e => { e.preventDefault(); if (view) applyParaStyle(view, { indent: Math.max(0, (fmt.para.indent as number || 0) - 1) }) }} />
 
                     {sep}
 
                     {/* 行距 */}
-                    <select
+                    <ToolbarSelect
                       title="行距"
                       value={fmt.para.lineHeight}
-                      style={{ height: 38, fontSize: 16, border: '1px solid #ddd', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}
+                      style={{ minWidth: 72 }}
                       onChange={e => { if (view) applyParaStyle(view, { lineHeight: Number(e.target.value) }) }}
                     >
                       {[1.0, 1.15, 1.5, 2.0, 2.5, 3.0].map(v => <option key={v} value={v}>{v}</option>)}
-                    </select>
+                    </ToolbarSelect>
 
                     {/* 段前间距 */}
-                    <button
+                    <IconButton
                       title="段前间距"
-                      className={btn(spacingPopover?.which === 'before')}
-                      style={{ minWidth: 52, fontSize: 12 }}
+                      icon={ALargeSmall}
+                      label={`段前${(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}`}
+                      active={spacingPopover?.which === 'before'}
+                      style={{ minWidth: 76 }}
                       onMouseDown={e => {
                         e.preventDefault()
                         e.stopPropagation()
                         if (spacingPopover?.which === 'before') { setSpacingPopover(null); return }
                         setSpacingPopover({ which: 'before', rect: e.currentTarget.getBoundingClientRect() })
                       }}
-                    >
-                      段前{(fmt.para.spaceBefore as number) > 0 ? `${fmt.para.spaceBefore}pt` : '0'}
-                    </button>
+                    />
 
                     {/* 段后间距 */}
-                    <button
+                    <IconButton
                       title="段后间距"
-                      className={btn(spacingPopover?.which === 'after')}
-                      style={{ minWidth: 52, fontSize: 12 }}
+                      icon={TextQuote}
+                      label={`段后${(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}`}
+                      active={spacingPopover?.which === 'after'}
+                      style={{ minWidth: 76 }}
                       onMouseDown={e => {
                         e.preventDefault()
                         e.stopPropagation()
                         if (spacingPopover?.which === 'after') { setSpacingPopover(null); return }
                         setSpacingPopover({ which: 'after', rect: e.currentTarget.getBoundingClientRect() })
                       }}
-                    >
-                      段后{(fmt.para.spaceAfter as number) > 0 ? `${fmt.para.spaceAfter}pt` : '0'}
-                    </button>
+                    />
                   </>
                 )}
               </>
@@ -1495,18 +1939,18 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 {selectedHorizontalRule && (
                   <>
                     <span style={{ fontSize: 13, color: '#374151', padding: '0 6px', whiteSpace: 'nowrap' }}>分割线</span>
-                    <select
+                    <ToolbarSelect
                       title="分割线样式"
                       value={selectedHorizontalRule.attrs.lineStyle}
-                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ minWidth: 84 }}
                       onChange={e => applyHorizontalRuleAttrs({ lineStyle: e.target.value })}
                     >
                       {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
                         <option key={option.value} value={option.value}>{option.label}</option>
                       ))}
-                    </select>
+                    </ToolbarSelect>
                     <div style={{ position: 'relative' }}>
-                      <button
+                      <IconButton
                         title="分割线颜色"
                         onMouseDown={e => {
                           e.preventDefault()
@@ -1519,12 +1963,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                           setColorPickerOpen('hr-selected')
                           setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
                         }}
-                        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                        className={btn(false)}
                       >
-                        <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                        <SeparatorHorizontal size={18} strokeWidth={2} />
                         <span style={{ height: 3, width: 16, background: selectedHorizontalRule.attrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
-                      </button>
+                      </IconButton>
                       {colorPickerOpen === 'hr-selected' && colorPickerAnchor && (
                         <ColorSwatch
                           colors={HORIZONTAL_RULE_COLORS}
@@ -1542,41 +1984,12 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   </>
                 )}
 
-                {/* 文件操作 */}
-                <button
-                  className={btn(false)}
-                  title="打开文档目录文件"
-                  onMouseDown={e => { e.preventDefault(); void onOpenServerFile?.() }}
-                >📁 打开</button>
-                <button
-                  className={btn(false)}
-                  title="保存到文档目录"
-                  onMouseDown={e => { e.preventDefault(); void onSaveServerFile?.() }}
-                >💾 保存</button>
-                <button
-                  className={btn(false)}
-                  title="导入 .docx / .md"
-                  onMouseDown={e => { e.preventDefault(); fileInputRef.current?.click() }}
-                >📥 导入</button>
-                <button
-                  className={btn(false)}
-                  title="导出 .docx"
-                  onMouseDown={e => { e.preventDefault(); void onExportDocx?.() }}
-                >📤 导出</button>
-                <button
-                  className={btn(false)}
-                  title="打开模板库"
-                  onMouseDown={e => { e.preventDefault(); void onOpenTemplates?.() }}
-                >📐 模板</button>
-
-                {sep}
-
                 {/* 插入内容 */}
-                <button className={btn(false)} title="插入水平分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view, horizontalRuleInsertAttrs) }}>── 分割线</button>
-                <select
+                <IconButton title="插入水平分割线" icon={SeparatorHorizontal} label="分割线" onMouseDown={e => { e.preventDefault(); if (view) insertHR(view, horizontalRuleInsertAttrs) }} />
+                <ToolbarSelect
                   title="插入分割线样式"
                   value={horizontalRuleInsertAttrs.lineStyle}
-                  style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                  style={{ minWidth: 84 }}
                   onChange={e => {
                     setHorizontalRuleInsertAttrs(current => ({ ...current, lineStyle: e.target.value }))
                   }}
@@ -1584,9 +1997,9 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                   {HORIZONTAL_RULE_STYLE_OPTIONS.map(option => (
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
-                </select>
+                </ToolbarSelect>
                 <div style={{ position: 'relative' }}>
-                  <button
+                  <IconButton
                     title="插入分割线颜色"
                     onMouseDown={e => {
                       e.preventDefault()
@@ -1599,12 +2012,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                       setColorPickerOpen('hr-insert')
                       setColorPickerAnchor(e.currentTarget.getBoundingClientRect())
                     }}
-                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '2px 4px', borderRadius: 4, cursor: 'pointer', border: 'none', background: 'transparent' }}
-                    className={btn(false)}
                   >
-                    <span style={{ fontSize: 12, lineHeight: 1 }}>━━</span>
+                    <Brush size={18} strokeWidth={2} />
                     <span style={{ height: 3, width: 16, background: horizontalRuleInsertAttrs.lineColor, border: '1px solid #ccc', borderRadius: 1 }} />
-                  </button>
+                  </IconButton>
                   {colorPickerOpen === 'hr-insert' && colorPickerAnchor && (
                     <ColorSwatch
                       colors={HORIZONTAL_RULE_COLORS}
@@ -1620,22 +2031,26 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     />
                   )}
                 </div>
-                <button className={btn(false)} title="插入分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }}>⊞ 分页符</button>
-                <button
-                  className={btn(false)}
-                  title="插入本地图片"
-                  onMouseDown={e => { e.preventDefault(); imageInputRef.current?.click() }}
-                >🖼 图片</button>
+                <IconButton title="插入分页符" icon={SquarePlus} label="分页符" onMouseDown={e => { e.preventDefault(); if (view) insertPageBreak(view) }} />
+                <IconButton title="插入本地图片" icon={Image} label="图片" onMouseDown={e => { e.preventDefault(); imageInputRef.current?.click() }} />
 
                 {sep}
 
                 {/* 插入表格 */}
                 <button
+                  type="button"
                   ref={tablePickerBtnRef}
-                  className={btn(tablePickerOpen)}
                   title="插入表格（选择行列数）"
                   onClick={() => setTablePickerOpen(v => !v)}
-                >⊞ 表格</button>
+                  style={{
+                    ...toolbarButtonBaseStyle,
+                    background: tablePickerOpen ? '#e5e7eb' : 'transparent',
+                    color: '#1f2937',
+                  }}
+                >
+                  <Table size={18} strokeWidth={2} />
+                  <span style={{ fontSize: 14 }}>表格</span>
+                </button>
                 {tablePickerOpen && (
                   <TablePicker
                     anchorRef={tablePickerBtnRef}
@@ -1647,23 +2062,21 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 {sep}
 
                 {/* 插入批注 */}
-                <button
-                  className={btn(false)}
+                <IconButton
                   title="添加批注（先选中文字）"
+                  icon={MessageSquarePlus}
+                  label="批注"
                   onMouseDown={e => { e.preventDefault(); onAddComment?.() }}
-                  style={{ display: 'flex', alignItems: 'center', gap: 3 }}
-                >
-                  <span style={{ fontSize: 14 }}>💬</span> 批注
-                </button>
+                />
 
                 {/* 表格操作（仅当光标在表格内时显示） */}
                 {selectionInTable && (
                   <>
                     {sep}
-                    <select
+                    <ToolbarSelect
                       title="表格行列操作"
                       value=""
-                      style={{ fontSize: 13, border: '1px solid #ddd', borderRadius: 4, padding: '2px 4px', cursor: 'pointer' }}
+                      style={{ minWidth: 118 }}
                       onMouseDown={() => {
                         savedTableViewRef.current = view
                       }}
@@ -1696,7 +2109,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                       <option value="merge">⊞ 合并单元格</option>
                       <option value="split">⊟ 拆分单元格</option>
                       <option value="delete-table">🗑 删除整个表格</option>
-                    </select>
+                    </ToolbarSelect>
                   </>
                 )}
               </>
@@ -1707,7 +2120,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               <>
                 <PageToolbarButton
                   label="页边距"
-                  icon="▣"
+                  icon={Ruler}
                   active={pagePopover?.section === 'margins'}
                   onMouseDown={e => {
                     e.preventDefault()
@@ -1719,7 +2132,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 {sep}
                 <PageToolbarButton
                   label="纸张方向"
-                  icon="↔"
+                  icon={PanelLeft}
                   active={pagePopover?.section === 'orientation'}
                   onMouseDown={e => {
                     e.preventDefault()
@@ -1730,7 +2143,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                 />
                 <PageToolbarButton
                   label="纸张大小"
-                  icon="⧉"
+                  icon={FileOutput}
                   active={pagePopover?.section === 'size'}
                   onMouseDown={e => {
                     e.preventDefault()
@@ -1750,28 +2163,25 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               style={{
                 flexShrink: 0, width: 28,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                cursor: 'pointer', border: 'none', borderLeft: '1px solid #e5e7eb',
-                background: '#f9fafb', color: '#6b7280', fontSize: 16,
+                cursor: 'pointer', border: 'none',
+                background: 'transparent', color: '#6b7280', fontSize: 16,
                 userSelect: 'none',
               }}
               title="向右滚动"
             >
-              ›
+              <ChevronRight size={18} strokeWidth={2} />
             </button>
           )}
 
           {/* 收起按钮 */}
-          <div style={{ display: 'flex', alignItems: 'center', borderLeft: '1px solid #e5e7eb', padding: '0 4px', flexShrink: 0 }}>
-            <button
+          <div style={{ display: 'flex', alignItems: 'center', padding: '0 8px 0 6px', borderLeft: '1px solid #d8dde3', flexShrink: 0 }}>
+            <IconButton
               title="收起工具栏"
               onClick={() => setCollapsed(true)}
-              style={{
-                cursor: 'pointer', border: 'none', background: 'transparent',
-                color: '#6b7280', fontSize: 14, padding: '4px 6px',
-              }}
-            >
-              ∧
-            </button>
+              icon={ChevronUp}
+              style={{ width: 30, minWidth: 30, height: 36, padding: 0 }}
+            />
+          </div>
           </div>
         </div>
       )}

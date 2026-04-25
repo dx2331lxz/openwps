@@ -31,7 +31,7 @@ from .config import (
     get_provider,
     read_config,
 )
-from .models import ChatMessage, ChatRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
+from .models import ChatMessage, ChatRequest, CompletionRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
 from .prompts import assemble_system_prompt, get_system_prompt
 from .tooling import get_tools
 from .delta_injection import compute_all_deltas, build_initial_context_attachment
@@ -4109,6 +4109,70 @@ def build_llm(streaming: bool, body: ChatRequest) -> Runnable:
     ).bind_tools(get_tools(body.mode))
 
 
+COMPLETION_ACTIVITY_CONFIG = {
+    "conservative": {
+        "temperature": 0.25,
+        "instruction": "风格偏保守：只有上下文已经形成清晰句意时才补全；明显不足或不适合时可以输出空字符串。",
+    },
+    "standard": {
+        "temperature": 0.35,
+        "instruction": "风格偏自然：优先给出顺畅、贴合上下文的短续写；只有完全没有有效文本或明显不适合时才输出空字符串。",
+    },
+    "active": {
+        "temperature": 0.55,
+        "instruction": "风格偏积极：尽量给出可用续写，帮助用户继续写下去；除非没有任何有效上下文，否则不要输出空字符串。",
+    },
+}
+
+
+def _normalize_completion_activity(value: str | None) -> str:
+    activity = str(value or "standard").strip()
+    return activity if activity in COMPLETION_ACTIVITY_CONFIG else "standard"
+
+
+def _normalize_completion_candidate_count(value: int | None) -> int:
+    try:
+        count = int(value or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, min(count, 3))
+
+
+def _completion_extra_body(provider: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
+    provider_id = str(provider.get("id") or "").lower()
+    provider_label = str(provider.get("label") or "").lower()
+    normalized_endpoint = endpoint.lower()
+    if "openrouter" not in provider_id and "openrouter" not in provider_label and "openrouter" not in normalized_endpoint:
+        return None
+
+    # Some OpenRouter reasoning models can spend the whole short completion budget
+    # on hidden reasoning and return message.content=null. Copilot needs plain text.
+    return {"reasoning": {"enabled": False}}
+
+
+def build_completion_llm(body: CompletionRequest, candidate_count: int) -> ChatOpenAI:
+    cfg = read_config()
+    provider = get_provider(cfg, body.providerId)
+    model = str(body.model or provider.get("defaultModel") or "").strip()
+    endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
+    api_key = str(provider.get("apiKey", "") or "")
+    if not model:
+        model = "Qwen/Qwen2.5-72B-Instruct"
+    activity = _normalize_completion_activity(body.activity)
+    temperature = float(COMPLETION_ACTIVITY_CONFIG[activity]["temperature"])
+
+    return ChatOpenAI(
+        model=model,
+        api_key=api_key or "not-needed",
+        base_url=endpoint,
+        temperature=temperature,
+        streaming=False,
+        n=candidate_count,
+        max_tokens=96,
+        extra_body=_completion_extra_body(provider, endpoint),
+    )
+
+
 def build_graph(llm) -> Any:
     graph = StateGraph(AgentState)
     assistant = (
@@ -4146,6 +4210,217 @@ async def run_chat(body: ChatRequest) -> dict[str, Any]:
         raise
     except Exception as exc:
         _raise_ai_api_request_error(body, exc)
+
+
+COMPLETION_SYSTEM_PROMPT = """你是 openwps 的 AI 伴写自动补全引擎。
+任务：根据光标前后的上下文，续写光标后的短文本。
+严格规则：
+- 只输出将要插入到光标处的纯文本。
+- 不要解释，不要寒暄，不要 Markdown，不要代码围栏。
+- 不要重复光标前已有文本。
+- 不要改写已存在内容。
+- 续写半句到一句即可，最多约 80 个中文字符。
+- 不要输出编号列表；每个候选只给一段可直接插入的文本。"""
+
+
+MULTI_COMPLETION_SYSTEM_PROMPT = """你是 openwps 的 AI 伴写多候选补全引擎。
+任务：根据光标前后的上下文，生成多条可替换选择的短续写。
+严格规则：
+- 只返回严格 JSON 数组，数组元素必须是字符串。
+- 不要解释，不要寒暄，不要 Markdown，不要代码围栏。
+- 每个数组元素都是一条可直接插入光标处的候选。
+- 候选之间要有明显措辞差异，但都必须贴合上下文。
+- 不要重复光标前已有文本，不要改写已存在内容。
+- 每条候选续写半句到一句即可，最多约 80 个中文字符。"""
+
+
+def _build_completion_user_prompt(body: CompletionRequest) -> str:
+    max_chars = max(8, min(int(body.maxChars or 80), 120))
+    activity = _normalize_completion_activity(body.activity)
+    activity_instruction = COMPLETION_ACTIVITY_CONFIG[activity]["instruction"]
+    return "\n".join([
+        "[补全策略]",
+        str(activity_instruction),
+        "",
+        "[文档统计]",
+        f"页数：{body.pageCount}",
+        f"段落数：{body.paragraphCount}",
+        f"字数：{body.wordCount}",
+        "",
+        "[相邻段落]",
+        f"上一段：{_compact_text_preview(body.previousParagraphText, 240)}",
+        f"下一段：{_compact_text_preview(body.nextParagraphText, 240)}",
+        "",
+        "[当前段落]",
+        f"光标前：{_compact_text_preview(body.prefixText, 500)}",
+        f"光标后：{_compact_text_preview(body.suffixText, 240)}",
+        f"整段：{_compact_text_preview(body.paragraphText, 700)}",
+        "",
+        f"请只输出适合插入光标处的续写文本，最多 {max_chars} 个中文字符。",
+    ])
+
+
+def _build_multi_completion_user_prompt(body: CompletionRequest, candidate_count: int) -> str:
+    max_chars = max(8, min(int(body.maxChars or 80), 120))
+    activity = _normalize_completion_activity(body.activity)
+    activity_instruction = COMPLETION_ACTIVITY_CONFIG[activity]["instruction"]
+    return "\n".join([
+        "[补全策略]",
+        str(activity_instruction),
+        "",
+        "[候选要求]",
+        f"请生成 {candidate_count} 条不同候选。",
+        f"每条最多 {max_chars} 个中文字符。",
+        "返回格式必须是严格 JSON 数组，例如：[\"候选一\", \"候选二\"]",
+        "",
+        "[文档统计]",
+        f"页数：{body.pageCount}",
+        f"段落数：{body.paragraphCount}",
+        f"字数：{body.wordCount}",
+        "",
+        "[相邻段落]",
+        f"上一段：{_compact_text_preview(body.previousParagraphText, 240)}",
+        f"下一段：{_compact_text_preview(body.nextParagraphText, 240)}",
+        "",
+        "[当前段落]",
+        f"光标前：{_compact_text_preview(body.prefixText, 500)}",
+        f"光标后：{_compact_text_preview(body.suffixText, 240)}",
+        f"整段：{_compact_text_preview(body.paragraphText, 700)}",
+    ])
+
+
+def _clean_completion_text(raw_text: str, body: CompletionRequest) -> str:
+    text = _strip_tool_result_json_leaks(raw_text or "")
+    text = re.sub(r"^```(?:\w+)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text).strip()
+    text = re.sub(r"^(?:补全|续写|建议|输出|回答)[:：]\s*", "", text).strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    prefix_tail = (body.prefixText or "").strip()[-80:]
+    if prefix_tail and text.startswith(prefix_tail):
+        text = text[len(prefix_tail):].lstrip()
+
+    suffix_head = (body.suffixText or "").strip()[:80]
+    if suffix_head and text.endswith(suffix_head):
+        text = text[: -len(suffix_head)].rstrip()
+
+    max_chars = max(8, min(int(body.maxChars or 80), 120))
+    stop_match = re.search(r"(.{1,%d}?[。！？!?；;])" % max_chars, text, flags=re.S)
+    if stop_match:
+        text = stop_match.group(1)
+    elif len(text) > max_chars:
+        text = text[:max_chars].rstrip()
+
+    return text.strip()
+
+
+def _extract_completion_list(raw_text: str) -> list[str]:
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+
+    candidates: list[str] = [text]
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        if match.group(1).strip()
+    )
+
+    array_start = text.find("[")
+    array_end = text.rfind("]")
+    if array_start >= 0 and array_end > array_start:
+        candidates.append(text[array_start:array_end + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, str)]
+        if isinstance(parsed, dict):
+            values = parsed.get("completions") or parsed.get("candidates")
+            if isinstance(values, list):
+                return [item for item in values if isinstance(item, str)]
+
+    lines = []
+    for line in text.splitlines():
+        normalized = re.sub(r"^\s*(?:[-*]|\d+[.)、])\s*", "", line).strip()
+        if normalized:
+            lines.append(normalized.strip('"“”'))
+    return lines
+
+
+def _dedupe_completion_texts(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+async def _generate_completion_texts(body: CompletionRequest, candidate_count: int) -> list[str]:
+    messages = [
+        SystemMessage(content=COMPLETION_SYSTEM_PROMPT),
+        HumanMessage(content=_build_completion_user_prompt(body)),
+    ]
+
+    llm = build_completion_llm(body, candidate_count)
+    result = await llm.agenerate([messages])
+    generations = result.generations[0] if result.generations else []
+    return [
+        _clean_completion_text(_stringify_content(generation.message.content), body)
+        for generation in generations
+    ]
+
+
+async def _generate_completion_list_texts(body: CompletionRequest, candidate_count: int) -> list[str]:
+    messages = [
+        SystemMessage(content=MULTI_COMPLETION_SYSTEM_PROMPT),
+        HumanMessage(content=_build_multi_completion_user_prompt(body, candidate_count)),
+    ]
+
+    llm = build_completion_llm(body, 1)
+    result = await llm.agenerate([messages])
+    generations = result.generations[0] if result.generations else []
+    values: list[str] = []
+    for generation in generations:
+        values.extend(_extract_completion_list(_stringify_content(generation.message.content)))
+    return [_clean_completion_text(value, body) for value in values]
+
+
+async def run_completion(body: CompletionRequest) -> dict[str, Any]:
+    try:
+        if not (body.prefixText or body.paragraphText or body.previousParagraphText).strip():
+            return {"completion": "", "completions": [], "model": body.model or ""}
+
+        candidate_count = _normalize_completion_candidate_count(body.candidateCount)
+        completions = _dedupe_completion_texts(
+            await (
+                _generate_completion_texts(body, 1)
+                if candidate_count <= 1
+                else _generate_completion_list_texts(body, candidate_count)
+            )
+        )
+        completions = completions[:candidate_count]
+
+        cfg = read_config()
+        provider = get_provider(cfg, body.providerId)
+        return {
+            "completion": completions[0] if completions else "",
+            "completions": completions,
+            "model": body.model or provider.get("defaultModel", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        detail = str(exc).strip() or "未知错误"
+        raise HTTPException(status_code=502, detail=f"AI 伴写请求失败: {detail}") from exc
 
 
 async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any], None]:

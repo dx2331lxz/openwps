@@ -39,6 +39,11 @@ interface PretextPageRendererProps {
   onRequestCaretPos?: (pos: number, clientX: number, clientY: number) => void
   onRequestSelectionRange?: (anchor: number, head: number) => void
   onRequestNodeSelection?: (pos: number) => void
+  ghostCompletion?: {
+    pages: RenderedPage[]
+    from: number
+    to: number
+  } | null
 }
 
 function renderFloatingParagraph(paragraph: FloatingParagraph, index: number) {
@@ -231,6 +236,101 @@ function renderListMarker(
       {line.listChecked ? '☑' : '☐'}
     </div>
   )
+}
+
+function renderGhostCompletion(
+  ghostCompletion: NonNullable<PretextPageRendererProps['ghostCompletion']>,
+  pageConfig: PageConfig,
+  pageGap: number,
+) {
+  const from = Math.min(ghostCompletion.from, ghostCompletion.to)
+  const to = Math.max(ghostCompletion.from, ghostCompletion.to)
+  if (from === to) return null
+
+  return ghostCompletion.pages.map((page, pageIndex) => (
+    <React.Fragment key={`ghost-page-${pageIndex}`}>
+      {page.lines.map((line) => {
+        const metrics = getLineLayoutMetrics(line, pageIndex, pageConfig, pageGap)
+        let cursorX = 0
+        const unitOffsets = line.units.map((unit, index) => {
+          const isLastUnit = index === line.units.length - 1
+          const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
+          const offset = typeof unit.offsetX === 'number' ? unit.offsetX : cursorX
+          cursorX += boxWidth
+          return offset
+        })
+        const ghostUnits = line.units.filter((unit) => (
+          typeof unit.startPos === 'number' &&
+          typeof unit.endPos === 'number' &&
+          unit.endPos > from &&
+          unit.startPos < to
+        ))
+        if (ghostUnits.length === 0) return null
+
+        return (
+          <div
+            key={`ghost-line-${pageIndex}-${line.blockIndex}-${line.lineIndex}-${line.startPos ?? 0}`}
+            data-openwps-ai-ghost="true"
+            style={{
+              position: 'absolute',
+              top: metrics.top,
+              left: metrics.left,
+              height: line.lineHeight,
+              display: 'block',
+              width: metrics.justifyEnabled ? line.availableWidth : Math.max(1, line.renderedWidth),
+              whiteSpace: 'pre',
+              overflow: 'visible',
+              pointerEvents: 'none',
+              zIndex: 2,
+            }}
+          >
+            {line.units.map((unit, index) => {
+              const unitStart = typeof unit.startPos === 'number' ? unit.startPos : null
+              const unitEnd = typeof unit.endPos === 'number' ? unit.endPos : null
+              const inGhostRange = unitStart != null && unitEnd != null && unitEnd > from && unitStart < to
+              if (!inGhostRange) return null
+
+              const style = getSafeTextStyle(unit.style)
+              const isLastUnit = index === line.units.length - 1
+              const boxWidth = unit.renderWidth + (metrics.justifyEnabled && !isLastUnit ? metrics.justifyExtra : 0)
+              const fontSizePt = style.superscript || style.subscript
+                ? style.fontSize * 0.75
+                : style.fontSize
+
+              return (
+                <span
+                  key={`ghost-${unit.startPos ?? index}-${unit.text}`}
+                  style={{
+                    position: 'absolute',
+                    left: unitOffsets[index],
+                    top: 0,
+                    display: 'inline-flex',
+                    alignItems: 'flex-end',
+                    justifyContent: unit.anchor === 'end' ? 'flex-end' : 'flex-start',
+                    width: Math.max(0, boxWidth),
+                    minWidth: 0,
+                    overflow: 'visible',
+                    whiteSpace: 'pre',
+                    fontFamily: style.fontFamily,
+                    fontSize: `${fontSizePt}pt`,
+                    fontWeight: style.bold ? 700 : 400,
+                    fontStyle: style.italic ? 'italic' : 'normal',
+                    letterSpacing: style.letterSpacing ? `${style.letterSpacing}pt` : undefined,
+                    color: '#9ca3af',
+                    opacity: 0.9,
+                    lineHeight: `${line.lineHeight}px`,
+                    transform: `translateY(${getVerticalOffset(unit)})`,
+                  }}
+                >
+                  {unit.text}
+                </span>
+              )
+            })}
+          </div>
+        )
+      })}
+    </React.Fragment>
+  ))
 }
 
 function getHorizontalRuleStyle(ruleStyle: string | undefined, ruleColor: string | undefined, selected: boolean): React.CSSProperties {
@@ -556,6 +656,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
   onRequestCaretPos,
   onRequestSelectionRange,
   onRequestNodeSelection,
+  ghostCompletion,
 }) => {
   const caretRect = showCaret ? getCaretRect(pages, pageConfig, pageGap, caretPos) : null
   const selectionRects = showSelection
@@ -810,6 +911,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
           </React.Fragment>
         )
       })}
+      {ghostCompletion && renderGhostCompletion(ghostCompletion, pageConfig, pageGap)}
       {caretRect && (
         <div
           style={{

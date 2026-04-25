@@ -62,6 +62,23 @@ class ChatRequest(BaseModel):
     ocrResults: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class CompletionRequest(BaseModel):
+    providerId: Optional[str] = None
+    model: Optional[str] = None
+    activity: str = "standard"
+    candidateCount: int = 1
+    cursorPos: int = 0
+    prefixText: str = ""
+    suffixText: str = ""
+    paragraphText: str = ""
+    previousParagraphText: str = ""
+    nextParagraphText: str = ""
+    wordCount: int = 0
+    pageCount: int = 1
+    paragraphCount: int = 0
+    maxChars: int = 80
+
+
 class ProviderSettings(BaseModel):
     id: str
     label: str
