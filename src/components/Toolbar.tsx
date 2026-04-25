@@ -1029,6 +1029,7 @@ function TopBarAction({
   label,
   active = false,
   primary = false,
+  compact = false,
   onMouseDown,
 }: {
   title: string
@@ -1036,6 +1037,7 @@ function TopBarAction({
   label: string
   active?: boolean
   primary?: boolean
+  compact?: boolean
   onMouseDown?: React.MouseEventHandler<HTMLButtonElement>
 }) {
   return (
@@ -1047,10 +1049,13 @@ function TopBarAction({
         height: 34,
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 7,
+        justifyContent: 'center',
+        gap: compact ? 0 : 7,
+        flexShrink: 0,
         border: primary ? 'none' : '1px solid transparent',
         borderRadius: primary ? 8 : 7,
-        padding: primary ? '0 14px' : '0 9px',
+        padding: compact ? '0 9px' : primary ? '0 14px' : '0 9px',
+        minWidth: compact ? 34 : undefined,
         background: primary ? '#2563eb' : active ? '#e8f1ff' : 'transparent',
         color: primary ? '#ffffff' : active ? '#2563eb' : '#1f2937',
         cursor: 'pointer',
@@ -1060,7 +1065,7 @@ function TopBarAction({
       }}
     >
       <Icon size={primary ? 17 : 18} strokeWidth={2} />
-      <span>{label}</span>
+      {!compact && <span>{label}</span>}
     </button>
   )
 }
@@ -1145,6 +1150,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const [tablePickerOpen, setTablePickerOpen] = React.useState(false)
   const tablePickerBtnRef = React.useRef<HTMLButtonElement | null>(null)
   const [collapsed, setCollapsed] = React.useState(false)
+  const topBarRef = React.useRef<HTMLDivElement | null>(null)
+  const [topBarWidth, setTopBarWidth] = React.useState(0)
   const scrollContainerRef = React.useRef<HTMLDivElement>(null)
   const [showScrollLeft, setShowScrollLeft] = React.useState(false)
   const [showScrollRight, setShowScrollRight] = React.useState(false)
@@ -1152,6 +1159,19 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   // (mousedown). This lets us run commands against the correct selection even
   // after the select element has stolen browser focus from the editor.
   const savedTableViewRef = React.useRef<EditorView | null>(null)
+  const topBarCompact = topBarWidth > 0 && topBarWidth < 1360
+  const topBarVeryCompact = topBarWidth > 0 && topBarWidth < 760
+
+  React.useEffect(() => {
+    const element = topBarRef.current
+    if (!element) return
+
+    const update = () => setTopBarWidth(element.getBoundingClientRect().width)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
 
   // Close spacing popover on outside click
   React.useEffect(() => {
@@ -1311,20 +1331,21 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   return (
     <>
       {/* ── 顶部应用栏：入口 + 标签 + 右侧操作按钮 ── */}
-      <div style={{
-        display: 'flex',
+      <div ref={topBarRef} style={{
+        display: 'grid',
+        gridTemplateColumns: topBarVeryCompact ? 'minmax(132px, 0.8fr) auto minmax(176px, 1fr)' : 'minmax(190px, 1fr) auto minmax(240px, 1fr)',
         alignItems: 'center',
         height: TOOLBAR_LAYER_HEIGHT,
         minHeight: TOOLBAR_LAYER_HEIGHT,
         background: '#f3f4f6',
         borderBottom: '1px solid #dfe3e8',
         padding: '0 10px',
-        gap: 14,
+        columnGap: topBarCompact ? 8 : 14,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: '1 1 260px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: topBarVeryCompact ? 4 : 8, minWidth: 0, overflow: 'hidden' }}>
           <IconButton title="主页" icon={Home} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
-          <IconButton title="新建" icon={Plus} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
-          <ToolbarSeparator />
+          {!topBarVeryCompact && <IconButton title="新建" icon={Plus} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />}
+          {!topBarVeryCompact && <ToolbarSeparator />}
           <IconButton
             title="文件菜单"
             icon={Menu}
@@ -1340,20 +1361,20 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           <div style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 8,
+            gap: topBarCompact ? 4 : 8,
             minWidth: 0,
             color: '#111827',
             fontSize: 15,
             fontWeight: 600,
           }}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 180 }}>OpenWPS</span>
-            <Star size={17} strokeWidth={1.8} color="#6b7280" />
-            <ChevronDown size={15} strokeWidth={2} color="#6b7280" />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: topBarCompact ? 92 : 180 }}>OpenWPS</span>
+            {!topBarCompact && <Star size={17} strokeWidth={1.8} color="#6b7280" />}
+            {!topBarVeryCompact && <ChevronDown size={15} strokeWidth={2} color="#6b7280" />}
           </div>
         </div>
 
         {/* 标签区 */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 26, flex: '0 0 auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: topBarCompact ? 14 : 26, minWidth: 126, overflow: 'hidden' }}>
           {(['home', 'insert', 'page'] as const).map(tab => {
             const label = tab === 'home' ? '开始' : tab === 'insert' ? '插入' : '页面'
             const active = activeTab === tab
@@ -1383,12 +1404,13 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </div>
 
         {/* 右侧操作区 */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, minWidth: 0, flex: '1 1 300px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: topBarCompact ? 4 : 6, minWidth: 0, overflow: 'hidden' }}>
           <TopBarAction
             title="工作区"
             icon={FolderOpen}
             label="工作区"
             active={Boolean(workspaceOpen)}
+            compact={topBarCompact}
             onMouseDown={e => { e.preventDefault(); onToggleWorkspace?.() }}
           />
           <TopBarAction
@@ -1396,14 +1418,16 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             icon={Bot}
             label="WPS AI"
             active={Boolean(sidebarOpen)}
+            compact={topBarCompact}
             onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
           />
-          <div style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 8, background: aiCopilotEnabled ? '#e8f1ff' : 'transparent' }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0, borderRadius: 8, background: aiCopilotEnabled ? '#e8f1ff' : 'transparent' }}>
             <TopBarAction
               title={aiCopilotEnabled ? '关闭 AI 伴写' : '开启 AI 伴写'}
               icon={Sparkles}
               label="伴写"
               active={Boolean(aiCopilotEnabled)}
+              compact={topBarVeryCompact}
               onMouseDown={e => { e.preventDefault(); onToggleAICopilot?.() }}
             />
             <button
@@ -1437,9 +1461,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             title={isFullscreen ? '退出全屏 (F11)' : '全屏模式 (F11)'}
             icon={isFullscreen ? Shrink : Expand}
             label={isFullscreen ? '退出全屏' : '全屏'}
+            compact={topBarCompact}
             onMouseDown={e => { e.preventDefault(); onToggleFullscreen?.() }}
           />
-          <IconButton title="云同步状态" icon={Cloud} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
+          {!topBarVeryCompact && <IconButton title="云同步状态" icon={Cloud} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />}
           {collapsed && (
             <IconButton
               title="展开工具栏"

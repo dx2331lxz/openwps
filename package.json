@@ -15,6 +15,7 @@
     "test:table-boundary-delete": "node scripts/test-table-boundary-delete.cjs",
     "test:block-controls": "node scripts/test-block-controls.cjs",
     "test:ai-copilot": "node scripts/test-ai-copilot.cjs",
+    "test:toolbar-overlap": "node scripts/test-toolbar-overlap.cjs",
     "preview": "vite preview",
     "start:prod": "npm run build && python3 server/main.py"
   },
