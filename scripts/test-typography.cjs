@@ -280,12 +280,28 @@ async function getFirstParaStyle(page) {
       await page.click('[title="#FFFF00"]')
       await page.waitForTimeout(200)
       await screenshot(page, '08-highlight')
-      const color = await page.evaluate(() => {
-        const span = document.querySelector('.ProseMirror span')
-        return span ? window.getComputedStyle(span).backgroundColor : null
+      const highlightState = await page.evaluate(() => {
+        const pmSpan = document.querySelector('.ProseMirror span')
+        const visibleSpan = Array.from(document.querySelectorAll('[aria-hidden="true"] span')).find((node) => {
+          const text = node.textContent || ''
+          const style = window.getComputedStyle(node)
+          return text.length > 0 && style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent'
+        })
+        const pmStyle = pmSpan?.getAttribute('style') || ''
+        const pmComputedBackground = pmSpan ? window.getComputedStyle(pmSpan).backgroundColor : ''
+        return {
+          pmStyle,
+          pmComputedBackground,
+          visibleBackground: visibleSpan ? window.getComputedStyle(visibleSpan).backgroundColor : '',
+          visibleColor: visibleSpan ? window.getComputedStyle(visibleSpan).color : '',
+        }
       })
-      if (color && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') pass('文字背景色高亮')
-      else fail('文字背景色高亮', `background-color=${color}`)
+      const markKeepsHighlight = highlightState.pmStyle.toLowerCase().includes('background-color')
+      const hiddenLayerDoesNotCoverText = highlightState.pmComputedBackground === 'rgba(0, 0, 0, 0)' || highlightState.pmComputedBackground === 'transparent'
+      const visibleLayerShowsHighlight = highlightState.visibleBackground && highlightState.visibleBackground !== 'rgba(0, 0, 0, 0)' && highlightState.visibleBackground !== 'transparent'
+      const visibleTextIsReadable = highlightState.visibleColor && highlightState.visibleColor !== 'rgba(0, 0, 0, 0)' && highlightState.visibleColor !== 'transparent'
+      if (markKeepsHighlight && hiddenLayerDoesNotCoverText && visibleLayerShowsHighlight && visibleTextIsReadable) pass('文字背景色高亮')
+      else fail('文字背景色高亮', `state=${JSON.stringify(highlightState)}`)
     } catch (e) { fail('文字背景色高亮', String(e.message)) }
 
     // 9. 清除格式

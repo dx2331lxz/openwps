@@ -521,6 +521,9 @@ const PM_STYLES = `
   text-emphasis-color: transparent !important;
   box-shadow: none !important;
 }
+.pretext-driving-editor .ProseMirror > p span {
+  background-color: transparent !important;
+}
 .pretext-driving-editor .ProseMirror ::selection,
 .pretext-driving-editor .ProseMirror *::selection {
   background: transparent !important;
@@ -3204,54 +3207,56 @@ export const Editor: React.FC = () => {
   }, [aiCopilotActivity, aiCopilotCandidateCount, cancelAICopilot, currentAIModel, currentAIProviderId])
 
   return (
-    <div className="flex h-screen" style={{ background: '#e8e8e8' }}>
-      {/* Workspace Panel — left side */}
-      {workspaceOpen && (
-        <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />
+    <div className="flex h-screen flex-col" style={{ background: '#e8e8e8' }}>
+      {/* Toolbar */}
+      <div data-openwps-toolbar-shell="true" className="sticky top-0 z-10 flex-shrink-0 shadow-sm">
+        <Toolbar
+          view={view}
+          editorState={editorState}
+          pageConfig={pageConfig}
+          onPageConfigChange={(newCfg) => {
+            setPageConfig(newCfg)
+            pageConfigRef.current = newCfg
+            repaginate()
+          }}
+          onToggleSidebar={() => setSidebarOpen(o => !o)}
+          sidebarOpen={sidebarOpen}
+          aiCopilotEnabled={aiCopilotEnabled}
+          aiCopilotActivity={aiCopilotActivity}
+          aiCopilotCandidateCount={aiCopilotCandidateCount}
+          onToggleAICopilot={handleToggleAICopilot}
+          onAICopilotActivityChange={handleAICopilotActivityChange}
+          onAICopilotCandidateCountChange={handleAICopilotCandidateCountChange}
+          onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
+          workspaceOpen={workspaceOpen}
+          onOpenServerFile={openServerFileModal}
+          onSaveServerFile={openSaveFileModal}
+          onImportDocx={handleImportFile}
+          onExportDocx={handleExportDocx}
+          onInsertImage={handleInsertImage}
+          onToggleFullscreen={() => { void handleToggleFullscreen() }}
+          isFullscreen={isFullscreen}
+          onAddComment={handleStartAddComment}
+          onOpenTemplates={() => setTemplateManagerOpen(true)}
+        />
+      </div>
+
+      {/* Add comment dialog */}
+      {addCommentAnchor && (
+        <AddCommentDialog
+          anchorRect={addCommentAnchor}
+          onConfirm={handleConfirmAddComment}
+          onCancel={closeAddCommentDialog}
+        />
       )}
 
-      <div className="flex flex-col flex-1 min-w-0">
-        {/* Toolbar */}
-        <div className="sticky top-0 z-10 shadow-sm">
-          <Toolbar
-            view={view}
-            editorState={editorState}
-            pageConfig={pageConfig}
-            onPageConfigChange={(newCfg) => {
-              setPageConfig(newCfg)
-              pageConfigRef.current = newCfg
-              repaginate()
-            }}
-            onToggleSidebar={() => setSidebarOpen(o => !o)}
-            sidebarOpen={sidebarOpen}
-            aiCopilotEnabled={aiCopilotEnabled}
-            aiCopilotActivity={aiCopilotActivity}
-            aiCopilotCandidateCount={aiCopilotCandidateCount}
-            onToggleAICopilot={handleToggleAICopilot}
-            onAICopilotActivityChange={handleAICopilotActivityChange}
-            onAICopilotCandidateCountChange={handleAICopilotCandidateCountChange}
-            onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
-            workspaceOpen={workspaceOpen}
-            onOpenServerFile={openServerFileModal}
-            onSaveServerFile={openSaveFileModal}
-            onImportDocx={handleImportFile}
-            onExportDocx={handleExportDocx}
-            onInsertImage={handleInsertImage}
-            onToggleFullscreen={() => { void handleToggleFullscreen() }}
-            isFullscreen={isFullscreen}
-            onAddComment={handleStartAddComment}
-            onOpenTemplates={() => setTemplateManagerOpen(true)}
-          />
-        </div>
-
-        {/* Add comment dialog */}
-        {addCommentAnchor && (
-          <AddCommentDialog
-            anchorRect={addCommentAnchor}
-            onConfirm={handleConfirmAddComment}
-            onCancel={closeAddCommentDialog}
-          />
+      <div className="flex min-h-0 flex-1">
+        {/* Workspace Panel — content-level library */}
+        {workspaceOpen && (
+          <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />
         )}
+
+        <div className="flex min-w-0 flex-1 flex-col">
 
         {/* Main content */}
         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
@@ -3557,32 +3562,34 @@ export const Editor: React.FC = () => {
           {/* end canvas */}
         </div>
         {/* end main content */}
-      </div>
-      {/* end left column */}
+        </div>
+        {/* end editor column */}
 
-      {/* AI Sidebar — outside left column, full height */}
-      {sidebarOpen && (
-        <AISidebar
-          view={view}
-          editorState={editorState}
-          pageConfig={pageConfig}
-          templates={templates}
-          activeTemplate={activeTemplate}
-          onModelContextChange={(next) => {
-            setCurrentAIProviderId(next.providerId)
-            setCurrentAIModel(next.model)
-          }}
-          onActivateTemplate={activateTemplate}
-          onOpenTemplateManager={() => setTemplateManagerOpen(true)}
-          onPageConfigChange={(newCfg) => {
-            setPageConfig(newCfg)
-            pageConfigRef.current = newCfg
-            repaginate()
-          }}
-          onDocumentStyleMutation={clearImportedDocxCompatibility}
-          onClose={() => setSidebarOpen(false)}
-        />
-      )}
+        {/* AI Sidebar — content-level right panel */}
+        {sidebarOpen && (
+          <AISidebar
+            view={view}
+            editorState={editorState}
+            pageConfig={pageConfig}
+            templates={templates}
+            activeTemplate={activeTemplate}
+            onModelContextChange={(next) => {
+              setCurrentAIProviderId(next.providerId)
+              setCurrentAIModel(next.model)
+            }}
+            onActivateTemplate={activateTemplate}
+            onOpenTemplateManager={() => setTemplateManagerOpen(true)}
+            onPageConfigChange={(newCfg) => {
+              setPageConfig(newCfg)
+              pageConfigRef.current = newCfg
+              repaginate()
+            }}
+            onDocumentStyleMutation={clearImportedDocxCompatibility}
+            onClose={() => setSidebarOpen(false)}
+          />
+        )}
+      </div>
+      {/* end content row */}
 
       {/* Settings gear button (bottom-left) */}
       <button
