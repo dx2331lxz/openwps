@@ -1751,6 +1751,7 @@ export default function AISidebar({
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [openingConversationId, setOpeningConversationId] = useState<string | null>(null)
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null)
   const [currentConversationTitle, setCurrentConversationTitle] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
@@ -2174,8 +2175,9 @@ export default function AISidebar({
   }, [])
 
   const openConversation = useCallback(async (conversationId: string) => {
-    if (loading) return
+    if (openingConversationId) return
     shouldAutoScrollRef.current = true
+    setOpeningConversationId(conversationId)
     try {
       const response = await fetch(`/api/conversations/${conversationId}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -2187,8 +2189,10 @@ export default function AISidebar({
       setViewMode('chat')
     } catch (error) {
       console.error('[AISidebar] open conversation failed', error)
+    } finally {
+      setOpeningConversationId(current => (current === conversationId ? null : current))
     }
-  }, [loading, sidebarWidth])
+  }, [openingConversationId, sidebarWidth])
 
   const deleteConversation = useCallback(async (conversationId: string) => {
     try {
@@ -3517,28 +3521,41 @@ export default function AISidebar({
               {conversations.map(conversation => (
                 <div
                   key={conversation.id}
-                  className="group w-full flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-left hover:border-blue-300 hover:bg-blue-50 transition-colors"
+                  role="button"
+                  tabIndex={0}
+                  aria-disabled={openingConversationId !== null}
+                  onClick={() => void openConversation(conversation.id)}
+                  onKeyDown={event => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return
+                    event.preventDefault()
+                    void openConversation(conversation.id)
+                  }}
+                  className="group w-full flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-left hover:border-blue-300 hover:bg-blue-50 transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-200"
                 >
-                  <button
-                    type="button"
-                    onClick={() => void openConversation(conversation.id)}
-                    className="min-w-0 flex-1"
-                  >
+                  <div className="min-w-0 flex-1">
                     <div className="text-sm text-gray-800 truncate">{truncateTitle(conversation.title || '新会话')}</div>
-                    <div className="text-xs text-gray-400 mt-0.5">{formatConversationTime(conversation.updatedAt || conversation.createdAt)}</div>
-                  </button>
+                    <div className="text-xs text-gray-400 mt-0.5">
+                      {openingConversationId === conversation.id ? '打开中...' : formatConversationTime(conversation.updatedAt || conversation.createdAt)}
+                    </div>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => void exportConversation(conversation.id)}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-blue-500 text-sm flex-shrink-0"
+                    onClick={event => {
+                      event.stopPropagation()
+                      void exportConversation(conversation.id)
+                    }}
+                    className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-blue-500 text-sm flex-shrink-0"
                     title="导出会话 JSON"
                   >
                     ⤓
                   </button>
                   <button
                     type="button"
-                    onClick={() => void deleteConversation(conversation.id)}
-                    className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-400 hover:text-red-500 text-sm flex-shrink-0"
+                    onClick={event => {
+                      event.stopPropagation()
+                      void deleteConversation(conversation.id)
+                    }}
+                    className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-red-500 text-sm flex-shrink-0"
                     title="删除会话"
                   >
                     🗑
