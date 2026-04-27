@@ -49,6 +49,9 @@ import type { TemplateAnalyzeResult, TemplateRecord, TemplateSummary } from '../
 const PAGE_GAP = 32 // px gap between A4 cards
 const DOCX_PUNCTUATION_COMPRESSION_PX = -0.34
 const DEFAULT_SERVER_DOCUMENT_NAME = 'document.docx'
+const EDITOR_DRAFT_STORAGE_KEY = 'openwps.editor.draft.v1'
+const EDITOR_DRAFT_VERSION = 1
+const EDITOR_DRAFT_SAVE_DELAY_MS = 500
 
 declare global {
   interface Window {
@@ -71,6 +74,21 @@ interface PendingCommentTarget {
 interface AISettingsSnapshot {
   activeProviderId?: string
   model?: string
+}
+
+interface EditorDraftSnapshot {
+  version: 1
+  savedAt: string
+  currentDocumentName: string
+  activeSource: DocumentSource
+  pageConfig: PageConfig
+  docxExportOptions: DocxExportOptions
+  docxLetterSpacingPx: number
+  doc: PMNodeJSON
+  selection?: {
+    from: number
+    to: number
+  }
 }
 
 interface BlockAIPopoverState {
@@ -381,6 +399,109 @@ function buildImportedDocumentName(filename: string) {
   return trimmed.replace(/\.(md|markdown)$/i, '.docx')
 }
 
+function buildDocumentNameFromTitle(title: string, currentName: string) {
+  const trimmed = title.trim()
+  if (!trimmed) return currentName || DEFAULT_SERVER_DOCUMENT_NAME
+  const fileName = trimmed.split(/[\\/]/).pop() || trimmed
+  if (/\.(docx|doc|md|markdown|txt)$/i.test(fileName)) return fileName
+  const extension = currentName.match(/\.(docx|doc|md|markdown|txt)$/i)?.[0] ?? '.docx'
+  return `${fileName}${extension}`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function normalizeDocumentSource(value: unknown): DocumentSource {
+  return value === 'wps_directory' ? 'wps_directory' : 'internal'
+}
+
+function normalizePageConfig(value: unknown): PageConfig {
+  if (!isRecord(value)) return DEFAULT_PAGE_CONFIG
+  return {
+    pageWidth: typeof value.pageWidth === 'number' ? value.pageWidth : DEFAULT_PAGE_CONFIG.pageWidth,
+    pageHeight: typeof value.pageHeight === 'number' ? value.pageHeight : DEFAULT_PAGE_CONFIG.pageHeight,
+    marginTop: typeof value.marginTop === 'number' ? value.marginTop : DEFAULT_PAGE_CONFIG.marginTop,
+    marginBottom: typeof value.marginBottom === 'number' ? value.marginBottom : DEFAULT_PAGE_CONFIG.marginBottom,
+    marginLeft: typeof value.marginLeft === 'number' ? value.marginLeft : DEFAULT_PAGE_CONFIG.marginLeft,
+    marginRight: typeof value.marginRight === 'number' ? value.marginRight : DEFAULT_PAGE_CONFIG.marginRight,
+  }
+}
+
+function createDefaultEditorDoc() {
+  const div = document.createElement('div')
+  div.innerHTML = '<p>开始输入文字，当内容超过一页高度时将自动出现第二张 A4 白纸...</p>'
+  return PMDOMParser.fromSchema(schema).parse(div)
+}
+
+function createBlankEditorDoc() {
+  return schema.nodes.doc.create(null, schema.nodes.paragraph.create())
+}
+
+function buildUntitledDocumentName(existingNames: string[]) {
+  const existing = new Set(existingNames.map(name => name.trim().toLowerCase()))
+  const base = '新建文档'
+  const first = `${base}.docx`
+  if (!existing.has(first.toLowerCase())) return first
+
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base} ${index}.docx`
+    if (!existing.has(candidate.toLowerCase())) return candidate
+  }
+
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:T]/g, '-')
+    .replace(/\..+$/, '')
+  return `${base} ${timestamp}.docx`
+}
+
+function readEditorDraftSnapshot(): EditorDraftSnapshot | null {
+  if (typeof window === 'undefined') return null
+  const raw = window.localStorage.getItem(EDITOR_DRAFT_STORAGE_KEY)
+  if (!raw) return null
+
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!isRecord(parsed) || parsed.version !== EDITOR_DRAFT_VERSION) throw new Error('unsupported draft version')
+    if (!isRecord(parsed.doc) || typeof parsed.doc.type !== 'string') throw new Error('invalid draft doc')
+    schema.nodeFromJSON(parsed.doc)
+
+    const selection = isRecord(parsed.selection)
+      && typeof parsed.selection.from === 'number'
+      && typeof parsed.selection.to === 'number'
+      ? { from: parsed.selection.from, to: parsed.selection.to }
+      : undefined
+
+    return {
+      version: 1,
+      savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : new Date().toISOString(),
+      currentDocumentName: typeof parsed.currentDocumentName === 'string' && parsed.currentDocumentName.trim()
+        ? parsed.currentDocumentName
+        : DEFAULT_SERVER_DOCUMENT_NAME,
+      activeSource: normalizeDocumentSource(parsed.activeSource),
+      pageConfig: normalizePageConfig(parsed.pageConfig),
+      docxExportOptions: isRecord(parsed.docxExportOptions) ? parsed.docxExportOptions as DocxExportOptions : {},
+      docxLetterSpacingPx: typeof parsed.docxLetterSpacingPx === 'number' ? parsed.docxLetterSpacingPx : 0,
+      doc: parsed.doc as PMNodeJSON,
+      selection,
+    }
+  } catch (error) {
+    console.warn('[Editor] failed to restore editor draft, clearing snapshot', error)
+    window.localStorage.removeItem(EDITOR_DRAFT_STORAGE_KEY)
+    return null
+  }
+}
+
+function writeEditorDraftSnapshot(snapshot: EditorDraftSnapshot) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(EDITOR_DRAFT_STORAGE_KEY, JSON.stringify(snapshot))
+  } catch (error) {
+    console.warn('[Editor] failed to save editor draft', error)
+  }
+}
+
 // Widget height for a break after a page that used `usedH` px of content:
 //   = (remaining space on that page) + BREAK_BASE
 //   = (CONTENT_H - usedH) + BREAK_BASE
@@ -531,38 +652,20 @@ const PM_STYLES = `
   -webkit-text-fill-color: transparent !important;
 }
 .pretext-driving-editor .ProseMirror table {
-  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
-.pretext-driving-editor .ProseMirror table {
-  opacity: 1;
-}
-.pretext-driving-editor .ProseMirror table,
 .pretext-driving-editor .ProseMirror img,
-.pretext-driving-editor .ProseMirror [data-pm-image-wrapper],
-.pretext-driving-editor .ProseMirror table * {
+.pretext-driving-editor .ProseMirror [data-pm-image-wrapper] {
   color: #111827 !important;
   -webkit-text-fill-color: #111827 !important;
   text-decoration-color: currentColor !important;
   text-emphasis-color: currentColor !important;
   pointer-events: auto;
 }
-.pretext-driving-editor .ProseMirror table,
-.pretext-driving-editor .ProseMirror table * {
-  caret-color: #111827 !important;
-}
 .ProseMirror [data-pm-image-wrapper],
 .ProseMirror [data-pm-image-wrapper] * {
   caret-color: transparent !important;
-}
-.pretext-driving-editor .ProseMirror table p,
-.pretext-driving-editor .ProseMirror table span {
-  text-shadow: none !important;
-}
-.pretext-driving-editor .ProseMirror table ::selection,
-.pretext-driving-editor .ProseMirror table *::selection {
-  background: rgba(24, 119, 242, 0.24) !important;
-  color: inherit !important;
-  -webkit-text-fill-color: currentColor !important;
 }
 .pretext-driving-editor .ProseMirror hr {
   opacity: 0;
@@ -729,6 +832,7 @@ function collectDomBlockMetrics(view: EditorView): DomBlockMetric[] {
 
     const rect = element.getBoundingClientRect()
     const style = window.getComputedStyle(element)
+    const rows = Array.from(element.querySelectorAll(':scope > tbody > tr, :scope > tr'))
     metrics.push({
       pos: offset,
       blockIndex,
@@ -736,6 +840,25 @@ function collectDomBlockMetrics(view: EditorView): DomBlockMetric[] {
       height: rect.height,
       marginTop: parseCssPx(style.marginTop),
       marginBottom: parseCssPx(style.marginBottom),
+      table: {
+        width: rect.width,
+        rows: rows.map((row) => {
+          const rowRect = row.getBoundingClientRect()
+          const cells = Array.from(row.children).filter((cell): cell is HTMLElement => (
+            cell instanceof HTMLElement && (cell.tagName === 'TD' || cell.tagName === 'TH')
+          ))
+          return {
+            height: rowRect.height,
+            cells: cells.map((cell) => {
+              const cellRect = cell.getBoundingClientRect()
+              return {
+                width: cellRect.width,
+                height: cellRect.height,
+              }
+            }),
+          }
+        }),
+      },
     })
   })
 
@@ -908,6 +1031,13 @@ function buildBlockDescriptors(
       title: getBlockTitle(kind),
       rects,
       tableStyle: kind === 'table' ? getTableStyleSummary(node) : undefined,
+      paragraphStyle: node.type.name === 'paragraph'
+        ? {
+          headingLevel: typeof node.attrs.headingLevel === 'number' ? node.attrs.headingLevel : null,
+          align: node.attrs.align === 'center' || node.attrs.align === 'right' || node.attrs.align === 'justify' ? node.attrs.align : 'left',
+          listType: node.attrs.listType === 'bullet' || node.attrs.listType === 'ordered' || node.attrs.listType === 'task' ? node.attrs.listType : 'none',
+        }
+        : undefined,
     })
   })
 
@@ -1409,11 +1539,16 @@ function deleteAroundImageForward(state: EditorState, dispatch?: (tr: import('pr
   return false
 }
 
-function initState(): EditorState {
-  const div = document.createElement('div')
-  div.innerHTML = '<p>开始输入文字，当内容超过一页高度时将自动出现第二张 A4 白纸...</p>'
-  const doc = PMDOMParser.fromSchema(schema).parse(div)
-
+function initState(initial?: { doc?: PMNodeJSON; selection?: { from: number; to: number } }): EditorState {
+  let doc = createDefaultEditorDoc()
+  if (initial?.doc) {
+    try {
+      doc = schema.nodeFromJSON(initial.doc)
+    } catch (error) {
+      console.warn('[Editor] failed to create editor state from draft doc', error)
+      window.localStorage.removeItem(EDITOR_DRAFT_STORAGE_KEY)
+    }
+  }
   const isCaretAtStartOfParagraphAfterTable = (state: EditorState) => {
     const { $from, empty } = state.selection
     if (!empty) return false
@@ -1428,8 +1563,7 @@ function initState(): EditorState {
     return previousNode.type.name === 'table'
   }
 
-
-  return EditorState.create({
+  const state = EditorState.create({
     doc,
     plugins: [
       history(),
@@ -1499,10 +1633,25 @@ function initState(): EditorState {
       pageBreakPlugin,
     ],
   })
+
+  if (!initial?.selection) return state
+
+  try {
+    const maxPos = state.doc.content.size
+    const from = Math.max(0, Math.min(initial.selection.from, maxPos))
+    const to = Math.max(from, Math.min(initial.selection.to, maxPos))
+    const nextSelection = from === to
+      ? Selection.near(state.doc.resolve(from))
+      : TextSelection.create(state.doc, from, to)
+    return state.apply(state.tr.setSelection(nextSelection))
+  } catch {
+    return state
+  }
 }
 
 // ─── Editor component ─────────────────────────────────────────────────────────
 export const Editor: React.FC = () => {
+  const [initialDraft] = useState<EditorDraftSnapshot | null>(() => readEditorDraftSnapshot())
   const mountRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -1514,9 +1663,9 @@ export const Editor: React.FC = () => {
   const applyingImportedDocxRef = useRef(false)
   const [view, setView] = useState<EditorView | null>(null)
   const [editorState, setEditorState] = useState<EditorState | null>(null)
-  const [pageConfig, setPageConfig] = useState<PageConfig>(DEFAULT_PAGE_CONFIG)
-  const pageConfigRef = useRef<PageConfig>(DEFAULT_PAGE_CONFIG)
-  const docxExportOptionsRef = useRef<DocxExportOptions>({})
+  const [pageConfig, setPageConfig] = useState<PageConfig>(initialDraft?.pageConfig ?? DEFAULT_PAGE_CONFIG)
+  const pageConfigRef = useRef<PageConfig>(initialDraft?.pageConfig ?? DEFAULT_PAGE_CONFIG)
+  const docxExportOptionsRef = useRef<DocxExportOptions>(initialDraft?.docxExportOptions ?? {})
   const [pageCount, setPageCount] = useState(1)
   const [layoutResult, setLayoutResult] = useState<PaginateResult | null>(null)
   const layoutResultRef = useRef<PaginateResult | null>(null)
@@ -1526,14 +1675,17 @@ export const Editor: React.FC = () => {
   const [editorFocused, setEditorFocused] = useState(false)
   const editorFocusedRef = useRef(false)
   const [editorComposing, setEditorComposing] = useState(false)
-  const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(0)
-  const docxLetterSpacingRef = useRef(0)
+  const [docxLetterSpacingPx, setDocxLetterSpacingPx] = useState(initialDraft?.docxLetterSpacingPx ?? 0)
+  const docxLetterSpacingRef = useRef(initialDraft?.docxLetterSpacingPx ?? 0)
   const [documentFiles, setDocumentFiles] = useState<DocumentFileSummary[]>([])
   const [documentFilesLoading, setDocumentFilesLoading] = useState(false)
   const [documentFilesError, setDocumentFilesError] = useState<string | null>(null)
-  const [documentSettings, setDocumentSettings] = useState<DocumentSettings>(DEFAULT_DOCUMENT_SETTINGS)
+  const [documentSettings, setDocumentSettings] = useState<DocumentSettings>({
+    ...DEFAULT_DOCUMENT_SETTINGS,
+    activeSource: initialDraft?.activeSource ?? DEFAULT_DOCUMENT_SETTINGS.activeSource,
+  })
   const [documentSettingsSaving, setDocumentSettingsSaving] = useState(false)
-  const [currentDocumentName, setCurrentDocumentName] = useState(DEFAULT_SERVER_DOCUMENT_NAME)
+  const [currentDocumentName, setCurrentDocumentName] = useState(initialDraft?.currentDocumentName ?? DEFAULT_SERVER_DOCUMENT_NAME)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [templateManagerOpen, setTemplateManagerOpen] = useState(false)
   const [activeTemplate, setActiveTemplate] = useState<TemplateRecord | null>(null)
@@ -1570,6 +1722,43 @@ export const Editor: React.FC = () => {
   useEffect(() => {
     aiCopilotPreviewRef.current = aiCopilotState.status === 'preview' ? aiCopilotState.preview : null
   }, [aiCopilotState])
+
+  const buildEditorDraftSnapshot = useCallback((): EditorDraftSnapshot | null => {
+    const state = editorStateRef.current
+    if (!state) return null
+    return {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      currentDocumentName,
+      activeSource: documentSettings.activeSource,
+      pageConfig,
+      docxExportOptions: docxExportOptionsRef.current,
+      docxLetterSpacingPx,
+      doc: state.doc.toJSON() as PMNodeJSON,
+      selection: {
+        from: state.selection.from,
+        to: state.selection.to,
+      },
+    }
+  }, [currentDocumentName, documentSettings.activeSource, docxLetterSpacingPx, pageConfig])
+
+  useEffect(() => {
+    if (!editorState) return undefined
+    const timer = window.setTimeout(() => {
+      const snapshot = buildEditorDraftSnapshot()
+      if (snapshot) writeEditorDraftSnapshot(snapshot)
+    }, EDITOR_DRAFT_SAVE_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [buildEditorDraftSnapshot, currentDocumentName, documentSettings.activeSource, docxLetterSpacingPx, editorState, pageConfig])
+
+  useEffect(() => {
+    const flushDraft = () => {
+      const snapshot = buildEditorDraftSnapshot()
+      if (snapshot) writeEditorDraftSnapshot(snapshot)
+    }
+    window.addEventListener('beforeunload', flushDraft)
+    return () => window.removeEventListener('beforeunload', flushDraft)
+  }, [buildEditorDraftSnapshot])
 
   const isTemplateExtractionRunning = ['preparing', 'analyzing', 'saving'].includes(templateExtractionState.status)
 
@@ -2031,7 +2220,10 @@ export const Editor: React.FC = () => {
     styleEl.textContent = PM_STYLES
     document.head.appendChild(styleEl)
 
-    const state = initState()
+    const state = initState(initialDraft ? {
+      doc: initialDraft.doc,
+      selection: initialDraft.selection,
+    } : undefined)
     const editorView = new EditorView(mountRef.current, {
       state,
       nodeViews: {
@@ -2135,7 +2327,7 @@ export const Editor: React.FC = () => {
       editorView.destroy()
       document.head.removeChild(styleEl)
     }
-  }, [acceptAICopilot, cancelAICopilot, clearAICopilotTimer, clearImportedDocxCompatibility, repaginate])
+  }, [acceptAICopilot, cancelAICopilot, clearAICopilotTimer, clearImportedDocxCompatibility, initialDraft, repaginate])
 
   useEffect(() => {
     if (viewRef.current) repaginate()
@@ -2229,6 +2421,31 @@ export const Editor: React.FC = () => {
     }
     await handleImportDocx(file)
   }, [handleImportDocx, handleImportMarkdown])
+
+  const handleDocumentTitleChange = useCallback((title: string) => {
+    setCurrentDocumentName(current => buildDocumentNameFromTitle(title, current))
+  }, [])
+
+  const handleNewDocument = useCallback(() => {
+    const blankDoc = createBlankEditorDoc()
+    applyDocumentState(blankDoc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
+    setCurrentDocumentName(buildUntitledDocumentName(documentFiles.map(file => file.name)))
+    setSelectedBlockPos(null)
+    setBlockAIPopover(null)
+    setActiveComment(null)
+    setAddCommentAnchor(null)
+    setPendingCommentTarget(null)
+    setVisibleComments([])
+    setAICopilotState({ status: 'idle' })
+    setTemplateNotice(null)
+    window.setTimeout(() => {
+      const editorView = viewRef.current
+      if (!editorView) return
+      const selection = TextSelection.create(editorView.state.doc, 1)
+      editorView.dispatch(editorView.state.tr.setSelection(selection).scrollIntoView())
+      editorView.focus()
+    }, 0)
+  }, [applyDocumentState, documentFiles])
 
   const handleOpenDocument = useCallback(async (name: string) => {
     try {
@@ -3213,6 +3430,8 @@ export const Editor: React.FC = () => {
         <Toolbar
           view={view}
           editorState={editorState}
+          documentTitle={currentDocumentName}
+          onDocumentTitleChange={handleDocumentTitleChange}
           pageConfig={pageConfig}
           onPageConfigChange={(newCfg) => {
             setPageConfig(newCfg)
@@ -3229,6 +3448,7 @@ export const Editor: React.FC = () => {
           onAICopilotCandidateCountChange={handleAICopilotCandidateCountChange}
           onToggleWorkspace={() => setWorkspaceOpen(o => !o)}
           workspaceOpen={workspaceOpen}
+          onNewDocument={handleNewDocument}
           onOpenServerFile={openServerFileModal}
           onSaveServerFile={openSaveFileModal}
           onImportDocx={handleImportFile}
@@ -3571,6 +3791,8 @@ export const Editor: React.FC = () => {
             view={view}
             editorState={editorState}
             pageConfig={pageConfig}
+            pageGap={PAGE_GAP}
+            getPageCanvasElement={() => canvasRef.current}
             templates={templates}
             activeTemplate={activeTemplate}
             onModelContextChange={(next) => {

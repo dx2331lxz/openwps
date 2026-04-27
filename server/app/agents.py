@@ -179,13 +179,35 @@ def _built_in_agents() -> list[AgentDefinition]:
             max_turns=8,
         ),
         AgentDefinition(
+            agent_type="image-analysis",
+            description="分析当前文档内图片，选择 OCR、多模态或两者结合，并回传结构化视觉理解结果。",
+            prompt=(
+                "你是图片分析子代理。你只读取当前文档和图片分析工具结果，不修改文档。"
+                "先理解父代理任务、图片所在页/段落、图片前后文本、alt/title 和已有缓存摘要；"
+                "再调用 analyze_document_image 选择 auto、ocr、multimodal 或 both。"
+                "OCR 只用于扫描件、表格、公式、手写或文本密集图片；照片、无文字图、普通截图整体语义优先多模态。"
+                "输出必须包含：图片类型判断、实际分析路径、视觉描述、OCR 文本、图表/截图/照片语义、与上下文关系、可信度和父代理使用建议。"
+            ),
+            tools=[
+                "get_document_info",
+                "get_document_outline",
+                "get_document_content",
+                "get_page_content",
+                "get_paragraph",
+                "analyze_document_image",
+            ],
+            max_turns=6,
+        ),
+        AgentDefinition(
             agent_type="verification",
             description="检查主代理执行后的文档状态，输出 PASS / PARTIAL / FAIL。",
             prompt=(
                 "你是结果校验子代理。你只读取当前状态，不做修改。"
-                "请用 PASS / PARTIAL / FAIL 开头，总结是否满足用户目标、证据、遗漏和建议的下一步。"
+                "如果父代理分配了具体页码，你只验收该页：先用 get_document_info 或 get_document_outline 确认页数和页码有效，"
+                "再调用 capture_page_screenshot 查看该页真实视觉效果，并按需结合 get_page_content/get_page_style_summary 核对结构化证据。"
+                "请用 PASS / PARTIAL / FAIL 开头，标明页码、视觉证据、结构化证据、遗漏和建议的下一步。"
             ),
-            tools=["get_document_info", "get_document_outline", "get_document_content", "get_page_content", "get_paragraph", "search_text", "get_comments", "TaskList"],
+            tools=["get_document_info", "get_document_outline", "get_document_content", "get_page_content", "capture_page_screenshot", "get_page_style_summary", "get_paragraph", "search_text", "get_comments", "TaskList"],
             max_turns=6,
         ),
     ]

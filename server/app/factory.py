@@ -9,8 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 
 from .ai import (
+    analyze_image_with_vision,
     analyze_images_with_ocr,
+    cancel_react_gateway_run,
+    create_react_gateway_run,
     create_react_session,
+    get_conversation_react_gateway_run,
+    get_react_gateway_run,
     get_react_session,
     get_react_session_trace,
     list_conversation_react_traces,
@@ -18,8 +23,11 @@ from .ai import (
     prepare_chat_request,
     run_chat,
     run_completion,
+    stream_react_gateway_run_events,
     stream_react_session,
+    submit_react_client_event,
     submit_react_tool_results,
+    test_vision_model,
 )
 from .config import DIST_DIR, get_provider, public_config, read_config, write_config
 from .conversations import (
@@ -35,6 +43,7 @@ from .agents import cancel_agent_run, list_agent_definitions, list_agent_runs, r
 from .models import (
     AppendMessagesRequest,
     ChatRequest,
+    ClientEventRequest,
     CompletionRequest,
     DocumentSettingsUpdateRequest,
     ModelDiscoveryRequest,
@@ -45,6 +54,8 @@ from .models import (
     TemplateCreateRequest,
     TemplateUpdateRequest,
     ToolResultsRequest,
+    VisionAnalyzeRequest,
+    VisionTestRequest,
 )
 from .models import OCRCommandRequest
 from .template_analysis import analyze_template_request
@@ -109,11 +120,13 @@ def create_api_router() -> APIRouter:
             if isinstance(provider, dict)
         }
         existing_ocr = dict(current.get("ocrConfig") or {})
+        existing_vision = dict(current.get("visionConfig") or {})
         cfg = {
             "version": 2,
             "activeProviderId": body.activeProviderId,
             "imageProcessingMode": body.imageProcessingMode,
             "ocrConfig": {},
+            "visionConfig": {},
             "tavilyConfig": {},
             "providers": [],
         }
@@ -128,6 +141,12 @@ def create_api_router() -> APIRouter:
         if "apiKey" not in ocr_item:
             ocr_item["apiKey"] = existing_ocr.get("apiKey", "")
         cfg["ocrConfig"] = ocr_item
+
+        vision_item = body.visionConfig.model_dump(exclude_none=True)
+        vision_item.pop("hasApiKey", None)
+        if "apiKey" not in vision_item:
+            vision_item["apiKey"] = existing_vision.get("apiKey", "")
+        cfg["visionConfig"] = vision_item
 
         existing_tavily = dict(current.get("tavilyConfig") or {})
         tavily_item = body.tavilyConfig.model_dump(exclude_none=True)
@@ -162,6 +181,14 @@ def create_api_router() -> APIRouter:
         models = await list_models(endpoint, api_key, body.providerId)
         return {"models": models}
 
+    @router.post("/ai/vision/test")
+    async def post_vision_test(body: VisionTestRequest):
+        return await test_vision_model(body)
+
+    @router.post("/ai/vision/analyze")
+    async def post_vision_analyze(body: VisionAnalyzeRequest):
+        return await analyze_image_with_vision(body)
+
     @router.get("/ai/agents")
     def get_agents():
         return {"agents": [agent.to_public_dict() for agent in list_agent_definitions()]}
@@ -183,6 +210,10 @@ def create_api_router() -> APIRouter:
     @router.get("/conversations/{conv_id}/react-traces")
     def get_conversation_react_traces(conv_id: str):
         return {"traces": list_conversation_react_traces(conv_id)}
+
+    @router.get("/conversations/{conv_id}/runs/active")
+    def get_conversation_active_run(conv_id: str):
+        return {"run": get_conversation_react_gateway_run(conv_id)}
 
     @router.post("/conversations/{conv_id}/messages")
     def post_messages(conv_id: str, body: AppendMessagesRequest):
@@ -348,9 +379,45 @@ def create_api_router() -> APIRouter:
             },
         )
 
+    @router.post("/ai/react/runs")
+    async def post_react_run(body: ChatRequest):
+        prepared_body = await prepare_chat_request(body)
+        run = await create_react_gateway_run(prepared_body)
+        return run.snapshot()
+
+    @router.get("/ai/react/runs/{session_id}/events")
+    async def get_react_run_events(session_id: str, after: int = 0):
+        async def generate():
+            try:
+                async for event in stream_react_gateway_run_events(session_id, after=after):
+                    yield sse(str(event["type"]), event)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @router.post("/ai/react/runs/{session_id}/cancel")
+    async def post_cancel_react_run(session_id: str):
+        cancel_react_gateway_run(session_id)
+        return {"success": True}
+
+    @router.post("/ai/react/{session_id}/client-events")
+    async def post_react_client_event(session_id: str, body: ClientEventRequest):
+        return await submit_react_client_event(session_id, body)
+
     @router.post("/ai/react/{session_id}/tool-results")
     async def post_tool_results(session_id: str, body: ToolResultsRequest):
-        session = get_react_session(session_id)
+        gateway_run = get_react_gateway_run(session_id)
+        session = gateway_run.session if gateway_run else get_react_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found or expired")
 

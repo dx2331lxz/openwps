@@ -238,6 +238,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "capture_page_screenshot",
+            "description": (
+                "截取指定正文页的当前可见页面截图，并把截图作为多模态图片交给模型查看。"
+                "适合校验分页、图文混排、遮挡、重叠、表格/图片附近视觉效果。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "description": "页码，从 1 开始"},
+                    "instruction": {"type": "string", "description": "本页截图需要重点检查的问题，可选"},
+                },
+                "required": ["page"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_page_style_summary",
             "description": "读取指定页面的样式摘要，返回该页每个段落的文字预览、样式签名、标题候选和常见样式统计。长文档排版时优先用它按页判断标题/正文是否混淆。",
             "parameters": {
@@ -301,6 +319,35 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_document_image",
+            "description": (
+                "分析当前文档内的图片。可按 imageId 或 paragraphIndex+imageIndex 定位；"
+                "auto 会根据图片和上下文选择多模态、OCR 或两者结合。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "imageId": {"type": "string", "description": "文档读取工具返回的稳定图片 ID。"},
+                    "paragraphIndex": {"type": "integer", "description": "图片所在段落索引；未提供 imageId 时使用。"},
+                    "imageIndex": {"type": "integer", "description": "段内图片序号，从 0 开始；未提供 imageId 时使用。"},
+                    "analysisMode": {
+                        "type": "string",
+                        "enum": ["auto", "multimodal", "ocr", "both"],
+                        "description": "分析路径，默认 auto。",
+                    },
+                    "taskType": {
+                        "type": "string",
+                        "enum": ["general_parse", "document_text", "table", "chart", "handwriting", "formula"],
+                        "description": "OCR 任务类型，analysisMode 为 ocr/both 或 auto 选择 OCR 时使用。",
+                    },
+                    "instruction": {"type": "string", "description": "附加分析说明。"},
+                },
             },
         },
     },
@@ -816,6 +863,7 @@ LAYOUT_TOOL_NAMES = {
     "get_document_outline",
     "get_document_content",
     "get_page_content",
+    "capture_page_screenshot",
     "get_page_style_summary",
     "get_paragraph",
     "search_text",
@@ -836,6 +884,7 @@ EDIT_TOOL_NAMES = {
     "get_document_outline",
     "get_document_content",
     "get_page_content",
+    "capture_page_screenshot",
     "get_page_style_summary",
     "get_paragraph",
     "search_text",
@@ -857,6 +906,7 @@ AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {
     "TaskList",
     "TaskUpdate",
     "Agent",
+    "analyze_document_image",
     "analyze_image_with_ocr",
     "workspace_search",
     "workspace_read",

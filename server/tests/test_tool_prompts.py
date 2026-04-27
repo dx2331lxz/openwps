@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from server.app.agents import build_agent_system_prompt
+from server.app.ai import PlannedToolExecution, SourceToolCall, _build_parallel_execution_batches
 from server.app.content import build_system_content
 from server.app.tool_registry import TOOL_SEARCH_NAME, build_tool_guidance_section
 from server.app.tooling import (
@@ -77,6 +78,10 @@ class ToolPromptInjectionTest(unittest.TestCase):
         self.assertEqual(get_tool_metadata_payload("web_search")["executorLocation"], "server")
         self.assertTrue(get_tool_metadata_payload("get_document_outline")["readOnly"])
         self.assertTrue(get_tool_metadata_payload("get_document_outline")["parallelSafe"])
+        self.assertTrue(get_tool_metadata_payload("capture_page_screenshot")["readOnly"])
+        self.assertTrue(get_tool_metadata_payload("capture_page_screenshot")["parallelSafe"])
+        self.assertTrue(get_tool_metadata_payload("capture_page_screenshot")["allowedForAgent"])
+        self.assertTrue(get_tool_metadata_payload("Agent")["parallelSafe"])
         self.assertFalse(get_tool_metadata_payload("apply_style_batch")["parallelSafe"])
         self.assertFalse(get_tool_metadata_payload("apply_style_batch")["allowedForAgent"])
 
@@ -97,6 +102,7 @@ class ToolPromptInjectionTest(unittest.TestCase):
             "get_document_content",
             "get_document_outline",
             "get_page_content",
+            "capture_page_screenshot",
             "get_paragraph",
             "search_text",
         ]
@@ -109,8 +115,26 @@ class ToolPromptInjectionTest(unittest.TestCase):
         )
         self.assertIn("只读子代理", prompt)
         self.assertIn("PASS / PARTIAL / FAIL", prompt)
+        self.assertIn("capture_page_screenshot", prompt)
         self.assertNotIn("begin_streaming_write", prompt)
         self.assertNotIn("apply_style_batch", prompt)
+
+    def test_parallel_agent_executions_are_batched(self) -> None:
+        executions = [
+            PlannedToolExecution(
+                execution_id=f"exec_{index}",
+                tool_name="Agent",
+                params={"prompt": f"check page {index}", "subagent_type": "verification"},
+                source_calls=[SourceToolCall(id=f"call_{index}", name="Agent", params={})],
+                parallel_group="parallel_agents",
+                executor_location="server",
+                parallel_safe=True,
+            )
+            for index in range(1, 4)
+        ]
+        batches = _build_parallel_execution_batches(executions)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual([item.execution_id for item in batches[0]], ["exec_1", "exec_2", "exec_3"])
 
     def test_system_content_trace_includes_tool_prompt_metadata_only(self) -> None:
         system_content = build_system_content("agent", {"id": "openai", "promptCacheMode": "openai_auto"}, get_tools("agent"))

@@ -41,6 +41,7 @@ export interface ExecuteOptions {
   pageConfig?: PageConfig
   onPageConfigChange?: (cfg: PageConfig) => void
   onDocumentStyleMutation?: () => void
+  imageAnalysisCache?: Map<string, unknown>
   selectionContext?: {
     from: number
     to: number
@@ -59,6 +60,8 @@ export interface StreamingWriteSession {
   from: number
   to: number
   text: string
+  lastAppliedChars: number
+  state: 'active' | 'interrupted' | 'closed'
   format: 'markdown'
   paragraphAttrs?: Record<string, unknown>
   rollbackFragment: Fragment
@@ -865,7 +868,12 @@ function hasMixedTextStyles(textRuns: ReturnType<typeof buildParagraphTextRuns>)
   return textRuns.some(run => JSON.stringify(run.style) !== first)
 }
 
-function buildParagraphNodeSnapshot(node: PMNode, index: number | null, includeTextRuns = true) {
+function buildParagraphNodeSnapshot(
+  node: PMNode,
+  index: number | null,
+  includeTextRuns = true,
+  imageRefs?: Map<string, DocumentImageRef>,
+) {
   const textStyle = getRepresentativeTextStyle(node)
   const paragraphStyle = {
     align: String(node.attrs.align ?? 'left'),
@@ -882,10 +890,12 @@ function buildParagraphNodeSnapshot(node: PMNode, index: number | null, includeT
   const representativeTextStyle = normalizeTextStyle(textStyle)
   const textRuns = includeTextRuns ? buildParagraphTextRuns(node) : []
 
+  const contentSnapshot = buildParagraphContentSnapshot(node, index, imageRefs)
   return {
     index,
     text: node.textContent,
     charCount: node.textContent.length,
+    inlineImages: contentSnapshot.inlineImages,
     style: {
       ...representativeTextStyle,
       ...paragraphStyle,
@@ -914,6 +924,31 @@ function resolveDetailMode(value: unknown): DetailMode {
 
 const SRC_PREVIEW_MAX = 64
 
+interface DocumentImageRef {
+  imageId: string
+  fingerprint: string
+  paragraphIndex: number
+  imageIndex: number
+  page: number | null
+  alt: string
+  title: string
+  width: number | null
+  height: number | null
+  srcKind: 'data' | 'url'
+  srcPreview: string
+  hasAnalysisCache: boolean
+  analysisSummary?: unknown
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 function summarizeImageSrc(rawSrc: unknown): { srcKind: 'data' | 'url'; srcPreview: string } {
   const src = String(rawSrc ?? '')
   if (src.startsWith('data:')) {
@@ -926,6 +961,85 @@ function summarizeImageSrc(rawSrc: unknown): { srcKind: 'data' | 'url'; srcPrevi
   return { srcKind: 'url', srcPreview: src }
 }
 
+function getImageFingerprint(node: PMNode): string {
+  const attrs = node.attrs as Record<string, unknown>
+  return hashString(JSON.stringify({
+    src: String(attrs.src ?? ''),
+    alt: String(attrs.alt ?? ''),
+    title: String(attrs.title ?? ''),
+    width: attrs.width ?? null,
+    height: attrs.height ?? null,
+  }))
+}
+
+function summarizeAnalysisCacheEntry(entry: unknown) {
+  if (!entry || typeof entry !== 'object') return undefined
+  const record = entry as Record<string, unknown>
+  return {
+    modeUsed: record.modeUsed,
+    visualSummary: record.visualSummary,
+    ocrText: typeof record.ocrText === 'string' && record.ocrText.length > 240
+      ? `${record.ocrText.slice(0, 240)}...`
+      : record.ocrText,
+    chartSummary: record.chartSummary,
+    confidence: record.confidence,
+  }
+}
+
+function buildDocumentImageIndex(
+  state: EditorState,
+  pageConfig?: PageConfig,
+  imageAnalysisCache?: Map<string, unknown>,
+) {
+  const paragraphs = getParagraphs(state)
+  const blocks = getBlocks(state)
+  const pagination = buildPaginationSummary(state, pageConfig)
+  const paragraphPage = new Map<number, number>()
+  pagination.renderedPages.forEach((page, pageIndex) => {
+    page.lines.forEach(line => {
+      const paragraphIndex = blocks[line.blockIndex]?.paragraphIndex
+      if (typeof paragraphIndex === 'number' && !paragraphPage.has(paragraphIndex)) {
+        paragraphPage.set(paragraphIndex, pageIndex + 1)
+      }
+    })
+  })
+
+  const occurrenceByFingerprint = new Map<string, number>()
+  const byParagraphImage = new Map<string, DocumentImageRef>()
+  const byId = new Map<string, DocumentImageRef>()
+  for (const paragraph of paragraphs) {
+    let imageIndex = 0
+    paragraph.node.forEach(child => {
+      if (child.type.name !== 'image') return
+      const attrs = child.attrs as Record<string, unknown>
+      const fingerprint = getImageFingerprint(child)
+      const occurrence = occurrenceByFingerprint.get(fingerprint) ?? 0
+      occurrenceByFingerprint.set(fingerprint, occurrence + 1)
+      const cacheEntry = imageAnalysisCache?.get(fingerprint)
+      const { srcKind, srcPreview } = summarizeImageSrc(attrs.src)
+      const ref: DocumentImageRef = {
+        imageId: `img_${fingerprint}_${occurrence}`,
+        fingerprint,
+        paragraphIndex: paragraph.index,
+        imageIndex,
+        page: paragraphPage.get(paragraph.index) ?? null,
+        alt: String(attrs.alt ?? ''),
+        title: String(attrs.title ?? ''),
+        width: attrs.width == null ? null : Number(attrs.width),
+        height: attrs.height == null ? null : Number(attrs.height),
+        srcKind,
+        srcPreview,
+        hasAnalysisCache: Boolean(cacheEntry),
+        analysisSummary: summarizeAnalysisCacheEntry(cacheEntry),
+      }
+      byParagraphImage.set(`${paragraph.index}:${imageIndex}`, ref)
+      byId.set(ref.imageId, ref)
+      imageIndex += 1
+    })
+  }
+  return { byParagraphImage, byId, all: [...byParagraphImage.values()] }
+}
+
 interface ParagraphContentSnapshot {
   index: number | null
   text: string
@@ -933,7 +1047,7 @@ interface ParagraphContentSnapshot {
   role: 'empty' | 'image-only' | 'task-item' | 'list-item' | 'heading' | 'paragraph'
   headingLevel?: 1 | 2 | 3
   list?: { type: 'bullet' | 'ordered' | 'task'; level: number; checked?: boolean }
-  inlineImages?: Array<{ alt: string; srcKind: 'data' | 'url'; srcPreview: string }>
+  inlineImages?: DocumentImageRef[]
   links?: Array<{ text: string; href: string }>
 }
 
@@ -950,18 +1064,42 @@ function inferHeadingLevel(node: PMNode, text: string): 1 | 2 | 3 | null {
   return null
 }
 
-function buildParagraphContentSnapshot(node: PMNode, index: number | null): ParagraphContentSnapshot {
+function buildParagraphContentSnapshot(
+  node: PMNode,
+  index: number | null,
+  imageRefs?: Map<string, DocumentImageRef>,
+): ParagraphContentSnapshot {
   // 自定义遍历：文字直接拼接，遇到 image 节点插入 [image:alt] 占位符
   const textParts: string[] = []
-  const inlineImages: Array<{ alt: string; srcKind: 'data' | 'url'; srcPreview: string }> = []
+  const inlineImages: DocumentImageRef[] = []
   const linkMap = new Map<string, { text: string; href: string }>()
   let nonImageInlineCount = 0
 
+  let imageIndex = 0
   node.forEach((child) => {
     if (child.type.name === 'image') {
       const alt = String(child.attrs.alt ?? '')
       textParts.push(alt ? `[image:${alt}]` : '[image]')
-      inlineImages.push({ alt, ...summarizeImageSrc(child.attrs.src) })
+      const ref = typeof index === 'number' ? imageRefs?.get(`${index}:${imageIndex}`) : undefined
+      if (ref) {
+        inlineImages.push(ref)
+      } else {
+        const fingerprint = getImageFingerprint(child)
+        inlineImages.push({
+          imageId: `img_${fingerprint}_0`,
+          fingerprint,
+          paragraphIndex: index ?? -1,
+          imageIndex,
+          page: null,
+          alt,
+          title: String(child.attrs.title ?? ''),
+          width: child.attrs.width == null ? null : Number(child.attrs.width),
+          height: child.attrs.height == null ? null : Number(child.attrs.height),
+          ...summarizeImageSrc(child.attrs.src),
+          hasAnalysisCache: false,
+        })
+      }
+      imageIndex += 1
       return
     }
     if (child.isText) {
@@ -1050,7 +1188,7 @@ function buildTableContentSnapshot(tableNode: PMNode) {
   }
 }
 
-function buildBlockContentSnapshot(block: BlockRef) {
+function buildBlockContentSnapshot(block: BlockRef, imageRefs?: Map<string, DocumentImageRef>) {
   switch (block.node.type.name) {
     case 'paragraph':
       return {
@@ -1058,7 +1196,7 @@ function buildBlockContentSnapshot(block: BlockRef) {
         type: 'paragraph' as const,
         paragraphIndex: block.paragraphIndex,
         afterParagraphIndex: block.afterParagraphIndex,
-        ...buildParagraphContentSnapshot(block.node, block.paragraphIndex),
+        ...buildParagraphContentSnapshot(block.node, block.paragraphIndex, imageRefs),
       }
     case 'table':
       return {
@@ -1193,7 +1331,7 @@ function executeTableCommand(
   }
 }
 
-function buildBlockSnapshot(block: BlockRef, includeTextRuns = true) {
+function buildBlockSnapshot(block: BlockRef, includeTextRuns = true, imageRefs?: Map<string, DocumentImageRef>) {
   switch (block.node.type.name) {
     case 'paragraph':
       return {
@@ -1201,7 +1339,7 @@ function buildBlockSnapshot(block: BlockRef, includeTextRuns = true) {
         type: 'paragraph',
         paragraphIndex: block.paragraphIndex,
         afterParagraphIndex: block.afterParagraphIndex,
-        ...buildParagraphNodeSnapshot(block.node, block.paragraphIndex, includeTextRuns),
+        ...buildParagraphNodeSnapshot(block.node, block.paragraphIndex, includeTextRuns, imageRefs),
       }
     case 'table':
       return {
@@ -1298,6 +1436,7 @@ function getDocumentInfo(state: EditorState, params: Record<string, unknown>, op
   const wordCount = state.doc.textContent.length
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
+  const imageIndex = buildDocumentImageIndex(state, options?.pageConfig, options?.imageAnalysisCache)
   const blockCounts = blocks.reduce<Record<string, number>>((counts, block) => {
     counts[block.node.type.name] = (counts[block.node.type.name] ?? 0) + 1
     return counts
@@ -1309,6 +1448,8 @@ function getDocumentInfo(state: EditorState, params: Record<string, unknown>, op
     pageCount: pagination.renderedPages.length,
     pageBreakCount: pagination.breaks.length,
     blockCounts,
+    imageCount: imageIndex.all.length,
+    images: imageIndex.all,
   }
   if (detail === 'format') {
     const paragraphSnapshots = paragraphs.map(paragraph => buildParagraphSnapshot(paragraph, false))
@@ -1327,6 +1468,7 @@ function getDocumentOutline(state: EditorState, params: Record<string, unknown>,
   const paragraphs = getParagraphs(state)
   const blocks = getBlocks(state)
   const pagination = buildPaginationSummary(state, options?.pageConfig)
+  const imageIndex = buildDocumentImageIndex(state, options?.pageConfig, options?.imageAnalysisCache)
 
   const pages = pagination.renderedPages.map((page, pageIndex) => {
     const pageBlocks = [...new Set(page.lines.map(line => line.blockIndex))]
@@ -1347,6 +1489,7 @@ function getDocumentOutline(state: EditorState, params: Record<string, unknown>,
       containsImage: pageBlocks.some(block => (
         block.node.type.name === 'paragraph' && block.node.content.content.some(child => child.type.name === 'image')
       )),
+      images: imageIndex.all.filter(image => image.page === pageIndex + 1),
     }
   })
 
@@ -1391,6 +1534,7 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
   const lastParagraphIndex = paragraphRefs.at(-1)!.index
   const pagination = buildPaginationSummary(state, options?.pageConfig)
   const blocks = getBlocks(state)
+  const imageIndex = buildDocumentImageIndex(state, options?.pageConfig, options?.imageAnalysisCache)
   const blocksInRange = blocks.filter(block => (
     (block.paragraphIndex != null && block.paragraphIndex >= firstParagraphIndex && block.paragraphIndex <= lastParagraphIndex)
     || (block.afterParagraphIndex != null && block.afterParagraphIndex >= firstParagraphIndex && block.afterParagraphIndex <= lastParagraphIndex)
@@ -1411,7 +1555,7 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
   })
 
   if (detail === 'format') {
-    const paragraphs = paragraphRefs.map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns))
+    const paragraphs = paragraphRefs.map(paragraph => buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns, imageIndex.byParagraphImage))
     const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
     return {
       success: true,
@@ -1423,13 +1567,14 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
         paragraphCount: paragraphs.length,
         totalChars,
         paragraphs,
-        blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns)),
+        blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns, imageIndex.byParagraphImage)),
+        images: imageIndex.all.filter(image => image.paragraphIndex >= firstParagraphIndex && image.paragraphIndex <= lastParagraphIndex),
         pageRanges,
       },
     }
   }
 
-  const paragraphs = paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index))
+  const paragraphs = paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index, imageIndex.byParagraphImage))
   const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
   return {
     success: true,
@@ -1441,7 +1586,8 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
       paragraphCount: paragraphs.length,
       totalChars,
       paragraphs,
-      blocks: blocksInRange.map(block => buildBlockContentSnapshot(block)),
+      blocks: blocksInRange.map(block => buildBlockContentSnapshot(block, imageIndex.byParagraphImage)),
+      images: imageIndex.all.filter(image => image.paragraphIndex >= firstParagraphIndex && image.paragraphIndex <= lastParagraphIndex),
       pageRanges,
     },
   }
@@ -1458,6 +1604,7 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
   const blocks = getBlocks(state)
   const paragraphs = getParagraphs(state)
   const pagination = buildPaginationSummary(state, options?.pageConfig)
+  const imageIndex = buildDocumentImageIndex(state, options?.pageConfig, options?.imageAnalysisCache)
   const page = pagination.renderedPages[pageNumber - 1]
 
   if (!page) {
@@ -1486,7 +1633,7 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
           ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
           : null,
         previewText: buildPageTextPreview(page.lines),
-        blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns)),
+        blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns, imageIndex.byParagraphImage)),
         lines: page.lines.map(line => ({
           blockIndex: line.blockIndex,
           lineIndex: line.lineIndex,
@@ -1494,7 +1641,8 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
           top: Math.round(line.top),
           startPos: line.startPos,
         })),
-        paragraphs: paragraphRefs.map(paragraph => buildParagraphSnapshot(paragraph, includeTextRuns)),
+        paragraphs: paragraphRefs.map(paragraph => buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns, imageIndex.byParagraphImage)),
+        images: imageIndex.all.filter(image => image.page === pageNumber),
       },
     }
   }
@@ -1511,13 +1659,14 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
         ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
         : null,
       previewText: buildPageTextPreview(page.lines),
-      blocks: pageBlocks.map(block => buildBlockContentSnapshot(block)),
+      blocks: pageBlocks.map(block => buildBlockContentSnapshot(block, imageIndex.byParagraphImage)),
       lines: page.lines.map(line => ({
         blockIndex: line.blockIndex,
         lineIndex: line.lineIndex,
         text: line.text,
       })),
-      paragraphs: paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index)),
+      paragraphs: paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index, imageIndex.byParagraphImage)),
+      images: imageIndex.all.filter(image => image.page === pageNumber),
     },
   }
 }
@@ -1580,18 +1729,19 @@ function getPageStyleSummary(state: EditorState, pageNumber: number, options?: E
   }
 }
 
-function getParagraph(state: EditorState, index: number, detail: DetailMode): ExecuteResult {
+function getParagraph(state: EditorState, index: number, detail: DetailMode, options?: ExecuteOptions): ExecuteResult {
   const paragraph = getParagraphAtIndex(state, index)
   if (!paragraph) {
     return { success: false, message: `未找到第 ${index + 1} 段` }
   }
 
+  const imageIndex = buildDocumentImageIndex(state, options?.pageConfig, options?.imageAnalysisCache)
   return {
     success: true,
     message: detail === 'format' ? `已读取第 ${index + 1} 段（format）` : `已读取第 ${index + 1} 段`,
     data: detail === 'format'
-      ? { detail, ...buildParagraphSnapshot(paragraph) }
-      : { detail, ...buildParagraphContentSnapshot(paragraph.node, paragraph.index) },
+      ? { detail, ...buildParagraphNodeSnapshot(paragraph.node, paragraph.index, true, imageIndex.byParagraphImage) }
+      : { detail, ...buildParagraphContentSnapshot(paragraph.node, paragraph.index, imageIndex.byParagraphImage) },
   }
 }
 
@@ -1658,6 +1808,8 @@ export function beginStreamingWrite(
         from: targetParagraph.pos,
         to: targetParagraph.pos + targetParagraph.node.nodeSize,
         text: '',
+        lastAppliedChars: 0,
+        state: 'active',
         format: 'markdown',
         paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
         rollbackFragment: Fragment.empty,
@@ -1693,6 +1845,8 @@ export function beginStreamingWrite(
         from: targetParagraph.pos,
         to: targetParagraph.pos + targetParagraph.node.nodeSize,
         text: '',
+        lastAppliedChars: 0,
+        state: 'active',
         format: 'markdown',
         paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
         rollbackFragment: Fragment.from(paragraph.node),
@@ -1719,6 +1873,7 @@ export function appendStreamingWrite(
   view.dispatch(tr)
 
   session.text = nextText
+  session.lastAppliedChars = nextText.length
   session.to = session.from + fragment.size
 
   return { success: true, message: '正文流式写入中' }
@@ -2224,7 +2379,7 @@ export async function executeTool(
         return getPageStyleSummary(state, Number(params.page), options)
 
       case 'get_paragraph':
-        return getParagraph(state, Number(params.index), resolveDetailMode(params.detail))
+        return getParagraph(state, Number(params.index), resolveDetailMode(params.detail), options)
 
       case 'get_comments': {
         interface CommentEntry {

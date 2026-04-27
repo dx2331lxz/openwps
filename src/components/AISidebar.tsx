@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent as ReactClipboardEvent, MouseEvent as ReactMouseEvent } from 'react'
+import html2canvas from 'html2canvas'
 import { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import type { Node as ProseMirrorNode } from 'prosemirror-model'
 import { marked } from 'marked'
+import type { Tokens } from 'marked'
 import mermaid from 'mermaid'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
@@ -23,18 +25,46 @@ import type {
   AISettingsData,
   ModelOption,
   OcrConfigData,
+  VisionConfigData,
 } from '../ai/providers'
 import { paginate, type PageConfig } from '../layout/paginator'
 import ModelPicker from './ModelPicker'
 
 type View = 'history' | 'chat'
 type AssistantMode = 'agent' | 'layout' | 'edit'
+const ACTIVE_CONVERSATION_STORAGE_KEY = 'openwps:ai-active-conversation'
+const STREAMING_WRITE_MARKERS_STORAGE_KEY = 'openwps:ai-streaming-write-markers'
+
+type StreamingWriteMarkerState = 'active' | 'interrupted' | 'closed'
+
+interface StreamingWriteMarker {
+  conversationId: string
+  sessionId: string
+  streamingWriteId: string
+  toolName: 'begin_streaming_write'
+  state: StreamingWriteMarkerState
+  lastAppliedChars: number
+  createdAt: string
+  updatedAt: string
+  interruptEventId?: string
+  closeEventId?: string
+  reason?: string
+}
 
 interface ConversationSummary {
   id: string
   title: string
   createdAt: string
   updatedAt: string
+  runStatus?: ReactRunSummary['status'] | null
+  activeRunSessionId?: string | null
+  streamWriteState?: ReactRunSummary['streamWriteState']
+}
+
+interface ConversationGroup {
+  key: string
+  label: string
+  conversations: ConversationSummary[]
 }
 
 interface StoredMessage {
@@ -49,6 +79,16 @@ interface StoredMessage {
 
 interface ConversationDetail extends ConversationSummary {
   messages: StoredMessage[]
+}
+
+interface ReactRunSummary {
+  sessionId: string
+  conversationId?: string | null
+  status: 'running' | 'awaiting_client' | 'completed' | 'failed'
+  error?: string | null
+  lastSeq?: number
+  streamWriteState?: StreamingWriteMarkerState | 'idle' | null
+  interruptedStreamingWrite?: Record<string, unknown> | null
 }
 
 interface ToolCallResult {
@@ -159,6 +199,25 @@ interface OcrAnalysisResponse {
   taskType: OcrTaskType
   imageCount: number
   results: OcrAnalysisResult[]
+}
+
+type DocumentImageAnalysisMode = 'auto' | 'multimodal' | 'ocr' | 'both'
+
+interface DocumentImageTarget {
+  imageId: string
+  fingerprint: string
+  paragraphIndex: number
+  imageIndex: number
+  page: number | null
+  alt: string
+  title: string
+  width: number | null
+  height: number | null
+  srcKind: 'data' | 'url'
+  dataUrl: string
+  beforeText: string
+  afterText: string
+  paragraphText: string
 }
 
 // ─── Selection context ───────────────────────────────────────────────────────
@@ -317,10 +376,45 @@ function buildContextPreview(editorState: EditorState, pageConfig: PageConfig) {
   }
 }
 
+function buildPageSnapshotMetadata(editorState: EditorState, pageConfig: PageConfig, pageNumber: number) {
+  const pagination = paginate(editorState.doc, pageConfig)
+  const page = pagination.renderedPages[pageNumber - 1]
+  if (!page) return null
+
+  const blockParagraphIndexes: Array<number | null> = []
+  let paragraphIndex = 0
+  editorState.doc.forEach((node) => {
+    if (node.type.name === 'paragraph') {
+      blockParagraphIndexes.push(paragraphIndex)
+      paragraphIndex += 1
+      return
+    }
+    blockParagraphIndexes.push(null)
+  })
+
+  const paragraphIndexes = [...new Set(
+    page.lines
+      .map(line => blockParagraphIndexes[line.blockIndex] ?? null)
+      .filter((value): value is number => typeof value === 'number')
+  )]
+
+  return {
+    page: pageNumber,
+    pageCount: pagination.renderedPages.length,
+    paragraphIndexes,
+    paragraphRange: paragraphIndexes.length > 0
+      ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
+      : null,
+    previewText: truncatePreviewText(page.lines.map(line => line.text).join(' '), 180),
+  }
+}
+
 interface Props {
   view: EditorView | null
   editorState?: EditorState | null
   pageConfig: PageConfig
+  pageGap: number
+  getPageCanvasElement?: () => HTMLElement | null
   templates: TemplateSummary[]
   activeTemplate: TemplateRecord | null
   onModelContextChange?: (next: { providerId: string | null, model: string | null }) => void
@@ -424,6 +518,127 @@ function newId() {
   return `m${msgIdCounter}`
 }
 
+function nowIso() {
+  return new Date().toISOString()
+}
+
+function readStreamingWriteMarkers(): StreamingWriteMarker[] {
+  try {
+    const raw = window.localStorage.getItem(STREAMING_WRITE_MARKERS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is StreamingWriteMarker => (
+      item
+      && typeof item === 'object'
+      && typeof item.conversationId === 'string'
+      && typeof item.sessionId === 'string'
+      && typeof item.streamingWriteId === 'string'
+    ))
+  } catch {
+    return []
+  }
+}
+
+function writeStreamingWriteMarkers(markers: StreamingWriteMarker[]) {
+  if (markers.length === 0) {
+    window.localStorage.removeItem(STREAMING_WRITE_MARKERS_STORAGE_KEY)
+    return
+  }
+  window.localStorage.setItem(STREAMING_WRITE_MARKERS_STORAGE_KEY, JSON.stringify(markers))
+}
+
+function upsertStreamingWriteMarker(marker: StreamingWriteMarker) {
+  const markers = readStreamingWriteMarkers()
+  const index = markers.findIndex(item => item.sessionId === marker.sessionId && item.streamingWriteId === marker.streamingWriteId)
+  if (index >= 0) markers[index] = marker
+  else markers.push(marker)
+  writeStreamingWriteMarkers(markers)
+}
+
+function removeStreamingWriteMarker(sessionId: string, streamingWriteId: string) {
+  writeStreamingWriteMarkers(readStreamingWriteMarkers().filter(marker => (
+    marker.sessionId !== sessionId || marker.streamingWriteId !== streamingWriteId
+  )))
+}
+
+function findActiveStreamingWriteMarker(conversationId: string, sessionId?: string | null) {
+  return readStreamingWriteMarkers().find(marker => (
+    marker.conversationId === conversationId
+    && (!sessionId || marker.sessionId === sessionId)
+    && marker.state !== 'closed'
+  )) ?? null
+}
+
+function buildStreamingWriteClientEventPayload(
+  marker: StreamingWriteMarker,
+  eventType: 'page_refresh' | 'stream_write_interrupted' | 'stream_write_closed',
+  reason: string,
+) {
+  const eventId = eventType === 'stream_write_closed'
+    ? (marker.closeEventId ?? `${marker.streamingWriteId}:closed`)
+    : (marker.interruptEventId ?? `${marker.streamingWriteId}:interrupted`)
+  return {
+    eventId,
+    eventType,
+    conversationId: marker.conversationId,
+    toolName: marker.toolName,
+    streamingWriteId: marker.streamingWriteId,
+    reason,
+    lastAppliedChars: marker.lastAppliedChars,
+    createdAt: nowIso(),
+  }
+}
+
+function markStreamingWriteMarkerInterrupted(marker: StreamingWriteMarker, reason: string): StreamingWriteMarker {
+  const next = {
+    ...marker,
+    state: 'interrupted' as const,
+    reason,
+    interruptEventId: marker.interruptEventId ?? `${marker.streamingWriteId}:interrupted`,
+    updatedAt: nowIso(),
+  }
+  upsertStreamingWriteMarker(next)
+  return next
+}
+
+function markStreamingWriteMarkerClosed(marker: StreamingWriteMarker): StreamingWriteMarker {
+  const next = {
+    ...marker,
+    state: 'closed' as const,
+    closeEventId: marker.closeEventId ?? `${marker.streamingWriteId}:closed`,
+    updatedAt: nowIso(),
+  }
+  upsertStreamingWriteMarker(next)
+  return next
+}
+
+function postStreamingWriteClientEvent(
+  marker: StreamingWriteMarker,
+  eventType: 'page_refresh' | 'stream_write_interrupted' | 'stream_write_closed',
+  reason: string,
+  transport: 'fetch' | 'beacon' = 'fetch',
+) {
+  const payload = buildStreamingWriteClientEventPayload(marker, eventType, reason)
+  const url = `/api/ai/react/${marker.sessionId}/client-events`
+  if (transport === 'beacon' && navigator.sendBeacon) {
+    return navigator.sendBeacon(url, new Blob([JSON.stringify(payload)], { type: 'application/json' }))
+  }
+  void fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    keepalive: transport === 'beacon',
+  }).then(response => {
+    if (response.ok && eventType !== 'stream_write_closed') {
+      removeStreamingWriteMarker(marker.sessionId, marker.streamingWriteId)
+    }
+  }).catch(error => {
+    console.error('[AISidebar] post streaming write client event failed', error)
+  })
+  return true
+}
+
 function findTightBubbleWidth(prepared: PreparedTextWithSegments, maxWidth: number): number {
   if (maxWidth <= 0) return 0
   const targetLineCount = layout(prepared, maxWidth, LINE_HEIGHT).lineCount
@@ -466,6 +681,52 @@ function formatConversationTime(value: string) {
   if (targetDay.getTime() === today.getTime()) return `今天${time}`
   if (targetDay.getTime() === yesterday.getTime()) return `昨天${time}`
   return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function formatConversationMonth(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+}
+
+function getLocalDayIndex(date: Date) {
+  return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000)
+}
+
+function getConversationGroupLabel(value: string, now = new Date()) {
+  if (!value) return '未知时间'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '未知时间'
+
+  const diffDays = getLocalDayIndex(now) - getLocalDayIndex(date)
+
+  if (diffDays < 0) return '未来'
+  if (diffDays === 0) return '今天'
+  if (diffDays === 1) return '昨天'
+
+  // 互斥区间：7天内不含今天/昨天，三十天内不含前面的7天内。
+  if (diffDays >= 2 && diffDays <= 7) return '7天内'
+  if (diffDays >= 8 && diffDays <= 30) return '三十天内'
+
+  return formatConversationMonth(date)
+}
+
+function groupConversationsByTime(conversations: ConversationSummary[], now = new Date()): ConversationGroup[] {
+  const groups: ConversationGroup[] = []
+  const groupByKey = new Map<string, ConversationGroup>()
+
+  conversations.forEach(conversation => {
+    const value = conversation.updatedAt || conversation.createdAt
+    const label = getConversationGroupLabel(value, now)
+    const key = label === '未知时间' ? 'unknown' : label
+    let group = groupByKey.get(key)
+    if (!group) {
+      group = { key, label, conversations: [] }
+      groupByKey.set(key, group)
+      groups.push(group)
+    }
+    group.conversations.push(conversation)
+  })
+
+  return groups
 }
 
 function truncateText(value: string, maxLength = 48) {
@@ -833,8 +1094,20 @@ function serializeToolParamsWithSelection(
   return { ...params, range: nextRange }
 }
 
+function escapeHtmlText(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const safeMarkdownRenderer = new marked.Renderer()
+safeMarkdownRenderer.html = ({ text }: Tokens.HTML | Tokens.Tag) => escapeHtmlText(text)
+
 function toHtml(markdown: string) {
-  const parsed = marked.parse(markdown)
+  const parsed = marked.parse(markdown, { renderer: safeMarkdownRenderer })
   return typeof parsed === 'string' ? parsed : markdown
 }
 
@@ -1319,6 +1592,17 @@ function serializeToolResult(tool: ToolCallRecord) {
   })
 }
 
+function sanitizeToolResultForDisplay(toolName: string, result: ExecuteResult): ExecuteResult {
+  if (toolName !== 'capture_page_screenshot') return result
+  if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) return result
+  const data = { ...(result.data as Record<string, unknown>) }
+  if (typeof data.dataUrl === 'string') {
+    delete data.dataUrl
+    data.imageAttached = true
+  }
+  return { ...result, data }
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(',')}]`
   if (value && typeof value === 'object') {
@@ -1568,6 +1852,15 @@ function buildReactMessages(messages: StoredMessage[], userText: string): ReactM
 function buildErrorText(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
 
+  if (
+    message.includes('Cloudflare') ||
+    message.includes('人机验证') ||
+    message.includes('挑战页') ||
+    message.includes('返回了 HTML 页面')
+  ) {
+    return `❌ 上游模型服务不可用：${message}\n\n后端已经响应，但当前模型服务端点没有返回标准 API 响应。请在 AI 设置中切换到可直连的服务商/端点，或更换当前 API 网关。`
+  }
+
   if (message.includes('未接受图片输入') || message.includes('不兼容 image_url 图片格式')) {
     return `❌ 当前模型未接受图片输入：${message}\n\n你可以切换到明确支持视觉的模型，或改用 OCR 路径。`
   }
@@ -1584,24 +1877,15 @@ function buildErrorText(error: unknown) {
     return `❌ OCR 已返回响应，但结果格式不可解析：${message}\n\n这通常表示 OCR 模型返回了非预期格式，或输出被截断。建议先换一张更清晰的图片，或检查当前 OCR 模型是否支持该接口格式。`
   }
 
+  if (message.includes('AI API 请求失败') || message.includes('AI 请求失败')) {
+    return `❌ AI 服务请求失败：${message}\n\n后端服务已返回错误，但上游模型服务调用失败。请检查当前 AI 设置中的服务商、端点、模型和 API Key。`
+  }
+
   return `❌ 请求失败：${message}\n\n请确认后端服务已启动（端口 5174）并已配置 API Key。`
 }
 
 function makeConversationTitle(text: string) {
   return text.trim().slice(0, 30) || '新会话'
-}
-
-function buildDefaultImagePrompt(mode: AssistantMode) {
-  if (mode === 'layout') return '请根据上传的图片内容复现版式到当前文档中。'
-  if (mode === 'edit') return '请根据上传的图片内容复现正文到当前文档中。'
-  return '请根据上传的图片内容复现到当前文档中。'
-}
-
-function buildDefaultAttachmentPrompt(mode: AssistantMode, attachments: ChatAttachment[]) {
-  if (attachments.some(isImageAttachment)) return buildDefaultImagePrompt(mode)
-  if (mode === 'layout') return '请根据上传的附件内容整理并完成排版。'
-  if (mode === 'edit') return '请根据上传的附件内容整理并写入正文。'
-  return '请根据上传的附件内容处理当前任务。'
 }
 
 function createDefaultOcrConfig(): OcrConfigData {
@@ -1617,6 +1901,17 @@ function createDefaultOcrConfig(): OcrConfigData {
   }
 }
 
+function createDefaultVisionConfig(): VisionConfigData {
+  return {
+    enabled: false,
+    providerId: 'openai',
+    endpoint: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    hasApiKey: false,
+    timeoutSeconds: 30,
+  }
+}
+
 function normalizeOcrTaskType(value: string | undefined): OcrTaskType {
   const normalized = String(value || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
   if (normalized === 'table' || normalized === 'tables') return 'table'
@@ -1625,6 +1920,138 @@ function normalizeOcrTaskType(value: string | undefined): OcrTaskType {
   if (normalized === 'formula' || normalized === 'math') return 'formula'
   if (normalized === 'document_text' || normalized === 'document' || normalized === 'text' || normalized === 'doc') return 'document_text'
   return 'general_parse'
+}
+
+function normalizeDocumentImageAnalysisMode(value: unknown): DocumentImageAnalysisMode {
+  return value === 'multimodal' || value === 'ocr' || value === 'both' ? value : 'auto'
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+function getImageFingerprintFromAttrs(attrs: Record<string, unknown>): string {
+  return hashString(JSON.stringify({
+    src: String(attrs.src ?? ''),
+    alt: String(attrs.alt ?? ''),
+    title: String(attrs.title ?? ''),
+    width: attrs.width ?? null,
+    height: attrs.height ?? null,
+  }))
+}
+
+function inferImageMimeType(src: string) {
+  const match = src.match(/^data:([^;,]+)/)
+  if (match?.[1]) return match[1]
+  if (/\.jpe?g($|\?)/i.test(src)) return 'image/jpeg'
+  if (/\.webp($|\?)/i.test(src)) return 'image/webp'
+  if (/\.gif($|\?)/i.test(src)) return 'image/gif'
+  if (/\.svg($|\?)/i.test(src)) return 'image/svg+xml'
+  return 'image/png'
+}
+
+function estimateDataUrlSize(src: string) {
+  const payload = src.startsWith('data:') ? src.split(',', 2)[1] ?? '' : ''
+  if (!payload) return 0
+  const padding = payload.length - payload.replace(/=+$/, '').length
+  return Math.max(Math.floor(payload.length * 3 / 4) - padding, 0)
+}
+
+function findDocumentImageTarget(
+  state: EditorState,
+  params: Record<string, unknown>,
+  pageConfig?: PageConfig,
+): DocumentImageTarget | null {
+  const targetImageId = typeof params.imageId === 'string' ? params.imageId : ''
+  const targetParagraphIndex = Number(params.paragraphIndex)
+  const targetImageIndex = Number(params.imageIndex ?? 0)
+  const paragraphTexts: string[] = []
+  const occurrenceByFingerprint = new Map<string, number>()
+  let paragraphIndex = 0
+  let found: DocumentImageTarget | null = null
+  const pageByParagraph = new Map<number, number>()
+  try {
+    const pages = paginate(state.doc, pageConfig).renderedPages
+    pages.forEach((page, pageIndex) => {
+      page.lines.forEach(line => {
+        const startPos = Number(line.startPos ?? 0)
+        if (startPos > 0) {
+          let currentParagraph = 0
+          state.doc.descendants((node, pos) => {
+            if (node.type.name !== 'paragraph') return true
+            if (pos <= startPos && startPos <= pos + node.nodeSize) {
+              if (!pageByParagraph.has(currentParagraph)) pageByParagraph.set(currentParagraph, pageIndex + 1)
+              return false
+            }
+            currentParagraph += 1
+            return false
+          })
+        }
+      })
+    })
+  } catch {
+    // Page metadata is useful but non-essential for image analysis.
+  }
+
+  state.doc.descendants((node) => {
+    if (node.type.name !== 'paragraph') return true
+    paragraphTexts[paragraphIndex] = node.textContent
+    let imageIndex = 0
+    node.forEach((child) => {
+      if (child.type.name !== 'image' || found) return
+      const attrs = child.attrs as Record<string, unknown>
+      const fingerprint = getImageFingerprintFromAttrs(attrs)
+      const occurrence = occurrenceByFingerprint.get(fingerprint) ?? 0
+      occurrenceByFingerprint.set(fingerprint, occurrence + 1)
+      const imageId = `img_${fingerprint}_${occurrence}`
+      const matchesById = targetImageId && imageId === targetImageId
+      const matchesByPosition = !targetImageId
+        && paragraphIndex === targetParagraphIndex
+        && imageIndex === (Number.isInteger(targetImageIndex) ? targetImageIndex : 0)
+      if (matchesById || matchesByPosition) {
+        const src = String(attrs.src ?? '')
+        found = {
+          imageId,
+          fingerprint,
+          paragraphIndex,
+          imageIndex,
+          page: pageByParagraph.get(paragraphIndex) ?? null,
+          alt: String(attrs.alt ?? ''),
+          title: String(attrs.title ?? ''),
+          width: attrs.width == null ? null : Number(attrs.width),
+          height: attrs.height == null ? null : Number(attrs.height),
+          srcKind: src.startsWith('data:') ? 'data' : 'url',
+          dataUrl: src,
+          beforeText: paragraphTexts[paragraphIndex - 1] ?? '',
+          afterText: '',
+          paragraphText: node.textContent,
+        }
+      }
+      imageIndex += 1
+    })
+    paragraphIndex += 1
+    return false
+  })
+
+  const resolvedTarget = found as DocumentImageTarget | null
+  if (resolvedTarget) {
+    resolvedTarget.afterText = paragraphTexts[resolvedTarget.paragraphIndex + 1] ?? ''
+  }
+  return resolvedTarget
+}
+
+function chooseDocumentImageMode(target: DocumentImageTarget, requestedMode: DocumentImageAnalysisMode, taskType: OcrTaskType): Exclude<DocumentImageAnalysisMode, 'auto'> {
+  if (requestedMode !== 'auto') return requestedMode
+  const contextText = `${target.alt} ${target.title} ${target.paragraphText} ${target.beforeText} ${target.afterText}`.toLowerCase()
+  if (taskType === 'table' || taskType === 'formula' || taskType === 'handwriting' || taskType === 'document_text') return 'ocr'
+  if (/(扫描|表格|公式|手写|ocr|文字|正文|document|table|formula|handwriting)/i.test(contextText)) return 'ocr'
+  if (/(图表|截图|chart|graph|dashboard|报表)/i.test(contextText)) return 'both'
+  return 'multimodal'
 }
 
 function parseOcrCommand(text: string): OcrIntentMatch | null {
@@ -1738,6 +2165,8 @@ export default function AISidebar({
   view: editorView,
   editorState,
   pageConfig,
+  pageGap,
+  getPageCanvasElement,
   templates,
   activeTemplate,
   onModelContextChange,
@@ -1771,18 +2200,25 @@ export default function AISidebar({
   const [modelsLoading, setModelsLoading] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([])
   const [ocrConfig, setOcrConfig] = useState<OcrConfigData>(createDefaultOcrConfig())
+  const [visionConfig, setVisionConfig] = useState<VisionConfigData>(createDefaultVisionConfig())
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const activeRunSessionIdRef = useRef<string | null>(null)
+  const autoRestoreAttemptedRef = useRef(false)
+  const conversationNavigationSeqRef = useRef(0)
   const isDragging = useRef(false)
   const isComposingRef = useRef(false)
   const shouldAutoScrollRef = useRef(true)
   const currentConversationIdRef = useRef<string | null>(null)
   const conversationMessagesRef = useRef<StoredMessage[]>([])
   const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
+  const activeStreamingWriteMarkerRef = useRef<StreamingWriteMarker | null>(null)
+  const imageAnalysisCacheRef = useRef<Map<string, unknown>>(new Map())
+  const visionTestCacheRef = useRef<Map<string, boolean>>(new Map())
   const tasksRef = useRef<TaskItem[]>([])
   const taskHideTimerRef = useRef<number | null>(null)
 
@@ -1793,6 +2229,10 @@ export default function AISidebar({
   const activeOcrProvider = useMemo(
     () => providers.find(provider => provider.id === ocrConfig.providerId) ?? null,
     [ocrConfig.providerId, providers],
+  )
+  const activeVisionProvider = useMemo(
+    () => providers.find(provider => provider.id === visionConfig.providerId) ?? null,
+    [providers, visionConfig.providerId],
   )
   const activeProviderSupportsVision = Boolean(activeProvider?.supportsVision)
   const currentModelId = selectedModel || modelName
@@ -1809,15 +2249,46 @@ export default function AISidebar({
     && effectiveOcrEndpoint
     && effectiveOcrHasApiKey,
   )
+  const isVisionFallbackReady = Boolean(
+    visionConfig.enabled
+    && (visionConfig.endpoint || activeVisionProvider?.endpoint)
+    && visionConfig.model.trim()
+    && (visionConfig.hasApiKey || activeVisionProvider?.hasApiKey),
+  )
   const canSendMessage = Boolean(input.trim() || pendingAttachments.length > 0)
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
+    if (currentConversationId) {
+      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, currentConversationId)
+    }
   }, [currentConversationId])
 
   useEffect(() => {
     tasksRef.current = tasks
   }, [tasks])
+
+  useEffect(() => {
+    const handlePageExit = (event: PageTransitionEvent | Event) => {
+      const reason = event.type === 'beforeunload' ? 'beforeunload' : 'pagehide'
+      const markers = readStreamingWriteMarkers()
+      const interruptedMarkers = markers.map(marker => (
+        marker.state === 'closed' ? marker : markStreamingWriteMarkerInterrupted(marker, reason)
+      ))
+      writeStreamingWriteMarkers(interruptedMarkers)
+      for (const marker of interruptedMarkers) {
+        if (marker.state === 'closed') continue
+        postStreamingWriteClientEvent(marker, 'page_refresh', reason, 'beacon')
+      }
+    }
+
+    window.addEventListener('pagehide', handlePageExit)
+    window.addEventListener('beforeunload', handlePageExit)
+    return () => {
+      window.removeEventListener('pagehide', handlePageExit)
+      window.removeEventListener('beforeunload', handlePageExit)
+    }
+  }, [])
 
   useEffect(() => () => {
     if (taskHideTimerRef.current != null) {
@@ -2042,13 +2513,256 @@ export default function AISidebar({
     return data
   }, [effectiveOcrEndpoint, isOcrReady, ocrConfig.backend, ocrConfig.enabled, ocrConfig.maxImages, ocrConfig.model, ocrConfig.providerId, ocrConfig.timeoutSeconds])
 
+  const ensureVisionModelReady = useCallback(async () => {
+    if (currentModelSupportsVision) return
+    if (!isVisionFallbackReady) {
+      throw new Error('当前主模型不是多模态模型，且未配置可用的多模态图片分析模型。请在设置中启用并测试多模态模型。')
+    }
+    const cacheKey = `${visionConfig.providerId}|${visionConfig.endpoint || activeVisionProvider?.endpoint || ''}|${visionConfig.model}`
+    if (visionTestCacheRef.current.get(cacheKey)) return
+    const response = await fetch('/api/ai/vision/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerId: visionConfig.providerId,
+        endpoint: visionConfig.endpoint || activeVisionProvider?.endpoint || undefined,
+        model: visionConfig.model,
+        timeoutSeconds: visionConfig.timeoutSeconds,
+      }),
+    })
+    const data = await response.json() as { success?: boolean; detail?: string }
+    if (!response.ok || data.success !== true) {
+      throw new Error(data.detail || '多模态图片分析模型测试失败')
+    }
+    visionTestCacheRef.current.set(cacheKey, true)
+  }, [activeVisionProvider?.endpoint, currentModelSupportsVision, isVisionFallbackReady, visionConfig.endpoint, visionConfig.model, visionConfig.providerId, visionConfig.timeoutSeconds])
+
+  const requestVisionAnalysis = useCallback(async (target: DocumentImageTarget, instruction: string) => {
+    await ensureVisionModelReady()
+    const response = await fetch('/api/ai/vision/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerId: activeProviderId || undefined,
+        model: selectedModel || modelName || undefined,
+        instruction,
+        context: {
+          imageId: target.imageId,
+          paragraphIndex: target.paragraphIndex,
+          imageIndex: target.imageIndex,
+          page: target.page,
+          alt: target.alt,
+          title: target.title,
+          width: target.width,
+          height: target.height,
+          beforeText: target.beforeText,
+          paragraphText: target.paragraphText,
+          afterText: target.afterText,
+        },
+        image: {
+          name: target.alt || target.title || target.imageId,
+          type: inferImageMimeType(target.dataUrl),
+          size: estimateDataUrlSize(target.dataUrl),
+          dataUrl: target.dataUrl,
+        },
+      }),
+    })
+    const data = await response.json() as { success?: boolean; result?: Record<string, unknown>; detail?: string; model?: string; providerId?: string; usedFallbackVisionConfig?: boolean }
+    if (!response.ok || data.success !== true) throw new Error(data.detail || '多模态图片分析失败')
+    return data
+  }, [activeProviderId, ensureVisionModelReady, modelName, selectedModel])
+
+  const analyzeDocumentImage = useCallback(async (params: Record<string, unknown>): Promise<ExecuteResult> => {
+    if (!editorView) return { success: false, message: '编辑器尚未就绪，无法分析文档图片' }
+    const target = findDocumentImageTarget(editorView.state, params, pageConfig)
+    if (!target) return { success: false, message: '未找到指定的文档图片' }
+    if (!target.dataUrl.startsWith('data:')) {
+      return { success: false, message: '当前图片不是内嵌 data URL，暂不能从文档内直接发送给图片分析模型' }
+    }
+    const cached = imageAnalysisCacheRef.current.get(target.fingerprint)
+    if (cached) {
+      return {
+        success: true,
+        message: `已命中图片分析缓存：${target.imageId}`,
+        data: { ...(cached as Record<string, unknown>), cacheHit: true },
+      }
+    }
+
+    const requestedMode = normalizeDocumentImageAnalysisMode(params.analysisMode)
+    const taskType = normalizeOcrTaskType(typeof params.taskType === 'string' ? params.taskType : undefined)
+    const modeUsed = chooseDocumentImageMode(target, requestedMode, taskType)
+    const instruction = typeof params.instruction === 'string' ? params.instruction : ''
+    const warnings: string[] = []
+    let visualResult: Record<string, unknown> = {}
+    let ocrResponse: OcrAnalysisResponse | null = null
+
+    try {
+      if (modeUsed === 'multimodal' || modeUsed === 'both') {
+        const vision = await requestVisionAnalysis(target, instruction)
+        visualResult = vision.result ?? {}
+      }
+      if (modeUsed === 'ocr' || modeUsed === 'both') {
+        ocrResponse = await requestOcrAnalysis({
+          taskType,
+          instruction,
+          source: 'intent',
+        }, [{
+          id: target.imageId,
+          name: target.alt || target.title || target.imageId,
+          size: estimateDataUrlSize(target.dataUrl),
+          type: inferImageMimeType(target.dataUrl),
+          kind: 'image',
+          dataUrl: target.dataUrl,
+        }])
+      }
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : String(error) }
+    }
+
+    const firstOcr = ocrResponse?.results[0]
+    const result = {
+      imageId: target.imageId,
+      fingerprint: target.fingerprint,
+      paragraphIndex: target.paragraphIndex,
+      imageIndex: target.imageIndex,
+      page: target.page,
+      modeUsed,
+      visualSummary: String(visualResult.visualSummary ?? visualResult.summary ?? ''),
+      ocrText: firstOcr?.markdown || firstOcr?.plainText || firstOcr?.handwritingText || '',
+      tables: firstOcr?.tables ?? [],
+      detectedObjects: Array.isArray(visualResult.detectedObjects) ? visualResult.detectedObjects : [],
+      chartSummary: visualResult.chartSummary ?? firstOcr?.charts?.map(chart => chart.summary).filter(Boolean).join('\n') ?? '',
+      styleHints: visualResult.styleHints ?? {},
+      warnings: [...warnings, ...(Array.isArray(visualResult.warnings) ? visualResult.warnings.map(String) : []), ...(firstOcr?.warnings ?? [])],
+      confidence: typeof visualResult.confidence === 'number' ? visualResult.confidence : (firstOcr ? 0.8 : 0.7),
+      cacheHit: false,
+    }
+    imageAnalysisCacheRef.current.set(target.fingerprint, result)
+    return {
+      success: true,
+      message: `已完成文档图片分析：${target.imageId}（${modeUsed}）`,
+      data: result,
+    }
+  }, [editorView, pageConfig, requestOcrAnalysis, requestVisionAnalysis])
+
+  const capturePageScreenshot = useCallback(async (params: Record<string, unknown>): Promise<ExecuteResult> => {
+    if (!editorView) return { success: false, message: '编辑器尚未就绪，无法截取页面截图' }
+    const page = Number(params.page)
+    if (!Number.isInteger(page) || page < 1) return { success: false, message: 'page 必须是从 1 开始的整数' }
+
+    const metadata = buildPageSnapshotMetadata(editorView.state, pageConfig, page)
+    if (!metadata) return { success: false, message: `未找到第 ${page} 页` }
+
+    const canvasElement = getPageCanvasElement?.()
+    if (!canvasElement) return { success: false, message: '页面画布尚未就绪，无法截取截图' }
+
+    const pageTop = (page - 1) * (pageConfig.pageHeight + pageGap)
+    try {
+      const rendered = await html2canvas(canvasElement, {
+        backgroundColor: null,
+        logging: false,
+        scale: Math.min(Math.max(window.devicePixelRatio || 1, 1), 2),
+        useCORS: true,
+        x: 0,
+        y: pageTop,
+        width: pageConfig.pageWidth,
+        height: pageConfig.pageHeight,
+        windowWidth: Math.max(canvasElement.scrollWidth, pageConfig.pageWidth),
+        windowHeight: Math.max(canvasElement.scrollHeight, pageTop + pageConfig.pageHeight),
+      })
+      const dataUrl = rendered.toDataURL('image/png')
+      return {
+        success: true,
+        message: `已截取第 ${page} 页截图`,
+        data: {
+          ...metadata,
+          width: pageConfig.pageWidth,
+          height: pageConfig.pageHeight,
+          instruction: typeof params.instruction === 'string' ? params.instruction : '',
+          dataUrl,
+        },
+      }
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  }, [editorView, getPageCanvasElement, pageConfig, pageGap])
+
+  const startStreamingWriteMarker = useCallback((
+    conversationId: string,
+    sessionId: string,
+    session: StreamingWriteSession,
+  ) => {
+    const marker: StreamingWriteMarker = {
+      conversationId,
+      sessionId,
+      streamingWriteId: session.id,
+      toolName: 'begin_streaming_write',
+      state: 'active',
+      lastAppliedChars: session.text.length,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      interruptEventId: `${session.id}:interrupted`,
+      closeEventId: `${session.id}:closed`,
+    }
+    activeStreamingWriteMarkerRef.current = marker
+    upsertStreamingWriteMarker(marker)
+    return marker
+  }, [])
+
+  const updateStreamingWriteMarkerProgress = useCallback((session: StreamingWriteSession) => {
+    const marker = activeStreamingWriteMarkerRef.current
+    if (!marker) return
+    const next = {
+      ...marker,
+      lastAppliedChars: session.text.length,
+      updatedAt: nowIso(),
+    }
+    activeStreamingWriteMarkerRef.current = next
+    upsertStreamingWriteMarker(next)
+  }, [])
+
+  const reportActiveStreamingWriteInterrupted = useCallback((
+    reason: string,
+    transport: 'fetch' | 'beacon' = 'fetch',
+  ) => {
+    const marker = activeStreamingWriteMarkerRef.current
+    if (!marker || marker.state === 'closed') return
+    const interrupted = markStreamingWriteMarkerInterrupted(marker, reason)
+    activeStreamingWriteMarkerRef.current = interrupted
+    postStreamingWriteClientEvent(interrupted, reason === 'pagehide' || reason === 'beforeunload' ? 'page_refresh' : 'stream_write_interrupted', reason, transport)
+  }, [])
+
+  const closeActiveStreamingWriteMarker = useCallback((reason: string) => {
+    const marker = activeStreamingWriteMarkerRef.current
+    if (!marker) return
+    const closed = markStreamingWriteMarkerClosed(marker)
+    postStreamingWriteClientEvent(closed, 'stream_write_closed', reason)
+    removeStreamingWriteMarker(marker.sessionId, marker.streamingWriteId)
+    activeStreamingWriteMarkerRef.current = null
+  }, [])
+
   const loadConversations = useCallback(async () => {
     setHistoryLoading(true)
     try {
       const response = await fetch('/api/conversations')
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const data = (await response.json()) as ConversationSummary[]
-      setConversations(data)
+      const enriched = await Promise.all(data.map(async conversation => {
+        try {
+          const runResponse = await fetch(`/api/conversations/${conversation.id}/runs/active`)
+          if (!runResponse.ok) return conversation
+          const payload = await runResponse.json() as { run?: ReactRunSummary | null }
+          return {
+            ...conversation,
+            runStatus: payload.run?.status ?? null,
+            activeRunSessionId: payload.run?.sessionId ?? null,
+            streamWriteState: payload.run?.streamWriteState ?? null,
+          }
+        } catch {
+          return conversation
+        }
+      }))
+      setConversations(enriched)
     } catch (error) {
       console.error('[AISidebar] load conversations failed', error)
       setConversations([])
@@ -2056,6 +2770,331 @@ export default function AISidebar({
       setHistoryLoading(false)
     }
   }, [])
+
+  const subscribeToExistingRun = useCallback(async (
+    conversationId: string,
+    sessionId: string,
+    after = 0,
+    replayHighWater = 0,
+    allowCurrentPendingToolExecution = true,
+  ) => {
+    if (!sessionId) return
+    const aiMessage = makeAiMessage('', true)
+    setMessages(prev => prev.some(message => message.streaming) ? prev : [...prev, aiMessage])
+    setLoading(true)
+    activeRunSessionIdRef.current = sessionId
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    const updateMessage = (updater: (message: Message) => Message) => {
+      setMessages(prev => prev.map(message => (message.id === aiMessage.id ? updater(message) : message)))
+    }
+
+    let buffer = ''
+    let finalText = ''
+    let thinkingText = ''
+    let finished = false
+    let roundNumber = 0
+    let currentToolPlan: ToolExecutionPlan | null = null
+    const pendingToolCalls: ToolCallResult[] = []
+    const restoredImages = conversationMessagesRef.current
+      .filter(message => message.role === 'user')
+      .at(-1)?.attachments?.filter(isImageAttachment) ?? []
+
+    const executeRestoredPlan = async (plan: ToolExecutionPlan) => {
+      if (!editorView) {
+        throw new Error('编辑器尚未就绪，无法恢复执行前端工具')
+      }
+      const selectionContext = extractSelectionContext(getContext())
+      const toolCallsById = new Map<string, ToolCallResult>()
+      for (const toolCall of pendingToolCalls) {
+        if (toolCall.id) toolCallsById.set(toolCall.id, toolCall)
+      }
+      const results: Array<{ execution_id: string; content: string }> = []
+
+      for (const execution of plan.executions) {
+        const executedParams = serializeToolParamsWithSelection(execution.toolName, execution.params, selectionContext)
+        let result: ExecuteResult
+        if (execution.toolName === 'TaskCreate') {
+          const response = await fetch(`/api/conversations/${conversationId}/tasks`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(executedParams),
+          })
+          result = response.ok
+            ? { success: true, message: '任务已创建', data: await response.json() }
+            : { success: false, message: `HTTP ${response.status}` }
+        } else if (execution.toolName === 'TaskGet') {
+          const taskId = String(executedParams.taskId ?? '').trim()
+          const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`)
+          result = response.ok
+            ? { success: true, message: `已读取任务 #${taskId}`, data: await response.json() }
+            : { success: false, message: `HTTP ${response.status}` }
+        } else if (execution.toolName === 'TaskList') {
+          const latestTasks = await fetchTasksForConversation(conversationId)
+          result = { success: true, message: latestTasks.length > 0 ? `当前有 ${latestTasks.length} 个任务` : '当前还没有任务计划', data: { tasks: latestTasks, ...buildTaskStats(latestTasks) } }
+        } else if (execution.toolName === 'TaskUpdate') {
+          const taskId = String(executedParams.taskId ?? '').trim()
+          const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(executedParams),
+          })
+          result = response.ok
+            ? { success: true, message: `任务 #${taskId} 已更新`, data: await response.json() }
+            : { success: false, message: `HTTP ${response.status}` }
+        } else if (execution.toolName === 'begin_streaming_write') {
+          const beginResult = beginStreamingWrite(editorView, executedParams)
+          result = beginResult
+          if ('session' in beginResult && beginResult.session) {
+            activeStreamingWriteRef.current = beginResult.session
+            startStreamingWriteMarker(conversationId, sessionId, beginResult.session)
+          }
+        } else if (execution.toolName === 'capture_page_screenshot') {
+          result = await capturePageScreenshot(executedParams)
+        } else if (execution.toolName === 'analyze_document_image') {
+          result = await analyzeDocumentImage(executedParams)
+        } else if (execution.toolName === 'analyze_image_with_ocr') {
+          if (restoredImages.length === 0) {
+            result = { success: false, message: '恢复会话中没有可供 OCR 分析的图片' }
+          } else {
+            const ocrResponse = await requestOcrAnalysis({
+              taskType: normalizeOcrTaskType(typeof executedParams.taskType === 'string' ? executedParams.taskType : undefined),
+              instruction: typeof executedParams.instruction === 'string' ? executedParams.instruction : '',
+              source: 'slash',
+            }, restoredImages)
+            result = { success: true, message: `已完成 OCR 识别（${ocrResponse.imageCount} 张图片）`, data: ocrResponse }
+          }
+        } else {
+          result = await executeTool(editorView, execution.toolName, executedParams, {
+            pageConfig,
+            onPageConfigChange,
+            onDocumentStyleMutation,
+            imageAnalysisCache: imageAnalysisCacheRef.current,
+            selectionContext,
+          })
+        }
+
+        const sourceToolCall = execution.sourceToolCallIds
+          .map(toolCallId => toolCallsById.get(toolCallId))
+          .find((toolCall): toolCall is ToolCallResult => toolCall !== undefined)
+        updateMessage(message => ({
+          ...updateToolCallInMessage(
+            message,
+            currentToolCall => Boolean(sourceToolCall?.id && currentToolCall.id === sourceToolCall.id) || currentToolCall.name === execution.toolName,
+            currentToolCall => ({
+              ...currentToolCall,
+              params: executedParams,
+              status: result.success ? 'ok' : 'err',
+              message: result.message,
+              data: sanitizeToolResultForDisplay(execution.toolName, result).data,
+              isExpanded: false,
+            }),
+          ),
+          activityLabel: result.success ? '工具已执行，正在继续...' : '工具执行失败，正在交回模型处理...',
+        }))
+        results.push({
+          execution_id: execution.executionId,
+          content: serializeToolResultPayload({
+            toolName: execution.toolName,
+            result,
+            executedParams,
+            originalParams: normalizeToolParams(sourceToolCall?.originalParams ?? sourceToolCall?.params ?? execution.params),
+            extra: {
+              executionId: execution.executionId,
+              mergeStrategy: execution.mergeStrategy,
+              sourceToolCallIds: execution.sourceToolCallIds,
+              parallelGroup: execution.parallelGroup ?? null,
+            },
+          }),
+        })
+      }
+
+      const latestContext = getContext()
+      const response = await fetch(`/api/ai/react/${sessionId}/tool-results`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          plan_id: plan.planId,
+          round: plan.round,
+          agent_id: plan.agentId,
+          results,
+          stop: false,
+          context: latestContext,
+        }),
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    }
+    try {
+      const response = await fetch(`/api/ai/react/runs/${sessionId}/events?after=${after}`, {
+        signal: controller.signal,
+      })
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      while (!finished) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let event: Record<string, unknown>
+          try {
+            event = JSON.parse(line.slice(6)) as Record<string, unknown>
+          } catch {
+            continue
+          }
+
+          switch (event.type) {
+            case 'thinking': {
+              const chunk = String(event.content ?? '')
+              thinkingText += chunk
+              updateMessage(message => ({
+                ...appendThinkingChunk(message, chunk),
+                activityLabel: '正在恢复思考过程...',
+              }))
+              break
+            }
+            case 'round_start':
+              roundNumber = Number(event.round ?? roundNumber)
+              currentToolPlan = null
+              break
+            case 'content': {
+              const chunk = String(event.content ?? '')
+              finalText = stripToolResultJsonLeaks(finalText + chunk)
+              if (activeStreamingWriteRef.current && editorView && chunk) {
+                const streamResult = appendStreamingWrite(editorView, activeStreamingWriteRef.current, chunk)
+                if (streamResult.success) {
+                  updateStreamingWriteMarkerProgress(activeStreamingWriteRef.current)
+                } else {
+                  reportActiveStreamingWriteInterrupted(`append_failed:${streamResult.message}`)
+                  activeStreamingWriteRef.current.state = 'interrupted'
+                  activeStreamingWriteRef.current = null
+                }
+              }
+              updateMessage(message => ({
+                ...appendContentChunk(message, chunk),
+                activityLabel: activeStreamingWriteRef.current ? '正在写入正文...' : '正在生成回复...',
+              }))
+              break
+            }
+            case 'client_event': {
+              updateMessage(message => ({
+                ...appendContentChunk(message, `${message.text ? '\n\n' : ''}${String(event.message ?? '前端状态已同步到后端')}`),
+                activityLabel: '正在等待模型根据前端状态继续...',
+              }))
+              break
+            }
+            case 'tool_call': {
+              const toolCall: ToolCallResult = {
+                id: typeof event.id === 'string' ? event.id : undefined,
+                name: String(event.name ?? ''),
+                params: normalizeToolParams(event.params),
+                originalParams: normalizeToolParams(event.params),
+                status: 'pending',
+                isExpanded: true,
+              }
+              updateMessage(message => ({
+                ...appendToolSegment(message, toolCall),
+                activityLabel: `等待执行 ${toolCall.name}...`,
+              }))
+              pendingToolCalls.push(toolCall)
+              break
+            }
+            case 'tool_plan':
+              currentToolPlan = parseToolPlanEvent(event)
+              break
+            case 'tool_result': {
+              const toolId = typeof event.id === 'string' ? event.id : undefined
+              const toolName = String(event.name ?? '')
+              const result = (event.result && typeof event.result === 'object' && !Array.isArray(event.result))
+                ? event.result as Record<string, unknown>
+                : {}
+              updateMessage(message => ({
+                ...updateToolCallInMessage(
+                  message,
+                  currentToolCall => Boolean(toolId && currentToolCall.id === toolId) || (!toolId && currentToolCall.name === toolName && currentToolCall.status === 'pending'),
+                  currentToolCall => ({
+                    ...currentToolCall,
+                    status: result.success === true ? 'ok' : 'err',
+                    message: typeof result.message === 'string' ? result.message : '',
+                    data: result.data,
+                    isExpanded: false,
+                  }),
+                ),
+                activityLabel: '已收到工具结果，继续生成...',
+              }))
+              break
+            }
+            case 'awaiting_tool_results':
+              {
+                const eventSeq = Number(event.seq ?? 0)
+                const shouldExecuteTools = allowCurrentPendingToolExecution || eventSeq > replayHighWater
+                updateMessage(message => ({
+                  ...message,
+                  activityLabel: shouldExecuteTools ? '正在恢复执行前端工具...' : '正在回放工具执行记录...',
+                }))
+                if (shouldExecuteTools) {
+                  await executeRestoredPlan(currentToolPlan ?? buildFallbackToolPlan(roundNumber, pendingToolCalls))
+                }
+              }
+              break
+            case 'agent_progress':
+              if (String(event.phase ?? '') !== 'awaiting_tool_results') break
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '子代理等待前端工具结果...',
+              }))
+              break
+            case 'done':
+              finished = true
+              if (activeStreamingWriteRef.current) {
+                activeStreamingWriteRef.current.state = 'closed'
+                closeActiveStreamingWriteMarker('done')
+                activeStreamingWriteRef.current = null
+              }
+              updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
+              break
+            case 'error':
+              throw new Error(String(event.message ?? 'AI 请求失败'))
+          }
+        }
+      }
+
+      if (finalText.trim() || thinkingText.trim()) {
+        const message: StoredMessage = {
+          role: 'assistant',
+          content: finalText || null,
+          thinking: thinkingText || undefined,
+        }
+        await fetch(`/api/conversations/${conversationId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: [message] }),
+        })
+        conversationMessagesRef.current = [...conversationMessagesRef.current, message]
+      }
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AbortError')) {
+        console.error('[AISidebar] restore react run failed', error)
+        updateMessage(message => ({
+          ...appendContentChunk(message, buildErrorText(error), true),
+          streaming: false,
+          activityLabel: '',
+        }))
+      }
+    } finally {
+      setLoading(false)
+      abortRef.current = null
+      if (activeRunSessionIdRef.current === sessionId) activeRunSessionIdRef.current = null
+      void loadConversations()
+    }
+  }, [loadConversations])
 
   useEffect(() => {
     void loadConversations()
@@ -2073,6 +3112,7 @@ export default function AISidebar({
         setProviders(data.providers)
         setActiveProviderId(data.activeProviderId)
         setOcrConfig(data.ocrConfig || createDefaultOcrConfig())
+        setVisionConfig(data.visionConfig || createDefaultVisionConfig())
         setModelName(data.model || '')
         setSelectedModel(data.model || '')
       })
@@ -2176,23 +3216,51 @@ export default function AISidebar({
 
   const openConversation = useCallback(async (conversationId: string) => {
     if (openingConversationId) return
+    const navigationSeq = conversationNavigationSeqRef.current + 1
+    conversationNavigationSeqRef.current = navigationSeq
     shouldAutoScrollRef.current = true
     setOpeningConversationId(conversationId)
     try {
       const response = await fetch(`/api/conversations/${conversationId}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const data = (await response.json()) as ConversationDetail
+      if (conversationNavigationSeqRef.current !== navigationSeq) return
       setCurrentConversationId(data.id)
       setCurrentConversationTitle(data.title || '新会话')
       conversationMessagesRef.current = data.messages ?? []
       setMessages(fromStoredMessages(conversationMessagesRef.current, sidebarWidth))
       setViewMode('chat')
+      try {
+        const runResponse = await fetch(`/api/conversations/${conversationId}/runs/active`)
+        if (runResponse.ok) {
+          const payload = await runResponse.json() as { run?: ReactRunSummary | null }
+          if (conversationNavigationSeqRef.current !== navigationSeq) return
+          const run = payload.run
+          const hasFinalAssistant = (data.messages ?? []).some(message => message.role === 'assistant')
+          if (run?.sessionId && (run.status !== 'completed' || !hasFinalAssistant)) {
+            const marker = findActiveStreamingWriteMarker(conversationId, run.sessionId)
+            if (marker) {
+              const interrupted = markStreamingWriteMarkerInterrupted(marker, 'reopen_conversation_after_refresh')
+              postStreamingWriteClientEvent(interrupted, 'stream_write_interrupted', 'reopen_conversation_after_refresh')
+            }
+            void subscribeToExistingRun(
+              conversationId,
+              run.sessionId,
+              0,
+              Number(run.lastSeq ?? 0),
+              run.status === 'awaiting_client',
+            )
+          }
+        }
+      } catch (error) {
+        console.error('[AISidebar] load active react run failed', error)
+      }
     } catch (error) {
       console.error('[AISidebar] open conversation failed', error)
     } finally {
       setOpeningConversationId(current => (current === conversationId ? null : current))
     }
-  }, [openingConversationId, sidebarWidth])
+  }, [openingConversationId, sidebarWidth, subscribeToExistingRun])
 
   const deleteConversation = useCallback(async (conversationId: string) => {
     try {
@@ -2204,11 +3272,22 @@ export default function AISidebar({
         setCurrentConversationTitle('')
         conversationMessagesRef.current = []
         setMessages([])
+        window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY)
       }
     } catch (error) {
       console.error('[AISidebar] delete conversation failed', error)
     }
   }, [])
+
+  useEffect(() => {
+    if (autoRestoreAttemptedRef.current) return
+    if (currentConversationId || openingConversationId || conversations.length === 0) return
+    autoRestoreAttemptedRef.current = true
+    const storedConversationId = window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY)
+    if (!storedConversationId) return
+    if (!conversations.some(conversation => conversation.id === storedConversationId)) return
+    void openConversation(storedConversationId)
+  }, [conversations, currentConversationId, openConversation, openingConversationId])
 
   const exportConversation = useCallback(async (conversationId?: string | null) => {
     const targetConversationId = conversationId ?? currentConversationIdRef.current
@@ -2242,6 +3321,12 @@ export default function AISidebar({
         endpoint: effectiveOcrEndpoint || null,
         model: ocrConfig.model || null,
       },
+      visionConfig: {
+        enabled: visionConfig.enabled,
+        providerId: visionConfig.providerId,
+        endpoint: visionConfig.endpoint || activeVisionProvider?.endpoint || null,
+        model: visionConfig.model || null,
+      },
       includeSelection,
       currentContext: getContext(),
       storedMessages: detail?.messages ?? conversationMessagesRef.current,
@@ -2252,9 +3337,15 @@ export default function AISidebar({
 
     const safeTitle = String(payload.title || 'conversation').replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 40) || 'conversation'
     downloadJsonFile(`${safeTitle}-${targetConversationId ?? 'draft'}.json`, payload)
-  }, [activeProviderId, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, includeSelection, messages, modelName, ocrConfig.backend, ocrConfig.model, ocrConfig.providerId, selectedModel])
+  }, [activeProviderId, activeVisionProvider?.endpoint, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, includeSelection, messages, modelName, ocrConfig.backend, ocrConfig.model, ocrConfig.providerId, selectedModel, visionConfig.enabled, visionConfig.endpoint, visionConfig.model, visionConfig.providerId])
 
   const handleCancel = useCallback(() => {
+    const sessionId = activeRunSessionIdRef.current
+    if (sessionId) {
+      void fetch(`/api/ai/react/runs/${sessionId}/cancel`, { method: 'POST' }).catch(error => {
+        console.error('[AISidebar] cancel react run failed', error)
+      })
+    }
     abortRef.current?.abort()
   }, [])
 
@@ -2326,8 +3417,8 @@ export default function AISidebar({
       return
     }
     const ocrIntent = imageAttachments.length > 0 ? (parseOcrCommand(rawText) ?? detectOcrIntent(rawText)) : null
-    const text = rawText || (pendingAttachments.length > 0 ? buildDefaultAttachmentPrompt(assistantMode, pendingAttachments) : '')
-    if (!text || loading) return
+    const text = rawText
+    if ((!text && pendingAttachments.length === 0) || loading) return
 
     const templateMatch = resolveTemplateFromMessage(text, templates)
     if (templateMatch.ambiguous.length > 0) {
@@ -2357,6 +3448,10 @@ export default function AISidebar({
     const aiMessage = makeAiMessage('', true)
 
     if (shouldStartNewConversation) {
+      autoRestoreAttemptedRef.current = true
+      conversationNavigationSeqRef.current += 1
+      currentConversationIdRef.current = null
+      window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY)
       applyTaskState([])
       setAgentRuns([])
       setIsAgentPanelExpanded(false)
@@ -2401,7 +3496,9 @@ export default function AISidebar({
     } catch { /* ignore */ }
     let persistedAssistantText = ''
     let conversationPersisted = false
-    const persistedRecords: StoredMessage[] = [{ role: 'user', content: text, attachments: pendingAttachments }]
+    let userMessagePersisted = false
+    const userRecord: StoredMessage = { role: 'user', content: text, attachments: pendingAttachments }
+    const persistedRecords: StoredMessage[] = [userRecord]
     let pendingStreamingChunk = ''
     let streamingFlushTimer: number | null = null
 
@@ -2466,8 +3563,13 @@ export default function AISidebar({
 
       if (!streamResult.success) {
         console.error('[AISidebar] append streaming write failed', streamResult.message)
+        reportActiveStreamingWriteInterrupted(`append_failed:${streamResult.message}`)
+        activeStreamingWriteRef.current.state = 'interrupted'
         activeStreamingWriteRef.current = null
+        activeStreamingWriteMarkerRef.current = null
+        return
       }
+      updateStreamingWriteMarkerProgress(activeStreamingWriteRef.current)
     }
 
     const queueStreamingWrite = (chunk: string) => {
@@ -2496,10 +3598,14 @@ export default function AISidebar({
       if (!session.text.trim()) {
         const rollbackResult = abortStreamingWrite(editorView, session)
         console.warn('[AISidebar] begin_streaming_write finished without streamed content', { reason, rollbackResult })
+        session.state = 'closed'
+        closeActiveStreamingWriteMarker(reason)
         activeStreamingWriteRef.current = null
         return '检测到 `begin_streaming_write` 后没有实际输出正文，已自动撤销这次空写入。'
       }
 
+      session.state = 'closed'
+      closeActiveStreamingWriteMarker(reason)
       activeStreamingWriteRef.current = null
       return null
     }
@@ -2525,6 +3631,16 @@ export default function AISidebar({
         void loadConversations()
       }
 
+      if (conversationId && !userMessagePersisted) {
+        await fetch(`/api/conversations/${conversationId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: [userRecord] }),
+        })
+        userMessagePersisted = true
+        conversationMessagesRef.current = [...previousConversationMessages, userRecord]
+      }
+
       const reactMessages = buildReactMessages(previousConversationMessages, text)
       let finished = false
       let sessionId = ''
@@ -2545,16 +3661,17 @@ export default function AISidebar({
           await fetch(`/api/conversations/${conversationId}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages: persistedRecords }),
+            body: JSON.stringify({ messages: userMessagePersisted ? persistedRecords.slice(1) : persistedRecords }),
           })
           conversationPersisted = true
-          conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
+          conversationMessagesRef.current = userMessagePersisted
+            ? [...previousConversationMessages, userRecord, ...persistedRecords.slice(1)]
+            : [...previousConversationMessages, ...persistedRecords]
         }
         return
       }
 
-      // ── Single SSE connection for the entire ReAct session ──
-      const response = await fetch('/api/ai/react/stream', {
+      const runResponse = await fetch('/api/ai/react/runs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -2584,6 +3701,17 @@ export default function AISidebar({
         }),
       })
 
+      if (!runResponse.ok) throw new Error(`HTTP ${runResponse.status}`)
+      const run = (await runResponse.json()) as ReactRunSummary
+      sessionId = String(run.sessionId || '')
+      activeRunSessionIdRef.current = sessionId || null
+      if (!sessionId) throw new Error('后端未返回 ReAct sessionId')
+
+      // ── Subscribe to the Gateway-owned ReAct session ──
+      const response = await fetch(`/api/ai/react/runs/${sessionId}/events?after=0`, {
+        signal: controller.signal,
+      })
+
       if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
 
       const reader = response.body.getReader()
@@ -2595,6 +3723,9 @@ export default function AISidebar({
       const pendingToolCalls: ToolCallResult[] = []
       const pendingAgentToolCalls = new Map<string, ToolCallResult[]>()
       const currentAgentToolPlans = new Map<string, ToolExecutionPlan>()
+      const executingAgentToolPlans = new Set<string>()
+      const agentToolResultPosts: Promise<void>[] = []
+      const agentThinkingKeys = new Set<string>()
       let roundToolResultsPersisted = false
 
       persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
@@ -2792,7 +3923,14 @@ export default function AISidebar({
             result = beginResult
             if ('session' in beginResult && beginResult.session) {
               activeStreamingWriteRef.current = beginResult.session
+              if (conversationId && sessionId) {
+                startStreamingWriteMarker(conversationId, sessionId, beginResult.session)
+              }
             }
+          } else if (execution.toolName === 'capture_page_screenshot') {
+            result = await capturePageScreenshot(executedParams)
+          } else if (execution.toolName === 'analyze_document_image') {
+            result = await analyzeDocumentImage(executedParams)
           } else if (execution.toolName === 'analyze_image_with_ocr') {
             if (imagesForRequest.length === 0) {
               result = { success: false, message: '当前轮没有可供 OCR 分析的图片' }
@@ -2822,6 +3960,7 @@ export default function AISidebar({
                 pageConfig,
                 onPageConfigChange,
                 onDocumentStyleMutation,
+                imageAnalysisCache: imageAnalysisCacheRef.current,
                 selectionContext,
               })
               : { success: false, message: '编辑器尚未就绪' }
@@ -2864,10 +4003,11 @@ export default function AISidebar({
               executedParams,
               result,
             } = completed
+            const displayResult = sanitizeToolResultForDisplay(execution.toolName, result)
 
             const mergedFollowerMessage = sourceToolCalls.length > 1
-              ? `${result.success ? '已合并到后端执行计划' : '后端执行计划失败'}：${execution.toolName} x${sourceToolCalls.length}`
-              : result.message
+              ? `${displayResult.success ? '已合并到后端执行计划' : '后端执行计划失败'}：${execution.toolName} x${sourceToolCalls.length}`
+              : displayResult.message
             const leaderId = sourceToolCalls[0]?.id ?? leaderToolCall.id
 
             updateMessage(message => {
@@ -2877,9 +4017,9 @@ export default function AISidebar({
                 currentToolCall => ({
                   ...currentToolCall,
                   params: currentToolCall.id === leaderId ? executedParams : currentToolCall.params,
-                  status: result.success ? 'ok' : 'err',
-                  message: currentToolCall.id === leaderId ? result.message : mergedFollowerMessage,
-                  data: result.data,
+                  status: displayResult.success ? 'ok' : 'err',
+                  message: currentToolCall.id === leaderId ? displayResult.message : mergedFollowerMessage,
+                  data: displayResult.data,
                   isExpanded: false,
                 }),
               )
@@ -2891,16 +4031,16 @@ export default function AISidebar({
                   currentToolCall => ({
                     ...currentToolCall,
                     params: executedParams,
-                    status: result.success ? 'ok' : 'err',
-                    message: result.message,
-                    data: result.data,
+                    status: displayResult.success ? 'ok' : 'err',
+                    message: displayResult.message,
+                    data: displayResult.data,
                     isExpanded: false,
                   }),
                 )
               }
 
               const activityLabel =
-                result.success === false
+                displayResult.success === false
                   ? '正在调整执行方案...'
                   : execution.toolName === 'begin_streaming_write'
                     ? '正在写入正文...'
@@ -2913,7 +4053,7 @@ export default function AISidebar({
               name: sourceToolCall.name,
               params: executedParams,
               originalParams: normalizeToolParams(sourceToolCall.originalParams ?? sourceToolCall.params),
-              result,
+              result: displayResult,
             }))
             persistedToolResults.push(...sourceRecords)
             executionResults.push({
@@ -2972,6 +4112,7 @@ export default function AISidebar({
         if (isAgentPlan && plan.agentId) {
           pendingAgentToolCalls.delete(plan.agentId)
           currentAgentToolPlans.delete(plan.agentId)
+          executingAgentToolPlans.delete(plan.agentId)
         } else {
           pendingToolCalls.length = 0
           serverExecutedToolResults.length = 0
@@ -2999,7 +4140,8 @@ export default function AISidebar({
 
           switch (event.type) {
             case 'session_created':
-              sessionId = String(event.sessionId ?? '')
+              sessionId = String(event.sessionId ?? sessionId)
+              activeRunSessionIdRef.current = sessionId || null
               break
 
             case 'round_start':
@@ -3008,6 +4150,7 @@ export default function AISidebar({
               roundAssistantText = ''
               roundThinkingText = ''
               currentToolPlan = null
+              agentThinkingKeys.clear()
               serverExecutedToolResults.length = 0
               roundToolResultsPersisted = false
               break
@@ -3080,10 +4223,32 @@ export default function AISidebar({
               if (phase === 'awaiting_tool_results' && agentId) {
                 const agentPlan = currentAgentToolPlans.get(agentId)
                 const agentCalls = pendingAgentToolCalls.get(agentId) ?? []
-                if (agentPlan) {
-                  await executeAndPostToolResults(agentPlan, agentCalls)
+                if (agentPlan && !executingAgentToolPlans.has(agentId)) {
+                  executingAgentToolPlans.add(agentId)
+                  const postPromise = executeAndPostToolResults(agentPlan, agentCalls).catch(error => {
+                    executingAgentToolPlans.delete(agentId)
+                    throw error
+                  })
+                  agentToolResultPosts.push(postPromise)
                 }
                 break
+              }
+              if (phase === 'thinking') {
+                const content = String(event.content ?? '')
+                if (content) {
+                  const thinkingKey = agentId || agentType
+                  const prefix = agentThinkingKeys.has(thinkingKey)
+                    ? ''
+                    : `${roundThinkingText ? '\n\n' : ''}[子代理 ${agentType} 思考过程]\n`
+                  agentThinkingKeys.add(thinkingKey)
+                  const thinkingChunk = `${prefix}${content}`
+                  roundThinkingText += thinkingChunk
+                  updateMessage(message => ({
+                    ...appendThinkingChunk(message, thinkingChunk),
+                    activityLabel: `子代理 ${agentType} 正在推理...`,
+                  }))
+                  break
+                }
               }
               updateMessage(message => ({
                 ...message,
@@ -3130,8 +4295,26 @@ export default function AISidebar({
             }
 
             case 'agent_tool_result': {
+              const toolResult = event.toolResult && typeof event.toolResult === 'object' && !Array.isArray(event.toolResult)
+                ? event.toolResult as Record<string, unknown>
+                : {}
+              const toolId = typeof toolResult.id === 'string' ? toolResult.id : undefined
+              const toolName = String(toolResult.name ?? '')
+              const result = toolResult.result && typeof toolResult.result === 'object' && !Array.isArray(toolResult.result)
+                ? toolResult.result as Record<string, unknown>
+                : {}
               updateMessage(message => ({
-                ...message,
+                ...updateToolCallInMessage(
+                  message,
+                  currentToolCall => Boolean(toolId && currentToolCall.id === toolId) || (!toolId && currentToolCall.name === toolName && currentToolCall.status === 'pending'),
+                  currentToolCall => ({
+                    ...currentToolCall,
+                    status: result.success === true ? 'ok' : 'err',
+                    message: typeof result.message === 'string' ? result.message : '',
+                    data: result.data,
+                    isExpanded: false,
+                  }),
+                ),
                 activityLabel: '子代理已收到工具结果，继续分析...',
               }))
               break
@@ -3371,16 +4554,22 @@ export default function AISidebar({
         }
       }
 
+      if (agentToolResultPosts.length > 0) {
+        await Promise.all(agentToolResultPosts)
+      }
+
       if (conversationId) {
         await fetch(`/api/conversations/${conversationId}/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            messages: persistedRecords,
+            messages: userMessagePersisted ? persistedRecords.slice(1) : persistedRecords,
           }),
         })
         conversationPersisted = true
-        conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
+        conversationMessagesRef.current = userMessagePersisted
+          ? [...previousConversationMessages, userRecord, ...persistedRecords.slice(1)]
+          : [...previousConversationMessages, ...persistedRecords]
       }
     } catch (error) {
       if (streamingFlushTimer != null) {
@@ -3423,10 +4612,12 @@ export default function AISidebar({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              messages: persistedRecords,
+              messages: userMessagePersisted ? persistedRecords.slice(1) : persistedRecords,
             }),
           })
-          conversationMessagesRef.current = [...previousConversationMessages, ...persistedRecords]
+          conversationMessagesRef.current = userMessagePersisted
+            ? [...previousConversationMessages, userRecord, ...persistedRecords.slice(1)]
+            : [...previousConversationMessages, ...persistedRecords]
         } catch (persistError) {
           console.error('[AISidebar] persist conversation failed', persistError)
         }
@@ -3440,11 +4631,13 @@ export default function AISidebar({
       closeStreamingWriteSession('finish')
       setLoading(false)
       abortRef.current = null
+      activeRunSessionIdRef.current = null
       void loadConversations()
     }
-  }, [activeProviderId, activeTemplate, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
+  }, [activeProviderId, activeTemplate, analyzeDocumentImage, applyTaskState, assistantMode, capturePageScreenshot, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
+  const groupedConversations = useMemo(() => groupConversationsByTime(conversations), [conversations])
 
   return (
     <div
@@ -3518,49 +4711,66 @@ export default function AISidebar({
               {historyLoading && conversations.length === 0 && (
                 <div className="text-sm text-gray-400 text-center py-8">加载中...</div>
               )}
-              {conversations.map(conversation => (
-                <div
-                  key={conversation.id}
-                  role="button"
-                  tabIndex={0}
-                  aria-disabled={openingConversationId !== null}
-                  onClick={() => void openConversation(conversation.id)}
-                  onKeyDown={event => {
-                    if (event.key !== 'Enter' && event.key !== ' ') return
-                    event.preventDefault()
-                    void openConversation(conversation.id)
-                  }}
-                  className="group w-full flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-left hover:border-blue-300 hover:bg-blue-50 transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-200"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm text-gray-800 truncate">{truncateTitle(conversation.title || '新会话')}</div>
-                    <div className="text-xs text-gray-400 mt-0.5">
-                      {openingConversationId === conversation.id ? '打开中...' : formatConversationTime(conversation.updatedAt || conversation.createdAt)}
-                    </div>
+              {groupedConversations.map(group => (
+                <section key={group.key} className="space-y-2">
+                  <div className="px-1 pt-1 text-[11px] font-medium text-gray-400">{group.label}</div>
+                  <div className="space-y-2">
+                    {group.conversations.map(conversation => (
+                      <div
+                        key={conversation.id}
+                        role="button"
+                        tabIndex={0}
+                        aria-disabled={openingConversationId !== null}
+                        onClick={() => void openConversation(conversation.id)}
+                        onKeyDown={event => {
+                          if (event.key !== 'Enter' && event.key !== ' ') return
+                          event.preventDefault()
+                          void openConversation(conversation.id)
+                        }}
+                        className="group w-full flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2 text-left hover:border-blue-300 hover:bg-blue-50 transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm text-gray-800 truncate">{truncateTitle(conversation.title || '新会话')}</div>
+                          <div className="text-xs text-gray-400 mt-0.5">
+                            {openingConversationId === conversation.id
+                              ? '打开中...'
+                              : conversation.streamWriteState === 'interrupted'
+                                ? '写入中断，等待重试'
+                                : conversation.runStatus === 'awaiting_client'
+                                ? '等待前端工具'
+                                : conversation.runStatus === 'running'
+                                  ? '运行中'
+                                  : conversation.runStatus === 'failed'
+                                    ? '运行失败'
+                                    : formatConversationTime(conversation.updatedAt || conversation.createdAt)}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={event => {
+                            event.stopPropagation()
+                            void exportConversation(conversation.id)
+                          }}
+                          className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-blue-500 text-sm flex-shrink-0"
+                          title="导出会话 JSON"
+                        >
+                          ⤓
+                        </button>
+                        <button
+                          type="button"
+                          onClick={event => {
+                            event.stopPropagation()
+                            void deleteConversation(conversation.id)
+                          }}
+                          className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-red-500 text-sm flex-shrink-0"
+                          title="删除会话"
+                        >
+                          🗑
+                        </button>
+                      </div>
+                    ))}
                   </div>
-                  <button
-                    type="button"
-                    onClick={event => {
-                      event.stopPropagation()
-                      void exportConversation(conversation.id)
-                    }}
-                    className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-blue-500 text-sm flex-shrink-0"
-                    title="导出会话 JSON"
-                  >
-                    ⤓
-                  </button>
-                  <button
-                    type="button"
-                    onClick={event => {
-                      event.stopPropagation()
-                      void deleteConversation(conversation.id)
-                    }}
-                    className="opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus:pointer-events-auto focus:opacity-100 transition-opacity text-gray-400 hover:text-red-500 text-sm flex-shrink-0"
-                    title="删除会话"
-                  >
-                    🗑
-                  </button>
-                </div>
+                </section>
               ))}
             </div>
           )
@@ -3572,7 +4782,7 @@ export default function AISidebar({
 
             {/* Task Panel */}
             {tasks.length > 0 && (
-              <div className="sticky top-0 z-20 -mx-1 px-1 pb-1">
+              <div className="sticky top-0 z-20 -mx-1 -mt-3 px-1 pb-1">
                 <div className="border border-blue-200 rounded-xl overflow-hidden bg-blue-50/95 backdrop-blur-sm shadow-sm flex-shrink-0">
                   {(() => {
                     const activeTask = tasks.find(task => task.status === 'in_progress')
@@ -3812,12 +5022,14 @@ export default function AISidebar({
                             }
 
                             if (segment.type === 'thinking') {
-                              const isActiveThinking = message.streaming && segmentIndex === message.segments.length - 1
+                              const isActiveThinking = message.streaming
                               const isThinkingExpanded = isActiveThinking || message.isThinkingExpanded
+                              const trimmedThinking = segment.text.trim()
+                              const thinkingPreview = truncateText(trimmedThinking.split(/\n+/)[0] || trimmedThinking, 96)
                               return (
                                 <div
                                   key={segment.id}
-                                  className="relative border-l-2 border-dashed border-slate-200 pl-3 text-[13px] leading-6 text-slate-500 before:absolute before:-left-[18px] before:top-2 before:h-2 before:w-2 before:rounded-full before:bg-sky-300"
+                                  className="relative border-l-2 border-dashed border-sky-200 bg-sky-50/40 rounded-r-lg py-1.5 pl-3 pr-2 text-[13px] leading-6 text-slate-600 before:absolute before:-left-[18px] before:top-3 before:h-2 before:w-2 before:rounded-full before:bg-sky-300"
                                 >
                                   <button
                                     type="button"
@@ -3827,14 +5039,19 @@ export default function AISidebar({
                                         prev.map(m => (m.id === message.id ? { ...m, isThinkingExpanded: !m.isThinkingExpanded } : m)),
                                       )
                                     }}
-                                    className="flex items-center gap-1 text-[10px] font-medium uppercase tracking-[0.18em] text-sky-500/80 hover:text-sky-600 transition-colors"
+                                    className="flex items-center gap-1 text-[11px] font-medium text-sky-600 hover:text-sky-700 transition-colors"
                                   >
                                     <span>{isThinkingExpanded ? '▾' : '▸'}</span>
-                                    <span>Thinking{isActiveThinking ? '…' : ''}</span>
+                                    <span>{isActiveThinking ? '思考中...' : '思考过程'}</span>
                                   </button>
                                   {isThinkingExpanded && (
                                     <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }} className="mt-1">
                                       {segment.text}
+                                    </div>
+                                  )}
+                                  {!isThinkingExpanded && thinkingPreview && (
+                                    <div className="mt-0.5 truncate text-xs text-slate-400">
+                                      {thinkingPreview}
                                     </div>
                                   )}
                                 </div>

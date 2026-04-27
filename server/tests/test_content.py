@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 
 from server.app.content import (
     build_delta_content,
@@ -10,6 +11,7 @@ from server.app.content import (
     build_system_content,
     build_user_content,
 )
+from server.app.ai import _prepare_page_screenshot_tool_result
 from server.app.agents import AgentDefinition
 from server.app.config import PRESET_PROVIDERS, normalize_config
 
@@ -68,6 +70,20 @@ class ContentModuleTest(unittest.TestCase):
         self.assertEqual(trace["clippedChars"], 1000)
         self.assertNotIn("A" * 100, str(trace))
 
+    def test_image_content_keeps_user_text_exact_without_image_instruction(self) -> None:
+        result = build_user_content(
+            "你能描述图片的内容么",
+            images=[{"dataUrl": "data:image/png;base64,AAAA"}],
+            image_processing_mode="direct_multimodal",
+        )
+
+        self.assertIsInstance(result.content, list)
+        text = result.content[0]["text"]
+        self.assertEqual(text, "你能描述图片的内容么")
+        self.assertNotIn("[图片输入]", text)
+        self.assertNotIn("请按用户原始请求", text)
+        self.assertNotIn("复现到当前文档", text)
+
     def test_prompt_cache_defaults_and_key(self) -> None:
         normalized = normalize_config({"providers": PRESET_PROVIDERS, "activeProviderId": "openai"})
         providers = {provider["id"]: provider for provider in normalized["providers"]}
@@ -122,6 +138,29 @@ class ContentModuleTest(unittest.TestCase):
         self.assertIn("敏感正文", payload["userPrompt"])
         self.assertNotIn("敏感正文", str(result.trace))
         self.assertEqual(result.trace["agentType"], "verification")
+
+    def test_page_screenshot_tool_result_injects_image_without_text_data_url(self) -> None:
+        raw = {
+            "success": True,
+            "message": "已截取第 2 页截图",
+            "toolName": "capture_page_screenshot",
+            "data": {
+                "page": 2,
+                "pageCount": 3,
+                "previewText": "页面预览",
+                "instruction": "检查图片是否压住文字",
+                "dataUrl": "data:image/png;base64,AAAA",
+            },
+        }
+        safe_content, image_message = _prepare_page_screenshot_tool_result(
+            json.dumps(raw, ensure_ascii=False),
+        )
+
+        self.assertNotIn("data:image/png", safe_content)
+        self.assertIsNotNone(image_message)
+        self.assertIsInstance(image_message.content, list)
+        self.assertEqual(image_message.content[1]["type"], "image_url")
+        self.assertEqual(image_message.content[1]["image_url"]["url"], "data:image/png;base64,AAAA")
 
 
 if __name__ == "__main__":

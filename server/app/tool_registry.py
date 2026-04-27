@@ -100,15 +100,17 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "TaskGet": ToolMetadata("task", "task_read", "更新任务前读取最新任务状态，避免 stale update。", subagent_ok=True, available_in_modes=MODE_AGENT),
     "TaskList": ToolMetadata("task", "task_read", "查看当前内部任务列表和剩余工作；复杂任务完成前用它确认状态。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_AGENT),
     "TaskUpdate": ToolMetadata("task", "task_write", "任务开始、完成或状态变化时更新内部任务。", "不要把未完成、失败或未验证的任务标记 completed。", available_in_modes=MODE_AGENT),
-    "Agent": ToolMetadata("agent", "agent", "启动只读子代理做调研、规划、排版分析或验收。", "简单定位、少量读取或主流程下一步能直接完成时不要调用。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_AGENT),
+    "Agent": ToolMetadata("agent", "agent", "启动只读子代理做调研、规划、排版分析或验收。", "简单定位、少量读取或主流程下一步能直接完成时不要调用。", executor_location=EXECUTOR_SERVER, parallel_safe=True, available_in_modes=MODE_AGENT),
     "get_document_info": ToolMetadata("read", "read", "快速了解文档统计、页数和整体状态。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_document_outline": ToolMetadata("read", "read", "长文档或结构不确定时先用它导航页码和段落范围。", "不要一开始就读取全文。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_document_content": ToolMetadata("read", "read", "按段落范围读取正文和结构；需要验证写入内容时使用。", "长文档优先先用 get_document_outline 缩小范围。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_page_content": ToolMetadata("read", "read", "按页检查正文、表格、图片附近内容和版面快照。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
+    "capture_page_screenshot": ToolMetadata("read", "read", "按页截取当前可见正文页面，供多模态模型检查实际视觉效果。", "只用于需要肉眼验收分页、图文混排、遮挡、重叠或视觉一致性的问题。", "返回页面元数据；截图原图只注入多模态消息，不应保留在普通文本上下文。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_page_style_summary": ToolMetadata("read", "read", "怀疑标题/正文样式、分页或页级排版异常时抽查。", "普通内容核对不要用 format 级读取。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_paragraph": ToolMetadata("read", "read", "精确读取单段文字或样式，适合局部校验。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "search_text": ToolMetadata("search", "search", "按文字定位段落和锁定范围；修改某个词/短语前先用它精确定位。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_comments": ToolMetadata("read", "read", "需要处理批注、审阅意见或验收是否遗漏批注时使用。", subagent_ok=True, parallel_safe=True, available_in_modes=MODE_ALL),
+    "analyze_document_image": ToolMetadata("read", "read", "分析当前文档内图片，自动选择多模态、OCR 或两者结合。", "只读工具；不会修改文档，不会在上下文中暴露完整 data URL。", search_hint="文档 图片 多模态 视觉分析 OCR", subagent_ok=True, parallel_safe=False, should_defer=True, available_in_modes=MODE_AGENT),
     "analyze_image_with_ocr": ToolMetadata("read", "ocr", "图片涉及表格、扫描件、手写、公式或明确 OCR 任务时使用。", "普通图片复现优先直接多模态理解。", search_hint="OCR 图片 表格 扫描件 手写 公式", subagent_ok=True, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
     "set_text_style": ToolMetadata("style", "style", "只改文字片段的字体、颜色、粗体等内联样式。", "不要用它设置段落对齐、缩进、标题级别。", "返回受影响快照。", available_in_modes=MODE_LAYOUT_AGENT),
     "set_paragraph_style": ToolMetadata("style", "style", "设置段落对齐、缩进、行距、标题级别、列表或段前分页。", "只改某个词本身时用 set_text_style。", "返回受影响快照。", available_in_modes=MODE_LAYOUT_AGENT),
@@ -232,6 +234,8 @@ def build_tool_guidance_section(
             lines.append("- 同步子代理可请求前端只读工具读取当前编辑器状态；如果需要写入，只能把建议返回给父代理执行。")
         if agent_type == "verification":
             lines.append("- 验收顺序：先理解父代理委托和原始目标，再用 TaskList/outline/页面或段落读取核对结果，结论必须以 PASS / PARTIAL / FAIL 开头。")
+            if "capture_page_screenshot" in enabled:
+                lines.append("- 页面级视觉验收必须先确认页数/页码，再对被分配页调用 capture_page_screenshot；结合截图和结构化读取结论说明证据。")
             lines.append("- verification 不做修复；发现问题时说明证据、遗漏和建议父代理调用的下一步工具。")
         elif agent_type == "document-research":
             lines.append("- 调研优先级：当前文档 → 工作区资料 → 必要时 web_search；输出要区分文档内证据、外部资料和推断。")
@@ -239,12 +243,14 @@ def build_tool_guidance_section(
             lines.append("- 写作规划只产出结构、段落安排、措辞建议和父代理执行步骤，不直接写入正文。")
         elif agent_type == "layout-plan":
             lines.append("- 排版规划只分析页面、段落、标题、目录、图片和表格附近问题，并给出父代理可执行的格式化步骤。")
+        elif agent_type == "image-analysis":
+            lines.append("- 图片分析先读取图片所在页/段落和上下文，再调用 analyze_document_image；文本密集图片用 OCR，照片/无文字图用多模态，复杂截图或图表+文字用 both。")
         else:
             lines.append("- 开放式调研要先用读取/搜索工具缩小范围，再给出证据、风险和可执行建议。")
     else:
         lines.append("- 优先使用已绑定的专用工具；不要请求当前模式不可用的工具。")
-        if enabled & {"get_document_outline", "get_document_content", "get_page_content", "get_paragraph", "search_text"}:
-            lines.append("- 读取阶梯：结构不确定先 get_document_outline；按页判断用 get_page_content；按段落范围用 get_document_content；局部核对用 get_paragraph；改具体文字前用 search_text 锁定范围。")
+        if enabled & {"get_document_outline", "get_document_content", "get_page_content", "capture_page_screenshot", "get_paragraph", "search_text"}:
+            lines.append("- 读取阶梯：结构不确定先 get_document_outline；按页判断用 get_page_content；需要视觉验收时用 capture_page_screenshot；按段落范围用 get_document_content；局部核对用 get_paragraph；改具体文字前用 search_text 锁定范围。")
         if enabled & {"begin_streaming_write", "insert_text", "insert_paragraph_after", "replace_paragraph_text", "replace_selection_text", "delete_selection_text", "delete_paragraph"}:
             lines.append("- 写入阶梯：长文/多段/整体重写用 begin_streaming_write 并立刻输出 Markdown；短插入用 insert_text/insert_paragraph_after；局部替换用 replace_paragraph_text 或 replace_selection_text；删除前确认范围。")
         if enabled & {"apply_style_batch", "set_text_style", "set_paragraph_style", "clear_formatting", "set_page_config", "insert_table_of_contents"}:
@@ -252,7 +258,8 @@ def build_tool_guidance_section(
         if enabled & {"workspace_search", "workspace_read", "web_search"}:
             lines.append("- 资料检索：工作区资料优先 workspace_search 再 workspace_read；只有实时信息、公开网页或工作区外事实才用 web_search。")
         if "Agent" in enabled:
-            lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，复杂验收用 verification。")
+            lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，文档内图片语义用 image-analysis，复杂验收用 verification。")
+            lines.append("- 多页视觉验收时，先读取页数；然后在同一轮并行发起多个 Agent(subagent_type='verification')，每个委托只指定一个页码和对应验收标准。")
         if enabled & {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
             lines.append("- 任务工具只用于 AI 内部多步计划；用户说任务列表/checklist 时默认是文档正文需求，不要误用内部任务工具。")
         if TOOL_SEARCH_NAME in enabled:

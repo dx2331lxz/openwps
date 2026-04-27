@@ -279,15 +279,6 @@ def build_user_content(
             },
         )
 
-    user_text = (
-        user_text
-        + f"\n\n[图片输入]\n本轮附带了 {image_count} 张图片。"
-          + (
-              "当前路径是直接多模态模式。请直接根据图片内容和样式线索复现到当前文档中。"
-              if image_processing_mode == DEFAULT_IMAGE_PROCESSING_MODE
-              else "请根据图片内容复现到当前文档中。"
-          )
-    )
     content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for image in images:
         url = image.get("dataUrl") if isinstance(image, dict) else None

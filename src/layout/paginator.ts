@@ -50,6 +50,7 @@ export interface RenderUnit {
   endPos: number | null
   style: RenderTextStyle
   hasComment: boolean
+  hasLink: boolean
   width: number
   renderWidth: number
   glyphWidth: number
@@ -65,14 +66,16 @@ export interface RenderedLine extends LineInfo {
   usedWidth: number
   renderedWidth: number
   isLastLineOfParagraph: boolean
-  listType?: 'task' | null
+  listType?: 'task' | 'bullet' | 'ordered' | null
   listChecked?: boolean
+  listIndex?: number
   lineStyle?: string
   lineColor?: string
   tocTitle?: string
   tocLevelRange?: string
   tocHyperlink?: boolean
   tocEntries?: RenderedTableOfContentsEntry[]
+  table?: RenderedTable
 }
 
 export interface RenderedTableOfContentsEntry {
@@ -82,10 +85,36 @@ export interface RenderedTableOfContentsEntry {
   blockIndex: number
 }
 
+export interface RenderedTableCell {
+  text: string
+  paragraphs: string[]
+  firstTextPos: number | null
+  colspan: number
+  rowspan: number
+  header: boolean
+  backgroundColor: string
+  borderColor: string
+  borderWidth: number
+  width: number
+  height: number
+}
+
+export interface RenderedTableRow {
+  height: number
+  cells: RenderedTableCell[]
+}
+
+export interface RenderedTable {
+  rows: RenderedTableRow[]
+  width: number
+  height: number
+}
+
 export interface FloatingTextRun {
   text: string
   style: RenderTextStyle
   hasComment: boolean
+  hasLink: boolean
 }
 
 export interface FloatingParagraph {
@@ -145,6 +174,16 @@ export interface DomBlockMetric {
   height: number
   marginTop: number
   marginBottom: number
+  table?: {
+    width: number
+    rows: Array<{
+      height: number
+      cells: Array<{
+        width: number
+        height: number
+      }>
+    }>
+  }
 }
 
 export interface PaginateOptions {
@@ -178,6 +217,7 @@ interface MeasureUnit {
   measuredText: string
   style: RenderTextStyle
   hasComment: boolean
+  hasLink: boolean
   fontStr: string
   width: number
   compressedWidth: number
@@ -366,6 +406,7 @@ interface SourceChar {
   char: string
   style: RenderTextStyle
   hasComment: boolean
+  hasLink: boolean
   startPos: number | null
   endPos: number | null
 }
@@ -387,6 +428,7 @@ function extractParagraphSourceChars(paraNode: PMNode, paraPos: number): SourceC
         char: text[index] ?? '',
         style,
         hasComment: child.marks.some((mark) => mark.type.name === 'comment'),
+        hasLink: child.marks.some((mark) => mark.type.name === 'link'),
         startPos: childStart + index,
         endPos: childStart + index + 1,
       })
@@ -484,6 +526,7 @@ function buildMeasureUnits(chars: SourceChar[]): MeasureUnit[] {
       measuredText,
       style,
       hasComment: sourceChar.hasComment,
+      hasLink: sourceChar.hasLink,
       fontStr: textStyleToFontStr(style),
       width: 0,
       compressedWidth: 0,
@@ -540,6 +583,7 @@ function buildTabbedLine(
         endPos: unit.endPos,
         style: unit.style,
         hasComment: unit.hasComment,
+        hasLink: unit.hasLink,
         width: unit.width,
         renderWidth: unit.width,
         glyphWidth: unit.compressedWidth,
@@ -645,6 +689,7 @@ function fitUnitsToLines(
         endPos: unit.endPos,
         style: unit.style,
         hasComment: unit.hasComment,
+        hasLink: unit.hasLink,
         width: unit.width,
         renderWidth: unit.width,
         glyphWidth: unit.compressedWidth,
@@ -663,6 +708,7 @@ function fitUnitsToLines(
           endPos: unit.endPos,
           style: unit.style,
           hasComment: unit.hasComment,
+          hasLink: unit.hasLink,
           width: unit.width,
           renderWidth: unit.width,
           glyphWidth: unit.compressedWidth,
@@ -682,6 +728,7 @@ function fitUnitsToLines(
         endPos: unit.endPos,
         style: unit.style,
         hasComment: unit.hasComment,
+        hasLink: unit.hasLink,
         width: unit.width,
         renderWidth: Math.max(unit.compressedWidth, unit.width - applied),
         glyphWidth: unit.compressedWidth,
@@ -788,7 +835,8 @@ function measureParagraph(
   paraNode: PMNode,
   paraPos: number,
   blockIndex: number,
-  contentWidth: number
+  contentWidth: number,
+  orderedListIndex = 0
 ): MeasuredBlock {
   const { fontSize } = getParagraphTextStyle(paraNode)
   const align = ((paraNode.attrs.align as string) ?? 'left') as RenderedLine['align']
@@ -798,10 +846,12 @@ function measureParagraph(
   const paragraphIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.indent as number) ?? 0) * 2)))
   const paragraphRightIndentPx = Math.max(0, ptToPx(fontSize * (((paraNode.attrs.rightIndent as number) ?? 0) * 2)))
   const firstLineIndentPx = Math.max(0, ptToPx(fontSize * ((paraNode.attrs.firstLineIndent as number) ?? 0)))
-  const listType = ((paraNode.attrs.listType as string | null) ?? null) === 'task' ? 'task' : null
+  const rawListType = (paraNode.attrs.listType as string | null) ?? null
+  const listType: RenderedLine['listType'] =
+    rawListType === 'task' || rawListType === 'bullet' || rawListType === 'ordered' ? rawListType : null
   const listChecked = Boolean(paraNode.attrs.listChecked)
   const listLevel = Math.max(0, Number(paraNode.attrs.listLevel ?? 0))
-  const listIndentPx = listType === 'task' ? ptToPx(fontSize * (2 + listLevel * 2)) : 0
+  const listIndentPx = listType ? ptToPx(fontSize * (2 + listLevel * 2)) : 0
   const tabStops = parseParagraphTabStops(paraNode.attrs.tabStops)
 
   const fontSizePx = ptToPx(fontSize)
@@ -844,6 +894,7 @@ function measureParagraph(
         isLastLineOfParagraph: true,
         listType,
         listChecked,
+        listIndex: listType === 'ordered' ? Math.max(1, orderedListIndex) : undefined,
       }],
       totalHeight: lineHeight + spaceBefore + spaceAfter,
     }
@@ -881,6 +932,7 @@ function measureParagraph(
             endPos: null,
             style: { ...DEFAULT_TEXT_STYLE, fontSize },
             hasComment: false,
+            hasLink: false,
             width: fontSizePx,
             renderWidth: fontSizePx,
             glyphWidth: fontSizePx,
@@ -920,6 +972,7 @@ function measureParagraph(
         isLastLineOfParagraph: false,
         listType,
         listChecked,
+        listIndex: listType === 'ordered' ? Math.max(1, orderedListIndex) : undefined,
       })
       lineIndex += 1
     })
@@ -996,12 +1049,18 @@ function buildFloatingParagraphs(node: PMNode): FloatingParagraph[] {
             typeof mark === 'object' &&
             (mark as { type?: string }).type === 'comment'
           ))
+          const linkMark = marks.find((mark) => (
+            Boolean(mark) &&
+            typeof mark === 'object' &&
+            (mark as { type?: string }).type === 'link'
+          ))
           const style = { ...DEFAULT_TEXT_STYLE, ...(textStyleMark?.attrs ?? {}) }
           maxFontSize = Math.max(maxFontSize, Number(style.fontSize) || DEFAULT_TEXT_STYLE.fontSize)
           return {
             text: String(item.text ?? ''),
             style,
             hasComment: Boolean(commentMark),
+            hasLink: Boolean(linkMark),
           }
         })
         .filter((run) => run.text.length > 0)
@@ -1074,7 +1133,7 @@ function measureTableCell(cellNode: PMNode, cellContentWidth: number): number {
     if (child.type.name === 'paragraph') {
       totalHeight += measureParagraph(child, 0, 0, Math.max(cellContentWidth, 40)).totalHeight
     } else if (child.type.name === 'table') {
-      totalHeight += measureTable(child, Math.max(cellContentWidth, 40)).totalHeight
+      totalHeight += measureTable(child, 0, Math.max(cellContentWidth, 40)).totalHeight
     } else {
       totalHeight += 24
     }
@@ -1096,7 +1155,67 @@ function buildTablePreviewText(tableNode: PMNode) {
   return text.length > 180 ? `${text.slice(0, 180)}...` : text
 }
 
-function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBlockMetric): MeasuredBlock {
+function getFirstParagraphTextPos(cellNode: PMNode, cellPos: number) {
+  let found: number | null = null
+  cellNode.descendants((node, relativePos) => {
+    if (found != null || node.type.name !== 'paragraph') return true
+    found = cellPos + 1 + relativePos + 1
+    return false
+  })
+  return found
+}
+
+function buildRenderedTable(tableNode: PMNode, tablePos: number, contentWidth: number, contentHeight: number, domMetric?: DomBlockMetric): RenderedTable {
+  const fallbackColumnCount = (() => {
+    let count = 1
+    tableNode.forEach((rowNode) => {
+      count = Math.max(count, countRowColumns(rowNode))
+    })
+    return count
+  })()
+  const fallbackCellWidth = Math.max(contentWidth / fallbackColumnCount, 48)
+  const fallbackRowCount = Math.max(tableNode.childCount, 1)
+  const fallbackRowHeight = Math.max(contentHeight / fallbackRowCount, TABLE_MIN_ROW_HEIGHT_PX)
+  const rows: RenderedTableRow[] = []
+
+  tableNode.forEach((rowNode, rowOffset, rowIndex) => {
+    const rowMetric = domMetric?.table?.rows[rowIndex]
+    const cells: RenderedTableCell[] = []
+    rowNode.forEach((cellNode, cellOffset, cellIndex) => {
+      const paragraphs: string[] = []
+      cellNode.forEach((child) => {
+        if (child.type.name === 'paragraph') paragraphs.push(child.textContent)
+      })
+      const cellPos = tablePos + 1 + rowOffset + 1 + cellOffset
+      const cellMetric = rowMetric?.cells[cellIndex]
+      cells.push({
+        text: cellNode.textContent,
+        paragraphs: paragraphs.length ? paragraphs : [cellNode.textContent],
+        firstTextPos: getFirstParagraphTextPos(cellNode, cellPos),
+        colspan: Math.max(1, Number(cellNode.attrs.colspan) || 1),
+        rowspan: Math.max(1, Number(cellNode.attrs.rowspan) || 1),
+        header: Boolean(cellNode.attrs.header),
+        backgroundColor: String(cellNode.attrs.backgroundColor ?? ''),
+        borderColor: String(cellNode.attrs.borderColor ?? '#cccccc') || '#cccccc',
+        borderWidth: Math.max(0, Number(cellNode.attrs.borderWidth ?? 1) || 0),
+        width: Math.max(cellMetric?.width ?? fallbackCellWidth, 1),
+        height: Math.max(cellMetric?.height ?? rowMetric?.height ?? fallbackRowHeight, 1),
+      })
+    })
+    rows.push({
+      height: Math.max(rowMetric?.height ?? fallbackRowHeight, 1),
+      cells,
+    })
+  })
+
+  return {
+    rows,
+    width: Math.max(domMetric?.table?.width ?? contentWidth, 1),
+    height: Math.max(contentHeight, 1),
+  }
+}
+
+function measureTable(tableNode: PMNode, tablePos: number, contentWidth: number, domMetric?: DomBlockMetric): MeasuredBlock {
   if (domMetric) {
     const contentHeight = Math.max(0, domMetric.height)
     const spaceBefore = Math.max(0, domMetric.marginTop)
@@ -1120,6 +1239,7 @@ function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBl
         usedWidth: 0,
         renderedWidth: 0,
         isLastLineOfParagraph: true,
+        table: buildRenderedTable(tableNode, tablePos, contentWidth, contentHeight, domMetric),
       }],
       totalHeight: spaceBefore + contentHeight + spaceAfter,
     }
@@ -1165,11 +1285,12 @@ function measureTable(tableNode: PMNode, contentWidth: number, domMetric?: DomBl
       availableWidth: contentWidth,
       xOffset: 0,
       usedWidth: 0,
-      renderedWidth: 0,
-      isLastLineOfParagraph: true,
-    }],
-    totalHeight: contentHeight + TABLE_BLOCK_MARGIN_PX * 2,
-  }
+        renderedWidth: 0,
+        isLastLineOfParagraph: true,
+        table: buildRenderedTable(tableNode, tablePos, contentWidth, contentHeight),
+      }],
+      totalHeight: contentHeight + TABLE_BLOCK_MARGIN_PX * 2,
+    }
 }
 
 function normalizeHeadingLevel(rawLevel: unknown) {
@@ -1213,13 +1334,15 @@ function measureBlock(
   contentWidth: number,
   headings: DocumentHeading[] = [],
   domBlockMetrics: readonly DomBlockMetric[] = [],
+  orderedListIndex = 0,
 ): MeasuredBlock {
   switch (node.type.name) {
     case 'paragraph':
-      return measureParagraph(node, nodePos, blockIndex, contentWidth)
+      return measureParagraph(node, nodePos, blockIndex, contentWidth, orderedListIndex)
     case 'table': {
       const measured = measureTable(
         node,
+        nodePos,
         contentWidth,
         getDomBlockMetric(domBlockMetrics, nodePos, blockIndex, 'table'),
       )
@@ -1380,6 +1503,7 @@ export function paginate(
   let currentRenderedPage = renderedPages[0]!
   let blockIndex = 0
   let lastAnchorTop = 0
+  let orderedListIndex = 0
 
   doc.forEach((node, offset) => {
     const nodePos = offset
@@ -1391,7 +1515,17 @@ export function paginate(
       return
     }
 
-    const measured = measureBlock(node, nodePos, blockIndex, contentWidth, documentHeadings, domBlockMetrics)
+    const isOrderedParagraph = node.type.name === 'paragraph' && node.attrs.listType === 'ordered'
+    orderedListIndex = isOrderedParagraph ? orderedListIndex + 1 : 0
+    const measured = measureBlock(
+      node,
+      nodePos,
+      blockIndex,
+      contentWidth,
+      documentHeadings,
+      domBlockMetrics,
+      orderedListIndex,
+    )
     const floatingFlowFloor = getFloatingFlowFloor(currentRenderedPage, config)
     if (currentPage.totalHeight < floatingFlowFloor) {
       const gap = floatingFlowFloor - currentPage.totalHeight

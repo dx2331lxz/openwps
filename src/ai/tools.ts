@@ -108,6 +108,18 @@ const commonTools = [
     },
   },
   {
+    name: 'capture_page_screenshot',
+    description: '截取指定正文页的当前可见页面截图，并把截图作为多模态图片交给模型查看。适合校验分页、图文混排、遮挡、重叠、表格/图片附近视觉效果。',
+    parameters: {
+      type: 'object',
+      properties: {
+        page: { type: 'integer', description: '页码，从 1 开始' },
+        instruction: { type: 'string', description: '本页截图需要重点检查的问题，可选' },
+      },
+      required: ['page'],
+    },
+  },
+  {
     name: 'get_page_style_summary',
     description: '读取指定页面的样式摘要，返回该页每个段落的文字预览、样式签名、标题候选和常见样式统计。长文档排版时优先用它按页判断标题/正文是否混淆。',
     parameters: {
@@ -588,6 +600,33 @@ const ocrTool = {
   },
 } as const
 
+const documentImageAnalysisTool = {
+  name: 'analyze_document_image',
+  description: '分析当前文档内的图片。可按 imageId 或 paragraphIndex+imageIndex 定位；auto 会根据图片和上下文选择多模态、OCR 或两者结合。',
+  parameters: {
+    type: 'object',
+    properties: {
+      imageId: { type: 'string', description: '文档读取工具返回的稳定图片 ID。' },
+      paragraphIndex: { type: 'integer', description: '图片所在段落索引；未提供 imageId 时使用。' },
+      imageIndex: { type: 'integer', description: '段内图片序号，从 0 开始；未提供 imageId 时使用。' },
+      analysisMode: {
+        type: 'string',
+        enum: ['auto', 'multimodal', 'ocr', 'both'],
+        description: '分析路径，默认 auto。',
+      },
+      taskType: {
+        type: 'string',
+        enum: ['general_parse', 'document_text', 'table', 'chart', 'handwriting', 'formula'],
+        description: 'OCR 任务类型，analysisMode 为 ocr/both 或 auto 选择 OCR 时使用。',
+      },
+      instruction: {
+        type: 'string',
+        description: '附加分析说明。',
+      },
+    },
+  },
+} as const
+
 const workspaceSearchTool = {
   name: 'workspace_search',
   description: '在用户上传的工作区参考文档中搜索关键词。返回所有文档中包含该关键词的片段及上下文。多个关键词用空格分隔，采用AND逻辑。用于在写文档时查找参考资料、数据、法规条款等。',
@@ -632,6 +671,6 @@ const workspaceReadTool = {
   },
 } as const
 
-export const agentTools = [...taskTools, ...layoutTools, ...editTools, ocrTool, workspaceSearchTool, workspaceReadTool].filter(
+export const agentTools = [...taskTools, ...layoutTools, ...editTools, documentImageAnalysisTool, ocrTool, workspaceSearchTool, workspaceReadTool].filter(
   (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
 )

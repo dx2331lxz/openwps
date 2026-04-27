@@ -30,6 +30,11 @@ export interface BlockDescriptor {
     borderColor: string
     borderWidth: number
   }
+  paragraphStyle?: {
+    headingLevel: number | null
+    align: 'left' | 'center' | 'right' | 'justify'
+    listType: 'none' | 'bullet' | 'ordered' | 'task'
+  }
 }
 
 export type BlockTableCommand =
@@ -75,15 +80,29 @@ function getColorValue(value: string | undefined, fallback: string) {
   return /^#[0-9a-f]{6}$/i.test(value ?? '') ? value! : fallback
 }
 
-function getBlockMenuPosition(rect: BlockRect) {
-  const panelWidth = 210
-  const pageEdgeGap = 12
+const TEXT_MENU_WIDTH = 220
+const COMPACT_MENU_WIDTH = 210
+const MENU_VIEWPORT_GAP = 8
+const MENU_PAGE_EDGE_GAP = 12
+const TEXT_MENU_CONTENT_GAP = 48
+const TEXT_MENU_ESTIMATED_HEIGHT = 220
+
+function getBlockMenuPosition(rect: BlockRect, type: BlockKind) {
+  const panelWidth = type === 'text' ? TEXT_MENU_WIDTH : COMPACT_MENU_WIDTH
   const pageLeft = Math.max(0, rect.left - 113)
-  const left = pageLeft - pageEdgeGap - panelWidth
+  const preferredLeft = type === 'text'
+    ? rect.left - TEXT_MENU_CONTENT_GAP - panelWidth
+    : pageLeft - MENU_PAGE_EDGE_GAP - panelWidth
+  const maxLeft = Math.max(MENU_VIEWPORT_GAP, rect.left + rect.width - panelWidth)
+  const left = Math.min(Math.max(MENU_VIEWPORT_GAP, preferredLeft), maxLeft)
   return {
     width: panelWidth,
     left,
-    top: Math.max(8, rect.top - 30),
+    top: type === 'text'
+      ? (rect.top - TEXT_MENU_ESTIMATED_HEIGHT - MENU_VIEWPORT_GAP >= MENU_VIEWPORT_GAP
+        ? rect.top - TEXT_MENU_ESTIMATED_HEIGHT - MENU_VIEWPORT_GAP
+        : rect.top + rect.height + MENU_VIEWPORT_GAP)
+      : Math.max(MENU_VIEWPORT_GAP, rect.top - 30),
   }
 }
 
@@ -92,38 +111,42 @@ function MenuButton({
   title,
   onMouseDown,
   variant = 'tile',
+  active = false,
 }: {
   children: React.ReactNode
   title?: string
   onMouseDown: React.MouseEventHandler<HTMLButtonElement>
   variant?: 'tile' | 'compact' | 'wide'
+  active?: boolean
 }) {
   const isTile = variant === 'tile'
   const isWide = variant === 'wide'
+  const restingBackground = active ? '#e5e7eb' : 'transparent'
 
   return (
     <button
       title={title}
       onMouseDown={onMouseDown}
       style={{
-        width: isWide ? '100%' : isTile ? 34 : 'auto',
-        minWidth: isTile ? 34 : 42,
-        height: isTile ? 34 : 26,
+        width: isWide ? '100%' : isTile ? 38 : 'auto',
+        minWidth: isTile ? 38 : 42,
+        height: isTile ? 38 : 26,
         padding: isTile ? 0 : '0 8px',
         border: '1px solid transparent',
-        borderRadius: isTile ? 7 : 6,
-        background: 'transparent',
+        borderRadius: isTile ? 8 : 6,
+        background: restingBackground,
         color: '#1f2937',
-        fontSize: isTile ? 17 : 11,
+        fontSize: isTile ? 19 : 11,
         fontWeight: isTile ? 400 : 400,
         cursor: 'pointer',
         whiteSpace: 'nowrap',
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
+        transition: 'background 120ms ease',
       }}
-      onMouseEnter={(event) => { event.currentTarget.style.background = '#f3f4f6' }}
-      onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent' }}
+      onMouseEnter={(event) => { event.currentTarget.style.background = '#e5e7eb' }}
+      onMouseLeave={(event) => { event.currentTarget.style.background = restingBackground }}
     >
       {children}
     </button>
@@ -154,7 +177,8 @@ export const BlockControls: React.FC<BlockControlsProps> = ({
     ? null
     : blocks.find((block) => block.pos === selectedBlockPos) ?? null
   const menuRect = selectedBlock ? getPrimaryRect(selectedBlock) : null
-  const menuPosition = menuRect ? getBlockMenuPosition(menuRect) : null
+  const menuPosition = menuRect && selectedBlock ? getBlockMenuPosition(menuRect, selectedBlock.type) : null
+  const paragraphStyle = selectedBlock?.paragraphStyle
 
   return (
     <div
@@ -237,12 +261,15 @@ export const BlockControls: React.FC<BlockControlsProps> = ({
             left: menuPosition.left,
             top: menuPosition.top,
             width: menuPosition.width,
+            boxSizing: 'border-box',
             display: 'block',
-            padding: 10,
+            padding: selectedBlock.type === 'text' ? '16px 16px 14px' : 10,
             border: '1px solid #e5e7eb',
-            borderRadius: 10,
+            borderRadius: selectedBlock.type === 'text' ? 16 : 10,
             background: 'rgba(255,255,255,0.98)',
-            boxShadow: '0 20px 46px rgba(15, 23, 42, 0.18)',
+            boxShadow: selectedBlock.type === 'text'
+              ? '0 22px 54px rgba(15, 23, 42, 0.16)'
+              : '0 20px 46px rgba(15, 23, 42, 0.18)',
             pointerEvents: 'auto',
           }}
         >
@@ -251,18 +278,18 @@ export const BlockControls: React.FC<BlockControlsProps> = ({
               {selectedBlock.type === 'text' && (
                 <>
                   <div style={tileGridStyle}>
-                    <MenuButton title="正文" onMouseDown={() => onSetParagraphRole(selectedBlock, 0)}>T</MenuButton>
-                    <MenuButton title="标题 1" onMouseDown={() => onSetParagraphRole(selectedBlock, 1)}>H1</MenuButton>
-                    <MenuButton title="标题 2" onMouseDown={() => onSetParagraphRole(selectedBlock, 2)}>H2</MenuButton>
-                    <MenuButton title="标题 3" onMouseDown={() => onSetParagraphRole(selectedBlock, 3)}>H3</MenuButton>
-                    <MenuButton title="左对齐" onMouseDown={() => onSetParagraphAlign(selectedBlock, 'left')}>左</MenuButton>
-                    <MenuButton title="居中" onMouseDown={() => onSetParagraphAlign(selectedBlock, 'center')}>中</MenuButton>
-                    <MenuButton title="右对齐" onMouseDown={() => onSetParagraphAlign(selectedBlock, 'right')}>右</MenuButton>
-                    <MenuButton title="两端对齐" onMouseDown={() => onSetParagraphAlign(selectedBlock, 'justify')}>齐</MenuButton>
-                    <MenuButton title="任务列表" onMouseDown={() => onToggleParagraphList(selectedBlock, 'task')}>☑</MenuButton>
-                    <MenuButton title="无序列表" onMouseDown={() => onToggleParagraphList(selectedBlock, 'bullet')}>•</MenuButton>
-                    <MenuButton title="有序列表" onMouseDown={() => onToggleParagraphList(selectedBlock, 'ordered')}>1.</MenuButton>
-                    <MenuButton title="清除格式" onMouseDown={() => onClearBlockFormatting(selectedBlock)}>¶</MenuButton>
+                    <MenuButton title="正文" active={!paragraphStyle?.headingLevel} onMouseDown={() => onSetParagraphRole(selectedBlock, 0)}>T</MenuButton>
+                    <MenuButton title="标题 1" active={paragraphStyle?.headingLevel === 1} onMouseDown={() => onSetParagraphRole(selectedBlock, 1)}>H1</MenuButton>
+                    <MenuButton title="标题 2" active={paragraphStyle?.headingLevel === 2} onMouseDown={() => onSetParagraphRole(selectedBlock, 2)}>H2</MenuButton>
+                    <MenuButton title="标题 3" active={paragraphStyle?.headingLevel === 3} onMouseDown={() => onSetParagraphRole(selectedBlock, 3)}>H3</MenuButton>
+                    <MenuButton title="左对齐" active={paragraphStyle?.align === 'left'} onMouseDown={() => onSetParagraphAlign(selectedBlock, 'left')}><AlignGlyph align="left" /></MenuButton>
+                    <MenuButton title="居中" active={paragraphStyle?.align === 'center'} onMouseDown={() => onSetParagraphAlign(selectedBlock, 'center')}><AlignGlyph align="center" /></MenuButton>
+                    <MenuButton title="右对齐" active={paragraphStyle?.align === 'right'} onMouseDown={() => onSetParagraphAlign(selectedBlock, 'right')}><AlignGlyph align="right" /></MenuButton>
+                    <MenuButton title="两端对齐" active={paragraphStyle?.align === 'justify'} onMouseDown={() => onSetParagraphAlign(selectedBlock, 'justify')}><AlignGlyph align="justify" /></MenuButton>
+                    <MenuButton title="任务列表" active={paragraphStyle?.listType === 'task'} onMouseDown={() => onToggleParagraphList(selectedBlock, 'task')}><TaskGlyph /></MenuButton>
+                    <MenuButton title="无序列表" active={paragraphStyle?.listType === 'bullet'} onMouseDown={() => onToggleParagraphList(selectedBlock, 'bullet')}><BulletListGlyph /></MenuButton>
+                    <MenuButton title="有序列表" active={paragraphStyle?.listType === 'ordered'} onMouseDown={() => onToggleParagraphList(selectedBlock, 'ordered')}><OrderedListGlyph /></MenuButton>
+                    <MenuButton title="清除格式" onMouseDown={() => onClearBlockFormatting(selectedBlock)}><ParagraphGlyph /></MenuButton>
                   </div>
                 </>
               )}
@@ -334,13 +361,17 @@ export const BlockControls: React.FC<BlockControlsProps> = ({
             </div>
           )}
 
-          <PanelSeparator />
-          <div style={compactGridStyle}>
-            <MenuButton title="复制块" variant="compact" onMouseDown={() => onCopyBlock(selectedBlock)}>复制</MenuButton>
-            <MenuButton title="剪切块" variant="compact" onMouseDown={() => onCutBlock(selectedBlock)}>剪切</MenuButton>
-            <MenuButton title="重复块" variant="compact" onMouseDown={() => onDuplicateBlock(selectedBlock)}>重复</MenuButton>
-            <MenuButton title="删除块" variant="compact" onMouseDown={() => onDeleteBlock(selectedBlock)}>删除</MenuButton>
-          </div>
+          {selectedBlock.type !== 'text' && (
+            <>
+              <PanelSeparator />
+              <div style={compactGridStyle}>
+                <MenuButton title="复制块" variant="compact" onMouseDown={() => onCopyBlock(selectedBlock)}>复制</MenuButton>
+                <MenuButton title="剪切块" variant="compact" onMouseDown={() => onCutBlock(selectedBlock)}>剪切</MenuButton>
+                <MenuButton title="重复块" variant="compact" onMouseDown={() => onDuplicateBlock(selectedBlock)}>重复</MenuButton>
+                <MenuButton title="删除块" variant="compact" onMouseDown={() => onDeleteBlock(selectedBlock)}>删除</MenuButton>
+              </div>
+            </>
+          )}
           {selectedBlock.type === 'text' && (
             <>
               <PanelSeparator />
@@ -379,15 +410,15 @@ export const BlockControls: React.FC<BlockControlsProps> = ({
 }
 
 function PanelSeparator() {
-  return <div style={{ height: 1, background: '#e5e7eb', margin: '8px 0' }} />
+  return <div style={{ height: 1, background: '#eceff3', margin: '14px 0 12px' }} />
 }
 
 const tileGridStyle: React.CSSProperties = {
   display: 'grid',
-  gridTemplateColumns: 'repeat(4, 34px)',
-  columnGap: 12,
+  gridTemplateColumns: 'repeat(4, 38px)',
+  columnGap: 6,
   rowGap: 8,
-  justifyContent: 'center',
+  justifyContent: 'space-between',
 }
 
 const compactGridStyle: React.CSSProperties = {
@@ -430,13 +461,13 @@ const aiButtonStyle: React.CSSProperties = {
   height: 34,
   display: 'flex',
   alignItems: 'center',
-  gap: 9,
+  gap: 10,
   padding: '0 10px',
   border: '1px solid transparent',
-  borderRadius: 8,
+  borderRadius: 10,
   background: 'transparent',
   color: '#111827',
-  fontSize: 15,
+  fontSize: 18,
   fontWeight: 400,
   cursor: 'pointer',
 }
@@ -452,4 +483,77 @@ const aiMarkStyle: React.CSSProperties = {
   color: '#ffffff',
   fontSize: 11,
   fontWeight: 700,
+}
+
+function AlignGlyph({ align }: { align: 'left' | 'center' | 'right' | 'justify' }) {
+  const widths = align === 'justify' ? [24, 24, 24] : [24, 15, 20]
+  const justifyContent = align === 'right' ? 'flex-end' : align === 'center' ? 'center' : 'flex-start'
+  return (
+    <span style={{ width: 25, display: 'grid', gap: 4 }}>
+      {widths.map((width, index) => (
+        <span
+          key={index}
+          style={{
+            width,
+            height: 2,
+            justifySelf: justifyContent,
+            borderRadius: 999,
+            background: '#1f2937',
+          }}
+        />
+      ))}
+    </span>
+  )
+}
+
+function TaskGlyph() {
+  return (
+    <span
+      style={{
+        width: 28,
+        height: 28,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        border: '2px solid #1f2937',
+        borderRadius: 2,
+        fontSize: 18,
+        lineHeight: 1,
+      }}
+    >
+      ✓
+    </span>
+  )
+}
+
+function BulletListGlyph() {
+  return (
+    <span style={{ width: 27, display: 'grid', gridTemplateColumns: '5px 1fr', alignItems: 'center', gap: '4px 6px' }}>
+      {[0, 1, 2].flatMap((index) => [
+        <span key={`dot-${index}`} style={{ width: 4, height: 4, borderRadius: 999, background: '#1f2937' }} />,
+        <span key={`line-${index}`} style={{ width: 18, height: 2, borderRadius: 999, background: '#1f2937' }} />,
+      ])}
+    </span>
+  )
+}
+
+function OrderedListGlyph() {
+  return (
+    <span style={{ width: 30, display: 'grid', gridTemplateColumns: '9px 1fr', alignItems: 'center', gap: '1px 4px', fontSize: 13, lineHeight: '11px' }}>
+      <span>1</span><span style={{ width: 17, height: 2, borderRadius: 999, background: '#1f2937' }} />
+      <span>2</span><span style={{ width: 17, height: 2, borderRadius: 999, background: '#1f2937' }} />
+      <span>3</span><span style={{ width: 17, height: 2, borderRadius: 999, background: '#1f2937' }} />
+    </span>
+  )
+}
+
+function ParagraphGlyph() {
+  return (
+    <span style={{ position: 'relative', width: 27, height: 27, display: 'inline-block' }}>
+      <span style={{ position: 'absolute', left: 1, top: 6, width: 21, height: 2, borderRadius: 999, background: '#1f2937' }} />
+      <span style={{ position: 'absolute', right: 0, top: 14, width: 16, height: 2, borderRadius: 999, background: '#1f2937' }} />
+      <span style={{ position: 'absolute', left: 1, bottom: 5, width: 21, height: 2, borderRadius: 999, background: '#1f2937' }} />
+      <span style={{ position: 'absolute', right: 3, bottom: 0, color: '#2563eb', fontSize: 18, lineHeight: 1 }}>¶</span>
+    </span>
+  )
 }

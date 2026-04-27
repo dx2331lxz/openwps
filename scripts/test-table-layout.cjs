@@ -86,10 +86,23 @@ async function assertTableLayout(page, label) {
                 })
             }
         }
-        return { ok: failures.length === 0, failures }
+        const pmTable = document.querySelector('.ProseMirror table')
+        const pretextTable = document.querySelector('[data-pretext-table]')
+        const pmVisibility = pmTable ? window.getComputedStyle(pmTable).visibility : ''
+        const pretextRect = pretextTable?.getBoundingClientRect()
+        const pretextFailures = []
+        if (pretextTable) {
+            if (!pretextRect || pretextRect.width <= 0 || pretextRect.height <= 0) {
+                pretextFailures.push({ reason: 'pretext table has empty rect' })
+            }
+            if (pmVisibility !== 'hidden') {
+                pretextFailures.push({ reason: 'native ProseMirror table should be hidden while Pretext table is active', pmVisibility })
+            }
+        }
+        return { ok: failures.length === 0 && pretextFailures.length === 0, failures, pretextFailures }
     })
 
-    assert(result.ok, `${label} 表格与后续内容重叠: ${JSON.stringify(result.failures ?? result)}`)
+    assert(result.ok, `${label} 表格布局异常: ${JSON.stringify(result)}`)
 }
 
 async function run() {
@@ -146,8 +159,12 @@ async function run() {
         await page.waitForTimeout(600)
         await assertTableLayout(page, '导入后')
 
-        const firstCellParagraph = page.locator('.ProseMirror td p').first()
-        await firstCellParagraph.click()
+        const firstCell = page.locator('[data-pretext-table-cell]').first()
+        await firstCell.click()
+        await page.waitForFunction(() => {
+            const table = document.querySelector('.ProseMirror table')
+            return table && window.getComputedStyle(table).visibility !== 'hidden'
+        }, { timeout: 5000 })
         await page.keyboard.press(process.platform === 'darwin' ? 'Meta+End' : 'Control+End')
         await page.keyboard.type(`${longChinese}${longEnglish}`, { delay: 0 })
         await page.waitForTimeout(700)

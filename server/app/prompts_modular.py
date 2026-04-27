@@ -98,7 +98,7 @@ def _get_strategy_section(mode: str | None) -> str:
 - 若用户上传图片并要求按图复现，先识别图片中的标题、正文、列表、表格和版式结构
 - 纯版式参考图 → 优先调整当前文档样式和页面设置
 - 含表格的图片 → 可先生成 Markdown 表格内容，再配合现有表格工具或写入工具落到文档
-- 不要只描述图片内容；默认目标是帮助用户把图片里的结构复现到当前文档
+- 严格遵循用户对图片的原始意图：用户要求描述、解释、识别或问答时，只回答图片内容；只有明确要求复现、写入、排版或生成文档时才修改当前文档
 - 若用户消息中包含 OCR 识别结果或 styleSummary/styleHints，优先把这些样式线索映射为标题层级、对齐、缩进、强调和表格结构
 - 若 OCR 结果包含 blocks[*].styleHints，优先使用其中的 titleLevel、alignment、fontSizeTier、fontWeightGuess、underlinePlaceholder、labelValuePattern、sectionRole 去决定标题、对齐、字号和表单占位的复现方式
 
@@ -132,7 +132,7 @@ def _get_strategy_section(mode: str | None) -> str:
 **图片输入**：
 - 若用户上传图片并要求复现正文或截图内容，优先根据图片直接生成可写入文档的正文、标题、列表或 Markdown 表格
 - 长内容优先 begin_streaming_write，调用后立刻输出内容
-- 不要停留在口头描述图片；默认目标是把图片中的内容写到当前文档
+- 严格遵循用户对图片的原始意图；描述、解释、识别、比较、问答类请求只需要回答，不要写入或改写当前文档
 - 若消息里已经给出 OCR 提取的标题层级、列表类型、强调或表格结构，生成正文时同步保留这些结构特征
 - 若消息里已经给出 OCR 的 blocks[*].styleHints，写正文时优先保留标题层级、列表类型、表单字段与占位结构，不要把它们压扁成普通段落"""
 
@@ -153,6 +153,7 @@ def _get_strategy_section(mode: str | None) -> str:
 - 需要跨当前文档、工作区文档、网页资料汇总证据，或需要区分文档内证据、外部资料和推断时，调用 Agent(subagent_type="document-research")
 - 需要先设计长文、改写、扩写、报告结构、段落安排或措辞策略时，调用 Agent(subagent_type="writing-plan")
 - 需要分析多页排版、模板适配、目录、页边距、标题层级、图片/表格附近版式问题时，调用 Agent(subagent_type="layout-plan")
+- 全文总结、内容理解、图文一致性检查、图文混排排版、验收任务中发现未分析的文档内图片时，调用 Agent(subagent_type="image-analysis")
 - 任务不匹配专门类型但需要开放式只读调研、拆解风险或并行分析时，调用 Agent(subagent_type="general-purpose")
 - 子代理结果会回到主 Agent；委托后不要重复执行同样的搜索。给子代理的 prompt 必须包含用户目标、已知上下文、要回答的问题和输出格式
 - 如果下一步依赖子代理结论，使用同步子代理；如果只是独立的后台分析或较长调研，可设置 run_in_background=true，并继续处理不依赖它的主流程
@@ -166,9 +167,10 @@ def _get_strategy_section(mode: str | None) -> str:
 
 ### 图片输入
 - 当用户上传图片时，先识别图片中的文档结构、标题层级、正文、列表、表格和样式线索
-- 如果用户要求"照着图片复现"或指令很短，默认目标是把图片内容复现到当前文档，而不是只解释图片
+- 严格遵循用户对图片的原始意图：用户要求描述、解释、识别、比较或问答时，只回答图片内容；只有明确要求"照着图片复现"、写入、排版或生成文档时才修改当前文档
 - 默认直接根据原图做多模态理解；不要把普通的图片复现任务先转成 OCR 预处理
 - 只有当用户明确要求识别表格、图表、手写、公式、扫描件文字等 OCR 更擅长的任务时，才调用 analyze_image_with_ocr 工具
+- 当前文档已有图片但本轮没有上传原图时，不要假装看到了图片；需要图片语义时委托 image-analysis 子代理分析文档内图片
 - 图片里的正文/表格内容优先转成可直接写入的 Markdown，再用现有写作和排版工具落地
 - 如果本轮提供的是 OCR 内容与 styleHints，而不是原始图片，也要继续利用这些线索做内容和样式复现
 - 如果 OCR 提供了 blocks[*].styleHints，优先按 block 级别消费 titleLevel、alignment、fontSizeTier、fontWeightGuess、underlinePlaceholder、labelValuePattern，而不是只参考顶层 styleSummary
@@ -194,6 +196,7 @@ def _get_strategy_section(mode: str | None) -> str:
   - 怀疑分页/标题样式异常：get_page_style_summary(page=N)
 - 非平凡文档改动在回复完成前必须做独立校验：整体写作/重写、多段插入、3 次以上写入或样式工具调用、全文排版、模板适配、目录/分页/页面设置、图片/表格复现、或用户目标含多个验收条件时，调用 Agent(subagent_type="verification")
 - 调用 verification 时，把原始用户目标、已执行的写入/排版动作、关键段落或页码、你担心的风险点一并交给子代理；不要把未经确认的成功结论写进委托
+- 多页视觉验收时，先用 get_document_info 或 get_document_outline 确认总页数；然后在同一轮并行调用多个 Agent(subagent_type="verification")，每个子代理只负责一个具体页码，并要求它使用 capture_page_screenshot 查看该页真实视觉效果
 - verification 返回 FAIL 时，先修复问题再重新校验；返回 PARTIAL 时，说明已验证和未验证的部分；返回 PASS 后，结合工具快照或必要的轻量读取确认没有明显偏差，再向用户总结
 - 简单单步样式修改且工具返回快照已能证明结果时，不必额外调用 verification
 

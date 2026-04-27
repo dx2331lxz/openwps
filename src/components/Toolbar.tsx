@@ -78,6 +78,8 @@ import PageSettingsPanel, { type PageSettingsSection } from './PageSettingsPanel
 interface ToolbarProps {
   view: EditorView | null
   editorState: EditorState | null
+  documentTitle?: string
+  onDocumentTitleChange?: (title: string) => void
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
@@ -90,6 +92,7 @@ interface ToolbarProps {
   onAICopilotCandidateCountChange?: (count: number) => void
   onToggleWorkspace?: () => void
   workspaceOpen?: boolean
+  onNewDocument?: () => void | Promise<void>
   onOpenServerFile?: () => void | Promise<void>
   onSaveServerFile?: () => void | Promise<void>
   onImportDocx?: (file: File) => void | Promise<void>
@@ -1120,11 +1123,20 @@ function PageToolbarButton({
   )
 }
 
+function formatDocumentTitle(title?: string) {
+  const trimmed = (title || '').trim()
+  if (!trimmed) return '未命名文档'
+  const fileName = trimmed.split(/[\\/]/).pop() || trimmed
+  return fileName.replace(/\.(docx|doc|md|markdown|txt)$/i, '') || fileName
+}
+
 // ─── Toolbar component ────────────────────────────────────────────────────────
 
 export const Toolbar: React.FC<ToolbarProps> = ({
   view,
   editorState,
+  documentTitle,
+  onDocumentTitleChange,
   pageConfig,
   onPageConfigChange,
   onToggleSidebar,
@@ -1137,6 +1149,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onAICopilotCandidateCountChange,
   onToggleWorkspace,
   workspaceOpen,
+  onNewDocument,
   onOpenServerFile,
   onSaveServerFile,
   onImportDocx,
@@ -1163,7 +1176,10 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const tablePickerBtnRef = React.useRef<HTMLButtonElement | null>(null)
   const [collapsed, setCollapsed] = React.useState(false)
   const topBarRef = React.useRef<HTMLDivElement | null>(null)
+  const titleInputRef = React.useRef<HTMLInputElement | null>(null)
   const [topBarWidth, setTopBarWidth] = React.useState(0)
+  const [titleEditing, setTitleEditing] = React.useState(false)
+  const [titleDraft, setTitleDraft] = React.useState('')
   const scrollContainerRef = React.useRef<HTMLDivElement>(null)
   const [showScrollLeft, setShowScrollLeft] = React.useState(false)
   const [showScrollRight, setShowScrollRight] = React.useState(false)
@@ -1173,6 +1189,32 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const savedTableViewRef = React.useRef<EditorView | null>(null)
   const topBarCompact = topBarWidth > 0 && topBarWidth < 1360
   const topBarVeryCompact = topBarWidth > 0 && topBarWidth < 760
+  const displayDocumentTitle = formatDocumentTitle(documentTitle)
+
+  React.useEffect(() => {
+    if (!titleEditing) setTitleDraft(displayDocumentTitle)
+  }, [displayDocumentTitle, titleEditing])
+
+  React.useEffect(() => {
+    if (titleEditing) titleInputRef.current?.select()
+  }, [titleEditing])
+
+  const startTitleEdit = () => {
+    setTitleDraft(displayDocumentTitle)
+    setTitleEditing(true)
+  }
+
+  const cancelTitleEdit = () => {
+    setTitleDraft(displayDocumentTitle)
+    setTitleEditing(false)
+  }
+
+  const commitTitleEdit = () => {
+    const nextTitle = titleDraft.trim() || '未命名文档'
+    setTitleDraft(nextTitle)
+    setTitleEditing(false)
+    onDocumentTitleChange?.(nextTitle)
+  }
 
   React.useEffect(() => {
     const element = topBarRef.current
@@ -1379,7 +1421,18 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: topBarVeryCompact ? 4 : 8, minWidth: 0, overflow: 'hidden' }}>
           <IconButton title="主页" icon={Home} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />
-          {!topBarVeryCompact && <IconButton title="新建" icon={Plus} style={{ width: 32, height: 32, minWidth: 32, padding: 0 }} />}
+          {!topBarVeryCompact && (
+            <IconButton
+              title="新建文档"
+              icon={Plus}
+              onMouseDown={event => {
+                event.preventDefault()
+                event.stopPropagation()
+                void onNewDocument?.()
+              }}
+              style={{ width: 32, height: 32, minWidth: 32, padding: 0 }}
+            />
+          )}
           {!topBarVeryCompact && <ToolbarSeparator />}
           <IconButton
             title="文件菜单"
@@ -1402,7 +1455,62 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             fontSize: 15,
             fontWeight: 600,
           }}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: topBarCompact ? 92 : 180 }}>OpenWPS</span>
+            {titleEditing ? (
+              <input
+                ref={titleInputRef}
+                value={titleDraft}
+                onChange={event => setTitleDraft(event.currentTarget.value)}
+                onBlur={commitTitleEdit}
+                onKeyDown={event => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    commitTitleEdit()
+                  } else if (event.key === 'Escape') {
+                    event.preventDefault()
+                    cancelTitleEdit()
+                  }
+                }}
+                onMouseDown={event => event.stopPropagation()}
+                aria-label="编辑文章标题"
+                style={{
+                  width: topBarCompact ? 92 : 180,
+                  minWidth: 48,
+                  height: 28,
+                  border: '1px solid #93c5fd',
+                  borderRadius: 6,
+                  background: '#ffffff',
+                  color: '#111827',
+                  font: 'inherit',
+                  fontWeight: 600,
+                  outline: 'none',
+                  padding: '0 6px',
+                }}
+              />
+            ) : (
+              <button
+                type="button"
+                title="点击编辑文章标题"
+                onClick={startTitleEdit}
+                onMouseDown={event => event.stopPropagation()}
+                style={{
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  maxWidth: topBarCompact ? 92 : 180,
+                  minWidth: 0,
+                  border: 'none',
+                  background: 'transparent',
+                  color: 'inherit',
+                  cursor: 'text',
+                  font: 'inherit',
+                  fontWeight: 600,
+                  padding: 0,
+                  textAlign: 'left',
+                }}
+              >
+                {displayDocumentTitle}
+              </button>
+            )}
             {!topBarCompact && <Star size={17} strokeWidth={1.8} color="#6b7280" />}
             {!topBarVeryCompact && <ChevronDown size={15} strokeWidth={2} color="#6b7280" />}
           </div>

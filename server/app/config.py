@@ -89,6 +89,15 @@ DEFAULT_OCR_CONFIG = {
     "maxImages": 5,
 }
 
+DEFAULT_VISION_CONFIG = {
+    "enabled": False,
+    "providerId": "openai",
+    "endpoint": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "apiKey": "",
+    "timeoutSeconds": 30,
+}
+
 DEFAULT_TAVILY_CONFIG = {
     "enabled": True,
     "apiKey": "",
@@ -103,6 +112,7 @@ DEFAULT_CONFIG = {
     "activeProviderId": "siliconflow",
     "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
     "ocrConfig": deepcopy(DEFAULT_OCR_CONFIG),
+    "visionConfig": deepcopy(DEFAULT_VISION_CONFIG),
     "tavilyConfig": deepcopy(DEFAULT_TAVILY_CONFIG),
     "providers": deepcopy(PRESET_PROVIDERS),
 }
@@ -213,6 +223,31 @@ def _sanitize_ocr_config(raw: dict[str, Any] | None, providers: list[dict[str, A
     }
 
 
+def _sanitize_vision_config(raw: dict[str, Any] | None, providers: list[dict[str, Any]]) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    provider_id = str(source.get("providerId") or DEFAULT_VISION_CONFIG["providerId"]).strip() or DEFAULT_VISION_CONFIG["providerId"]
+    provider = next((item for item in providers if item["id"] == provider_id), None)
+    endpoint = _normalize_endpoint(source.get("endpoint")) or _normalize_endpoint(
+        provider.get("endpoint") if provider else DEFAULT_VISION_CONFIG["endpoint"]
+    )
+    model = str(source.get("model") or source.get("modelId") or "").strip()
+    if not model:
+        model = str((provider or {}).get("defaultModel") or DEFAULT_VISION_CONFIG["model"]).strip()
+    return {
+        "enabled": bool(source.get("enabled", DEFAULT_VISION_CONFIG["enabled"])),
+        "providerId": provider["id"] if provider else provider_id,
+        "endpoint": endpoint,
+        "model": model,
+        "apiKey": str(source.get("apiKey") or "").strip(),
+        "timeoutSeconds": _normalize_positive_int(
+            source.get("timeoutSeconds"),
+            DEFAULT_VISION_CONFIG["timeoutSeconds"],
+            minimum=5,
+            maximum=120,
+        ),
+    }
+
+
 def _sanitize_tavily_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     return {
@@ -310,6 +345,7 @@ def _migrate_legacy_config(raw: dict[str, Any]) -> dict[str, Any]:
         "activeProviderId": active_provider_id,
         "imageProcessingMode": DEFAULT_IMAGE_PROCESSING_MODE,
         "ocrConfig": _sanitize_ocr_config(None, providers),
+        "visionConfig": _sanitize_vision_config(None, providers),
         "tavilyConfig": deepcopy(DEFAULT_TAVILY_CONFIG),
         "providers": providers,
     }
@@ -329,6 +365,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             "activeProviderId": active_provider_id,
             "imageProcessingMode": _normalize_image_processing_mode(raw.get("imageProcessingMode")),
             "ocrConfig": _sanitize_ocr_config(raw.get("ocrConfig"), providers),
+            "visionConfig": _sanitize_vision_config(raw.get("visionConfig"), providers),
             "tavilyConfig": _sanitize_tavily_config(raw.get("tavilyConfig")),
             "providers": providers,
         }
@@ -366,8 +403,10 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
     normalized = normalize_config(cfg if cfg is not None else read_config())
     active_provider = get_provider(normalized)
     ocr_config = _sanitize_ocr_config(normalized.get("ocrConfig"), normalized["providers"])
+    vision_config = _sanitize_vision_config(normalized.get("visionConfig"), normalized["providers"])
     tavily_config = _sanitize_tavily_config(normalized.get("tavilyConfig"))
     ocr_provider = get_provider(normalized, ocr_config.get("providerId"))
+    vision_provider = get_provider(normalized, vision_config.get("providerId"))
     return {
         "activeProviderId": normalized["activeProviderId"],
         "imageProcessingMode": normalized.get("imageProcessingMode", DEFAULT_IMAGE_PROCESSING_MODE),
@@ -394,6 +433,14 @@ def public_config(cfg: dict | None = None) -> dict[str, Any]:
             "hasApiKey": bool(ocr_config.get("apiKey") or ocr_provider.get("apiKey")),
             "timeoutSeconds": int(ocr_config.get("timeoutSeconds") or DEFAULT_OCR_CONFIG["timeoutSeconds"]),
             "maxImages": int(ocr_config.get("maxImages") or DEFAULT_OCR_CONFIG["maxImages"]),
+        },
+        "visionConfig": {
+            "enabled": bool(vision_config.get("enabled", DEFAULT_VISION_CONFIG["enabled"])),
+            "providerId": vision_provider["id"],
+            "endpoint": _normalize_endpoint(vision_config.get("endpoint")) or vision_provider["endpoint"],
+            "model": str(vision_config.get("model") or vision_provider.get("defaultModel") or ""),
+            "hasApiKey": bool(vision_config.get("apiKey") or vision_provider.get("apiKey")),
+            "timeoutSeconds": int(vision_config.get("timeoutSeconds") or DEFAULT_VISION_CONFIG["timeoutSeconds"]),
         },
         "tavilyConfig": {
             "enabled": bool(tavily_config.get("enabled", DEFAULT_TAVILY_CONFIG["enabled"])),

@@ -2,6 +2,7 @@ import React from 'react'
 import type {
   FloatingParagraph,
   PageConfig,
+  RenderedTableCell,
   RenderedFloatingObject,
   RenderedLine,
   RenderedPage,
@@ -24,6 +25,10 @@ const DEFAULT_RENDER_TEXT_STYLE = {
 
 function getSafeTextStyle(style: Partial<RenderUnit['style']> | undefined) {
   return { ...DEFAULT_RENDER_TEXT_STYLE, ...(style ?? {}) }
+}
+
+function getTextColor(style: ReturnType<typeof getSafeTextStyle>, hasLink: boolean) {
+  return hasLink ? '#0b57d0' : (style.color || '#000000')
 }
 
 interface PretextPageRendererProps {
@@ -69,10 +74,10 @@ function renderFloatingParagraph(paragraph: FloatingParagraph, index: number) {
                 fontWeight: style.bold ? 700 : 400,
                 fontStyle: style.italic ? 'italic' : 'normal',
                 letterSpacing: style.letterSpacing ? `${style.letterSpacing}pt` : undefined,
-                color: style.color || '#000000',
+                color: getTextColor(style, run.hasLink),
                 backgroundColor: run.hasComment ? 'rgba(253, 224, 71, 0.35)' : (style.backgroundColor || undefined),
                 textDecoration: [
-                  style.underline ? 'underline' : '',
+                  style.underline || run.hasLink ? 'underline' : '',
                   style.strikethrough ? 'line-through' : '',
                 ].filter(Boolean).join(' ') || undefined,
               }}
@@ -149,7 +154,7 @@ function renderFloatingObject(
 function getTextDecoration(unit: RenderUnit) {
   const style = getSafeTextStyle(unit.style)
   const decorations: string[] = []
-  if (style.underline) decorations.push('underline')
+  if (style.underline || unit.hasLink) decorations.push('underline')
   if (style.strikethrough) decorations.push('line-through')
   return decorations.join(' ') || undefined
 }
@@ -212,7 +217,13 @@ function renderListMarker(
   line: RenderedLine & { top: number },
   metrics: LineLayoutMetrics,
 ) {
-  if (line.blockType !== 'paragraph' || line.lineIndex !== 0 || line.listType !== 'task') return null
+  if (line.blockType !== 'paragraph' || line.lineIndex !== 0 || !line.listType) return null
+
+  const marker = line.listType === 'task'
+    ? (line.listChecked ? '☑' : '☐')
+    : line.listType === 'ordered'
+      ? `${line.listIndex ?? 1}.`
+      : '•'
 
   return (
     <div
@@ -227,13 +238,13 @@ function renderListMarker(
         alignItems: 'center',
         justifyContent: 'center',
         color: '#4b5563',
-        fontSize: 16,
+        fontSize: line.listType === 'bullet' ? 22 : 16,
         lineHeight: 1,
         pointerEvents: 'none',
         userSelect: 'none',
       }}
     >
-      {line.listChecked ? '☑' : '☐'}
+      {marker}
     </div>
   )
 }
@@ -440,6 +451,97 @@ function renderTableOfContentsBox(line: RenderedLine & { top: number }, selected
         </div>
       )}
     </div>
+  )
+}
+
+function renderReadonlyTableCell(
+  cell: RenderedTableCell,
+  cellIndex: number,
+  onRequestCaretPos: PretextPageRendererProps['onRequestCaretPos'],
+) {
+  const tag = cell.header ? 'th' : 'td'
+  const content = cell.paragraphs.length ? cell.paragraphs : [cell.text]
+  const handleMouseDown = (event: React.MouseEvent) => {
+    if (event.button !== 0 || typeof cell.firstTextPos !== 'number') return
+    event.preventDefault()
+    event.stopPropagation()
+    onRequestCaretPos?.(cell.firstTextPos, event.clientX, event.clientY)
+  }
+
+  return React.createElement(
+    tag,
+    {
+      key: `cell-${cellIndex}`,
+      colSpan: cell.colspan > 1 ? cell.colspan : undefined,
+      rowSpan: cell.rowspan > 1 ? cell.rowspan : undefined,
+      'data-pretext-table-cell': 'true',
+      onMouseDown: handleMouseDown,
+      style: {
+        width: cell.width,
+        minWidth: 40,
+        height: cell.height,
+        boxSizing: 'border-box',
+        border: `${cell.borderWidth}px solid ${cell.borderColor}`,
+        padding: '4px 8px',
+        verticalAlign: 'top',
+        backgroundColor: cell.backgroundColor || undefined,
+        fontWeight: cell.header ? 700 : 400,
+        textAlign: 'left',
+        pointerEvents: 'auto',
+        cursor: 'text',
+        overflow: 'hidden',
+      } satisfies React.CSSProperties,
+    },
+    content.map((paragraph, paragraphIndex) => (
+      <p
+        key={`paragraph-${paragraphIndex}`}
+        style={{
+          margin: 0,
+          padding: 0,
+          minHeight: '1.5em',
+          whiteSpace: 'pre-wrap',
+          overflowWrap: 'anywhere',
+          wordBreak: 'normal',
+          lineBreak: 'strict',
+        }}
+      >
+        {paragraph}
+      </p>
+    )),
+  )
+}
+
+function renderReadonlyTable(
+  line: RenderedLine & { top: number },
+  onRequestCaretPos: PretextPageRendererProps['onRequestCaretPos'],
+) {
+  if (!line.table) return <span style={{ width: 1, height: line.lineHeight }} />
+
+  return (
+    <table
+      data-pretext-table="true"
+      style={{
+        borderCollapse: 'collapse',
+        width: line.table.width,
+        height: line.table.height,
+        boxSizing: 'border-box',
+        tableLayout: 'fixed',
+        fontFamily: DEFAULT_RENDER_TEXT_STYLE.fontFamily,
+        fontSize: `${DEFAULT_RENDER_TEXT_STYLE.fontSize}pt`,
+        lineHeight: 1.5,
+        color: DEFAULT_RENDER_TEXT_STYLE.color,
+        whiteSpace: 'normal',
+        pointerEvents: 'auto',
+      }}
+    >
+      <tbody>
+        {line.table.rows.map((row, rowIndex) => (
+          <tr key={`row-${rowIndex}`} style={{ height: row.height }}>
+            {row.cells.map((cell, cellIndex) => renderReadonlyTableCell(cell, cellIndex, onRequestCaretPos))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
 
@@ -753,10 +855,11 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
               const isTableOfContents = line.blockType === 'table_of_contents'
               const tableOfContentsPos = isTableOfContents && typeof line.startPos === 'number' ? line.startPos - 1 : null
               const isTableOfContentsSelected = tableOfContentsPos != null && selectedNodePos === tableOfContentsPos
+              const isTable = line.blockType === 'table'
               const isParagraphLine = line.blockType === 'paragraph'
-              const taskMarkerHitInset = line.lineIndex === 0 && line.listType === 'task' ? 28 : 0
-              const hitZoneLeft = pageConfig.marginLeft + line.xOffset - taskMarkerHitInset
-              const hitZoneWidth = Math.max(1, line.availableWidth + taskMarkerHitInset)
+              const listMarkerHitInset = line.lineIndex === 0 && line.listType ? 28 : 0
+              const hitZoneLeft = pageConfig.marginLeft + line.xOffset - listMarkerHitInset
+              const hitZoneWidth = Math.max(1, line.availableWidth + listMarkerHitInset)
 
               return (
                 <React.Fragment key={`${pageIndex}-${line.blockIndex}-${line.lineIndex}-${line.startPos ?? 0}`}>
@@ -837,9 +940,9 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                       top: metrics.top,
                       left: metrics.left,
                       height: line.lineHeight,
-                      display: line.units.some((unit) => typeof unit.offsetX === 'number') ? 'block' : 'flex',
+                      display: isTable || line.units.some((unit) => typeof unit.offsetX === 'number') ? 'block' : 'flex',
                       alignItems: 'flex-end',
-                      width: isHorizontalRule || isTableOfContents
+                      width: isHorizontalRule || isTableOfContents || isTable
                         ? line.availableWidth
                         : metrics.justifyEnabled
                           ? line.availableWidth
@@ -861,6 +964,8 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                       />
                     ) : isTableOfContents ? (
                       renderTableOfContentsBox(line, isTableOfContentsSelected)
+                    ) : isTable ? (
+                      renderReadonlyTable(line, onRequestCaretPos)
                     ) : line.units.length > 0 ? (
                       line.units.map((unit, index) => {
                         const style = getSafeTextStyle(unit.style)
@@ -889,7 +994,7 @@ export const PretextPageRenderer: React.FC<PretextPageRendererProps> = ({
                               fontWeight: style.bold ? 700 : 400,
                               fontStyle: style.italic ? 'italic' : 'normal',
                               letterSpacing: style.letterSpacing ? `${style.letterSpacing}pt` : undefined,
-                              color: style.color || '#000000',
+                              color: getTextColor(style, unit.hasLink),
                               backgroundColor: getUnitBackgroundColor(unit),
                               textDecoration: getTextDecoration(unit),
                               lineHeight: `${line.lineHeight}px`,

@@ -150,6 +150,7 @@ function startStaticServer() {
 
                 sendSse(res, { type: 'session_created', sessionId: 'session-weekly-brief' })
                 sendSse(res, { type: 'round_start', round: 1 })
+                sendSse(res, { type: 'thinking', content: '需要先读取文档结构，再决定标题和正文改写顺序。' })
                 sendSse(res, {
                     type: 'tooling_delta',
                     loadedToolNames: [],
@@ -205,6 +206,7 @@ function startStaticServer() {
                 await roundOneToolResults.promise
 
                 sendSse(res, { type: 'round_start', round: 2 })
+                sendSse(res, { type: 'thinking', content: '已拿到初始结构，先生成管理层简报正文，再追加责任表。' })
                 sendSse(res, { type: 'content', content: '已读取原始周报结构，下面整理为管理层简报。' })
                 sendSse(res, {
                     type: 'tooling_delta',
@@ -307,6 +309,13 @@ function startStaticServer() {
                     runMode: 'sync',
                     tools: ['get_document_content', 'get_document_outline'],
                     maxTurns: 2,
+                })
+                sendSse(res, {
+                    type: 'agent_progress',
+                    agentId: 'agent-brief-verification',
+                    agentType: 'verification',
+                    phase: 'thinking',
+                    content: '检查正文是否包含执行摘要、风险、行动项和责任人表格。',
                 })
                 sendSse(res, {
                     type: 'agent_tool_call',
@@ -543,6 +552,12 @@ async function run() {
         await page.waitForFunction(() => {
             return document.body.textContent?.includes('PASS：简报已包含执行摘要')
                 && document.body.textContent?.includes('已整理为管理层简报')
+        }, { timeout: 12000 })
+        await page.waitForFunction(() => {
+            const text = document.body.textContent ?? ''
+            return text.includes('思考过程')
+                && text.includes('需要先读取文档结构')
+                && text.includes('子代理 verification 思考过程')
         }, { timeout: 12000 })
 
         const documentState = await readDocumentState(page)

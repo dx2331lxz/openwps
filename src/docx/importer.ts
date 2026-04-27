@@ -755,16 +755,25 @@ function parseDocumentLayout(documentXml: string): DocumentLayout {
 
   const widthTwip = parseNumber(getAttr(pgSz, 'w'), 11906)
   const heightTwip = parseNumber(getAttr(pgSz, 'h'), 16838)
+  const orientation = (getAttr(pgSz, 'orient') ?? '').toLowerCase()
   const marginTopTwip = parseNumber(getAttr(pgMar, 'top'), 1440)
   const marginBottomTwip = parseNumber(getAttr(pgMar, 'bottom'), 1440)
   const marginLeftTwip = parseNumber(getAttr(pgMar, 'left'), 1800)
   const marginRightTwip = parseNumber(getAttr(pgMar, 'right'), 1800)
   const linePitchTwip = parseNumber(getAttr(docGrid, 'linePitch'))
+  let pageWidth = Math.round(twipToPx(widthTwip))
+  let pageHeight = Math.round(twipToPx(heightTwip))
+
+  if (orientation === 'landscape' && pageWidth < pageHeight) {
+    [pageWidth, pageHeight] = [pageHeight, pageWidth]
+  } else if (orientation === 'portrait' && pageWidth > pageHeight) {
+    [pageWidth, pageHeight] = [pageHeight, pageWidth]
+  }
 
   return {
     pageConfig: {
-      pageWidth: Math.round(twipToPx(widthTwip)),
-      pageHeight: Math.round(twipToPx(heightTwip)),
+      pageWidth,
+      pageHeight,
       marginTop: Math.round(twipToPx(marginTopTwip)),
       marginBottom: Math.round(twipToPx(marginBottomTwip)),
       marginLeft: Math.round(twipToPx(marginLeftTwip)),

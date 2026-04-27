@@ -29,6 +29,7 @@ from .config import (
     DEFAULT_OCR_BACKEND,
     DEFAULT_OCR_CONFIG,
     DEFAULT_TAVILY_CONFIG,
+    DEFAULT_VISION_CONFIG,
     get_provider,
     read_config,
 )
@@ -42,7 +43,7 @@ from .agents import (
     save_agent_run,
     unregister_background_task,
 )
-from .models import ChatMessage, ChatRequest, CompletionRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest
+from .models import ChatMessage, ChatRequest, ClientEventRequest, CompletionRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest, VisionAnalyzeRequest, VisionConfig, VisionTestRequest
 from .tool_registry import TOOL_SEARCH_NAME
 from .tooling import (
     build_tooling_delta_attachment,
@@ -227,11 +228,42 @@ def _stringify_content(content: Any) -> str:
 
 
 def _extract_reasoning(chunk: AIMessageChunk) -> str:
-    values = [
-        chunk.additional_kwargs.get("reasoning_content"),
-        chunk.additional_kwargs.get("thinking"),
-    ]
-    return "".join(value for value in values if isinstance(value, str))
+    values: list[str] = []
+
+    def add_candidate(value: Any) -> None:
+        if isinstance(value, str):
+            values.append(value)
+
+    for payload in (chunk.additional_kwargs, chunk.response_metadata):
+        if not isinstance(payload, dict):
+            continue
+        for key in (
+            "reasoning_content",
+            "thinking",
+            "reasoning",
+            "reasoningText",
+            "reasoning_text",
+        ):
+            add_candidate(payload.get(key))
+
+    content = chunk.content
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            block_type = str(item.get("type") or item.get("kind") or "").lower()
+            if block_type not in {
+                "reasoning",
+                "thinking",
+                "reasoning_content",
+                "reasoning_text",
+                "thinking_delta",
+            }:
+                continue
+            for key in ("text", "content", "reasoning", "thinking", "delta"):
+                add_candidate(item.get(key))
+
+    return "".join(values)
 
 
 def _extract_finish_reason(payload: Any) -> str:
@@ -601,6 +633,63 @@ def _selected_model_supports_vision(provider: dict[str, Any], model_name: str) -
     return False
 
 
+def _resolve_vision_config(request_config: VisionConfig | None = None) -> VisionConfig:
+    cfg = read_config()
+    saved = dict(cfg.get("visionConfig") or DEFAULT_VISION_CONFIG)
+    request_data = request_config.model_dump(exclude_none=True) if request_config else {}
+
+    merged: dict[str, Any] = dict(saved)
+    for key, value in request_data.items():
+        if key == "hasApiKey":
+            continue
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                merged[key] = normalized.rstrip("/") if key == "endpoint" else normalized
+            continue
+        merged[key] = value
+
+    provider_id = str(merged.get("providerId") or DEFAULT_VISION_CONFIG["providerId"]).strip() or DEFAULT_VISION_CONFIG["providerId"]
+    provider = get_provider(cfg, provider_id)
+    endpoint = str(merged.get("endpoint") or provider.get("endpoint") or DEFAULT_VISION_CONFIG["endpoint"]).strip().rstrip("/")
+    api_key = str(merged.get("apiKey") or provider.get("apiKey") or "").strip()
+    model = str(merged.get("model") or provider.get("defaultModel") or DEFAULT_VISION_CONFIG["model"]).strip()
+    try:
+        timeout_seconds = int(merged.get("timeoutSeconds") or DEFAULT_VISION_CONFIG["timeoutSeconds"])
+    except Exception:
+        timeout_seconds = int(DEFAULT_VISION_CONFIG["timeoutSeconds"])
+
+    return VisionConfig(
+        enabled=bool(merged.get("enabled", False)),
+        providerId=provider["id"],
+        endpoint=endpoint,
+        model=model,
+        apiKey=api_key or None,
+        hasApiKey=bool(api_key),
+        timeoutSeconds=max(5, min(timeout_seconds, 120)),
+    )
+
+
+def _resolve_vision_runtime(provider_id: str | None = None, model: str | None = None) -> tuple[dict[str, Any], str, bool]:
+    cfg = read_config()
+    main_provider = get_provider(cfg, provider_id)
+    main_model = str(model or main_provider.get("defaultModel") or "").strip()
+    if _selected_model_supports_vision(main_provider, main_model):
+        return main_provider, main_model, False
+
+    vision_config = _resolve_vision_config()
+    if not vision_config.enabled:
+        raise HTTPException(status_code=400, detail="当前主模型不是多模态模型，且未启用多模态图片分析模型。请在设置中配置多模态模型。")
+    if not vision_config.endpoint or not vision_config.model or not vision_config.hasApiKey:
+        raise HTTPException(status_code=400, detail="多模态图片分析模型配置不完整，请在设置中补充端点、模型和 API Key。")
+
+    provider = get_provider(cfg, vision_config.providerId)
+    provider["endpoint"] = vision_config.endpoint
+    provider["apiKey"] = vision_config.apiKey or ""
+    provider["supportsVision"] = True
+    return provider, vision_config.model, True
+
+
 def _parse_data_url_header(data_url: str) -> tuple[str, str] | None:
     if not isinstance(data_url, str) or not data_url.startswith("data:"):
         return None
@@ -660,6 +749,130 @@ def _validate_multimodal_request(body: ChatRequest) -> None:
     _validate_image_batch(images, max_images=MAX_MULTIMODAL_IMAGES)
 
 
+VISION_TEST_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+def _build_vision_messages(prompt: str, image_data_url: str) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": "你是 OpenWPS 的视觉理解引擎。请基于图片做简洁、可靠的中文分析。"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        },
+    ]
+
+
+async def _call_vision_chat(provider: dict[str, Any], model: str, prompt: str, image_data_url: str, timeout_seconds: int) -> str:
+    endpoint = str(provider.get("endpoint") or "").strip().rstrip("/")
+    api_key = str(provider.get("apiKey") or "").strip()
+    if not endpoint or not model or not api_key:
+        raise HTTPException(status_code=400, detail="多模态模型配置不完整，请检查端点、模型和 API Key。")
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": 1200,
+        "messages": _build_vision_messages(prompt, image_data_url),
+    }
+
+    async with httpx.AsyncClient(timeout=float(timeout_seconds)) as client:
+        try:
+            response = await client.post(f"{endpoint}/chat/completions", headers=headers, json=payload)
+            response.raise_for_status()
+            body = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip() or str(exc)
+            if _looks_like_multimodal_capability_error(detail):
+                raise HTTPException(status_code=400, detail=f"多模态模型未配置或不支持图片输入：{_compact_text_preview(detail, 180)}") from exc
+            raise HTTPException(status_code=502, detail=f"多模态模型请求失败: {detail}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"多模态模型请求失败: {exc}") from exc
+
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise HTTPException(status_code=502, detail="多模态模型没有返回有效结果")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    text = _stringify_content(content).strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="多模态模型返回为空")
+    return text
+
+
+async def test_vision_model(body: VisionTestRequest) -> dict[str, Any]:
+    cfg = read_config()
+    if body.providerId:
+        provider = get_provider(cfg, body.providerId)
+        saved_vision = _resolve_vision_config()
+        endpoint = str(body.endpoint or provider.get("endpoint") or "").strip().rstrip("/")
+        saved_matches = (
+            saved_vision.providerId == provider.get("id")
+            and (not body.endpoint or body.endpoint.rstrip("/") == saved_vision.endpoint)
+            and (not body.model or body.model == saved_vision.model)
+        )
+        api_key = str(
+            body.apiKey
+            if body.apiKey is not None
+            else (saved_vision.apiKey if saved_matches else provider.get("apiKey"))
+            or ""
+        ).strip()
+        model = str(body.model or provider.get("defaultModel") or "").strip()
+        timeout_seconds = max(5, min(int(body.timeoutSeconds or 30), 120))
+        runtime_provider = {**provider, "endpoint": endpoint, "apiKey": api_key, "supportsVision": True}
+    else:
+        vision_config = _resolve_vision_config()
+        runtime_provider = get_provider(cfg, vision_config.providerId)
+        runtime_provider.update(endpoint=vision_config.endpoint, apiKey=vision_config.apiKey or "", supportsVision=True)
+        model = vision_config.model
+        timeout_seconds = vision_config.timeoutSeconds
+
+    prompt = "这是一次能力测试。请只回答：ok。"
+    text = await _call_vision_chat(runtime_provider, model, prompt, VISION_TEST_IMAGE_DATA_URL, timeout_seconds)
+    return {
+        "success": True,
+        "providerId": runtime_provider.get("id"),
+        "model": model,
+        "message": "多模态图片输入测试通过",
+        "resultPreview": _compact_text_preview(text, 80),
+    }
+
+
+async def analyze_image_with_vision(body: VisionAnalyzeRequest) -> dict[str, Any]:
+    data_url = str((body.image or {}).get("dataUrl") or "").strip()
+    pseudo_request = ChatRequest(message=body.instruction or "", images=[body.image] if body.image else [])
+    _validate_multimodal_request(pseudo_request)
+    if not data_url:
+        raise HTTPException(status_code=400, detail="未提供可分析的图片")
+
+    provider, model, used_fallback = _resolve_vision_runtime(body.providerId, body.model)
+    timeout_seconds = int(body.timeoutSeconds or DEFAULT_VISION_CONFIG["timeoutSeconds"])
+    context = body.context or {}
+    prompt = "\n".join([
+        "请分析当前文档中的这张图片，返回严格 JSON 对象。",
+        "字段：visualSummary, detectedObjects, chartSummary, styleHints, warnings, confidence。",
+        "detectedObjects 和 warnings 使用数组；confidence 使用 0 到 1 的数字。",
+        f"图片上下文：{json.dumps(context, ensure_ascii=False)[:1800]}",
+        f"额外要求：{str(body.instruction or '').strip() or '按文档理解需要做图片语义分析。'}",
+    ])
+    raw_text = await _call_vision_chat(provider, model, prompt, data_url, timeout_seconds)
+    parsed = _extract_json_object(raw_text)
+    data = parsed if isinstance(parsed, dict) else {"visualSummary": raw_text}
+    return {
+        "success": True,
+        "providerId": provider.get("id"),
+        "model": model,
+        "usedFallbackVisionConfig": used_fallback,
+        "result": data,
+    }
+
+
 def _validate_ocr_request(body: ChatRequest, ocr_config: OCRConfig) -> None:
     images = body.images or []
     if not images:
@@ -706,14 +919,37 @@ def _looks_like_multimodal_capability_error(detail: str) -> bool:
 
 def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
     text = detail.strip() or "未知错误"
+    normalized = text.lower()
+    provider, model_name = _resolve_provider_and_model(body)
+    provider_name = str(provider.get("label") or provider.get("id") or "当前服务商")
+    endpoint = str(provider.get("endpoint") or "").strip()
+    endpoint_hint = f"（{endpoint}）" if endpoint else ""
+
+    if (
+        ("<!doctype html" in normalized or "<html" in normalized)
+        and (
+            "just a moment" in normalized
+            or "cloudflare" in normalized
+            or "challenges.cloudflare.com" in normalized
+        )
+    ):
+        return (
+            f"{provider_name}{endpoint_hint} 返回了 Cloudflare 人机验证/挑战页，而不是 OpenAI-compatible API 响应。"
+            "当前端点不能被后端作为模型 API 直接调用，请在 AI 设置中切换到可直连的服务商/端点，或更换当前 API 网关。"
+        )
+
+    if "<!doctype html" in normalized or "<html" in normalized:
+        return (
+            f"{provider_name}{endpoint_hint} 返回了 HTML 页面，而不是模型 API 的 JSON/SSE 响应。"
+            f"请检查端点是否填到了 API base URL；上游返回摘要：{_compact_text_preview(text, 180)}"
+        )
+
     images = body.images or []
     if not images:
         return text
     if not _looks_like_multimodal_capability_error(text):
         return text
 
-    provider, model_name = _resolve_provider_and_model(body)
-    provider_name = str(provider.get("label") or provider.get("id") or "当前服务商")
     model_text = model_name or str(provider.get("defaultModel") or "当前模型")
     return (
         f"当前模型 {model_text} 未接受图片输入，或 {provider_name} 接口不兼容 image_url 图片格式。"
@@ -2282,6 +2518,7 @@ class LoopState:
     compression_tier: int = 0  # 0=none, 1=tool_compress, 2=round_summary, 3=aggressive
     estimated_tokens: int = 0
     pending_write_follow_up: bool = False
+    pending_agent_follow_up: bool = False
     forced_follow_up_attempts: int = 0
     # Stop-hook tracking
     recent_tool_patterns: list[str] = field(default_factory=list)
@@ -2424,6 +2661,36 @@ def _assign_parallel_groups(executions: list[PlannedToolExecution]) -> list[Plan
     return grouped
 
 
+def _build_parallel_execution_batches(executions: list[PlannedToolExecution]) -> list[list[PlannedToolExecution]]:
+    batches: list[list[PlannedToolExecution]] = []
+    index = 0
+    while index < len(executions):
+        current = executions[index]
+        explicit_group = current.parallel_group or ""
+        if explicit_group:
+            batch = [current]
+            index += 1
+            while index < len(executions) and executions[index].parallel_group == explicit_group:
+                batch.append(executions[index])
+                index += 1
+            batches.append(batch)
+            continue
+        if current.parallel_safe:
+            batch = [current]
+            index += 1
+            while index < len(executions):
+                candidate = executions[index]
+                if candidate.parallel_group or not candidate.parallel_safe:
+                    break
+                batch.append(candidate)
+                index += 1
+            batches.append(batch)
+            continue
+        batches.append([current])
+        index += 1
+    return batches
+
+
 @dataclass(frozen=True)
 class PostedToolResult:
     execution_id: str
@@ -2527,6 +2794,56 @@ def _parse_tool_result_payload(content: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _body_model_supports_vision(body: ChatRequest) -> bool:
+    provider, model = _resolve_provider_and_model(body)
+    return _selected_model_supports_vision(provider, model)
+
+
+def _prepare_page_screenshot_tool_result(
+    content: str,
+    body: ChatRequest | None = None,
+) -> tuple[str, HumanMessage | None]:
+    payload = _parse_tool_result_payload(content)
+    if payload.get("toolName") != "capture_page_screenshot":
+        return content, None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return content, None
+    data_url = str(data.get("dataUrl") or "").strip()
+    if not data_url:
+        return content, None
+
+    safe_data = dict(data)
+    safe_data.pop("dataUrl", None)
+    page = safe_data.get("page")
+    page_count = safe_data.get("pageCount")
+    instruction = _stringify_content(safe_data.get("instruction")).strip()
+    preview_text = _stringify_content(safe_data.get("previewText")).strip()
+
+    safe_payload = dict(payload)
+    safe_payload["data"] = safe_data
+    if body is not None and not _body_model_supports_vision(body):
+        safe_payload["success"] = False
+        safe_payload["message"] = "已截取页面截图，但当前子代理模型不支持 image_url 多模态输入；请切换到支持视觉的模型后重新验证。"
+        return json.dumps(safe_payload, ensure_ascii=False), None
+
+    text_parts = [
+        "[页面截图]",
+        f"页码：{page}/{page_count}" if page_count else f"页码：{page}",
+    ]
+    if instruction:
+        text_parts.append(f"检查重点：{instruction}")
+    if preview_text:
+        text_parts.append(f"页面文字预览：{preview_text}")
+    text_parts.append("请基于这张当前正文页截图检查真实视觉效果，并结合前面的工具结果给出验收结论。")
+
+    image_message = HumanMessage(content=[
+        {"type": "text", "text": "\n".join(text_parts)},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ])
+    return json.dumps(safe_payload, ensure_ascii=False), image_message
+
+
 def _extract_tasks_from_payload(payload: dict[str, Any]) -> list[dict[str, str]] | None:
     candidates = [
         payload.get("data"),
@@ -2581,8 +2898,33 @@ def _tool_results_started_streaming_write(tool_results: list[dict[str, str]]) ->
     return False
 
 
+def _tool_results_completed_subagent(tool_results: list[dict[str, str]]) -> bool:
+    for item in tool_results:
+        payload = _parse_tool_result_payload(item.get("content", ""))
+        if payload.get("toolName") != "Agent":
+            continue
+        return True
+    return False
+
+
+def _build_stream_write_interruption_hint(event: dict[str, Any]) -> str:
+    event_type = str(event.get("eventType") or "stream_write_interrupted")
+    reason = str(event.get("reason") or event_type)
+    streaming_write_id = str(event.get("streamingWriteId") or "").strip()
+    last_applied_chars = int(event.get("lastAppliedChars") or 0)
+    id_text = f"写入会话 ID：{streaming_write_id}。" if streaming_write_id else ""
+    return "\n".join([
+        "前端报告：浏览器页面刷新或卸载导致 begin_streaming_write 的浏览器流式写入会话中断。",
+        f"中断原因：{reason}。{id_text}刷新前浏览器确认写入的字符数约为 {last_applied_chars}。",
+        "不要继续假设刚才流式输出的正文已经完整写入文档；刷新期间后续 token 可能只进入了会话日志，没有进入编辑器。",
+        "现在必须先调用 get_document_content 或 get_paragraph 重新读取并验证当前文档内容，再根据缺失部分重新调用 begin_streaming_write 或使用普通写入工具补写。",
+        "补写时避免重复写入已经存在的内容。",
+    ])
+
+
 def _build_follow_up_hint(
     needs_write_follow_up: bool,
+    needs_agent_follow_up: bool,
     needs_content_verification: bool,
     needs_task_check: bool,
     incomplete_tasks: list[dict[str, str]],
@@ -2594,6 +2936,11 @@ def _build_follow_up_hint(
         reasons.append("post_write_follow_up")
         parts.append("你刚刚完成的是正文流式写入阶段，这一轮纯文本输出属于写入文档的正文，不是最终结束信号。")
         parts.append("现在必须继续执行后续流程：先验证正文是否已经正确写入，再更新任务状态，然后完成剩余步骤。")
+
+    if needs_agent_follow_up:
+        reasons.append("post_agent_follow_up")
+        parts.append("你刚刚调用了子代理并收到了子代理结果，但主 Agent 还没有基于该结果给出后续决策或最终结论。")
+        parts.append("现在必须读取上一条 Agent 工具结果，明确说明验证/分析结论，并决定继续执行工具、补救问题，或向用户给出最终总结。不能空输出或直接结束。")
 
     if needs_content_verification:
         reasons.append("content_verification_required")
@@ -2672,6 +3019,7 @@ def _needs_forced_continuation(state: LoopState, messages: list[BaseMessage]) ->
     incomplete_tasks = _get_incomplete_tasks(messages)
     needs_continue = any([
         state.pending_write_follow_up,
+        state.pending_agent_follow_up,
         state.requires_content_verification,
         state.requires_task_check,
         bool(incomplete_tasks),
@@ -2697,6 +3045,7 @@ def _evaluate_completion_policy(state: LoopState, messages: list[BaseMessage]) -
 
     hint, reason = _build_follow_up_hint(
         state.pending_write_follow_up,
+        state.pending_agent_follow_up,
         state.requires_content_verification,
         state.requires_task_check,
         incomplete_tasks,
@@ -2901,7 +3250,7 @@ def _decide_text_round(state: LoopState, messages: list[BaseMessage]) -> RoundDe
             action=RoundDecisionAction.ERROR,
             transition=Transition.FATAL_ERROR,
             reason=completion_evaluation.reason,
-            error_message="AI 在正文写入后未继续完成剩余步骤，已达到自动续跑上限。",
+            error_message="AI 未继续完成必要的后续处理，已达到自动续跑上限。",
         )
 
     if completion_evaluation.decision == CompletionDecision.COMPLETE:
@@ -2925,6 +3274,8 @@ def _decide_text_round(state: LoopState, messages: list[BaseMessage]) -> RoundDe
         client_message=(
             "正文已写入，正在继续执行后续步骤..."
             if completion_evaluation.reason == "post_write_follow_up"
+            else "子代理已完成，主 Agent 正在继续处理结果..."
+            if completion_evaluation.reason == "post_agent_follow_up"
             else "任务计划尚未完成，继续执行后续步骤..."
         ),
         pending_task_count=completion_evaluation.pending_task_count,
@@ -2970,6 +3321,7 @@ def _snapshot_completion_gate(state: LoopState, messages: list[BaseMessage]) -> 
     incomplete_tasks = _get_incomplete_tasks(messages)
     return {
         "pendingWriteFollowUp": state.pending_write_follow_up,
+        "pendingAgentFollowUp": state.pending_agent_follow_up,
         "requiresContentVerification": state.requires_content_verification,
         "requiresTaskCheck": state.requires_task_check,
         "incompleteTaskCount": len(incomplete_tasks),
@@ -3263,6 +3615,85 @@ def _build_tool_result_event(
             "data": payload.get("data"),
         },
     }
+
+
+def _build_agent_execution_outcome(
+    execution: PlannedToolExecution,
+    *,
+    success: bool,
+    message: str,
+    executed_params: dict[str, Any],
+    original_params: dict[str, Any] | None = None,
+    data: Any = None,
+) -> tuple[str, dict[str, Any], dict[str, str], dict[str, Any]]:
+    content = _serialize_tool_result_payload(
+        tool_name="Agent",
+        success=success,
+        message=message,
+        executed_params=executed_params,
+        original_params=original_params if original_params is not None else executed_params,
+        data=data,
+    )
+    payload = _parse_tool_result_payload(content)
+    result = {
+        "execution_id": execution.execution_id,
+        "content": content,
+    }
+    summary = {
+        "executionId": execution.execution_id,
+        "toolName": execution.tool_name,
+        "success": payload.get("success") is True,
+        "message": _truncate_preview(payload.get("message", ""), 120),
+        "mergeStrategy": execution.merge_strategy,
+        "sourceToolCallCount": len(execution.source_calls),
+    }
+    return content, payload, result, summary
+
+
+def _append_agent_tool_result_messages(
+    session: "ReactSession",
+    execution: PlannedToolExecution,
+    content: str,
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for source_call in execution.source_calls:
+        session.messages.append(ToolMessage(
+            content=_decorate_tool_result_content(content, execution, source_call),
+            tool_call_id=source_call.id,
+        ))
+        events.append(_build_tool_result_event(execution, source_call, payload))
+    _record_content_event(session, {
+        "type": "tool_results",
+        "source": "agent",
+        "toolName": execution.tool_name,
+        "executionCount": 1,
+        "sourceToolCallCount": len(execution.source_calls),
+        "contentChars": len(content),
+    })
+    return events
+
+
+def _build_and_append_agent_execution_result(
+    session: "ReactSession",
+    execution: PlannedToolExecution,
+    *,
+    success: bool,
+    message: str,
+    executed_params: dict[str, Any],
+    original_params: dict[str, Any] | None = None,
+    data: Any = None,
+) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
+    content, payload, result, summary = _build_agent_execution_outcome(
+        execution,
+        success=success,
+        message=message,
+        executed_params=executed_params,
+        original_params=original_params,
+        data=data,
+    )
+    events = _append_agent_tool_result_messages(session, execution, content, payload)
+    return result, summary, events
 
 
 def _trim_tavily_result_item(item: Any) -> dict[str, Any] | None:
@@ -3622,10 +4053,11 @@ def _decorate_tool_result_content(
     execution: PlannedToolExecution,
     source_call: SourceToolCall,
 ) -> str:
-    payload = _parse_tool_result_payload(content)
+    safe_content, _ = _prepare_page_screenshot_tool_result(content)
+    payload = _parse_tool_result_payload(safe_content)
     decorated = dict(payload) if payload else {
         "success": True,
-        "message": _stringify_content(content),
+        "message": _stringify_content(safe_content),
     }
     decorated["toolName"] = source_call.name
     decorated["executionId"] = execution.execution_id
@@ -3648,6 +4080,8 @@ class ReactSession:
         "session_id", "body", "messages", "tool_result_queue",
         "state", "finished", "expected_plan", "trace", "latest_context",
         "agent_tool_result_queues", "agent_expected_plans", "loaded_deferred_tools",
+        "wait_for_client_tools", "client_events", "client_event_ids", "pending_client_hints",
+        "stream_write_interrupted_event",
     )
 
     def __init__(self, session_id: str, body: ChatRequest, messages: list[BaseMessage]):
@@ -3662,6 +4096,11 @@ class ReactSession:
         self.agent_tool_result_queues: dict[str, asyncio.Queue[PostedToolResults | None]] = {}
         self.agent_expected_plans: dict[str, ToolExecutionPlan] = {}
         self.loaded_deferred_tools: set[str] = set()
+        self.wait_for_client_tools = False
+        self.client_events: list[dict[str, Any]] = []
+        self.client_event_ids: set[str] = set()
+        self.pending_client_hints: list[dict[str, str]] = []
+        self.stream_write_interrupted_event: dict[str, Any] | None = None
         self.trace = SessionTrace(
             session_id=session_id,
             conversation_id=body.conversationId,
@@ -3676,6 +4115,98 @@ _active_sessions: dict[str, ReactSession] = {}
 _completed_react_traces: dict[str, dict[str, Any]] = {}
 _conversation_react_trace_index: dict[str, list[str]] = {}
 MAX_COMPLETED_REACT_TRACES = 50
+MAX_REACT_RUN_EVENTS = 1000
+
+
+@dataclass
+class ReactGatewayRun:
+    session: ReactSession
+    events: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "running"
+    error: str | None = None
+    pending_plan: dict[str, Any] | None = None
+    client_events: list[dict[str, Any]] = field(default_factory=list)
+    client_event_ids: set[str] = field(default_factory=set)
+    stream_write_state: str = "idle"
+    interrupted_streaming_write: dict[str, Any] | None = None
+    task: asyncio.Task[None] | None = None
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    created_at: str = field(default_factory=_now_iso)
+    updated_at: str = field(default_factory=_now_iso)
+    last_seq: int = 0
+
+    @property
+    def session_id(self) -> str:
+        return self.session.session_id
+
+    @property
+    def conversation_id(self) -> str | None:
+        return self.session.body.conversationId
+
+    async def append_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        self.last_seq += 1
+        item = {"seq": self.last_seq, **event}
+        event_type = str(item.get("type") or "")
+        if event_type in {"awaiting_tool_results", "tool_plan"}:
+            self.pending_plan = item
+            if event_type == "awaiting_tool_results":
+                self.status = "awaiting_client"
+        elif event_type == "agent_progress" and item.get("phase") == "awaiting_tool_results":
+            self.pending_plan = item
+            self.status = "awaiting_client"
+        elif event_type in {"tool_result", "agent_tool_result", "round_start", "content", "thinking"}:
+            if self.status != "completed":
+                self.status = "running"
+            if event_type == "tool_result" and item.get("name") == "begin_streaming_write":
+                result = item.get("result")
+                if isinstance(result, dict) and result.get("success") is True:
+                    self.stream_write_state = "active"
+                    self.interrupted_streaming_write = None
+        elif event_type == "client_event":
+            client_event_type = str(item.get("eventType") or "")
+            if client_event_type in {"page_refresh", "stream_write_interrupted"}:
+                self.stream_write_state = "interrupted"
+                self.interrupted_streaming_write = item
+            elif client_event_type == "stream_write_closed":
+                self.stream_write_state = "closed"
+                self.interrupted_streaming_write = None
+            if self.status not in {"completed", "failed"}:
+                self.status = "running"
+        elif event_type == "done":
+            self.status = "completed"
+            self.pending_plan = None
+            if self.stream_write_state == "active":
+                self.stream_write_state = "closed"
+        elif event_type == "error":
+            self.status = "failed"
+            self.error = str(item.get("message") or "AI 请求失败")
+            self.pending_plan = None
+
+        self.updated_at = _now_iso()
+        self.events.append(item)
+        if len(self.events) > MAX_REACT_RUN_EVENTS:
+            self.events = self.events[-MAX_REACT_RUN_EVENTS:]
+        async with self.condition:
+            self.condition.notify_all()
+        return item
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "sessionId": self.session_id,
+            "conversationId": self.conversation_id,
+            "status": self.status,
+            "error": self.error,
+            "createdAt": self.created_at,
+            "updatedAt": self.updated_at,
+            "lastSeq": self.last_seq,
+            "pendingPlan": self.pending_plan,
+            "streamWriteState": self.stream_write_state,
+            "interruptedStreamingWrite": self.interrupted_streaming_write,
+        }
+
+
+_react_gateway_runs: dict[str, ReactGatewayRun] = {}
+_conversation_gateway_run_index: dict[str, str] = {}
 
 
 def create_react_session(body: ChatRequest) -> ReactSession:
@@ -3686,6 +4217,153 @@ def create_react_session(body: ChatRequest) -> ReactSession:
     _record_content_events(session, content_events)
     _active_sessions[session_id] = session
     return session
+
+
+async def create_react_gateway_run(body: ChatRequest) -> ReactGatewayRun:
+    session = create_react_session(body)
+    session.wait_for_client_tools = True
+    run = ReactGatewayRun(session=session)
+    _react_gateway_runs[session.session_id] = run
+    if body.conversationId:
+        _conversation_gateway_run_index[body.conversationId] = session.session_id
+
+    async def runner() -> None:
+        try:
+            async for event in stream_react_session(session):
+                await run.append_event(event)
+        except HTTPException as exc:
+            await run.append_event({"type": "error", "message": exc.detail})
+        except asyncio.CancelledError:
+            await run.append_event({"type": "done", "reason": "stopped_by_client"})
+            submit_react_tool_results(session, ToolResultsRequest(stop=True))
+            raise
+        except Exception as exc:
+            logger.exception("[openwps.ai] gateway run %s failed", session.session_id)
+            await run.append_event({"type": "error", "message": str(exc)})
+
+    run.task = asyncio.create_task(runner())
+    return run
+
+
+def get_react_gateway_run(session_id: str) -> ReactGatewayRun | None:
+    return _react_gateway_runs.get(session_id)
+
+
+def get_conversation_react_gateway_run(conversation_id: str) -> dict[str, Any] | None:
+    session_id = _conversation_gateway_run_index.get(conversation_id)
+    if not session_id:
+        return None
+    run = _react_gateway_runs.get(session_id)
+    if not run:
+        _conversation_gateway_run_index.pop(conversation_id, None)
+        return None
+    return run.snapshot()
+
+
+async def stream_react_gateway_run_events(
+    session_id: str,
+    after: int = 0,
+) -> AsyncGenerator[dict[str, Any], None]:
+    run = _react_gateway_runs.get(session_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="React run not found or expired")
+
+    cursor = max(int(after or 0), 0)
+    while True:
+        pending = [event for event in run.events if int(event.get("seq") or 0) > cursor]
+        if pending:
+            for event in pending:
+                cursor = int(event.get("seq") or cursor)
+                yield event
+            if run.status in {"completed", "failed"}:
+                return
+            continue
+
+        if run.status in {"completed", "failed"}:
+            return
+
+        async with run.condition:
+            await run.condition.wait()
+
+
+def cancel_react_gateway_run(session_id: str) -> None:
+    run = _react_gateway_runs.get(session_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="React run not found or expired")
+    submit_react_tool_results(run.session, ToolResultsRequest(stop=True))
+    if run.task and not run.task.done():
+        run.task.cancel()
+
+
+async def submit_react_client_event(session_id: str, body: ClientEventRequest) -> dict[str, Any]:
+    run = _react_gateway_runs.get(session_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="React run not found or expired")
+
+    event_id = str(body.eventId or "").strip()
+    event_type = str(body.eventType or "").strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="eventId 不能为空")
+    if event_type not in {"page_refresh", "stream_write_interrupted", "stream_write_closed"}:
+        raise HTTPException(status_code=400, detail=f"未知 client event: {event_type}")
+
+    if event_id in run.client_event_ids or event_id in run.session.client_event_ids:
+        return {"success": True, "duplicate": True, "run": run.snapshot()}
+
+    event = {
+        "eventId": event_id,
+        "eventType": event_type,
+        "conversationId": body.conversationId,
+        "toolName": body.toolName,
+        "streamingWriteId": body.streamingWriteId,
+        "reason": body.reason,
+        "lastAppliedChars": max(0, int(body.lastAppliedChars or 0)),
+        "createdAt": body.createdAt or _now_iso(),
+        "metadata": body.metadata or {},
+    }
+    run.client_event_ids.add(event_id)
+    run.client_events.append(event)
+    if len(run.client_events) > MAX_REACT_RUN_EVENTS:
+        run.client_events = run.client_events[-MAX_REACT_RUN_EVENTS:]
+    run.session.client_event_ids.add(event_id)
+    run.session.client_events.append(event)
+    if len(run.session.client_events) > MAX_REACT_RUN_EVENTS:
+        run.session.client_events = run.session.client_events[-MAX_REACT_RUN_EVENTS:]
+
+    message = "已记录前端事件"
+    if event_type in {"page_refresh", "stream_write_interrupted"}:
+        message = "页面刷新导致流式写入中断，已提示模型重新验证并重试"
+        run.stream_write_state = "interrupted"
+        run.interrupted_streaming_write = event
+        run.session.stream_write_interrupted_event = event
+        run.session.pending_client_hints.append({
+            "eventId": event_id,
+            "content": _build_stream_write_interruption_hint(event),
+        })
+        run.session.state.pending_write_follow_up = True
+        run.session.state.requires_content_verification = True
+    elif event_type == "stream_write_closed":
+        message = "流式写入会话已正常关闭"
+        if run.stream_write_state != "interrupted":
+            run.stream_write_state = "closed"
+        if run.session.stream_write_interrupted_event is not None:
+            run.session.stream_write_interrupted_event = None
+
+    _record_trace_event(
+        run.session,
+        "client_event",
+        eventId=event_id,
+        eventType=event_type,
+        streamingWriteId=body.streamingWriteId,
+        reason=body.reason,
+        lastAppliedChars=max(0, int(body.lastAppliedChars or 0)),
+    )
+    await run.append_event({
+        "type": "client_event",
+        **event,
+        "message": message,
+    })
+    return {"success": True, "duplicate": False, "run": run.snapshot()}
 
 
 def get_react_session(session_id: str) -> ReactSession | None:
@@ -3822,6 +4500,10 @@ def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -
             results=posted_results,
             stop=False,
         ))
+        gateway_run = _react_gateway_runs.get(session.session_id)
+        if gateway_run:
+            gateway_run.status = "running"
+            gateway_run.pending_plan = None
         _record_trace_event(
             session,
             "agent_tool_results_posted",
@@ -3882,6 +4564,10 @@ def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -
         results=posted_results,
         stop=False,
     ))
+    gateway_run = _react_gateway_runs.get(session.session_id)
+    if gateway_run:
+        gateway_run.status = "running"
+        gateway_run.pending_plan = None
     _record_trace_event(
         session,
         "tool_results_posted",
@@ -4888,6 +5574,17 @@ class QueryCoordinator:
             **data,
         }
 
+    def _pop_client_hints(self) -> list[dict[str, str]]:
+        hints = list(self.session.pending_client_hints)
+        self.session.pending_client_hints.clear()
+        return hints
+
+    def _inject_client_hints(self, hints: list[dict[str, str]]) -> str:
+        content = "\n\n".join(hint["content"] for hint in hints if hint.get("content"))
+        if content:
+            self.session.messages.append(HumanMessage(content=content))
+        return content
+
     async def _run_model_round(self, messages: list[BaseMessage]) -> AsyncGenerator[dict[str, Any], None]:
         round_content = ""
         round_tool_calls: list[dict[str, Any]] = []
@@ -4982,15 +5679,21 @@ class QueryCoordinator:
 
         for execution in plan.executions:
             posted_result = results_by_execution[execution.execution_id]
+            safe_content, image_message = _prepare_page_screenshot_tool_result(
+                posted_result.content,
+                self.session.body,
+            )
             execution_results.append({
                 "execution_id": execution.execution_id,
-                "content": posted_result.content,
+                "content": safe_content,
             })
             for source_call in execution.source_calls:
                 self.session.messages.append(ToolMessage(
-                    content=_decorate_tool_result_content(posted_result.content, execution, source_call),
+                    content=_decorate_tool_result_content(safe_content, execution, source_call),
                     tool_call_id=source_call.id,
                 ))
+            if image_message is not None:
+                self.session.messages.append(image_message)
 
         _record_content_event(self.session, {
             "type": "tool_results",
@@ -5273,10 +5976,13 @@ class QueryCoordinator:
                 }
 
                 try:
-                    posted_results = await asyncio.wait_for(
-                        self.session.agent_tool_result_queues[agent_id].get(),
-                        timeout=TOOL_RESULT_TIMEOUT,
-                    )
+                    if self.session.wait_for_client_tools:
+                        posted_results = await self.session.agent_tool_result_queues[agent_id].get()
+                    else:
+                        posted_results = await asyncio.wait_for(
+                            self.session.agent_tool_result_queues[agent_id].get(),
+                            timeout=TOOL_RESULT_TIMEOUT,
+                        )
                 except asyncio.TimeoutError:
                     self.session.agent_expected_plans.pop(agent_id, None)
                     self.session.agent_tool_result_queues.pop(agent_id, None)
@@ -5295,11 +6001,17 @@ class QueryCoordinator:
                 }
                 for client_execution in client_plan.executions:
                     posted = results_by_execution[client_execution.execution_id]
+                    safe_content, image_message = _prepare_page_screenshot_tool_result(
+                        posted.content,
+                        child_body,
+                    )
                     for source_call in client_execution.source_calls:
                         child_messages.append(ToolMessage(
-                            content=_decorate_tool_result_content(posted.content, client_execution, source_call),
+                            content=_decorate_tool_result_content(safe_content, client_execution, source_call),
                             tool_call_id=source_call.id,
                         ))
+                    if image_message is not None:
+                        child_messages.append(image_message)
 
         if not final_text:
             final_text = f"子代理 {agent.agent_type} 已达到最大轮次，未形成完整结论。"
@@ -5361,128 +6073,219 @@ class QueryCoordinator:
         run_in_background = bool(params.get("run_in_background"))
 
         if not prompt:
-            content = _serialize_tool_result_payload(
-                tool_name="Agent",
+            result, summary, events = _build_and_append_agent_execution_result(
+                self.session,
+                execution,
                 success=False,
                 message="Agent 缺少 prompt 参数",
                 executed_params=params,
                 original_params=params,
             )
-            payload = _parse_tool_result_payload(content)
-            for source_call in execution.source_calls:
-                self.session.messages.append(ToolMessage(
-                    content=_decorate_tool_result_content(content, execution, source_call),
-                    tool_call_id=source_call.id,
-                ))
-                yield _build_tool_result_event(execution, source_call, payload)
-            yield {"type": "_server_execution_result", "result": {"execution_id": execution.execution_id, "content": content}, "summary": {
-                "executionId": execution.execution_id,
-                "toolName": execution.tool_name,
-                "success": False,
-                "message": "Agent 缺少 prompt 参数",
-                "mergeStrategy": execution.merge_strategy,
-                "sourceToolCallCount": len(execution.source_calls),
-            }}
+            for event in events:
+                yield event
+            yield {"type": "_server_execution_result", "result": result, "summary": summary}
             return
 
-        agent = get_agent_definition(subagent_type)
         agent_id = new_agent_run_id()
-        if run_in_background or agent.background:
-            conversation_id = self.session.body.conversationId or self.session.session_id
-            record = AgentRunRecord(
-                id=agent_id,
-                conversation_id=conversation_id,
-                agent_type=agent.agent_type,
-                description=description,
-                prompt=prompt,
-                run_mode="background",
-            )
-            save_agent_run(record)
-            task = asyncio.create_task(self._run_background_agent_lifecycle(record, agent, model_override))
-            register_background_task(agent_id, task)
-            content = _serialize_tool_result_payload(
-                tool_name="Agent",
-                success=True,
-                message=f"后台子代理已启动：{description}",
-                executed_params=params,
-                original_params=params,
-                data={
+        try:
+            agent = get_agent_definition(subagent_type)
+            if run_in_background or agent.background:
+                conversation_id = self.session.body.conversationId or self.session.session_id
+                record = AgentRunRecord(
+                    id=agent_id,
+                    conversation_id=conversation_id,
+                    agent_type=agent.agent_type,
+                    description=description,
+                    prompt=prompt,
+                    run_mode="background",
+                )
+                save_agent_run(record)
+                task = asyncio.create_task(self._run_background_agent_lifecycle(record, agent, model_override))
+                register_background_task(agent_id, task)
+                result, summary, events = _build_and_append_agent_execution_result(
+                    self.session,
+                    execution,
+                    success=True,
+                    message=f"后台子代理已启动：{description}",
+                    executed_params=params,
+                    original_params=params,
+                    data={
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "status": "background_launched",
+                        "conversationId": conversation_id,
+                    },
+                )
+                yield {
+                    "type": "agent_background_launched",
                     "agentId": agent_id,
                     "agentType": agent.agent_type,
-                    "status": "background_launched",
+                    "description": description,
                     "conversationId": conversation_id,
-                },
-            )
-            payload = _parse_tool_result_payload(content)
-            yield {
-                "type": "agent_background_launched",
-                "agentId": agent_id,
-                "agentType": agent.agent_type,
-                "description": description,
-                "conversationId": conversation_id,
-            }
-        else:
-            final_content = ""
-            async for event in self._run_subagent(
-                agent_id=agent_id,
-                agent=agent,
-                description=description,
-                prompt=prompt,
-                model_override=model_override,
-                background=False,
-            ):
-                if event["type"] == "_subagent_result":
-                    final_content = str(event.get("content") or "")
-                else:
-                    yield event
-            content = _serialize_tool_result_payload(
-                tool_name="Agent",
-                success=True,
-                message=f"子代理 {agent.agent_type} 已完成：{description}",
+                }
+            else:
+                final_content = ""
+                async for event in self._run_subagent(
+                    agent_id=agent_id,
+                    agent=agent,
+                    description=description,
+                    prompt=prompt,
+                    model_override=model_override,
+                    background=False,
+                ):
+                    if event["type"] == "_subagent_result":
+                        final_content = str(event.get("content") or "")
+                    else:
+                        yield event
+                agent_success = bool(final_content.strip())
+                result, summary, events = _build_and_append_agent_execution_result(
+                    self.session,
+                    execution,
+                    success=agent_success,
+                    message=(
+                        f"子代理 {agent.agent_type} 已完成：{description}"
+                        if agent_success
+                        else "Agent 执行未返回结果"
+                    ),
+                    executed_params=params,
+                    original_params=params,
+                    data={
+                        "agentId": agent_id,
+                        "agentType": agent.agent_type,
+                        "result": final_content,
+                    },
+                )
+                yield {
+                    "type": "agent_done",
+                    "agentId": agent_id,
+                    "agentType": agent.agent_type,
+                    "description": description,
+                    "result": final_content,
+                }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("[openwps.ai] Agent execution %s failed", execution.execution_id)
+            message = f"Agent 执行失败：{_truncate_preview(_stringify_content(exc), 240)}"
+            result, summary, events = _build_and_append_agent_execution_result(
+                self.session,
+                execution,
+                success=False,
+                message=message,
                 executed_params=params,
                 original_params=params,
                 data={
                     "agentId": agent_id,
-                    "agentType": agent.agent_type,
-                    "result": final_content,
+                    "agentType": subagent_type,
+                    "error": _stringify_content(exc),
                 },
             )
-            payload = _parse_tool_result_payload(content)
-            yield {
-                "type": "agent_done",
-                "agentId": agent_id,
-                "agentType": agent.agent_type,
-                "description": description,
-                "result": final_content,
-            }
 
-        result = {
-            "execution_id": execution.execution_id,
-            "content": content,
-        }
-        summary = {
-            "executionId": execution.execution_id,
-            "toolName": execution.tool_name,
-            "success": payload.get("success") is True,
-            "message": _truncate_preview(payload.get("message", ""), 120),
-            "mergeStrategy": execution.merge_strategy,
-            "sourceToolCallCount": len(execution.source_calls),
-        }
-        for source_call in execution.source_calls:
-            self.session.messages.append(ToolMessage(
-                content=_decorate_tool_result_content(content, execution, source_call),
-                tool_call_id=source_call.id,
-            ))
-            yield _build_tool_result_event(execution, source_call, payload)
-        _record_content_event(self.session, {
-            "type": "tool_results",
-            "source": "agent",
-            "toolName": execution.tool_name,
-            "executionCount": 1,
-            "sourceToolCallCount": len(execution.source_calls),
-            "contentChars": len(content),
-        })
+        for event in events:
+            yield event
         yield {"type": "_server_execution_result", "result": result, "summary": summary}
+
+    async def _execute_server_execution_events(
+        self,
+        execution: PlannedToolExecution,
+    ) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
+        if execution.tool_name == "Agent":
+            server_result = None
+            server_summary = None
+            events: list[dict[str, Any]] = []
+            async for agent_event in self._execute_agent_execution(execution):
+                if agent_event["type"] == "_server_execution_result":
+                    server_result = agent_event["result"]
+                    server_summary = agent_event["summary"]
+                else:
+                    events.append(agent_event)
+            if server_result is None or server_summary is None:
+                server_result, server_summary, fallback_events = _build_and_append_agent_execution_result(
+                    self.session,
+                    execution,
+                    success=False,
+                    message="Agent 执行未返回结果",
+                    executed_params=execution.params,
+                    original_params=execution.params,
+                )
+                events.extend(fallback_events)
+            return server_result, server_summary, events
+
+        return await self._execute_server_execution(execution)
+
+    async def _execute_parallel_server_batch(
+        self,
+        batch: list[PlannedToolExecution],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        async def run_one(execution: PlannedToolExecution) -> None:
+            try:
+                if execution.tool_name == "Agent":
+                    result = None
+                    summary = None
+                    async for agent_event in self._execute_agent_execution(execution):
+                        if agent_event["type"] == "_server_execution_result":
+                            result = agent_event["result"]
+                            summary = agent_event["summary"]
+                        else:
+                            await queue.put({"type": "event", "event": agent_event})
+                    if result is None or summary is None:
+                        result, summary, fallback_events = _build_and_append_agent_execution_result(
+                            self.session,
+                            execution,
+                            success=False,
+                            message="Agent 执行未返回结果",
+                            executed_params=execution.params,
+                            original_params=execution.params,
+                        )
+                        for event in fallback_events:
+                            await queue.put({"type": "event", "event": event})
+                else:
+                    result, summary, events = await self._execute_server_execution(execution)
+                    for event in events:
+                        await queue.put({"type": "event", "event": event})
+                await queue.put({
+                    "type": "done",
+                    "executionId": execution.execution_id,
+                    "result": result,
+                    "summary": summary,
+                })
+            except Exception as exc:
+                await queue.put({
+                    "type": "error",
+                    "executionId": execution.execution_id,
+                    "error": exc,
+                })
+
+        tasks = [asyncio.create_task(run_one(execution)) for execution in batch]
+        pending = len(tasks)
+        results_by_execution: dict[str, dict[str, str]] = {}
+        summaries_by_execution: dict[str, dict[str, Any]] = {}
+        try:
+            while pending > 0:
+                item = await queue.get()
+                item_type = item.get("type")
+                if item_type == "event":
+                    yield item["event"]
+                    continue
+                if item_type == "error":
+                    for task in tasks:
+                        task.cancel()
+                    raise item["error"]
+                if item_type == "done":
+                    execution_id = str(item.get("executionId") or "")
+                    results_by_execution[execution_id] = item["result"]
+                    summaries_by_execution[execution_id] = item["summary"]
+                    pending -= 1
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        yield {
+            "type": "_parallel_server_batch_result",
+            "results": [results_by_execution[execution.execution_id] for execution in batch],
+            "summaries": [summaries_by_execution[execution.execution_id] for execution in batch],
+        }
 
     async def stream(self) -> AsyncGenerator[dict[str, Any], None]:
         _record_trace_event(self.session, "session_created")
@@ -5494,6 +6297,22 @@ class QueryCoordinator:
                 self.state.retries_this_round = 0
                 _record_trace_event(self.session, "round_start", round=self.state.round)
                 yield {"type": "round_start", "round": self.state.round}
+
+                client_hints = self._pop_client_hints()
+                if client_hints:
+                    hint_text = self._inject_client_hints(client_hints)
+                    _record_trace_event(
+                        self.session,
+                        "client_event_hint_injected",
+                        round=self.state.round,
+                        eventIds=[hint.get("eventId") for hint in client_hints],
+                    )
+                    yield self._make_recovery_event(
+                        "client_event",
+                        message="页面刷新导致流式写入中断，正在让模型重新验证并重试。",
+                        eventIds=[hint.get("eventId") for hint in client_hints],
+                        hintChars=len(hint_text),
+                    )
 
                 previous_tier = self.state.compression_tier
                 self.state.compression_tier = _determine_compression_tier(
@@ -5540,6 +6359,40 @@ class QueryCoordinator:
                 self.state.last_model_finish_reason = round_finish_reason
                 if round_tool_calls or not _is_output_truncated_finish_reason(round_finish_reason):
                     self.state.output_continuation_attempts = 0
+
+                client_hints = self._pop_client_hints()
+                if client_hints and round_tool_calls:
+                    self.session.pending_client_hints = client_hints + self.session.pending_client_hints
+                elif client_hints:
+                    self.session.messages.append(AIMessage(content=round_content))
+                    hint_text = self._inject_client_hints(client_hints)
+                    self.state.pending_write_follow_up = False
+                    self.state.pending_agent_follow_up = False
+                    self.state.transition = Transition.FOLLOW_UP_CONTINUE
+                    _record_round_checkpoint(
+                        self.session,
+                        round_number=self.state.round,
+                        kind="text_round",
+                        assistant_preview=_truncate_preview(round_content),
+                        transition=self.state.transition,
+                        reason="client_stream_write_interrupted",
+                        model_finish_reason=round_finish_reason,
+                    )
+                    _record_trace_event(
+                        self.session,
+                        "round_complete",
+                        round=self.state.round,
+                        reason="client_stream_write_interrupted",
+                        eventIds=[hint.get("eventId") for hint in client_hints],
+                    )
+                    yield {
+                        "type": "round_complete",
+                        "reason": "client_stream_write_interrupted",
+                        "message": "页面刷新导致流式写入中断，正在让模型重新验证并重试。",
+                        "eventIds": [hint.get("eventId") for hint in client_hints],
+                        "hintChars": len(hint_text),
+                    }
+                    continue
 
                 if not round_tool_calls:
                     self.session.messages.append(AIMessage(content=round_content))
@@ -5590,6 +6443,8 @@ class QueryCoordinator:
                         )
                         continue
 
+                    if self.state.pending_agent_follow_up and round_content.strip():
+                        self.state.pending_agent_follow_up = False
                     round_decision = _decide_text_round(self.state, self.session.messages)
                     if round_decision.action == RoundDecisionAction.CONTINUE:
                         self.state.consecutive_empty_content += 1
@@ -5611,7 +6466,8 @@ class QueryCoordinator:
                                 "estimatedTokens": round_decision.budget_evaluation.estimated_tokens,
                                 "stagnantRounds": round_decision.budget_evaluation.stagnant_rounds,
                             }
-                        self.state.pending_write_follow_up = False
+                        if round_decision.reason == "post_write_follow_up":
+                            self.state.pending_write_follow_up = False
                         self.state.forced_follow_up_attempts += 1
                         self.session.messages.append(HumanMessage(content=round_decision.hint_to_model))
                         self.state.transition = round_decision.transition
@@ -5699,41 +6555,13 @@ class QueryCoordinator:
                     executionCount=len(execution_plan.executions),
                     sourceToolCallCount=len(round_tool_calls),
                 )
-                for execution in server_executions:
-                    if execution.tool_name == "Agent":
-                        server_result = None
-                        server_summary = None
-                        async for agent_event in self._execute_agent_execution(execution):
-                            if agent_event["type"] == "_server_execution_result":
-                                server_result = agent_event["result"]
-                                server_summary = agent_event["summary"]
-                            else:
-                                yield agent_event
-                        if server_result is None or server_summary is None:
-                            server_result = {
-                                "execution_id": execution.execution_id,
-                                "content": _serialize_tool_result_payload(
-                                    tool_name="Agent",
-                                    success=False,
-                                    message="Agent 执行未返回结果",
-                                    executed_params=execution.params,
-                                    original_params=execution.params,
-                                ),
-                            }
-                            server_summary = {
-                                "executionId": execution.execution_id,
-                                "toolName": execution.tool_name,
-                                "success": False,
-                                "message": "Agent 执行未返回结果",
-                                "mergeStrategy": execution.merge_strategy,
-                                "sourceToolCallCount": len(execution.source_calls),
-                            }
-                    else:
-                        server_result, server_summary, server_events = await self._execute_server_execution(execution)
-                        for server_event in server_events:
-                            yield server_event
-                    server_execution_results.append(server_result)
-                    server_execution_summary.append(server_summary)
+                for server_batch in _build_parallel_execution_batches(server_executions):
+                    async for server_batch_event in self._execute_parallel_server_batch(server_batch):
+                        if server_batch_event["type"] == "_parallel_server_batch_result":
+                            server_execution_results.extend(server_batch_event["results"])
+                            server_execution_summary.extend(server_batch_event["summaries"])
+                        else:
+                            yield server_batch_event
 
                 execution_results = list(server_execution_results)
                 execution_summary = list(server_execution_summary)
@@ -5762,10 +6590,13 @@ class QueryCoordinator:
                     }
 
                     try:
-                        posted_results = await asyncio.wait_for(
-                            self.session.tool_result_queue.get(),
-                            timeout=TOOL_RESULT_TIMEOUT,
-                        )
+                        if self.session.wait_for_client_tools:
+                            posted_results = await self.session.tool_result_queue.get()
+                        else:
+                            posted_results = await asyncio.wait_for(
+                                self.session.tool_result_queue.get(),
+                                timeout=TOOL_RESULT_TIMEOUT,
+                            )
                     except asyncio.TimeoutError:
                         self.session.expected_plan = None
                         self.state.transition = Transition.TIMEOUT
@@ -5787,6 +6618,7 @@ class QueryCoordinator:
                     self.session.expected_plan = None
                 _update_completion_gate_state(self.state, execution_results)
                 self.state.pending_write_follow_up = _tool_results_started_streaming_write(execution_results)
+                self.state.pending_agent_follow_up = _tool_results_completed_subagent(execution_results)
                 self.state.forced_follow_up_attempts = 0
                 self.state.consecutive_empty_content = 0
 

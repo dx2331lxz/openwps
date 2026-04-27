@@ -28,6 +28,16 @@ class OCRConfig(BaseModel):
     maxImages: int = 5
 
 
+class VisionConfig(BaseModel):
+    enabled: bool = False
+    providerId: str = "openai"
+    endpoint: str = ""
+    model: str = "gpt-4o-mini"
+    apiKey: Optional[str] = None
+    hasApiKey: bool = False
+    timeoutSeconds: int = 30
+
+
 class TavilyConfig(BaseModel):
     enabled: bool = True
     apiKey: Optional[str] = None
@@ -95,6 +105,7 @@ class SettingsUpdate(BaseModel):
     activeProviderId: str
     imageProcessingMode: str = "direct_multimodal"
     ocrConfig: OCRConfig = Field(default_factory=OCRConfig)
+    visionConfig: VisionConfig = Field(default_factory=VisionConfig)
     tavilyConfig: TavilyConfig = Field(default_factory=TavilyConfig)
     providers: list[ProviderSettings] = Field(default_factory=list)
 
@@ -103,6 +114,23 @@ class ModelDiscoveryRequest(BaseModel):
     endpoint: Optional[str] = None
     apiKey: Optional[str] = None
     providerId: Optional[str] = None
+
+
+class VisionTestRequest(BaseModel):
+    providerId: Optional[str] = None
+    endpoint: Optional[str] = None
+    model: Optional[str] = None
+    apiKey: Optional[str] = None
+    timeoutSeconds: int = 30
+
+
+class VisionAnalyzeRequest(BaseModel):
+    image: dict[str, Any] = Field(default_factory=dict)
+    providerId: Optional[str] = None
+    model: Optional[str] = None
+    instruction: Optional[str] = None
+    context: Optional[dict[str, Any]] = None
+    timeoutSeconds: Optional[int] = None
 
 
 class DocumentSettingsUpdateRequest(BaseModel):
@@ -127,6 +155,18 @@ class ToolResultsRequest(BaseModel):
     results: list[ToolResultItem] = Field(default_factory=list)
     stop: bool = False
     context: Optional[dict[str, Any]] = None  # Frontend sends latest context each round
+
+
+class ClientEventRequest(BaseModel):
+    eventId: str
+    eventType: str
+    conversationId: Optional[str] = None
+    toolName: Optional[str] = None
+    streamingWriteId: Optional[str] = None
+    reason: Optional[str] = None
+    lastAppliedChars: int = 0
+    createdAt: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskCreateRequest(BaseModel):

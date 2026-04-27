@@ -21,6 +21,15 @@ export interface TavilyConfigData {
   timeoutSeconds: number
 }
 
+export interface VisionConfigData {
+  enabled: boolean
+  providerId: string
+  endpoint: string
+  model: string
+  hasApiKey: boolean
+  timeoutSeconds: number
+}
+
 export interface AIProviderSettings {
   id: string
   label: string
@@ -37,6 +46,7 @@ export interface AISettingsData {
   activeProviderId: string
   imageProcessingMode: ImageProcessingMode
   ocrConfig: OcrConfigData
+  visionConfig: VisionConfigData
   tavilyConfig: TavilyConfigData
   providers: AIProviderSettings[]
   endpoint: string

@@ -41,6 +41,12 @@ function pxToTwip(value: number) {
   return Math.round(value * PX_TO_TWIP)
 }
 
+function withXmlAttribute(tag: string, name: string, value: string | number) {
+  const pattern = new RegExp(`\\s${name}="[^"]*"`)
+  const normalized = tag.replace(pattern, '')
+  return normalized.replace(/\/>$/, ` ${name}="${value}"/>`)
+}
+
 function dataUrlToBytes(dataUrl: string) {
   const [header, payload] = dataUrl.split(',', 2)
   if (!payload) throw new Error('无效的数据图片')
@@ -561,6 +567,35 @@ async function patchDocxSettings(
   })
 }
 
+function patchDocumentXmlWithPageConfig(documentXml: string, pageConfig: PageConfig) {
+  const orientation = pageConfig.pageWidth > pageConfig.pageHeight ? 'landscape' : 'portrait'
+  const pageWidthTwip = pxToTwip(pageConfig.pageWidth)
+  const pageHeightTwip = pxToTwip(pageConfig.pageHeight)
+
+  return documentXml.replace(/<w:pgSz\b[^>]*\/>/, (tag) => {
+    let patched = tag
+    patched = withXmlAttribute(patched, 'w:w', pageWidthTwip)
+    patched = withXmlAttribute(patched, 'w:h', pageHeightTwip)
+    patched = withXmlAttribute(patched, 'w:orient', orientation)
+    return patched
+  })
+}
+
+async function patchDocxPageConfig(blob: Blob, pageConfig: PageConfig) {
+  const zip = await JSZip.loadAsync(await blob.arrayBuffer())
+  const documentFile = zip.file('word/document.xml')
+  if (!documentFile) return blob
+
+  const documentXml = await documentFile.async('string')
+  zip.file('word/document.xml', patchDocumentXmlWithPageConfig(documentXml, pageConfig))
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    compression: 'DEFLATE',
+  })
+}
+
 export async function buildDocxBlob(
   pmDoc: PMNode,
   pageConfig: PageConfig,
@@ -639,7 +674,8 @@ export async function buildDocxBlob(
   })
 
   const blob = await Packer.toBlob(doc)
-  const settingsPatched = await patchDocxSettings(blob, exportOptions)
+  const pageConfigPatched = await patchDocxPageConfig(blob, pageConfig)
+  const settingsPatched = await patchDocxSettings(pageConfigPatched, exportOptions)
   return patchDocxComments(settingsPatched, pmDoc)
 }
 
