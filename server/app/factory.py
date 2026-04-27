@@ -15,8 +15,6 @@ from .ai import (
     create_react_gateway_run,
     create_react_session,
     get_conversation_react_gateway_run,
-    get_react_gateway_run,
-    get_react_session,
     get_react_session_trace,
     list_conversation_react_traces,
     list_models,
@@ -25,8 +23,6 @@ from .ai import (
     run_completion,
     stream_react_gateway_run_events,
     stream_react_session,
-    submit_react_client_event,
-    submit_react_tool_results,
     test_vision_model,
 )
 from .config import DIST_DIR, get_provider, public_config, read_config, write_config
@@ -39,13 +35,25 @@ from .conversations import (
 )
 from .documents import delete_document, list_documents, read_document_path, save_document
 from .documents import get_document_settings, update_document_settings
+from .doc_sessions import (
+    create_document_session,
+    execute_document_tool,
+    read_active_document_session,
+    read_document_session,
+    set_active_document_session,
+    subscribe_document_events,
+    update_document_session_from_client,
+)
 from .agents import cancel_agent_run, list_agent_definitions, list_agent_runs, read_agent_run
 from .models import (
     AppendMessagesRequest,
     ChatRequest,
-    ClientEventRequest,
     CompletionRequest,
+    DocumentSessionActiveRequest,
     DocumentSettingsUpdateRequest,
+    DocumentSessionCreateRequest,
+    DocumentSessionPatchRequest,
+    DocumentToolExecuteRequest,
     ModelDiscoveryRequest,
     SettingsUpdate,
     TaskCreateRequest,
@@ -53,7 +61,6 @@ from .models import (
     TemplateAnalyzeRequest,
     TemplateCreateRequest,
     TemplateUpdateRequest,
-    ToolResultsRequest,
     VisionAnalyzeRequest,
     VisionTestRequest,
 )
@@ -276,6 +283,56 @@ def create_api_router() -> APIRouter:
     def put_documents_settings(body: DocumentSettingsUpdateRequest):
         return update_document_settings(body.model_dump(exclude_unset=True))
 
+    @router.post("/doc-sessions")
+    async def post_doc_session(body: DocumentSessionCreateRequest):
+        return await create_document_session(body.model_dump(exclude_none=True))
+
+    @router.get("/doc-sessions/active")
+    async def get_active_doc_session():
+        return await read_active_document_session()
+
+    @router.get("/doc-sessions/{session_id}")
+    async def get_doc_session(session_id: str):
+        return await read_document_session(session_id)
+
+    @router.post("/doc-sessions/{session_id}/active")
+    async def post_active_doc_session(session_id: str, body: DocumentSessionActiveRequest):
+        return await set_active_document_session(session_id, body.model_dump(exclude_none=True))
+
+    @router.post("/doc-sessions/{session_id}/client-patches")
+    async def post_doc_session_patch(session_id: str, body: DocumentSessionPatchRequest):
+        return await update_document_session_from_client(session_id, body.model_dump(exclude_unset=True))
+
+    @router.post("/doc-sessions/{session_id}/tools")
+    async def post_doc_session_tool(session_id: str, body: DocumentToolExecuteRequest):
+        return await execute_document_tool(
+            session_id,
+            body.toolName,
+            body.params,
+            base_version=body.baseVersion,
+            selection_context=body.selectionContext,
+        )
+
+    @router.get("/doc-sessions/{session_id}/events")
+    async def get_doc_session_events(session_id: str):
+        async def generate():
+            try:
+                async for event in subscribe_document_events(session_id):
+                    yield sse(str(event.get("type") or "document_event"), event)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": str(exc)})
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @router.put("/documents/{name:path}")
     async def put_document(name: str, request: Request, source: str | None = None):
         content = await request.body()
@@ -408,20 +465,6 @@ def create_api_router() -> APIRouter:
     @router.post("/ai/react/runs/{session_id}/cancel")
     async def post_cancel_react_run(session_id: str):
         cancel_react_gateway_run(session_id)
-        return {"success": True}
-
-    @router.post("/ai/react/{session_id}/client-events")
-    async def post_react_client_event(session_id: str, body: ClientEventRequest):
-        return await submit_react_client_event(session_id, body)
-
-    @router.post("/ai/react/{session_id}/tool-results")
-    async def post_tool_results(session_id: str, body: ToolResultsRequest):
-        gateway_run = get_react_gateway_run(session_id)
-        session = gateway_run.session if gateway_run else get_react_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found or expired")
-
-        submit_react_tool_results(session, body)
         return {"success": True}
 
     @router.get("/ai/react/{session_id}/trace")

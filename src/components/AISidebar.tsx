@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent as ReactClipboardEvent, MouseEvent as ReactMouseEvent } from 'react'
-import html2canvas from 'html2canvas'
 import { EditorView } from 'prosemirror-view'
 import type { EditorState } from 'prosemirror-state'
 import type { Node as ProseMirrorNode } from 'prosemirror-model'
@@ -9,14 +8,7 @@ import type { Tokens } from 'marked'
 import mermaid from 'mermaid'
 import { prepareWithSegments, layout, walkLineRanges } from '@chenglou/pretext'
 import type { PreparedTextWithSegments } from '@chenglou/pretext'
-import {
-  abortStreamingWrite,
-  appendStreamingWrite,
-  beginStreamingWrite,
-  executeTool,
-  type ExecuteResult,
-  type StreamingWriteSession,
-} from '../ai/executor'
+import type { ExecuteResult } from '../ai/executor'
 import { agentTools } from '../ai/tools'
 import { schema } from '../editor/schema'
 import type { TemplateRecord, TemplateSummary } from '../templates/types'
@@ -33,22 +25,10 @@ import ModelPicker from './ModelPicker'
 type View = 'history' | 'chat'
 type AssistantMode = 'agent' | 'layout' | 'edit'
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'openwps:ai-active-conversation'
-const STREAMING_WRITE_MARKERS_STORAGE_KEY = 'openwps:ai-streaming-write-markers'
 
-type StreamingWriteMarkerState = 'active' | 'interrupted' | 'closed'
-
-interface StreamingWriteMarker {
-  conversationId: string
-  sessionId: string
-  streamingWriteId: string
-  toolName: 'begin_streaming_write'
-  state: StreamingWriteMarkerState
-  lastAppliedChars: number
-  createdAt: string
-  updatedAt: string
-  interruptEventId?: string
-  closeEventId?: string
-  reason?: string
+function createDocumentClientId() {
+  const randomId = globalThis.crypto?.randomUUID?.()
+  return `client_${randomId ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`
 }
 
 interface ConversationSummary {
@@ -58,7 +38,6 @@ interface ConversationSummary {
   updatedAt: string
   runStatus?: ReactRunSummary['status'] | null
   activeRunSessionId?: string | null
-  streamWriteState?: ReactRunSummary['streamWriteState']
 }
 
 interface ConversationGroup {
@@ -84,11 +63,9 @@ interface ConversationDetail extends ConversationSummary {
 interface ReactRunSummary {
   sessionId: string
   conversationId?: string | null
-  status: 'running' | 'awaiting_client' | 'completed' | 'failed'
+  status: 'running' | 'completed' | 'failed'
   error?: string | null
   lastSeq?: number
-  streamWriteState?: StreamingWriteMarkerState | 'idle' | null
-  interruptedStreamingWrite?: Record<string, unknown> | null
 }
 
 interface ToolCallResult {
@@ -152,10 +129,6 @@ interface TaskListResponse {
   tasks: TaskItem[]
 }
 
-interface TaskResponse {
-  task: TaskItem
-}
-
 interface AgentRunItem {
   id: string
   agentType: string
@@ -199,25 +172,6 @@ interface OcrAnalysisResponse {
   taskType: OcrTaskType
   imageCount: number
   results: OcrAnalysisResult[]
-}
-
-type DocumentImageAnalysisMode = 'auto' | 'multimodal' | 'ocr' | 'both'
-
-interface DocumentImageTarget {
-  imageId: string
-  fingerprint: string
-  paragraphIndex: number
-  imageIndex: number
-  page: number | null
-  alt: string
-  title: string
-  width: number | null
-  height: number | null
-  srcKind: 'data' | 'url'
-  dataUrl: string
-  beforeText: string
-  afterText: string
-  paragraphText: string
 }
 
 // ─── Selection context ───────────────────────────────────────────────────────
@@ -376,51 +330,17 @@ function buildContextPreview(editorState: EditorState, pageConfig: PageConfig) {
   }
 }
 
-function buildPageSnapshotMetadata(editorState: EditorState, pageConfig: PageConfig, pageNumber: number) {
-  const pagination = paginate(editorState.doc, pageConfig)
-  const page = pagination.renderedPages[pageNumber - 1]
-  if (!page) return null
-
-  const blockParagraphIndexes: Array<number | null> = []
-  let paragraphIndex = 0
-  editorState.doc.forEach((node) => {
-    if (node.type.name === 'paragraph') {
-      blockParagraphIndexes.push(paragraphIndex)
-      paragraphIndex += 1
-      return
-    }
-    blockParagraphIndexes.push(null)
-  })
-
-  const paragraphIndexes = [...new Set(
-    page.lines
-      .map(line => blockParagraphIndexes[line.blockIndex] ?? null)
-      .filter((value): value is number => typeof value === 'number')
-  )]
-
-  return {
-    page: pageNumber,
-    pageCount: pagination.renderedPages.length,
-    paragraphIndexes,
-    paragraphRange: paragraphIndexes.length > 0
-      ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
-      : null,
-    previewText: truncatePreviewText(page.lines.map(line => line.text).join(' '), 180),
-  }
-}
-
 interface Props {
   view: EditorView | null
   editorState?: EditorState | null
   pageConfig: PageConfig
-  pageGap: number
-  getPageCanvasElement?: () => HTMLElement | null
   templates: TemplateSummary[]
   activeTemplate: TemplateRecord | null
   onModelContextChange?: (next: { providerId: string | null, model: string | null }) => void
   onActivateTemplate: (templateId: string) => Promise<void> | void
   onOpenTemplateManager: () => void
   onPageConfigChange: (cfg: PageConfig) => void
+  onApplyServerDocumentState?: (docJson: Record<string, unknown>, pageConfig: PageConfig) => void
   onDocumentStyleMutation?: () => void
   onClose: () => void
 }
@@ -435,8 +355,6 @@ const PADDING_V = 8
 const BUBBLE_MAX_RATIO = 0.85
 const TEXTAREA_MIN_HEIGHT = 72
 const TEXTAREA_MAX_HEIGHT = 200
-const STREAMING_WRITE_FLUSH_MS = 80
-const STREAMING_WRITE_MAX_BUFFER = 1200
 const MAX_ATTACHMENT_COUNT = 8
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024
 const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -445,198 +363,9 @@ const TOOL_DESCRIPTIONS = Object.fromEntries(agentTools.map(tool => [tool.name, 
 
 let msgIdCounter = 0
 
-function isEscapedMarkdownMarker(text: string, index: number) {
-  let slashCount = 0
-  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
-    slashCount += 1
-  }
-  return slashCount % 2 === 1
-}
-
-function findLastUnclosedMarkdownMarker(text: string) {
-  const pairedMarkers = ['```', '**', '__', '~~'] as const
-  let lastUnclosedIndex = -1
-
-  for (const marker of pairedMarkers) {
-    let count = 0
-    let searchFrom = 0
-    let lastIndex = -1
-
-    while (searchFrom < text.length) {
-      const index = text.indexOf(marker, searchFrom)
-      if (index === -1) break
-      if (!isEscapedMarkdownMarker(text, index)) {
-        count += 1
-        lastIndex = index
-      }
-      searchFrom = index + marker.length
-    }
-
-    if (count % 2 === 1 && lastIndex > lastUnclosedIndex) {
-      lastUnclosedIndex = lastIndex
-    }
-  }
-
-  let backtickCount = 0
-  let lastBacktickIndex = -1
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] !== '`') continue
-    if (text.slice(index, index + 3) === '```') {
-      index += 2
-      continue
-    }
-    if (isEscapedMarkdownMarker(text, index)) continue
-    backtickCount += 1
-    lastBacktickIndex = index
-  }
-
-  if (backtickCount % 2 === 1 && lastBacktickIndex > lastUnclosedIndex) {
-    lastUnclosedIndex = lastBacktickIndex
-  }
-
-  return lastUnclosedIndex
-}
-
-function splitStableStreamingMarkdown(text: string, final: boolean) {
-  if (!text || final) {
-    return { flushable: text, deferred: '' }
-  }
-
-  const unstableStart = findLastUnclosedMarkdownMarker(text)
-  if (unstableStart === -1) {
-    return { flushable: text, deferred: '' }
-  }
-
-  return {
-    flushable: text.slice(0, unstableStart),
-    deferred: text.slice(unstableStart),
-  }
-}
-
 function newId() {
   msgIdCounter += 1
   return `m${msgIdCounter}`
-}
-
-function nowIso() {
-  return new Date().toISOString()
-}
-
-function readStreamingWriteMarkers(): StreamingWriteMarker[] {
-  try {
-    const raw = window.localStorage.getItem(STREAMING_WRITE_MARKERS_STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((item): item is StreamingWriteMarker => (
-      item
-      && typeof item === 'object'
-      && typeof item.conversationId === 'string'
-      && typeof item.sessionId === 'string'
-      && typeof item.streamingWriteId === 'string'
-    ))
-  } catch {
-    return []
-  }
-}
-
-function writeStreamingWriteMarkers(markers: StreamingWriteMarker[]) {
-  if (markers.length === 0) {
-    window.localStorage.removeItem(STREAMING_WRITE_MARKERS_STORAGE_KEY)
-    return
-  }
-  window.localStorage.setItem(STREAMING_WRITE_MARKERS_STORAGE_KEY, JSON.stringify(markers))
-}
-
-function upsertStreamingWriteMarker(marker: StreamingWriteMarker) {
-  const markers = readStreamingWriteMarkers()
-  const index = markers.findIndex(item => item.sessionId === marker.sessionId && item.streamingWriteId === marker.streamingWriteId)
-  if (index >= 0) markers[index] = marker
-  else markers.push(marker)
-  writeStreamingWriteMarkers(markers)
-}
-
-function removeStreamingWriteMarker(sessionId: string, streamingWriteId: string) {
-  writeStreamingWriteMarkers(readStreamingWriteMarkers().filter(marker => (
-    marker.sessionId !== sessionId || marker.streamingWriteId !== streamingWriteId
-  )))
-}
-
-function findActiveStreamingWriteMarker(conversationId: string, sessionId?: string | null) {
-  return readStreamingWriteMarkers().find(marker => (
-    marker.conversationId === conversationId
-    && (!sessionId || marker.sessionId === sessionId)
-    && marker.state !== 'closed'
-  )) ?? null
-}
-
-function buildStreamingWriteClientEventPayload(
-  marker: StreamingWriteMarker,
-  eventType: 'page_refresh' | 'stream_write_interrupted' | 'stream_write_closed',
-  reason: string,
-) {
-  const eventId = eventType === 'stream_write_closed'
-    ? (marker.closeEventId ?? `${marker.streamingWriteId}:closed`)
-    : (marker.interruptEventId ?? `${marker.streamingWriteId}:interrupted`)
-  return {
-    eventId,
-    eventType,
-    conversationId: marker.conversationId,
-    toolName: marker.toolName,
-    streamingWriteId: marker.streamingWriteId,
-    reason,
-    lastAppliedChars: marker.lastAppliedChars,
-    createdAt: nowIso(),
-  }
-}
-
-function markStreamingWriteMarkerInterrupted(marker: StreamingWriteMarker, reason: string): StreamingWriteMarker {
-  const next = {
-    ...marker,
-    state: 'interrupted' as const,
-    reason,
-    interruptEventId: marker.interruptEventId ?? `${marker.streamingWriteId}:interrupted`,
-    updatedAt: nowIso(),
-  }
-  upsertStreamingWriteMarker(next)
-  return next
-}
-
-function markStreamingWriteMarkerClosed(marker: StreamingWriteMarker): StreamingWriteMarker {
-  const next = {
-    ...marker,
-    state: 'closed' as const,
-    closeEventId: marker.closeEventId ?? `${marker.streamingWriteId}:closed`,
-    updatedAt: nowIso(),
-  }
-  upsertStreamingWriteMarker(next)
-  return next
-}
-
-function postStreamingWriteClientEvent(
-  marker: StreamingWriteMarker,
-  eventType: 'page_refresh' | 'stream_write_interrupted' | 'stream_write_closed',
-  reason: string,
-  transport: 'fetch' | 'beacon' = 'fetch',
-) {
-  const payload = buildStreamingWriteClientEventPayload(marker, eventType, reason)
-  const url = `/api/ai/react/${marker.sessionId}/client-events`
-  if (transport === 'beacon' && navigator.sendBeacon) {
-    return navigator.sendBeacon(url, new Blob([JSON.stringify(payload)], { type: 'application/json' }))
-  }
-  void fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    keepalive: transport === 'beacon',
-  }).then(response => {
-    if (response.ok && eventType !== 'stream_write_closed') {
-      removeStreamingWriteMarker(marker.sessionId, marker.streamingWriteId)
-    }
-  }).catch(error => {
-    console.error('[AISidebar] post streaming write client event failed', error)
-  })
-  return true
 }
 
 function findTightBubbleWidth(prepared: PreparedTextWithSegments, maxWidth: number): number {
@@ -773,7 +502,7 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'TaskUpdate') return '更新 AI 内部任务状态'
   if (toolCall.name === 'get_document_info') return '读取当前文档的统计信息'
   if (toolCall.name === 'get_document_outline') return '读取整篇文档的分页概览和样式概览'
-  if (toolCall.name === 'get_document_content') return target ? `读取${target}的内容和样式` : '读取全文内容和样式，辅助后续判断'
+  if (toolCall.name === 'get_document_content') return target ? `读取${target}的内容` : '读取全文内容，辅助后续判断'
   if (toolCall.name === 'get_page_content') return target ? `查看${target}的分页快照` : '查看指定页面的排版快照'
   if (toolCall.name === 'get_page_style_summary') return target ? `查看${target}的样式摘要` : '查看指定页面的样式摘要'
   if (toolCall.name === 'get_paragraph') return target ? `查看${target}的内容和样式` : '查看指定段落内容和样式'
@@ -1038,60 +767,6 @@ function extractSelectionContext(context: Record<string, unknown>) {
     suffixText: String((selection as Record<string, unknown>).suffixText ?? ''),
     paragraphText: String((selection as Record<string, unknown>).paragraphText ?? ''),
   }
-}
-
-function hasUsableRange(params: Record<string, unknown>) {
-  const range = params.range
-  if (!range || typeof range !== 'object' || Array.isArray(range)) return false
-  const candidate = range as Record<string, unknown>
-  return (
-    typeof candidate.type === 'string'
-    || Number.isFinite(Number(candidate.paragraphIndex))
-    || Number.isFinite(Number(candidate.from))
-    || Number.isFinite(Number(candidate.to))
-    || Number.isFinite(Number(candidate.selectionFrom))
-    || Number.isFinite(Number(candidate.selectionTo))
-    || typeof candidate.text === 'string'
-  )
-}
-
-function serializeToolParamsWithSelection(
-  toolName: string,
-  params: Record<string, unknown>,
-  selectionContext: {
-    from: number
-    to: number
-    paragraphIndex?: number
-    charOffset?: number
-    selectedText?: string
-    prefixText?: string
-    suffixText?: string
-    paragraphText?: string
-  } | null,
-) {
-  const range = params.range
-  if (!selectionContext) return params
-
-  if (
-    (toolName === 'set_text_style' || toolName === 'set_paragraph_style' || toolName === 'clear_formatting')
-    && !hasUsableRange(params)
-  ) {
-    return {
-      ...params,
-      range: {
-        type: 'selection',
-        selectionFrom: selectionContext.from,
-        selectionTo: selectionContext.to,
-      },
-    }
-  }
-
-  if (!range || typeof range !== 'object' || Array.isArray(range)) return params
-  const nextRange = { ...(range as Record<string, unknown>) }
-  if (nextRange.type !== 'selection') return params
-  if (!Number.isFinite(Number(nextRange.selectionFrom))) nextRange.selectionFrom = selectionContext.from
-  if (!Number.isFinite(Number(nextRange.selectionTo))) nextRange.selectionTo = selectionContext.to
-  return { ...params, range: nextRange }
 }
 
 function escapeHtmlText(text: string) {
@@ -1439,79 +1114,6 @@ interface ToolCallRecord {
   result: ExecuteResult
 }
 
-interface ToolPlanExecution {
-  executionId: string
-  toolName: string
-  params: Record<string, unknown>
-  sourceToolCallIds: string[]
-  mergeStrategy: string
-  continueOnError: boolean
-  parallelGroup: string | null
-  executorLocation: 'client' | 'server'
-  readOnly: boolean
-  allowedForAgent: boolean
-  parallelSafe: boolean
-}
-
-interface ToolExecutionPlan {
-  planId: string
-  round: number
-  executions: ToolPlanExecution[]
-  agentId?: string
-  agentType?: string
-}
-
-function canRunToolInParallel(execution: ToolPlanExecution) {
-  return execution.parallelSafe
-}
-
-function buildExecutionBatches(executions: ToolPlanExecution[]): ToolPlanExecution[][] {
-  const batches: ToolPlanExecution[][] = []
-  let index = 0
-
-  while (index < executions.length) {
-    const current = executions[index]
-    if (!current) break
-
-    const explicitGroup = typeof current.parallelGroup === 'string' && current.parallelGroup.length > 0
-      ? current.parallelGroup
-      : null
-
-    if (explicitGroup) {
-      const batch: ToolPlanExecution[] = [current]
-      let nextIndex = index + 1
-      while (nextIndex < executions.length && executions[nextIndex]?.parallelGroup === explicitGroup) {
-        batch.push(executions[nextIndex]!)
-        nextIndex += 1
-      }
-      batches.push(batch)
-      index = nextIndex
-      continue
-    }
-
-    if (canRunToolInParallel(current)) {
-      const batch: ToolPlanExecution[] = [current]
-      let nextIndex = index + 1
-      while (nextIndex < executions.length) {
-        const nextExecution = executions[nextIndex]
-        if (!nextExecution) break
-        if (nextExecution.parallelGroup) break
-        if (!canRunToolInParallel(nextExecution)) break
-        batch.push(nextExecution)
-        nextIndex += 1
-      }
-      batches.push(batch)
-      index = nextIndex
-      continue
-    }
-
-    batches.push([current])
-    index += 1
-  }
-
-  return batches
-}
-
 type ReactMessagePayload =
   | { role: 'user' | 'assistant'; content: string | null; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> }
   | { role: 'tool'; tool_call_id: string; content: string }
@@ -1575,11 +1177,6 @@ function serializeToolResultPayload({
     paramsRepaired: stableStringify(replayParams) !== stableStringify(executedParams),
   }
 
-  if (toolName === 'begin_streaming_write' && result.success) {
-    payload.nextAction = 'immediately_stream_markdown_content'
-    payload.instruction = '现在必须立刻输出要写入文档的 Markdown 正文内容，不要结束，不要解释，不要再次调用 begin_streaming_write。'
-  }
-
   return JSON.stringify(payload)
 }
 
@@ -1592,17 +1189,6 @@ function serializeToolResult(tool: ToolCallRecord) {
   })
 }
 
-function sanitizeToolResultForDisplay(toolName: string, result: ExecuteResult): ExecuteResult {
-  if (toolName !== 'capture_page_screenshot') return result
-  if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) return result
-  const data = { ...(result.data as Record<string, unknown>) }
-  if (typeof data.dataUrl === 'string') {
-    delete data.dataUrl
-    data.imageAttached = true
-  }
-  return { ...result, data }
-}
-
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(item => stableStringify(item)).join(',')}]`
   if (value && typeof value === 'object') {
@@ -1612,65 +1198,6 @@ function stableStringify(value: unknown): string {
     return `{${entries.join(',')}}`
   }
   return JSON.stringify(value)
-}
-
-function parseToolPlanEvent(event: Record<string, unknown>): ToolExecutionPlan | null {
-  const planId = typeof event.planId === 'string' ? event.planId : ''
-  const round = Number(event.round)
-  if (!planId || !Number.isFinite(round) || !Array.isArray(event.executions)) return null
-
-  const executions = event.executions
-    .map(item => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return null
-      const raw = item as Record<string, unknown>
-      const executionId = typeof raw.executionId === 'string' ? raw.executionId : ''
-      const toolName = typeof raw.toolName === 'string' ? raw.toolName : ''
-      if (!executionId || !toolName) return null
-      return {
-        executionId,
-        toolName,
-        params: normalizeToolParams(raw.params),
-        sourceToolCallIds: Array.isArray(raw.sourceToolCallIds)
-          ? raw.sourceToolCallIds.map(id => String(id)).filter(Boolean)
-          : [],
-        mergeStrategy: typeof raw.mergeStrategy === 'string' ? raw.mergeStrategy : 'single',
-        continueOnError: raw.continueOnError !== false,
-        parallelGroup: typeof raw.parallelGroup === 'string' && raw.parallelGroup.length > 0 ? raw.parallelGroup : null,
-        executorLocation: raw.executorLocation === 'server' ? 'server' : 'client',
-        readOnly: raw.readOnly === true,
-        allowedForAgent: raw.allowedForAgent === true,
-        parallelSafe: raw.parallelSafe === true,
-      }
-    })
-    .filter((execution): execution is ToolPlanExecution => Boolean(execution))
-
-  return {
-    planId,
-    round,
-    executions,
-    agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
-    agentType: typeof event.agentType === 'string' ? event.agentType : undefined,
-  }
-}
-
-function buildFallbackToolPlan(round: number, toolCalls: ToolCallResult[]): ToolExecutionPlan {
-  return {
-    planId: `fallback-${round}`,
-    round,
-    executions: toolCalls.map((toolCall, index) => ({
-      executionId: toolCall.id ?? `fallback-${round}-${index}`,
-      toolName: toolCall.name,
-      params: normalizeToolParams(toolCall.params),
-      sourceToolCallIds: toolCall.id ? [toolCall.id] : [],
-      mergeStrategy: 'single',
-      continueOnError: true,
-      parallelGroup: null,
-      executorLocation: 'client',
-      readOnly: false,
-      allowedForAgent: false,
-      parallelSafe: false,
-    })),
-  }
 }
 
 function repairToolArgsJson(raw: string): string | null {
@@ -1922,138 +1449,6 @@ function normalizeOcrTaskType(value: string | undefined): OcrTaskType {
   return 'general_parse'
 }
 
-function normalizeDocumentImageAnalysisMode(value: unknown): DocumentImageAnalysisMode {
-  return value === 'multimodal' || value === 'ocr' || value === 'both' ? value : 'auto'
-}
-
-function hashString(value: string): string {
-  let hash = 2166136261
-  for (let i = 0; i < value.length; i++) {
-    hash ^= value.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0')
-}
-
-function getImageFingerprintFromAttrs(attrs: Record<string, unknown>): string {
-  return hashString(JSON.stringify({
-    src: String(attrs.src ?? ''),
-    alt: String(attrs.alt ?? ''),
-    title: String(attrs.title ?? ''),
-    width: attrs.width ?? null,
-    height: attrs.height ?? null,
-  }))
-}
-
-function inferImageMimeType(src: string) {
-  const match = src.match(/^data:([^;,]+)/)
-  if (match?.[1]) return match[1]
-  if (/\.jpe?g($|\?)/i.test(src)) return 'image/jpeg'
-  if (/\.webp($|\?)/i.test(src)) return 'image/webp'
-  if (/\.gif($|\?)/i.test(src)) return 'image/gif'
-  if (/\.svg($|\?)/i.test(src)) return 'image/svg+xml'
-  return 'image/png'
-}
-
-function estimateDataUrlSize(src: string) {
-  const payload = src.startsWith('data:') ? src.split(',', 2)[1] ?? '' : ''
-  if (!payload) return 0
-  const padding = payload.length - payload.replace(/=+$/, '').length
-  return Math.max(Math.floor(payload.length * 3 / 4) - padding, 0)
-}
-
-function findDocumentImageTarget(
-  state: EditorState,
-  params: Record<string, unknown>,
-  pageConfig?: PageConfig,
-): DocumentImageTarget | null {
-  const targetImageId = typeof params.imageId === 'string' ? params.imageId : ''
-  const targetParagraphIndex = Number(params.paragraphIndex)
-  const targetImageIndex = Number(params.imageIndex ?? 0)
-  const paragraphTexts: string[] = []
-  const occurrenceByFingerprint = new Map<string, number>()
-  let paragraphIndex = 0
-  let found: DocumentImageTarget | null = null
-  const pageByParagraph = new Map<number, number>()
-  try {
-    const pages = paginate(state.doc, pageConfig).renderedPages
-    pages.forEach((page, pageIndex) => {
-      page.lines.forEach(line => {
-        const startPos = Number(line.startPos ?? 0)
-        if (startPos > 0) {
-          let currentParagraph = 0
-          state.doc.descendants((node, pos) => {
-            if (node.type.name !== 'paragraph') return true
-            if (pos <= startPos && startPos <= pos + node.nodeSize) {
-              if (!pageByParagraph.has(currentParagraph)) pageByParagraph.set(currentParagraph, pageIndex + 1)
-              return false
-            }
-            currentParagraph += 1
-            return false
-          })
-        }
-      })
-    })
-  } catch {
-    // Page metadata is useful but non-essential for image analysis.
-  }
-
-  state.doc.descendants((node) => {
-    if (node.type.name !== 'paragraph') return true
-    paragraphTexts[paragraphIndex] = node.textContent
-    let imageIndex = 0
-    node.forEach((child) => {
-      if (child.type.name !== 'image' || found) return
-      const attrs = child.attrs as Record<string, unknown>
-      const fingerprint = getImageFingerprintFromAttrs(attrs)
-      const occurrence = occurrenceByFingerprint.get(fingerprint) ?? 0
-      occurrenceByFingerprint.set(fingerprint, occurrence + 1)
-      const imageId = `img_${fingerprint}_${occurrence}`
-      const matchesById = targetImageId && imageId === targetImageId
-      const matchesByPosition = !targetImageId
-        && paragraphIndex === targetParagraphIndex
-        && imageIndex === (Number.isInteger(targetImageIndex) ? targetImageIndex : 0)
-      if (matchesById || matchesByPosition) {
-        const src = String(attrs.src ?? '')
-        found = {
-          imageId,
-          fingerprint,
-          paragraphIndex,
-          imageIndex,
-          page: pageByParagraph.get(paragraphIndex) ?? null,
-          alt: String(attrs.alt ?? ''),
-          title: String(attrs.title ?? ''),
-          width: attrs.width == null ? null : Number(attrs.width),
-          height: attrs.height == null ? null : Number(attrs.height),
-          srcKind: src.startsWith('data:') ? 'data' : 'url',
-          dataUrl: src,
-          beforeText: paragraphTexts[paragraphIndex - 1] ?? '',
-          afterText: '',
-          paragraphText: node.textContent,
-        }
-      }
-      imageIndex += 1
-    })
-    paragraphIndex += 1
-    return false
-  })
-
-  const resolvedTarget = found as DocumentImageTarget | null
-  if (resolvedTarget) {
-    resolvedTarget.afterText = paragraphTexts[resolvedTarget.paragraphIndex + 1] ?? ''
-  }
-  return resolvedTarget
-}
-
-function chooseDocumentImageMode(target: DocumentImageTarget, requestedMode: DocumentImageAnalysisMode, taskType: OcrTaskType): Exclude<DocumentImageAnalysisMode, 'auto'> {
-  if (requestedMode !== 'auto') return requestedMode
-  const contextText = `${target.alt} ${target.title} ${target.paragraphText} ${target.beforeText} ${target.afterText}`.toLowerCase()
-  if (taskType === 'table' || taskType === 'formula' || taskType === 'handwriting' || taskType === 'document_text') return 'ocr'
-  if (/(扫描|表格|公式|手写|ocr|文字|正文|document|table|formula|handwriting)/i.test(contextText)) return 'ocr'
-  if (/(图表|截图|chart|graph|dashboard|报表)/i.test(contextText)) return 'both'
-  return 'multimodal'
-}
-
 function parseOcrCommand(text: string): OcrIntentMatch | null {
   const match = text.match(/^\/ocr(?:\s+([a-zA-Z_-]+))?(?:\s+([\s\S]+))?$/i)
   if (!match) return null
@@ -2165,14 +1560,13 @@ export default function AISidebar({
   view: editorView,
   editorState,
   pageConfig,
-  pageGap,
-  getPageCanvasElement,
   templates,
   activeTemplate,
   onModelContextChange,
   onActivateTemplate,
   onOpenTemplateManager,
   onPageConfigChange,
+  onApplyServerDocumentState,
   onDocumentStyleMutation,
   onClose,
 }: Props) {
@@ -2192,6 +1586,9 @@ export default function AISidebar({
   const [agentRuns, setAgentRuns] = useState<AgentRunItem[]>([])
   const [isAgentPanelExpanded, setIsAgentPanelExpanded] = useState(false)
   const [includeSelection, setIncludeSelection] = useState(true)
+  const documentSessionRef = useRef<{ id: string; version: number } | null>(null)
+  const documentClientIdRef = useRef(createDocumentClientId())
+  const [documentSessionInfo, setDocumentSessionInfo] = useState<{ id: string; version: number } | null>(null)
   const [providers, setProviders] = useState<AIProviderSettings[]>([])
   const [modelName, setModelName] = useState('')
   const [selectedModel, setSelectedModel] = useState('')
@@ -2215,10 +1612,6 @@ export default function AISidebar({
   const shouldAutoScrollRef = useRef(true)
   const currentConversationIdRef = useRef<string | null>(null)
   const conversationMessagesRef = useRef<StoredMessage[]>([])
-  const activeStreamingWriteRef = useRef<StreamingWriteSession | null>(null)
-  const activeStreamingWriteMarkerRef = useRef<StreamingWriteMarker | null>(null)
-  const imageAnalysisCacheRef = useRef<Map<string, unknown>>(new Map())
-  const visionTestCacheRef = useRef<Map<string, boolean>>(new Map())
   const tasksRef = useRef<TaskItem[]>([])
   const taskHideTimerRef = useRef<number | null>(null)
 
@@ -2249,12 +1642,6 @@ export default function AISidebar({
     && effectiveOcrEndpoint
     && effectiveOcrHasApiKey,
   )
-  const isVisionFallbackReady = Boolean(
-    visionConfig.enabled
-    && (visionConfig.endpoint || activeVisionProvider?.endpoint)
-    && visionConfig.model.trim()
-    && (visionConfig.hasApiKey || activeVisionProvider?.hasApiKey),
-  )
   const canSendMessage = Boolean(input.trim() || pendingAttachments.length > 0)
 
   useEffect(() => {
@@ -2267,28 +1654,6 @@ export default function AISidebar({
   useEffect(() => {
     tasksRef.current = tasks
   }, [tasks])
-
-  useEffect(() => {
-    const handlePageExit = (event: PageTransitionEvent | Event) => {
-      const reason = event.type === 'beforeunload' ? 'beforeunload' : 'pagehide'
-      const markers = readStreamingWriteMarkers()
-      const interruptedMarkers = markers.map(marker => (
-        marker.state === 'closed' ? marker : markStreamingWriteMarkerInterrupted(marker, reason)
-      ))
-      writeStreamingWriteMarkers(interruptedMarkers)
-      for (const marker of interruptedMarkers) {
-        if (marker.state === 'closed') continue
-        postStreamingWriteClientEvent(marker, 'page_refresh', reason, 'beacon')
-      }
-    }
-
-    window.addEventListener('pagehide', handlePageExit)
-    window.addEventListener('beforeunload', handlePageExit)
-    return () => {
-      window.removeEventListener('pagehide', handlePageExit)
-      window.removeEventListener('beforeunload', handlePageExit)
-    }
-  }, [])
 
   useEffect(() => () => {
     if (taskHideTimerRef.current != null) {
@@ -2474,6 +1839,186 @@ export default function AISidebar({
     return ctx
   }, [activeTemplate, editorView, editorState, includeSelection, pageConfig, templates])
 
+  const rememberDocumentSession = useCallback((next: { id: string; version: number } | null) => {
+    documentSessionRef.current = next
+    setDocumentSessionInfo(prev => {
+      if (!next && !prev) return prev
+      if (next && prev && prev.id === next.id && prev.version === next.version) return prev
+      return next
+    })
+  }, [])
+
+  const registerActiveDocumentSession = useCallback(async (sessionId: string) => {
+    try {
+      await fetch(`/api/doc-sessions/${sessionId}/active`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId: documentClientIdRef.current }),
+      })
+    } catch (error) {
+      console.warn('登记当前后端文档会话失败', error)
+    }
+  }, [])
+
+  const syncDocumentSession = useCallback(async (contextSnapshot?: Record<string, unknown>) => {
+    if (!editorView) return null
+    const selectionContext = extractSelectionContext(contextSnapshot ?? getContext())
+    const payload = {
+      docJson: editorView.state.doc.toJSON() as Record<string, unknown>,
+      pageConfig,
+      selectionContext,
+    }
+    const createDocumentSession = async () => {
+      const response = await fetch('/api/doc-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) throw new Error(`创建后端文档会话失败：HTTP ${response.status}`)
+      const data = await response.json() as { documentSessionId?: string; version?: number }
+      const id = String(data.documentSessionId || '')
+      if (!id) throw new Error('后端未返回 documentSessionId')
+      rememberDocumentSession({ id, version: Number(data.version ?? 1) || 1 })
+      await registerActiveDocumentSession(id)
+      return id
+    }
+    const current = documentSessionRef.current
+    if (!current) {
+      return createDocumentSession()
+    }
+
+    const response = await fetch(`/api/doc-sessions/${current.id}/client-patches`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, baseVersion: current.version, clientId: documentClientIdRef.current }),
+    })
+    if (response.status === 404) {
+      rememberDocumentSession(null)
+      return createDocumentSession()
+    }
+    if (response.status === 409) {
+      rememberDocumentSession(null)
+      return syncDocumentSession(contextSnapshot)
+    }
+    if (!response.ok) throw new Error(`同步后端文档会话失败：HTTP ${response.status}`)
+    const data = await response.json() as { version?: number }
+    rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
+    await registerActiveDocumentSession(current.id)
+    return current.id
+  }, [editorView, getContext, pageConfig, registerActiveDocumentSession, rememberDocumentSession])
+
+  const applyDocumentEventRecords = useCallback((
+    data: unknown,
+    options?: { ignoreOwnClientPatch?: boolean; skipSnapshotApply?: boolean },
+  ) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return
+    const record = data as Record<string, unknown>
+    const events = Array.isArray(record.documentEvents)
+      ? record.documentEvents
+      : record.type && record.type !== 'snapshot'
+        ? [record]
+        : []
+    const sessionId = typeof record.documentSessionId === 'string'
+      ? record.documentSessionId
+      : documentSessionRef.current?.id
+    if (!sessionId) return
+    if (record.type === 'snapshot') {
+      const version = Number(record.version ?? documentSessionRef.current?.version ?? 1) || 1
+      rememberDocumentSession({ id: sessionId, version })
+      return
+    }
+
+    let nextDocJson: Record<string, unknown> | null = null
+    let nextPageConfig: PageConfig | null = null
+    let nextVersion = documentSessionRef.current?.id === sessionId ? documentSessionRef.current.version : 0
+    for (const event of events) {
+      if (!event || typeof event !== 'object' || Array.isArray(event)) continue
+      const eventRecord = event as Record<string, unknown>
+      const eventVersion = typeof eventRecord.version === 'number' ? eventRecord.version : undefined
+      if (eventVersion !== undefined && documentSessionRef.current?.id === sessionId && eventVersion <= documentSessionRef.current.version) {
+        continue
+      }
+      if (
+        options?.ignoreOwnClientPatch
+        && eventRecord.source === 'client_patch'
+        && eventRecord.originClientId === documentClientIdRef.current
+      ) {
+        if (eventVersion !== undefined) nextVersion = Math.max(nextVersion, eventVersion)
+        continue
+      }
+      if (options?.skipSnapshotApply && eventRecord.type === 'snapshot') {
+        if (eventVersion !== undefined) nextVersion = Math.max(nextVersion, eventVersion)
+        continue
+      }
+      if (
+        eventRecord.type === 'document_replace'
+        && eventRecord.docJson
+        && typeof eventRecord.docJson === 'object'
+        && !Array.isArray(eventRecord.docJson)
+      ) {
+        nextDocJson = eventRecord.docJson as Record<string, unknown>
+      }
+      if (
+        eventRecord.type === 'page_config_changed'
+        && eventRecord.pageConfig
+        && typeof eventRecord.pageConfig === 'object'
+        && !Array.isArray(eventRecord.pageConfig)
+      ) {
+        nextPageConfig = eventRecord.pageConfig as PageConfig
+      }
+      if (eventVersion !== undefined) nextVersion = Math.max(nextVersion, eventVersion)
+    }
+    if (typeof record.version === 'number' && typeof record.documentSessionId === 'string') {
+      nextVersion = Math.max(nextVersion, record.version)
+    }
+    if (nextDocJson && onApplyServerDocumentState) {
+      onApplyServerDocumentState(nextDocJson, nextPageConfig ?? pageConfig)
+      onDocumentStyleMutation?.()
+    } else if (nextPageConfig) {
+      onPageConfigChange(nextPageConfig)
+    }
+    if (nextVersion > 0) rememberDocumentSession({ id: sessionId, version: nextVersion })
+  }, [onApplyServerDocumentState, onDocumentStyleMutation, onPageConfigChange, pageConfig, rememberDocumentSession])
+
+  const applyServerDocumentEvents = useCallback((data: unknown) => {
+    applyDocumentEventRecords(data)
+  }, [applyDocumentEventRecords])
+
+  useEffect(() => {
+    if (!editorView || documentSessionRef.current) return
+    void syncDocumentSession().catch(error => {
+      console.warn('初始化后端文档会话失败', error)
+    })
+  }, [editorView, syncDocumentSession])
+
+  useEffect(() => {
+    if (!editorView || !documentSessionInfo?.id) return
+    const timer = window.setTimeout(() => {
+      void syncDocumentSession().catch(error => {
+        console.warn('同步后端文档会话失败', error)
+      })
+    }, 800)
+    return () => window.clearTimeout(timer)
+  }, [documentSessionInfo?.id, editorState, editorView, pageConfig, syncDocumentSession])
+
+  useEffect(() => {
+    const sessionId = documentSessionInfo?.id
+    if (!sessionId) return
+    const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
+    source.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as Record<string, unknown>
+        applyDocumentEventRecords(data, { ignoreOwnClientPatch: true, skipSnapshotApply: true })
+      } catch (error) {
+        console.warn('解析后端文档事件失败', error)
+      }
+    }
+    source.onerror = () => {
+      console.warn('后端文档事件连接异常')
+    }
+    return () => source.close()
+  }, [applyDocumentEventRecords, documentSessionInfo?.id])
+
   const requestOcrAnalysis = useCallback(async (
     request: OcrIntentMatch,
     images: ChatAttachment[],
@@ -2513,234 +2058,6 @@ export default function AISidebar({
     return data
   }, [effectiveOcrEndpoint, isOcrReady, ocrConfig.backend, ocrConfig.enabled, ocrConfig.maxImages, ocrConfig.model, ocrConfig.providerId, ocrConfig.timeoutSeconds])
 
-  const ensureVisionModelReady = useCallback(async () => {
-    if (currentModelSupportsVision) return
-    if (!isVisionFallbackReady) {
-      throw new Error('当前主模型不是多模态模型，且未配置可用的多模态图片分析模型。请在设置中启用并测试多模态模型。')
-    }
-    const cacheKey = `${visionConfig.providerId}|${visionConfig.endpoint || activeVisionProvider?.endpoint || ''}|${visionConfig.model}`
-    if (visionTestCacheRef.current.get(cacheKey)) return
-    const response = await fetch('/api/ai/vision/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        providerId: visionConfig.providerId,
-        endpoint: visionConfig.endpoint || activeVisionProvider?.endpoint || undefined,
-        model: visionConfig.model,
-        timeoutSeconds: visionConfig.timeoutSeconds,
-      }),
-    })
-    const data = await response.json() as { success?: boolean; detail?: string }
-    if (!response.ok || data.success !== true) {
-      throw new Error(data.detail || '多模态图片分析模型测试失败')
-    }
-    visionTestCacheRef.current.set(cacheKey, true)
-  }, [activeVisionProvider?.endpoint, currentModelSupportsVision, isVisionFallbackReady, visionConfig.endpoint, visionConfig.model, visionConfig.providerId, visionConfig.timeoutSeconds])
-
-  const requestVisionAnalysis = useCallback(async (target: DocumentImageTarget, instruction: string) => {
-    await ensureVisionModelReady()
-    const response = await fetch('/api/ai/vision/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        providerId: activeProviderId || undefined,
-        model: selectedModel || modelName || undefined,
-        instruction,
-        context: {
-          imageId: target.imageId,
-          paragraphIndex: target.paragraphIndex,
-          imageIndex: target.imageIndex,
-          page: target.page,
-          alt: target.alt,
-          title: target.title,
-          width: target.width,
-          height: target.height,
-          beforeText: target.beforeText,
-          paragraphText: target.paragraphText,
-          afterText: target.afterText,
-        },
-        image: {
-          name: target.alt || target.title || target.imageId,
-          type: inferImageMimeType(target.dataUrl),
-          size: estimateDataUrlSize(target.dataUrl),
-          dataUrl: target.dataUrl,
-        },
-      }),
-    })
-    const data = await response.json() as { success?: boolean; result?: Record<string, unknown>; detail?: string; model?: string; providerId?: string; usedFallbackVisionConfig?: boolean }
-    if (!response.ok || data.success !== true) throw new Error(data.detail || '多模态图片分析失败')
-    return data
-  }, [activeProviderId, ensureVisionModelReady, modelName, selectedModel])
-
-  const analyzeDocumentImage = useCallback(async (params: Record<string, unknown>): Promise<ExecuteResult> => {
-    if (!editorView) return { success: false, message: '编辑器尚未就绪，无法分析文档图片' }
-    const target = findDocumentImageTarget(editorView.state, params, pageConfig)
-    if (!target) return { success: false, message: '未找到指定的文档图片' }
-    if (!target.dataUrl.startsWith('data:')) {
-      return { success: false, message: '当前图片不是内嵌 data URL，暂不能从文档内直接发送给图片分析模型' }
-    }
-    const cached = imageAnalysisCacheRef.current.get(target.fingerprint)
-    if (cached) {
-      return {
-        success: true,
-        message: `已命中图片分析缓存：${target.imageId}`,
-        data: { ...(cached as Record<string, unknown>), cacheHit: true },
-      }
-    }
-
-    const requestedMode = normalizeDocumentImageAnalysisMode(params.analysisMode)
-    const taskType = normalizeOcrTaskType(typeof params.taskType === 'string' ? params.taskType : undefined)
-    const modeUsed = chooseDocumentImageMode(target, requestedMode, taskType)
-    const instruction = typeof params.instruction === 'string' ? params.instruction : ''
-    const warnings: string[] = []
-    let visualResult: Record<string, unknown> = {}
-    let ocrResponse: OcrAnalysisResponse | null = null
-
-    try {
-      if (modeUsed === 'multimodal' || modeUsed === 'both') {
-        const vision = await requestVisionAnalysis(target, instruction)
-        visualResult = vision.result ?? {}
-      }
-      if (modeUsed === 'ocr' || modeUsed === 'both') {
-        ocrResponse = await requestOcrAnalysis({
-          taskType,
-          instruction,
-          source: 'intent',
-        }, [{
-          id: target.imageId,
-          name: target.alt || target.title || target.imageId,
-          size: estimateDataUrlSize(target.dataUrl),
-          type: inferImageMimeType(target.dataUrl),
-          kind: 'image',
-          dataUrl: target.dataUrl,
-        }])
-      }
-    } catch (error) {
-      return { success: false, message: error instanceof Error ? error.message : String(error) }
-    }
-
-    const firstOcr = ocrResponse?.results[0]
-    const result = {
-      imageId: target.imageId,
-      fingerprint: target.fingerprint,
-      paragraphIndex: target.paragraphIndex,
-      imageIndex: target.imageIndex,
-      page: target.page,
-      modeUsed,
-      visualSummary: String(visualResult.visualSummary ?? visualResult.summary ?? ''),
-      ocrText: firstOcr?.markdown || firstOcr?.plainText || firstOcr?.handwritingText || '',
-      tables: firstOcr?.tables ?? [],
-      detectedObjects: Array.isArray(visualResult.detectedObjects) ? visualResult.detectedObjects : [],
-      chartSummary: visualResult.chartSummary ?? firstOcr?.charts?.map(chart => chart.summary).filter(Boolean).join('\n') ?? '',
-      styleHints: visualResult.styleHints ?? {},
-      warnings: [...warnings, ...(Array.isArray(visualResult.warnings) ? visualResult.warnings.map(String) : []), ...(firstOcr?.warnings ?? [])],
-      confidence: typeof visualResult.confidence === 'number' ? visualResult.confidence : (firstOcr ? 0.8 : 0.7),
-      cacheHit: false,
-    }
-    imageAnalysisCacheRef.current.set(target.fingerprint, result)
-    return {
-      success: true,
-      message: `已完成文档图片分析：${target.imageId}（${modeUsed}）`,
-      data: result,
-    }
-  }, [editorView, pageConfig, requestOcrAnalysis, requestVisionAnalysis])
-
-  const capturePageScreenshot = useCallback(async (params: Record<string, unknown>): Promise<ExecuteResult> => {
-    if (!editorView) return { success: false, message: '编辑器尚未就绪，无法截取页面截图' }
-    const page = Number(params.page)
-    if (!Number.isInteger(page) || page < 1) return { success: false, message: 'page 必须是从 1 开始的整数' }
-
-    const metadata = buildPageSnapshotMetadata(editorView.state, pageConfig, page)
-    if (!metadata) return { success: false, message: `未找到第 ${page} 页` }
-
-    const canvasElement = getPageCanvasElement?.()
-    if (!canvasElement) return { success: false, message: '页面画布尚未就绪，无法截取截图' }
-
-    const pageTop = (page - 1) * (pageConfig.pageHeight + pageGap)
-    try {
-      const rendered = await html2canvas(canvasElement, {
-        backgroundColor: null,
-        logging: false,
-        scale: Math.min(Math.max(window.devicePixelRatio || 1, 1), 2),
-        useCORS: true,
-        x: 0,
-        y: pageTop,
-        width: pageConfig.pageWidth,
-        height: pageConfig.pageHeight,
-        windowWidth: Math.max(canvasElement.scrollWidth, pageConfig.pageWidth),
-        windowHeight: Math.max(canvasElement.scrollHeight, pageTop + pageConfig.pageHeight),
-      })
-      const dataUrl = rendered.toDataURL('image/png')
-      return {
-        success: true,
-        message: `已截取第 ${page} 页截图`,
-        data: {
-          ...metadata,
-          width: pageConfig.pageWidth,
-          height: pageConfig.pageHeight,
-          instruction: typeof params.instruction === 'string' ? params.instruction : '',
-          dataUrl,
-        },
-      }
-    } catch (error) {
-      return { success: false, message: error instanceof Error ? error.message : String(error) }
-    }
-  }, [editorView, getPageCanvasElement, pageConfig, pageGap])
-
-  const startStreamingWriteMarker = useCallback((
-    conversationId: string,
-    sessionId: string,
-    session: StreamingWriteSession,
-  ) => {
-    const marker: StreamingWriteMarker = {
-      conversationId,
-      sessionId,
-      streamingWriteId: session.id,
-      toolName: 'begin_streaming_write',
-      state: 'active',
-      lastAppliedChars: session.text.length,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      interruptEventId: `${session.id}:interrupted`,
-      closeEventId: `${session.id}:closed`,
-    }
-    activeStreamingWriteMarkerRef.current = marker
-    upsertStreamingWriteMarker(marker)
-    return marker
-  }, [])
-
-  const updateStreamingWriteMarkerProgress = useCallback((session: StreamingWriteSession) => {
-    const marker = activeStreamingWriteMarkerRef.current
-    if (!marker) return
-    const next = {
-      ...marker,
-      lastAppliedChars: session.text.length,
-      updatedAt: nowIso(),
-    }
-    activeStreamingWriteMarkerRef.current = next
-    upsertStreamingWriteMarker(next)
-  }, [])
-
-  const reportActiveStreamingWriteInterrupted = useCallback((
-    reason: string,
-    transport: 'fetch' | 'beacon' = 'fetch',
-  ) => {
-    const marker = activeStreamingWriteMarkerRef.current
-    if (!marker || marker.state === 'closed') return
-    const interrupted = markStreamingWriteMarkerInterrupted(marker, reason)
-    activeStreamingWriteMarkerRef.current = interrupted
-    postStreamingWriteClientEvent(interrupted, reason === 'pagehide' || reason === 'beforeunload' ? 'page_refresh' : 'stream_write_interrupted', reason, transport)
-  }, [])
-
-  const closeActiveStreamingWriteMarker = useCallback((reason: string) => {
-    const marker = activeStreamingWriteMarkerRef.current
-    if (!marker) return
-    const closed = markStreamingWriteMarkerClosed(marker)
-    postStreamingWriteClientEvent(closed, 'stream_write_closed', reason)
-    removeStreamingWriteMarker(marker.sessionId, marker.streamingWriteId)
-    activeStreamingWriteMarkerRef.current = null
-  }, [])
-
   const loadConversations = useCallback(async () => {
     setHistoryLoading(true)
     try {
@@ -2756,7 +2073,6 @@ export default function AISidebar({
             ...conversation,
             runStatus: payload.run?.status ?? null,
             activeRunSessionId: payload.run?.sessionId ?? null,
-            streamWriteState: payload.run?.streamWriteState ?? null,
           }
         } catch {
           return conversation
@@ -2775,8 +2091,6 @@ export default function AISidebar({
     conversationId: string,
     sessionId: string,
     after = 0,
-    replayHighWater = 0,
-    allowCurrentPendingToolExecution = true,
   ) => {
     if (!sessionId) return
     const aiMessage = makeAiMessage('', true)
@@ -2794,138 +2108,6 @@ export default function AISidebar({
     let finalText = ''
     let thinkingText = ''
     let finished = false
-    let roundNumber = 0
-    let currentToolPlan: ToolExecutionPlan | null = null
-    const pendingToolCalls: ToolCallResult[] = []
-    const restoredImages = conversationMessagesRef.current
-      .filter(message => message.role === 'user')
-      .at(-1)?.attachments?.filter(isImageAttachment) ?? []
-
-    const executeRestoredPlan = async (plan: ToolExecutionPlan) => {
-      if (!editorView) {
-        throw new Error('编辑器尚未就绪，无法恢复执行前端工具')
-      }
-      const selectionContext = extractSelectionContext(getContext())
-      const toolCallsById = new Map<string, ToolCallResult>()
-      for (const toolCall of pendingToolCalls) {
-        if (toolCall.id) toolCallsById.set(toolCall.id, toolCall)
-      }
-      const results: Array<{ execution_id: string; content: string }> = []
-
-      for (const execution of plan.executions) {
-        const executedParams = serializeToolParamsWithSelection(execution.toolName, execution.params, selectionContext)
-        let result: ExecuteResult
-        if (execution.toolName === 'TaskCreate') {
-          const response = await fetch(`/api/conversations/${conversationId}/tasks`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(executedParams),
-          })
-          result = response.ok
-            ? { success: true, message: '任务已创建', data: await response.json() }
-            : { success: false, message: `HTTP ${response.status}` }
-        } else if (execution.toolName === 'TaskGet') {
-          const taskId = String(executedParams.taskId ?? '').trim()
-          const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`)
-          result = response.ok
-            ? { success: true, message: `已读取任务 #${taskId}`, data: await response.json() }
-            : { success: false, message: `HTTP ${response.status}` }
-        } else if (execution.toolName === 'TaskList') {
-          const latestTasks = await fetchTasksForConversation(conversationId)
-          result = { success: true, message: latestTasks.length > 0 ? `当前有 ${latestTasks.length} 个任务` : '当前还没有任务计划', data: { tasks: latestTasks, ...buildTaskStats(latestTasks) } }
-        } else if (execution.toolName === 'TaskUpdate') {
-          const taskId = String(executedParams.taskId ?? '').trim()
-          const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(executedParams),
-          })
-          result = response.ok
-            ? { success: true, message: `任务 #${taskId} 已更新`, data: await response.json() }
-            : { success: false, message: `HTTP ${response.status}` }
-        } else if (execution.toolName === 'begin_streaming_write') {
-          const beginResult = beginStreamingWrite(editorView, executedParams)
-          result = beginResult
-          if ('session' in beginResult && beginResult.session) {
-            activeStreamingWriteRef.current = beginResult.session
-            startStreamingWriteMarker(conversationId, sessionId, beginResult.session)
-          }
-        } else if (execution.toolName === 'capture_page_screenshot') {
-          result = await capturePageScreenshot(executedParams)
-        } else if (execution.toolName === 'analyze_document_image') {
-          result = await analyzeDocumentImage(executedParams)
-        } else if (execution.toolName === 'analyze_image_with_ocr') {
-          if (restoredImages.length === 0) {
-            result = { success: false, message: '恢复会话中没有可供 OCR 分析的图片' }
-          } else {
-            const ocrResponse = await requestOcrAnalysis({
-              taskType: normalizeOcrTaskType(typeof executedParams.taskType === 'string' ? executedParams.taskType : undefined),
-              instruction: typeof executedParams.instruction === 'string' ? executedParams.instruction : '',
-              source: 'slash',
-            }, restoredImages)
-            result = { success: true, message: `已完成 OCR 识别（${ocrResponse.imageCount} 张图片）`, data: ocrResponse }
-          }
-        } else {
-          result = await executeTool(editorView, execution.toolName, executedParams, {
-            pageConfig,
-            onPageConfigChange,
-            onDocumentStyleMutation,
-            imageAnalysisCache: imageAnalysisCacheRef.current,
-            selectionContext,
-          })
-        }
-
-        const sourceToolCall = execution.sourceToolCallIds
-          .map(toolCallId => toolCallsById.get(toolCallId))
-          .find((toolCall): toolCall is ToolCallResult => toolCall !== undefined)
-        updateMessage(message => ({
-          ...updateToolCallInMessage(
-            message,
-            currentToolCall => Boolean(sourceToolCall?.id && currentToolCall.id === sourceToolCall.id) || currentToolCall.name === execution.toolName,
-            currentToolCall => ({
-              ...currentToolCall,
-              params: executedParams,
-              status: result.success ? 'ok' : 'err',
-              message: result.message,
-              data: sanitizeToolResultForDisplay(execution.toolName, result).data,
-              isExpanded: false,
-            }),
-          ),
-          activityLabel: result.success ? '工具已执行，正在继续...' : '工具执行失败，正在交回模型处理...',
-        }))
-        results.push({
-          execution_id: execution.executionId,
-          content: serializeToolResultPayload({
-            toolName: execution.toolName,
-            result,
-            executedParams,
-            originalParams: normalizeToolParams(sourceToolCall?.originalParams ?? sourceToolCall?.params ?? execution.params),
-            extra: {
-              executionId: execution.executionId,
-              mergeStrategy: execution.mergeStrategy,
-              sourceToolCallIds: execution.sourceToolCallIds,
-              parallelGroup: execution.parallelGroup ?? null,
-            },
-          }),
-        })
-      }
-
-      const latestContext = getContext()
-      const response = await fetch(`/api/ai/react/${sessionId}/tool-results`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          plan_id: plan.planId,
-          round: plan.round,
-          agent_id: plan.agentId,
-          results,
-          stop: false,
-          context: latestContext,
-        }),
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    }
     try {
       const response = await fetch(`/api/ai/react/runs/${sessionId}/events?after=${after}`, {
         signal: controller.signal,
@@ -2961,32 +2143,13 @@ export default function AISidebar({
               break
             }
             case 'round_start':
-              roundNumber = Number(event.round ?? roundNumber)
-              currentToolPlan = null
               break
             case 'content': {
               const chunk = String(event.content ?? '')
               finalText = stripToolResultJsonLeaks(finalText + chunk)
-              if (activeStreamingWriteRef.current && editorView && chunk) {
-                const streamResult = appendStreamingWrite(editorView, activeStreamingWriteRef.current, chunk)
-                if (streamResult.success) {
-                  updateStreamingWriteMarkerProgress(activeStreamingWriteRef.current)
-                } else {
-                  reportActiveStreamingWriteInterrupted(`append_failed:${streamResult.message}`)
-                  activeStreamingWriteRef.current.state = 'interrupted'
-                  activeStreamingWriteRef.current = null
-                }
-              }
               updateMessage(message => ({
                 ...appendContentChunk(message, chunk),
-                activityLabel: activeStreamingWriteRef.current ? '正在写入正文...' : '正在生成回复...',
-              }))
-              break
-            }
-            case 'client_event': {
-              updateMessage(message => ({
-                ...appendContentChunk(message, `${message.text ? '\n\n' : ''}${String(event.message ?? '前端状态已同步到后端')}`),
-                activityLabel: '正在等待模型根据前端状态继续...',
+                activityLabel: '正在生成回复...',
               }))
               break
             }
@@ -3003,18 +2166,15 @@ export default function AISidebar({
                 ...appendToolSegment(message, toolCall),
                 activityLabel: `等待执行 ${toolCall.name}...`,
               }))
-              pendingToolCalls.push(toolCall)
               break
             }
-            case 'tool_plan':
-              currentToolPlan = parseToolPlanEvent(event)
-              break
             case 'tool_result': {
               const toolId = typeof event.id === 'string' ? event.id : undefined
               const toolName = String(event.name ?? '')
               const result = (event.result && typeof event.result === 'object' && !Array.isArray(event.result))
                 ? event.result as Record<string, unknown>
                 : {}
+              applyServerDocumentEvents(result.data)
               updateMessage(message => ({
                 ...updateToolCallInMessage(
                   message,
@@ -3031,33 +2191,8 @@ export default function AISidebar({
               }))
               break
             }
-            case 'awaiting_tool_results':
-              {
-                const eventSeq = Number(event.seq ?? 0)
-                const shouldExecuteTools = allowCurrentPendingToolExecution || eventSeq > replayHighWater
-                updateMessage(message => ({
-                  ...message,
-                  activityLabel: shouldExecuteTools ? '正在恢复执行前端工具...' : '正在回放工具执行记录...',
-                }))
-                if (shouldExecuteTools) {
-                  await executeRestoredPlan(currentToolPlan ?? buildFallbackToolPlan(roundNumber, pendingToolCalls))
-                }
-              }
-              break
-            case 'agent_progress':
-              if (String(event.phase ?? '') !== 'awaiting_tool_results') break
-              updateMessage(message => ({
-                ...message,
-                activityLabel: '子代理等待前端工具结果...',
-              }))
-              break
             case 'done':
               finished = true
-              if (activeStreamingWriteRef.current) {
-                activeStreamingWriteRef.current.state = 'closed'
-                closeActiveStreamingWriteMarker('done')
-                activeStreamingWriteRef.current = null
-              }
               updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
               break
             case 'error':
@@ -3238,18 +2373,7 @@ export default function AISidebar({
           const run = payload.run
           const hasFinalAssistant = (data.messages ?? []).some(message => message.role === 'assistant')
           if (run?.sessionId && (run.status !== 'completed' || !hasFinalAssistant)) {
-            const marker = findActiveStreamingWriteMarker(conversationId, run.sessionId)
-            if (marker) {
-              const interrupted = markStreamingWriteMarkerInterrupted(marker, 'reopen_conversation_after_refresh')
-              postStreamingWriteClientEvent(interrupted, 'stream_write_interrupted', 'reopen_conversation_after_refresh')
-            }
-            void subscribeToExistingRun(
-              conversationId,
-              run.sessionId,
-              0,
-              Number(run.lastSeq ?? 0),
-              run.status === 'awaiting_client',
-            )
+            void subscribeToExistingRun(conversationId, run.sessionId, 0)
           }
         }
       } catch (error) {
@@ -3461,7 +2585,6 @@ export default function AISidebar({
     setIncludeSelection(true)
     resetTextareaHeight()
     shouldAutoScrollRef.current = true
-    activeStreamingWriteRef.current = null
 
     if (shouldStartNewConversation) {
       setCurrentConversationId(null)
@@ -3482,7 +2605,7 @@ export default function AISidebar({
     }
 
     let conversationId = shouldStartNewConversation ? null : currentConversationIdRef.current
-    const context = getContext()
+    let context = getContext()
     try {
       const wsRes = await fetch('/api/workspace')
       if (wsRes.ok) {
@@ -3494,13 +2617,25 @@ export default function AISidebar({
         }
       }
     } catch { /* ignore */ }
+    try {
+      const documentSessionId = await syncDocumentSession(context)
+      if (documentSessionId) {
+        context = { ...getContext(), ...context, documentSessionId }
+      }
+    } catch (error) {
+      console.error('[AISidebar] sync document session failed', error)
+      updateMessage(message => ({
+        ...message,
+        activityLabel: `后端文档会话同步失败：${error instanceof Error ? error.message : String(error)}`,
+      }))
+      setLoading(false)
+      return
+    }
     let persistedAssistantText = ''
     let conversationPersisted = false
     let userMessagePersisted = false
     const userRecord: StoredMessage = { role: 'user', content: text, attachments: pendingAttachments }
     const persistedRecords: StoredMessage[] = [userRecord]
-    let pendingStreamingChunk = ''
-    let streamingFlushTimer: number | null = null
 
     const appendAssistantRound = (
       assistantText: string,
@@ -3534,80 +2669,6 @@ export default function AISidebar({
           }))
           : undefined,
       })
-    }
-
-    const flushStreamingWrite = (final = false) => {
-      if (!pendingStreamingChunk) return
-      if (streamingFlushTimer != null) {
-        window.clearTimeout(streamingFlushTimer)
-        streamingFlushTimer = null
-      }
-      if (!activeStreamingWriteRef.current || !editorView) {
-        pendingStreamingChunk = ''
-        return
-      }
-
-      const { flushable, deferred } = splitStableStreamingMarkdown(pendingStreamingChunk, final)
-      if (!flushable) {
-        pendingStreamingChunk = deferred
-        return
-      }
-
-      const streamResult = appendStreamingWrite(
-        editorView,
-        activeStreamingWriteRef.current,
-        flushable,
-        { final },
-      )
-      pendingStreamingChunk = deferred
-
-      if (!streamResult.success) {
-        console.error('[AISidebar] append streaming write failed', streamResult.message)
-        reportActiveStreamingWriteInterrupted(`append_failed:${streamResult.message}`)
-        activeStreamingWriteRef.current.state = 'interrupted'
-        activeStreamingWriteRef.current = null
-        activeStreamingWriteMarkerRef.current = null
-        return
-      }
-      updateStreamingWriteMarkerProgress(activeStreamingWriteRef.current)
-    }
-
-    const queueStreamingWrite = (chunk: string) => {
-      if (!chunk) return
-      pendingStreamingChunk += chunk
-
-      if (pendingStreamingChunk.length >= STREAMING_WRITE_MAX_BUFFER) {
-        flushStreamingWrite(false)
-        return
-      }
-
-      if (streamingFlushTimer != null) return
-      streamingFlushTimer = window.setTimeout(() => {
-        streamingFlushTimer = null
-        flushStreamingWrite(false)
-      }, STREAMING_WRITE_FLUSH_MS)
-    }
-
-    const closeStreamingWriteSession = (reason: 'done' | 'tool_call' | 'awaiting_tool_results' | 'finish' | 'error') => {
-      const session = activeStreamingWriteRef.current
-      if (!session || !editorView) {
-        activeStreamingWriteRef.current = null
-        return null
-      }
-
-      if (!session.text.trim()) {
-        const rollbackResult = abortStreamingWrite(editorView, session)
-        console.warn('[AISidebar] begin_streaming_write finished without streamed content', { reason, rollbackResult })
-        session.state = 'closed'
-        closeActiveStreamingWriteMarker(reason)
-        activeStreamingWriteRef.current = null
-        return '检测到 `begin_streaming_write` 后没有实际输出正文，已自动撤销这次空写入。'
-      }
-
-      session.state = 'closed'
-      closeActiveStreamingWriteMarker(reason)
-      activeStreamingWriteRef.current = null
-      return null
     }
 
     const serverExecutedToolResults: ToolCallRecord[] = []
@@ -3644,7 +2705,6 @@ export default function AISidebar({
       const reactMessages = buildReactMessages(previousConversationMessages, text)
       let finished = false
       let sessionId = ''
-      let currentToolPlan: ToolExecutionPlan | null = null
 
       if (ocrIntent) {
         const ocrResponse = await requestOcrAnalysis(ocrIntent, imagesForRequest)
@@ -3682,6 +2742,7 @@ export default function AISidebar({
           conversationId,
           reactMessages,
           mode: assistantMode,
+          documentSessionId: typeof context.documentSessionId === 'string' ? context.documentSessionId : undefined,
           model: selectedModel || modelName || undefined,
           providerId: activeProviderId || undefined,
           imageProcessingMode: 'direct_multimodal',
@@ -3721,10 +2782,6 @@ export default function AISidebar({
       let roundThinkingText = ''
       let roundNumber = 0
       const pendingToolCalls: ToolCallResult[] = []
-      const pendingAgentToolCalls = new Map<string, ToolCallResult[]>()
-      const currentAgentToolPlans = new Map<string, ToolExecutionPlan>()
-      const executingAgentToolPlans = new Set<string>()
-      const agentToolResultPosts: Promise<void>[] = []
       const agentThinkingKeys = new Set<string>()
       let roundToolResultsPersisted = false
 
@@ -3740,384 +2797,6 @@ export default function AISidebar({
           })),
         )
         roundToolResultsPersisted = true
-      }
-
-      // Helper: execute pending tool calls and POST results back to session
-      const executeAndPostToolResults = async (plan: ToolExecutionPlan, sourceToolCallsOverride?: ToolCallResult[]) => {
-        const isAgentPlan = typeof plan.agentId === 'string' && plan.agentId.length > 0
-        const persistedToolResults: ToolCallRecord[] = []
-        const executionResults: Array<{ execution_id: string; content: string }> = []
-        const selectionContext = extractSelectionContext(context)
-        const toolCallsById = new Map<string, ToolCallResult>()
-        const sourceToolCallsForPlan = sourceToolCallsOverride ?? pendingToolCalls
-        for (const toolCall of sourceToolCallsForPlan) {
-          if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
-            toolCallsById.set(toolCall.id, toolCall)
-          }
-        }
-
-        const executePlannedTool = async (execution: ToolPlanExecution) => {
-          if (execution.executorLocation !== 'client') {
-            const rejectedResult: ExecuteResult = {
-              success: false,
-              message: `前端拒绝执行服务端工具：${execution.toolName}`,
-            }
-            return {
-              execution,
-              sourceToolCalls: [],
-              fallbackSourceCall: {
-                id: execution.executionId,
-                name: execution.toolName,
-                params: execution.params,
-                originalParams: execution.params,
-                status: 'pending' as const,
-                isExpanded: false,
-              },
-              leaderToolCall: {
-                id: execution.executionId,
-                name: execution.toolName,
-                params: execution.params,
-                originalParams: execution.params,
-                status: 'pending' as const,
-                isExpanded: false,
-              },
-              executedParams: normalizeToolParams(execution.params),
-              result: rejectedResult,
-            }
-          }
-
-          if (isAgentPlan && !execution.allowedForAgent) {
-            const rejectedResult: ExecuteResult = {
-              success: false,
-              message: `子代理只允许执行只读工具，已拒绝：${execution.toolName}`,
-            }
-            return {
-              execution,
-              sourceToolCalls: [],
-              fallbackSourceCall: {
-                id: execution.executionId,
-                name: execution.toolName,
-                params: execution.params,
-                originalParams: execution.params,
-                status: 'pending' as const,
-                isExpanded: false,
-              },
-              leaderToolCall: {
-                id: execution.executionId,
-                name: execution.toolName,
-                params: execution.params,
-                originalParams: execution.params,
-                status: 'pending' as const,
-                isExpanded: false,
-              },
-              executedParams: normalizeToolParams(execution.params),
-              result: rejectedResult,
-            }
-          }
-
-          const sourceToolCalls = execution.sourceToolCallIds
-            .map(toolCallId => toolCallsById.get(toolCallId))
-            .filter((toolCall): toolCall is ToolCallResult => toolCall !== undefined)
-          const fallbackSourceCall: ToolCallResult = {
-            id: execution.executionId,
-            name: execution.toolName,
-            params: execution.params,
-            originalParams: execution.params,
-            status: 'pending',
-            isExpanded: false,
-          }
-          const leaderToolCall = sourceToolCalls[0] ?? fallbackSourceCall
-          const executedParams = serializeToolParamsWithSelection(execution.toolName, execution.params, selectionContext)
-
-          let result: ExecuteResult
-          if (execution.toolName === 'TaskCreate') {
-            if (!conversationId) {
-              result = { success: false, message: '当前会话尚未创建，无法创建任务' }
-            } else {
-              try {
-                const response = await fetch(`/api/conversations/${conversationId}/tasks`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(executedParams),
-                })
-                if (!response.ok) throw new Error(`HTTP ${response.status}`)
-                const payload = await response.json() as Partial<TaskResponse>
-                const createdTask = normalizeTaskItem(payload.task)
-                const latestTasks = await fetchTasksForConversation(conversationId)
-                const stats = buildTaskStats(latestTasks)
-                result = createdTask
-                  ? {
-                    success: true,
-                    message: `任务 #${createdTask.id} 已创建：${createdTask.subject}`,
-                    data: { task: createdTask, tasks: latestTasks, ...stats },
-                  }
-                  : { success: false, message: '任务创建成功，但返回结果格式无效' }
-              } catch (error) {
-                result = { success: false, message: error instanceof Error ? error.message : String(error) }
-              }
-            }
-          } else if (execution.toolName === 'TaskGet') {
-            if (!conversationId) {
-              result = { success: false, message: '当前会话尚未创建，无法读取任务' }
-            } else {
-              try {
-                const taskId = String(executedParams.taskId ?? '').trim()
-                const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`)
-                if (!response.ok) throw new Error(`HTTP ${response.status}`)
-                const payload = await response.json() as Partial<TaskResponse>
-                const task = normalizeTaskItem(payload.task)
-                result = task
-                  ? { success: true, message: `已读取任务 #${task.id}`, data: { task } }
-                  : { success: false, message: '任务读取成功，但返回结果格式无效' }
-              } catch (error) {
-                result = { success: false, message: error instanceof Error ? error.message : String(error) }
-              }
-            }
-          } else if (execution.toolName === 'TaskList') {
-            if (!conversationId) {
-              result = { success: false, message: '当前会话尚未创建，无法读取任务列表' }
-            } else {
-              try {
-                const latestTasks = await fetchTasksForConversation(conversationId)
-                const stats = buildTaskStats(latestTasks)
-                result = {
-                  success: true,
-                  message: latestTasks.length > 0 ? `当前有 ${latestTasks.length} 个任务` : '当前还没有任务计划',
-                  data: { tasks: latestTasks, ...stats },
-                }
-              } catch (error) {
-                result = { success: false, message: error instanceof Error ? error.message : String(error) }
-              }
-            }
-          } else if (execution.toolName === 'TaskUpdate') {
-            if (!conversationId) {
-              result = { success: false, message: '当前会话尚未创建，无法更新任务' }
-            } else {
-              try {
-                const taskId = String(executedParams.taskId ?? '').trim()
-                const response = await fetch(`/api/conversations/${conversationId}/tasks/${taskId}`, {
-                  method: 'PATCH',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(executedParams),
-                })
-                if (!response.ok) throw new Error(`HTTP ${response.status}`)
-                const payload = await response.json() as Partial<TaskResponse>
-                const task = normalizeTaskItem(payload.task)
-                const latestTasks = await fetchTasksForConversation(conversationId)
-                const stats = buildTaskStats(latestTasks)
-                result = task
-                  ? {
-                    success: true,
-                    message: `任务 #${task.id} 已更新为 ${task.status}`,
-                    data: { task, tasks: latestTasks, ...stats },
-                  }
-                  : { success: false, message: '任务更新成功，但返回结果格式无效' }
-              } catch (error) {
-                result = { success: false, message: error instanceof Error ? error.message : String(error) }
-              }
-            }
-          } else if (execution.toolName === 'begin_streaming_write') {
-            const beginResult = editorView
-              ? beginStreamingWrite(editorView, executedParams)
-              : { success: false, message: '编辑器尚未就绪' }
-            result = beginResult
-            if ('session' in beginResult && beginResult.session) {
-              activeStreamingWriteRef.current = beginResult.session
-              if (conversationId && sessionId) {
-                startStreamingWriteMarker(conversationId, sessionId, beginResult.session)
-              }
-            }
-          } else if (execution.toolName === 'capture_page_screenshot') {
-            result = await capturePageScreenshot(executedParams)
-          } else if (execution.toolName === 'analyze_document_image') {
-            result = await analyzeDocumentImage(executedParams)
-          } else if (execution.toolName === 'analyze_image_with_ocr') {
-            if (imagesForRequest.length === 0) {
-              result = { success: false, message: '当前轮没有可供 OCR 分析的图片' }
-            } else {
-              try {
-                const taskType = normalizeOcrTaskType(typeof executedParams.taskType === 'string' ? executedParams.taskType : undefined)
-                const imageIndices = Array.isArray(executedParams.imageIndices)
-                  ? executedParams.imageIndices.map(value => Number(value)).filter(value => Number.isInteger(value) && value > 0)
-                  : undefined
-                const ocrResponse = await requestOcrAnalysis({
-                  taskType,
-                  instruction: typeof executedParams.instruction === 'string' ? executedParams.instruction : '',
-                  source: 'slash',
-                }, imagesForRequest, imageIndices)
-                result = {
-                  success: true,
-                  message: `已完成 OCR 识别（${ocrResponse.taskType}，${ocrResponse.imageCount} 张图片）`,
-                  data: ocrResponse,
-                }
-              } catch (error) {
-                result = { success: false, message: error instanceof Error ? error.message : String(error) }
-              }
-            }
-          } else {
-            result = editorView
-              ? await executeTool(editorView, execution.toolName, executedParams, {
-                pageConfig,
-                onPageConfigChange,
-                onDocumentStyleMutation,
-                imageAnalysisCache: imageAnalysisCacheRef.current,
-                selectionContext,
-              })
-              : { success: false, message: '编辑器尚未就绪' }
-          }
-
-          if (!result.success) {
-            console.error('[AISidebar] tool call failed', execution.toolName, executedParams, result.message)
-          }
-
-          return {
-            execution,
-            sourceToolCalls,
-            fallbackSourceCall,
-            leaderToolCall,
-            executedParams,
-            result,
-          }
-        }
-
-        for (const batch of buildExecutionBatches(plan.executions)) {
-          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
-
-          if (batch.length > 1) {
-            updateMessage(message => ({
-              ...message,
-              activityLabel: `正在并行执行 ${batch.length} 个互不冲突的工具...`,
-            }))
-          }
-
-          const completedBatch = batch.length === 1
-            ? [await executePlannedTool(batch[0]!)]
-            : await Promise.all(batch.map(execution => executePlannedTool(execution)))
-
-          for (const completed of completedBatch) {
-            const {
-              execution,
-              sourceToolCalls,
-              fallbackSourceCall,
-              leaderToolCall,
-              executedParams,
-              result,
-            } = completed
-            const displayResult = sanitizeToolResultForDisplay(execution.toolName, result)
-
-            const mergedFollowerMessage = sourceToolCalls.length > 1
-              ? `${displayResult.success ? '已合并到后端执行计划' : '后端执行计划失败'}：${execution.toolName} x${sourceToolCalls.length}`
-              : displayResult.message
-            const leaderId = sourceToolCalls[0]?.id ?? leaderToolCall.id
-
-            updateMessage(message => {
-              let nextMessage = updateToolCallInMessage(
-                message,
-                currentToolCall => Boolean(currentToolCall.id && execution.sourceToolCallIds.includes(currentToolCall.id)),
-                currentToolCall => ({
-                  ...currentToolCall,
-                  params: currentToolCall.id === leaderId ? executedParams : currentToolCall.params,
-                  status: displayResult.success ? 'ok' : 'err',
-                  message: currentToolCall.id === leaderId ? displayResult.message : mergedFollowerMessage,
-                  data: displayResult.data,
-                  isExpanded: false,
-                }),
-              )
-
-              if (sourceToolCalls.length === 0) {
-                nextMessage = updateToolCallInMessage(
-                  nextMessage,
-                  (currentToolCall, index, array) => currentToolCall.name === execution.toolName && index === array.findIndex(item => item.name === execution.toolName),
-                  currentToolCall => ({
-                    ...currentToolCall,
-                    params: executedParams,
-                    status: displayResult.success ? 'ok' : 'err',
-                    message: displayResult.message,
-                    data: displayResult.data,
-                    isExpanded: false,
-                  }),
-                )
-              }
-
-              const activityLabel =
-                displayResult.success === false
-                  ? '正在调整执行方案...'
-                  : execution.toolName === 'begin_streaming_write'
-                    ? '正在写入正文...'
-                    : '正在整理工具结果...'
-              return { ...nextMessage, activityLabel }
-            })
-            const persistedSourceCalls: ToolCallResult[] = sourceToolCalls.length > 0 ? sourceToolCalls : [fallbackSourceCall]
-            const sourceRecords = persistedSourceCalls.map(sourceToolCall => ({
-              id: sourceToolCall.id ?? execution.executionId,
-              name: sourceToolCall.name,
-              params: executedParams,
-              originalParams: normalizeToolParams(sourceToolCall.originalParams ?? sourceToolCall.params),
-              result: displayResult,
-            }))
-            persistedToolResults.push(...sourceRecords)
-            executionResults.push({
-              execution_id: execution.executionId,
-              content: serializeToolResultPayload({
-                toolName: execution.toolName,
-                result,
-                executedParams,
-                originalParams: normalizeToolParams(leaderToolCall.originalParams ?? leaderToolCall.params),
-                extra: {
-                  executionId: execution.executionId,
-                  mergeStrategy: execution.mergeStrategy,
-                  sourceToolCallIds: execution.sourceToolCallIds,
-                  parallelGroup: execution.parallelGroup ?? null,
-                },
-              }),
-            })
-          }
-        }
-
-        if (!isAgentPlan) {
-          persistRoundToolResults([...serverExecutedToolResults, ...persistedToolResults])
-        }
-
-        if (sessionId) {
-          // Get latest context for delta injection (selection may have changed, etc.)
-          const latestContext = getContext()
-          try {
-            const wsRes = await fetch('/api/workspace')
-            if (wsRes.ok) {
-              const wsDocs = await wsRes.json()
-              if (Array.isArray(wsDocs) && wsDocs.length > 0) {
-                latestContext.workspaceDocs = wsDocs.map((d: { id: string; name: string; type: string; size: number; textLength: number }) => ({
-                  id: d.id, name: d.name, type: d.type, size: d.size, textLength: d.textLength,
-                }))
-              }
-            }
-          } catch { /* ignore */ }
-
-          const toolResultsResponse = await fetch(`/api/ai/react/${sessionId}/tool-results`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            signal: controller.signal,
-            body: JSON.stringify({
-              plan_id: plan.planId,
-              round: plan.round,
-              agent_id: plan.agentId,
-              results: executionResults,
-              stop: false,
-              context: latestContext,
-            }),
-          })
-          if (!toolResultsResponse.ok) throw new Error(`HTTP ${toolResultsResponse.status}`)
-        }
-
-        if (isAgentPlan && plan.agentId) {
-          pendingAgentToolCalls.delete(plan.agentId)
-          currentAgentToolPlans.delete(plan.agentId)
-          executingAgentToolPlans.delete(plan.agentId)
-        } else {
-          pendingToolCalls.length = 0
-          serverExecutedToolResults.length = 0
-          currentToolPlan = null
-        }
       }
 
       // ── Read SSE events from the single long-lived connection ──
@@ -4149,7 +2828,6 @@ export default function AISidebar({
               roundNumber = Number(event.round ?? 0)
               roundAssistantText = ''
               roundThinkingText = ''
-              currentToolPlan = null
               agentThinkingKeys.clear()
               serverExecutedToolResults.length = 0
               roundToolResultsPersisted = false
@@ -4166,24 +2844,16 @@ export default function AISidebar({
             case 'content': {
               const rawChunk = String(event.content ?? '')
               const nextRoundAssistantText = stripToolResultJsonLeaks(roundAssistantText + rawChunk)
-              const chunk = nextRoundAssistantText.startsWith(roundAssistantText)
-                ? nextRoundAssistantText.slice(roundAssistantText.length)
-                : ''
               roundAssistantText = nextRoundAssistantText
               persistedAssistantText = stripToolResultJsonLeaks(persistedAssistantText + rawChunk)
-              if (activeStreamingWriteRef.current && editorView && chunk) {
-                queueStreamingWrite(chunk)
-              }
               updateMessage(message => ({
                 ...appendContentChunk(message, rawChunk),
-                activityLabel: activeStreamingWriteRef.current ? '正在写入正文...' : '正在生成回复...',
+                activityLabel: '正在生成回复...',
               }))
               break
             }
 
             case 'tool_call': {
-              flushStreamingWrite(true)
-              const emptyStreamingWarning = closeStreamingWriteSession('tool_call')
               const toolCall: ToolCallResult = {
                 id: typeof event.id === 'string' ? event.id : undefined,
                 name: String(event.name ?? ''),
@@ -4193,15 +2863,10 @@ export default function AISidebar({
                 isExpanded: true,
               }
 
-              updateMessage(message => {
-                const withWarning = emptyStreamingWarning
-                  ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
-                  : message
-                return {
-                  ...appendToolSegment(withWarning, toolCall),
-                  activityLabel: `正在调用 ${toolCall.name}...`,
-                }
-              })
+              updateMessage(message => ({
+                ...appendToolSegment(message, toolCall),
+                activityLabel: `正在调用 ${toolCall.name}...`,
+              }))
               pendingToolCalls.push(toolCall)
               break
             }
@@ -4220,19 +2885,6 @@ export default function AISidebar({
               const agentId = typeof event.agentId === 'string' ? event.agentId : ''
               const agentType = String(event.agentType ?? 'agent')
               const phase = String(event.phase ?? '')
-              if (phase === 'awaiting_tool_results' && agentId) {
-                const agentPlan = currentAgentToolPlans.get(agentId)
-                const agentCalls = pendingAgentToolCalls.get(agentId) ?? []
-                if (agentPlan && !executingAgentToolPlans.has(agentId)) {
-                  executingAgentToolPlans.add(agentId)
-                  const postPromise = executeAndPostToolResults(agentPlan, agentCalls).catch(error => {
-                    executingAgentToolPlans.delete(agentId)
-                    throw error
-                  })
-                  agentToolResultPosts.push(postPromise)
-                }
-                break
-              }
               if (phase === 'thinking') {
                 const content = String(event.content ?? '')
                 if (content) {
@@ -4272,25 +2924,10 @@ export default function AISidebar({
                 status: 'pending',
                 isExpanded: true,
               }
-              const calls = pendingAgentToolCalls.get(agentId) ?? []
-              calls.push(toolCall)
-              pendingAgentToolCalls.set(agentId, calls)
               updateMessage(message => ({
                 ...appendToolSegment(message, toolCall),
                 activityLabel: `子代理正在读取：${toolCall.name}`,
               }))
-              break
-            }
-
-            case 'agent_tool_plan': {
-              const agentPlan = parseToolPlanEvent(event)
-              if (agentPlan?.agentId) {
-                currentAgentToolPlans.set(agentPlan.agentId, agentPlan)
-                updateMessage(message => ({
-                  ...message,
-                  activityLabel: `子代理已生成 ${agentPlan.executions.length} 个只读执行步骤`,
-                }))
-              }
               break
             }
 
@@ -4362,20 +2999,6 @@ export default function AISidebar({
               break
             }
 
-            case 'tool_plan': {
-              const nextToolPlan = parseToolPlanEvent(event)
-              currentToolPlan = nextToolPlan
-              if (nextToolPlan) {
-                updateMessage(message => ({
-                  ...message,
-                  activityLabel: nextToolPlan.executions.length > 1
-                    ? `后端已生成 ${nextToolPlan.executions.length} 个执行步骤`
-                    : '后端已生成工具执行计划',
-                }))
-              }
-              break
-            }
-
             case 'tooling_delta': {
               const loadedCount = Number(event.loadedDeferredToolCount ?? 0)
               const deferredCount = Number(event.deferredToolCount ?? 0)
@@ -4394,6 +3017,7 @@ export default function AISidebar({
               const result = (event.result && typeof event.result === 'object' && !Array.isArray(event.result))
                 ? event.result as Record<string, unknown>
                 : {}
+              applyServerDocumentEvents(result.data)
               const toolRecord: ToolCallRecord = {
                 id: toolId ?? String(event.executionId ?? newId()),
                 name: toolName,
@@ -4433,57 +3057,28 @@ export default function AISidebar({
               break
             }
 
-            case 'awaiting_tool_results':
-              flushStreamingWrite(true)
-              {
-                const emptyStreamingWarning = closeStreamingWriteSession('awaiting_tool_results')
-                if (emptyStreamingWarning) {
-                  updateMessage(message => ({
-                    ...appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`),
-                    activityLabel: '正在整理工具结果...',
-                  }))
-                }
-              }
-
-              if (pendingToolCalls.length > 0) {
-                const plan = currentToolPlan ?? buildFallbackToolPlan(roundNumber, pendingToolCalls)
-                await executeAndPostToolResults(plan)
-              }
-              break
-
             case 'round_complete': {
-              flushStreamingWrite(true)
-              const emptyStreamingWarning = closeStreamingWriteSession('finish')
               persistRoundToolResults(serverExecutedToolResults)
               if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
                 appendAssistantRound(roundAssistantText, roundThinkingText, [])
               }
-              updateMessage(message => {
-                const nextMessage = emptyStreamingWarning
-                  ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
-                  : message
-                return {
-                  ...nextMessage,
-                  activityLabel: String(event.message ?? '正在继续执行后续步骤...'),
-                }
-              })
+              updateMessage(message => ({
+                ...message,
+                activityLabel: String(event.message ?? '正在继续执行后续步骤...'),
+              }))
               break
             }
 
             case 'done':
-              flushStreamingWrite(true)
               finished = true
               {
-                const emptyStreamingWarning = closeStreamingWriteSession('done')
                 persistRoundToolResults(serverExecutedToolResults)
                 // Persist the final round (content-only, no tools)
                 if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
                   appendAssistantRound(roundAssistantText, roundThinkingText, [])
                 }
                 updateMessage(message => {
-                  let nextMessage = emptyStreamingWarning
-                    ? appendContentChunk(message, `${message.text ? '\n\n' : ''}${emptyStreamingWarning}`)
-                    : message
+                  let nextMessage = message
                   if (String(event.reason ?? '') === 'max_rounds') {
                     nextMessage = appendContentChunk(nextMessage, `${nextMessage.text ? '\n\n' : ''}已执行 ${roundNumber} 轮操作，已停止当前自动链路。请根据当前结果继续下达下一步指令。`)
                   }
@@ -4537,13 +3132,10 @@ export default function AISidebar({
             }
 
             case 'stop_hook': {
-              const hint = String(event.hint ?? '')
-              if (hint) {
-                updateMessage(message => ({
-                  ...appendContentChunk(message, `${message.text ? '\n\n' : ''}> ⚠️ ${hint}`),
-                  activityLabel: '检测到异常模式，正在调整策略...',
-                }))
-              }
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '后端正在调整执行路径...',
+              }))
               break
             }
 
@@ -4552,10 +3144,6 @@ export default function AISidebar({
               break
           }
         }
-      }
-
-      if (agentToolResultPosts.length > 0) {
-        await Promise.all(agentToolResultPosts)
       }
 
       if (conversationId) {
@@ -4572,12 +3160,6 @@ export default function AISidebar({
           : [...previousConversationMessages, ...persistedRecords]
       }
     } catch (error) {
-      if (streamingFlushTimer != null) {
-        window.clearTimeout(streamingFlushTimer)
-        streamingFlushTimer = null
-      }
-      flushStreamingWrite(true)
-      closeStreamingWriteSession('error')
       persistRoundToolResults(serverExecutedToolResults)
       if (error instanceof Error && error.name === 'AbortError') {
         persistedAssistantText = '（已取消）'
@@ -4623,18 +3205,12 @@ export default function AISidebar({
         }
       }
     } finally {
-      if (streamingFlushTimer != null) {
-        window.clearTimeout(streamingFlushTimer)
-        streamingFlushTimer = null
-      }
-      flushStreamingWrite(true)
-      closeStreamingWriteSession('finish')
       setLoading(false)
       abortRef.current = null
       activeRunSessionIdRef.current = null
       void loadConversations()
     }
-  }, [activeProviderId, activeTemplate, analyzeDocumentImage, applyTaskState, assistantMode, capturePageScreenshot, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, onDocumentStyleMutation, onPageConfigChange, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, templates, viewMode])
+  }, [activeProviderId, activeTemplate, applyServerDocumentEvents, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, syncDocumentSession, templates, viewMode])
 
   const historyEmpty = !historyLoading && conversations.length === 0
   const groupedConversations = useMemo(() => groupConversationsByTime(conversations), [conversations])
@@ -4734,11 +3310,7 @@ export default function AISidebar({
                           <div className="text-xs text-gray-400 mt-0.5">
                             {openingConversationId === conversation.id
                               ? '打开中...'
-                              : conversation.streamWriteState === 'interrupted'
-                                ? '写入中断，等待重试'
-                                : conversation.runStatus === 'awaiting_client'
-                                ? '等待前端工具'
-                                : conversation.runStatus === 'running'
+                              : conversation.runStatus === 'running'
                                   ? '运行中'
                                   : conversation.runStatus === 'failed'
                                     ? '运行失败'

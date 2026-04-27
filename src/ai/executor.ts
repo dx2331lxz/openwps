@@ -722,14 +722,57 @@ function normalizeToolText(raw: string) {
     .replace(/\\t/g, '\t')
 }
 
-function buildParagraphNodeFromText(paragraph: ParagraphRef | null, text: string) {
-  return buildParagraphNode(normalizeToolText(text), (paragraph?.node.attrs as Record<string, unknown> | undefined) ?? undefined)
+function inheritedParagraphAttrs(
+  attrs?: Record<string, unknown>,
+  options: { preservePageBreakBefore?: boolean } = {},
+) {
+  return {
+    ...(attrs ?? {}),
+    pageBreakBefore: options.preservePageBreakBefore ? Boolean(attrs?.pageBreakBefore) : false,
+  }
 }
 
-function buildParagraphNodesFromText(text: string, paragraphAttrs?: Record<string, unknown>) {
+function buildParagraphNodeFromText(
+  paragraph: ParagraphRef | null,
+  text: string,
+  options: { preservePageBreakBefore?: boolean } = {},
+) {
+  return buildParagraphNode(
+    normalizeToolText(text),
+    inheritedParagraphAttrs(paragraph?.node.attrs as Record<string, unknown> | undefined, options),
+  )
+}
+
+function buildParagraphNodesFromText(
+  text: string,
+  paragraphAttrs?: Record<string, unknown>,
+  options: { preserveFirstPageBreakBefore?: boolean } = {},
+) {
   const normalized = normalizeToolText(text)
   const parts = normalized === '' ? [''] : normalized.split('\n')
-  return parts.map(part => buildParagraphNode(part, paragraphAttrs))
+  return parts.map((part, index) => buildParagraphNode(part, inheritedParagraphAttrs(paragraphAttrs, {
+    preservePageBreakBefore: options.preserveFirstPageBreakBefore && index === 0,
+  })))
+}
+
+function sanitizeStreamingFragmentPageBreaks(fragment: Fragment, preserveFirstPageBreakBefore: boolean) {
+  const nodes: PMNode[] = []
+  let paragraphIndex = 0
+  fragment.forEach(node => {
+    if (node.type.name !== 'paragraph') {
+      nodes.push(node)
+      return
+    }
+    nodes.push(schema.nodes.paragraph.create(
+      inheritedParagraphAttrs(node.attrs as Record<string, unknown>, {
+        preservePageBreakBefore: preserveFirstPageBreakBefore && paragraphIndex === 0,
+      }),
+      node.content,
+      node.marks,
+    ))
+    paragraphIndex += 1
+  })
+  return Fragment.fromArray(nodes)
 }
 
 function isFullParagraphSelection(range: { from: number; to: number }, paragraph: ParagraphRef) {
@@ -1331,55 +1374,6 @@ function executeTableCommand(
   }
 }
 
-function buildBlockSnapshot(block: BlockRef, includeTextRuns = true, imageRefs?: Map<string, DocumentImageRef>) {
-  switch (block.node.type.name) {
-    case 'paragraph':
-      return {
-        blockIndex: block.blockIndex,
-        type: 'paragraph',
-        paragraphIndex: block.paragraphIndex,
-        afterParagraphIndex: block.afterParagraphIndex,
-        ...buildParagraphNodeSnapshot(block.node, block.paragraphIndex, includeTextRuns, imageRefs),
-      }
-    case 'table':
-      return {
-        blockIndex: block.blockIndex,
-        type: 'table',
-        paragraphIndex: block.paragraphIndex,
-        afterParagraphIndex: block.afterParagraphIndex,
-        ...buildTableSnapshot(block.node, includeTextRuns),
-      }
-    case 'horizontal_rule':
-      return {
-        blockIndex: block.blockIndex,
-        type: 'horizontal_rule',
-        paragraphIndex: block.paragraphIndex,
-        afterParagraphIndex: block.afterParagraphIndex,
-        text: '',
-      }
-    case 'table_of_contents':
-      return {
-        blockIndex: block.blockIndex,
-        type: 'table_of_contents',
-        paragraphIndex: block.paragraphIndex,
-        afterParagraphIndex: block.afterParagraphIndex,
-        title: String(block.node.attrs.title ?? '目录'),
-        minLevel: Number(block.node.attrs.minLevel ?? 1),
-        maxLevel: Number(block.node.attrs.maxLevel ?? 3),
-        hyperlink: block.node.attrs.hyperlink !== false,
-        text: '[Word 自动目录]',
-      }
-    default:
-      return {
-        blockIndex: block.blockIndex,
-        type: block.node.type.name,
-        paragraphIndex: block.paragraphIndex,
-        afterParagraphIndex: block.afterParagraphIndex,
-        text: block.node.textContent,
-      }
-  }
-}
-
 function buildStyleSignature(paragraph: ReturnType<typeof buildParagraphSnapshot>) {
   const style = paragraph.style
   return [
@@ -1513,12 +1507,10 @@ function getDocumentOutline(state: EditorState, params: Record<string, unknown>,
 }
 
 function getDocumentContent(state: EditorState, params: Record<string, unknown>, options?: ExecuteOptions): ExecuteResult {
-  const detail = resolveDetailMode(params.detail)
   const fromParagraph = Number.isInteger(params.fromParagraph) ? Number(params.fromParagraph) : 0
   const allParagraphs = getParagraphs(state)
   const maxIndex = Math.max(0, allParagraphs.length - 1)
   const toParagraph = Number.isInteger(params.toParagraph) ? Number(params.toParagraph) : maxIndex
-  const includeTextRuns = detail === 'format' ? params.includeTextRuns !== false : false
   const paragraphRefs = allParagraphs.filter(paragraph => (
     paragraph.index >= fromParagraph && paragraph.index <= toParagraph
   ))
@@ -1554,33 +1546,13 @@ function getDocumentContent(state: EditorState, params: Record<string, unknown>,
     }
   })
 
-  if (detail === 'format') {
-    const paragraphs = paragraphRefs.map(paragraph => buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns, imageIndex.byParagraphImage))
-    const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
-    return {
-      success: true,
-      message: `已读取第 ${firstParagraphIndex + 1} 到第 ${lastParagraphIndex + 1} 段（format）`,
-      data: {
-        detail,
-        fromParagraph: firstParagraphIndex,
-        toParagraph: lastParagraphIndex,
-        paragraphCount: paragraphs.length,
-        totalChars,
-        paragraphs,
-        blocks: blocksInRange.map(block => buildBlockSnapshot(block, includeTextRuns, imageIndex.byParagraphImage)),
-        images: imageIndex.all.filter(image => image.paragraphIndex >= firstParagraphIndex && image.paragraphIndex <= lastParagraphIndex),
-        pageRanges,
-      },
-    }
-  }
-
   const paragraphs = paragraphRefs.map(paragraph => buildParagraphContentSnapshot(paragraph.node, paragraph.index, imageIndex.byParagraphImage))
   const totalChars = paragraphs.reduce((sum, paragraph) => sum + paragraph.charCount, 0)
   return {
     success: true,
     message: `已读取第 ${firstParagraphIndex + 1} 到第 ${lastParagraphIndex + 1} 段`,
     data: {
-      detail,
+      detail: 'content',
       fromParagraph: firstParagraphIndex,
       toParagraph: lastParagraphIndex,
       paragraphCount: paragraphs.length,
@@ -1599,7 +1571,12 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
     return { success: false, message: 'page 必须是从 1 开始的整数' }
   }
   const detail = resolveDetailMode(params.detail)
-  const includeTextRuns = detail === 'format' ? params.includeTextRuns === true : false
+  if (detail === 'format') {
+    return {
+      success: false,
+      message: 'get_page_content 只返回页面文字结构，不返回样式详情。需要查看样式时请调用 get_page_style_summary，并且每次只指定一个 page。',
+    }
+  }
 
   const blocks = getBlocks(state)
   const paragraphs = getParagraphs(state)
@@ -1619,33 +1596,6 @@ function getPageContent(state: EditorState, params: Record<string, unknown>, opt
   const paragraphRefs = paragraphIndexes
     .map(index => paragraphs[index])
     .filter((paragraph): paragraph is ParagraphRef => Boolean(paragraph))
-
-  if (detail === 'format') {
-    return {
-      success: true,
-      message: `已读取第 ${pageNumber} 页（format）`,
-      data: {
-        detail,
-        page: pageNumber,
-        pageCount: pagination.renderedPages.length,
-        paragraphIndexes,
-        paragraphRange: paragraphIndexes.length > 0
-          ? { from: Math.min(...paragraphIndexes), to: Math.max(...paragraphIndexes) }
-          : null,
-        previewText: buildPageTextPreview(page.lines),
-        blocks: pageBlocks.map(block => buildBlockSnapshot(block, includeTextRuns, imageIndex.byParagraphImage)),
-        lines: page.lines.map(line => ({
-          blockIndex: line.blockIndex,
-          lineIndex: line.lineIndex,
-          text: line.text,
-          top: Math.round(line.top),
-          startPos: line.startPos,
-        })),
-        paragraphs: paragraphRefs.map(paragraph => buildParagraphNodeSnapshot(paragraph.node, paragraph.index, includeTextRuns, imageIndex.byParagraphImage)),
-        images: imageIndex.all.filter(image => image.page === pageNumber),
-      },
-    }
-  }
 
   return {
     success: true,
@@ -1782,6 +1732,13 @@ export function beginStreamingWrite(
 ): BeginStreamingWriteResult {
   const { state, dispatch } = view
   const action = String(params.action ?? '')
+  const markdown = typeof params.markdown === 'string' ? params.markdown : ''
+  if (!markdown) {
+    return {
+      success: false,
+      message: 'begin_streaming_write 需要 markdown 参数。请把要写入文档的完整 Markdown 正文放入工具参数，不要在侧边栏回复中输出正文。',
+    }
+  }
 
   if (action === 'insert_after_paragraph') {
     const afterParagraph = Number(params.afterParagraph)
@@ -1799,22 +1756,18 @@ export function beginStreamingWrite(
       return { success: false, message: '已创建流式写入占位段落，但无法定位写入位置' }
     }
 
-    return {
-      success: true,
-      message: `已开始在第 ${afterParagraph + 1} 段后流式写入正文`,
-      session: {
-        id: `stream-${Date.now()}`,
-        action: 'insert_after_paragraph',
-        from: targetParagraph.pos,
-        to: targetParagraph.pos + targetParagraph.node.nodeSize,
-        text: '',
-        lastAppliedChars: 0,
-        state: 'active',
-        format: 'markdown',
-        paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
-        rollbackFragment: Fragment.empty,
-      },
-    }
+    return appendStreamingWrite(view, {
+      id: `stream-${Date.now()}`,
+      action: 'insert_after_paragraph',
+      from: targetParagraph.pos,
+      to: targetParagraph.pos + targetParagraph.node.nodeSize,
+      text: '',
+      lastAppliedChars: 0,
+      state: 'active',
+      format: 'markdown',
+      paragraphAttrs: inheritedParagraphAttrs(paragraph.node.attrs as Record<string, unknown> | undefined),
+      rollbackFragment: Fragment.empty,
+    }, markdown, { final: true })
   }
 
   if (action === 'replace_paragraph') {
@@ -1826,7 +1779,7 @@ export function beginStreamingWrite(
       state.tr.replaceWith(
         paragraph.pos,
         paragraph.pos + paragraph.node.nodeSize,
-        buildParagraphNodeFromText(paragraph, ''),
+        buildParagraphNodeFromText(paragraph, '', { preservePageBreakBefore: true }),
       ),
     )
     view.focus()
@@ -1836,22 +1789,18 @@ export function beginStreamingWrite(
       return { success: false, message: '已创建流式写入占位段落，但无法定位写入位置' }
     }
 
-    return {
-      success: true,
-      message: `已开始流式改写第 ${paragraphIndex + 1} 段`,
-      session: {
-        id: `stream-${Date.now()}`,
-        action: 'replace_paragraph',
-        from: targetParagraph.pos,
-        to: targetParagraph.pos + targetParagraph.node.nodeSize,
-        text: '',
-        lastAppliedChars: 0,
-        state: 'active',
-        format: 'markdown',
-        paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
-        rollbackFragment: Fragment.from(paragraph.node),
-      },
-    }
+    return appendStreamingWrite(view, {
+      id: `stream-${Date.now()}`,
+      action: 'replace_paragraph',
+      from: targetParagraph.pos,
+      to: targetParagraph.pos + targetParagraph.node.nodeSize,
+      text: '',
+      lastAppliedChars: 0,
+      state: 'active',
+      format: 'markdown',
+      paragraphAttrs: { ...(paragraph.node.attrs as Record<string, unknown>) },
+      rollbackFragment: Fragment.from(paragraph.node),
+    }, markdown, { final: true })
   }
 
   return { success: false, message: `begin_streaming_write 的 action 无效：${action || '空值'}` }
@@ -1866,7 +1815,10 @@ export function appendStreamingWrite(
   if (!chunk) return { success: true, message: '本次未追加正文内容' }
 
   const nextText = session.text + chunk
-  const fragment = markdownToFragment(nextText, { baseParagraphAttrs: session.paragraphAttrs })
+  const fragment = sanitizeStreamingFragmentPageBreaks(
+    markdownToFragment(nextText, { baseParagraphAttrs: session.paragraphAttrs }),
+    session.action === 'replace_paragraph',
+  )
 
   const tr = view.state.tr.replaceWith(session.from, session.to, fragment)
   if (!options?.final) tr.setMeta('addToHistory', false)
@@ -2288,7 +2240,7 @@ export async function executeTool(
         tr.replaceWith(
           paragraph.pos,
           paragraph.pos + paragraph.node.nodeSize,
-          Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined)),
+          Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined, { preserveFirstPageBreakBefore: true })),
         )
         dispatch(tr)
         view.focus()
@@ -2309,7 +2261,7 @@ export async function executeTool(
             tr.replaceWith(
               paragraph.pos,
               paragraph.pos + paragraph.node.nodeSize,
-              Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined)),
+              Fragment.fromArray(buildParagraphNodesFromText(text, paragraph.node.attrs as Record<string, unknown> | undefined, { preserveFirstPageBreakBefore: true })),
             )
             dispatch(tr)
             view.focus()

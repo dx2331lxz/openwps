@@ -70,6 +70,7 @@ class ChatRequest(BaseModel):
     imageProcessingMode: str = "direct_multimodal"
     ocrConfig: Optional[OCRConfig] = None
     ocrResults: list[dict[str, Any]] = Field(default_factory=list)
+    documentSessionId: Optional[str] = None
 
 
 class CompletionRequest(BaseModel):
@@ -138,35 +139,35 @@ class DocumentSettingsUpdateRequest(BaseModel):
     wpsDirectory: Optional[str] = None
 
 
+class DocumentSessionCreateRequest(BaseModel):
+    docJson: Optional[dict[str, Any]] = None
+    pageConfig: Optional[dict[str, Any]] = None
+    selectionContext: Optional[dict[str, Any]] = None
+    currentDocumentName: Optional[str] = None
+
+
+class DocumentSessionPatchRequest(BaseModel):
+    baseVersion: Optional[int] = None
+    docJson: Optional[dict[str, Any]] = None
+    pageConfig: Optional[dict[str, Any]] = None
+    selectionContext: Optional[dict[str, Any]] = None
+    clientId: Optional[str] = None
+
+
+class DocumentSessionActiveRequest(BaseModel):
+    clientId: Optional[str] = None
+    currentDocumentName: Optional[str] = None
+
+
+class DocumentToolExecuteRequest(BaseModel):
+    toolName: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    baseVersion: Optional[int] = None
+    selectionContext: Optional[dict[str, Any]] = None
+
+
 class AppendMessagesRequest(BaseModel):
     messages: list[ChatMessage]
-
-
-class ToolResultItem(BaseModel):
-    execution_id: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    content: str
-
-
-class ToolResultsRequest(BaseModel):
-    plan_id: Optional[str] = None
-    round: Optional[int] = None
-    agent_id: Optional[str] = None
-    results: list[ToolResultItem] = Field(default_factory=list)
-    stop: bool = False
-    context: Optional[dict[str, Any]] = None  # Frontend sends latest context each round
-
-
-class ClientEventRequest(BaseModel):
-    eventId: str
-    eventType: str
-    conversationId: Optional[str] = None
-    toolName: Optional[str] = None
-    streamingWriteId: Optional[str] = None
-    reason: Optional[str] = None
-    lastAppliedChars: int = 0
-    createdAt: Optional[str] = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskCreateRequest(BaseModel):

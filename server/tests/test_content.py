@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import struct
 import unittest
 import json
+import zlib
 
+from server.app.models import ChatRequest
 from server.app.content import (
     build_delta_content,
     build_initial_context_content,
@@ -11,7 +15,7 @@ from server.app.content import (
     build_system_content,
     build_user_content,
 )
-from server.app.ai import _prepare_page_screenshot_tool_result
+from server.app.ai import VISION_TEST_IMAGE_DATA_URL, _prepare_page_screenshot_tool_result
 from server.app.agents import AgentDefinition
 from server.app.config import PRESET_PROVIDERS, normalize_config
 
@@ -22,6 +26,28 @@ class DummyMessage:
 
 
 class ContentModuleTest(unittest.TestCase):
+    def test_builtin_vision_test_image_is_valid_png(self) -> None:
+        header, encoded = VISION_TEST_IMAGE_DATA_URL.split(",", 1)
+        self.assertEqual(header, "data:image/png;base64")
+        raw = base64.b64decode(encoded, validate=True)
+        self.assertEqual(raw[:8], b"\x89PNG\r\n\x1a\n")
+
+        cursor = 8
+        found_iend = False
+        while cursor < len(raw):
+            length = struct.unpack(">I", raw[cursor:cursor + 4])[0]
+            chunk_type = raw[cursor + 4:cursor + 8]
+            chunk_data = raw[cursor + 8:cursor + 8 + length]
+            expected_crc = struct.unpack(">I", raw[cursor + 8 + length:cursor + 12 + length])[0]
+            actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+            self.assertEqual(actual_crc, expected_crc, chunk_type.decode("ascii", errors="replace"))
+            cursor += 12 + length
+            if chunk_type == b"IEND":
+                found_iend = True
+                break
+
+        self.assertTrue(found_iend)
+
     def test_system_prompt_hash_ignores_dynamic_context(self) -> None:
         provider = {"id": "openai", "promptCacheMode": "openai_auto", "promptCacheRetention": "in_memory"}
         first = build_system_content("agent", provider, tools=[])
@@ -53,6 +79,73 @@ class ContentModuleTest(unittest.TestCase):
         full = build_delta_content(changed_context, messages, force_full=True)
         self.assertGreaterEqual(full.trace["deltaCount"], 1)
         self.assertTrue(full.trace["forceFull"])
+
+    def test_initial_workspace_docs_are_not_described_as_new(self) -> None:
+        context = {
+            "workspaceDocs": [{
+                "id": "doc_1",
+                "name": "初试成绩.pdf",
+                "type": "pdf",
+                "size": 1024,
+                "textLength": 88,
+            }],
+        }
+
+        initial = build_initial_context_content(context)
+
+        self.assertIn("当前工作区已有文档", initial.content)
+        self.assertIn("已有文档", initial.content)
+        self.assertNotIn("新增文档", initial.content)
+        self.assertIn("不代表当前任务执行过程中新增", initial.content)
+
+    def test_workspace_docs_without_prior_delta_are_treated_as_initial(self) -> None:
+        context = {
+            "workspaceDocs": [{
+                "id": "doc_1",
+                "name": "初试成绩.pdf",
+                "type": "pdf",
+                "size": 1024,
+                "textLength": 88,
+            }],
+        }
+
+        delta = build_delta_content(context, [])
+
+        self.assertEqual(delta.trace["deltaCount"], 1)
+        self.assertIn("当前工作区已有文档", delta.content[0])
+        self.assertIn("已有文档", delta.content[0])
+        self.assertNotIn("新增文档", delta.content[0])
+
+    def test_workspace_delta_after_initial_context_describes_new_docs(self) -> None:
+        initial_context = {
+            "workspaceDocs": [{
+                "id": "doc_1",
+                "name": "参考资料.pdf",
+                "type": "pdf",
+                "size": 1024,
+                "textLength": 88,
+            }],
+        }
+        initial = build_initial_context_content(initial_context)
+        changed = build_delta_content(
+            {
+                "workspaceDocs": [
+                    *initial_context["workspaceDocs"],
+                    {
+                        "id": "doc_2",
+                        "name": "新增资料.pdf",
+                        "type": "pdf",
+                        "size": 2048,
+                        "textLength": 120,
+                    },
+                ],
+            },
+            [DummyMessage(initial.content)],
+        )
+
+        self.assertEqual(changed.trace["deltaCount"], 1)
+        self.assertIn("新增文档", changed.content[0])
+        self.assertIn("新增资料.pdf", changed.content[0])
 
     def test_user_attachment_trace_counts_clipped_chars_without_content(self) -> None:
         result = build_user_content(
@@ -161,6 +254,36 @@ class ContentModuleTest(unittest.TestCase):
         self.assertIsInstance(image_message.content, list)
         self.assertEqual(image_message.content[1]["type"], "image_url")
         self.assertEqual(image_message.content[1]["image_url"]["url"], "data:image/png;base64,AAAA")
+
+    def test_page_screenshot_tool_result_blocks_non_vision_model(self) -> None:
+        raw = {
+            "success": True,
+            "message": "已截取第 2 页截图",
+            "toolName": "capture_page_screenshot",
+            "data": {
+                "page": 2,
+                "pageCount": 3,
+                "previewText": "页面预览",
+                "dataUrl": "data:image/png;base64,AAAA",
+            },
+        }
+        safe_content, image_message = _prepare_page_screenshot_tool_result(
+            json.dumps(raw, ensure_ascii=False),
+            ChatRequest(
+                message="检查页面视觉效果",
+                providerId="siliconflow",
+                model="Qwen/Qwen2.5-72B-Instruct",
+            ),
+        )
+        payload = json.loads(safe_content)
+
+        self.assertIsNone(image_message)
+        self.assertFalse(payload["success"])
+        self.assertNotIn("data:image/png", safe_content)
+        self.assertEqual(payload["capabilityBlocked"], "vision")
+        self.assertEqual(payload["data"]["capabilityBlocked"], "vision")
+        self.assertFalse(payload["recoverable"])
+        self.assertEqual(payload["suggestedAction"], "finalize_or_switch_vision_model")
 
 
 if __name__ == "__main__":

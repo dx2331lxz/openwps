@@ -166,6 +166,7 @@ def _built_in_agents() -> list[AgentDefinition]:
             description="分析当前文档排版，给出格式与版式修复方案。",
             prompt=(
                 "你是排版规划子代理。你只读取文档和页面样式，不修改格式。"
+                "如果父代理指定了页码，你只能分析该页；样式详情只能通过 get_page_style_summary(page=N) 单页读取。"
                 "请指出标题、正文、列表、页边距、分页、目录、图片/表格附近可能的问题，并给出父代理可执行的格式化步骤。"
             ),
             tools=[
@@ -204,7 +205,7 @@ def _built_in_agents() -> list[AgentDefinition]:
             prompt=(
                 "你是结果校验子代理。你只读取当前状态，不做修改。"
                 "如果父代理分配了具体页码，你只验收该页：先用 get_document_info 或 get_document_outline 确认页数和页码有效，"
-                "再调用 capture_page_screenshot 查看该页真实视觉效果，并按需结合 get_page_content/get_page_style_summary 核对结构化证据。"
+                "再调用 capture_page_screenshot 查看该页真实视觉效果，并按需结合 get_page_content/get_page_style_summary 核对结构化证据；样式详情只能读取这一页。"
                 "请用 PASS / PARTIAL / FAIL 开头，标明页码、视觉证据、结构化证据、遗漏和建议的下一步。"
             ),
             tools=["get_document_info", "get_document_outline", "get_document_content", "get_page_content", "capture_page_screenshot", "get_page_style_summary", "get_paragraph", "search_text", "get_comments", "TaskList"],

@@ -209,13 +209,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_document_content",
-            "description": "读取文档内容，可按段落范围分块返回；默认返回段落内容、段落样式、textRuns，以及该范围内的块级元素快照（含表格/分割线）。",
+            "description": "按段落范围读取文档正文和粗略结构。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "fromParagraph": {"type": "integer", "description": "起始段落索引（包含），不传则从 0 开始"},
                     "toParagraph": {"type": "integer", "description": "结束段落索引（包含），不传则到最后一段"},
-                    "includeTextRuns": {"type": "boolean", "description": "是否返回 textRuns，默认 true"},
                 },
             },
         },
@@ -224,12 +223,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_page_content",
-            "description": "读取指定页面的排版快照，返回该页涉及的段落、块级元素和逐行预览；表格会附带单元格文本快照。长文档或需要按页判断版式时优先使用。",
+            "description": "读取指定页面的紧凑文字结构，只返回页内段落/表格/图片占位等文章结构和具体文字内容，不返回逐行布局、样式明细、textRuns 或图片 dataUrl。需要检查字号/对齐/缩进等格式时改用 get_page_style_summary。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "page": {"type": "integer", "description": "页码，从 1 开始"},
-                    "includeTextRuns": {"type": "boolean", "description": "是否返回该页相关段落的 textRuns，默认 false"},
                 },
                 "required": ["page"],
             },
@@ -257,7 +255,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_page_style_summary",
-            "description": "读取指定页面的样式摘要，返回该页每个段落的文字预览、样式签名、标题候选和常见样式统计。长文档排版时优先用它按页判断标题/正文是否混淆。",
+            "description": "读取指定单页的样式摘要，返回该页段落文字预览、代表字体/字号/对齐/缩进/行距、标题候选和常见样式统计。该工具是唯一可返回详细样式的读取工具；一次只能读取一页。多页排版分析请让 layout-plan/verification 子代理并行按页分析，不要由主 Agent 连续调用多页。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -536,7 +534,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "begin_streaming_write",
-            "description": "开始一次流式正文写入。先声明写入位置，然后把真正要写入文档的 Markdown 正文作为后续 assistant 文本直接输出，前端会实时解析并写入文档。适合新增长段落、表格、分割线或整体改写整段。",
+            "description": "一次性写入后端权威 Markdown 正文。必须把完整正文放在 markdown 参数中；不要先声明位置后再把侧边栏回复当正文输出。适合新增长段落、表格、分割线或整体改写整段。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -547,8 +545,9 @@ TOOLS = [
                     },
                     "afterParagraph": {"type": "integer", "description": "action=insert_after_paragraph 时，在该段后开始流式写入"},
                     "paragraphIndex": {"type": "integer", "description": "action=replace_paragraph 时，整体改写该段"},
+                    "markdown": {"type": "string", "description": "必填。要写入文档的完整 Markdown 正文。"},
                 },
-                "required": ["action"],
+                "required": ["action", "markdown"],
             },
         },
     },

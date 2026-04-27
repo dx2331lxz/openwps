@@ -52,6 +52,12 @@ const DEFAULT_SERVER_DOCUMENT_NAME = 'document.docx'
 const EDITOR_DRAFT_STORAGE_KEY = 'openwps.editor.draft.v1'
 const EDITOR_DRAFT_VERSION = 1
 const EDITOR_DRAFT_SAVE_DELAY_MS = 500
+const SERVER_DOCUMENT_SYNC_DELAY_MS = 800
+
+function createDocumentClientId() {
+  const randomId = globalThis.crypto?.randomUUID?.()
+  return `editor_${randomId ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`}`
+}
 
 declare global {
   interface Window {
@@ -1705,6 +1711,9 @@ export const Editor: React.FC = () => {
   const aiCopilotPreviewRef = useRef<AICopilotPreview | null>(null)
   const aiCopilotEnabledRef = useRef(aiCopilotEnabled)
   const editorStateRef = useRef<EditorState | null>(null)
+  const documentClientIdRef = useRef(createDocumentClientId())
+  const documentSessionRef = useRef<{ id: string; version: number } | null>(null)
+  const [documentSessionInfo, setDocumentSessionInfo] = useState<{ id: string; version: number } | null>(null)
 
   // ── Comment state ───────────────────────────────────────────────────────────
   const [activeComment, setActiveComment] = useState<CommentData | null>(null)
@@ -1827,6 +1836,92 @@ export const Editor: React.FC = () => {
     docxLetterSpacingRef.current = nextDocxLetterSpacingPx
     setDocxLetterSpacingPx(nextDocxLetterSpacingPx)
   }, [])
+
+  const rememberDocumentSession = useCallback((next: { id: string; version: number } | null) => {
+    documentSessionRef.current = next
+    setDocumentSessionInfo(prev => {
+      if (!next && !prev) return prev
+      if (next && prev && prev.id === next.id && prev.version === next.version) return prev
+      return next
+    })
+  }, [])
+
+  const registerActiveDocumentSession = useCallback(async (sessionId: string) => {
+    try {
+      await fetch(`/api/doc-sessions/${sessionId}/active`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId: documentClientIdRef.current,
+          currentDocumentName: currentDocumentName || undefined,
+        }),
+      })
+    } catch (error) {
+      console.warn('登记当前文档会话失败', error)
+    }
+  }, [currentDocumentName])
+
+  const syncDocumentSession = useCallback(async () => {
+    const currentState = editorStateRef.current
+    if (!currentState) return
+    const payload = {
+      docJson: currentState.doc.toJSON() as PMNodeJSON,
+      pageConfig: pageConfigRef.current,
+      clientId: documentClientIdRef.current,
+      currentDocumentName: currentDocumentName || undefined,
+    }
+    const createDocumentSession = async () => {
+      const response = await fetch('/api/doc-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await readJsonResponse<{ documentSessionId?: string; version?: number }>(response)
+      const id = String(data.documentSessionId || '')
+      if (!id) throw new Error('后端未返回 documentSessionId')
+      rememberDocumentSession({ id, version: Number(data.version ?? 1) || 1 })
+      await registerActiveDocumentSession(id)
+    }
+    const current = documentSessionRef.current
+    if (!current) {
+      await createDocumentSession()
+      return
+    }
+
+    const response = await fetch(`/api/doc-sessions/${current.id}/client-patches`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, baseVersion: current.version }),
+    })
+    if (response.status === 404) {
+      rememberDocumentSession(null)
+      await createDocumentSession()
+      return
+    }
+    if (response.status === 409) {
+      const latest = await readJsonResponse<{ documentSessionId?: string; version?: number }>(
+        await fetch(`/api/doc-sessions/${current.id}`),
+      )
+      rememberDocumentSession({
+        id: current.id,
+        version: Number(latest.version ?? current.version) || current.version,
+      })
+      return
+    }
+    const data = await readJsonResponse<{ version?: number }>(response)
+    rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
+    await registerActiveDocumentSession(current.id)
+  }, [currentDocumentName, registerActiveDocumentSession, rememberDocumentSession])
+
+  useEffect(() => {
+    if (!editorState) return undefined
+    const timer = window.setTimeout(() => {
+      void syncDocumentSession().catch(error => {
+        console.warn('同步当前文档会话失败', error)
+      })
+    }, SERVER_DOCUMENT_SYNC_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [currentDocumentName, editorState, pageConfig, syncDocumentSession])
 
   const loadDocumentSettings = useCallback(async () => {
     const response = await fetch('/api/documents/settings')
@@ -2082,6 +2177,55 @@ export const Editor: React.FC = () => {
       void performRepagination()
     }, 150)
   }, [performRepagination])
+
+  useEffect(() => {
+    const sessionId = documentSessionInfo?.id
+    if (!sessionId) return undefined
+    const source = new EventSource(`/api/doc-sessions/${sessionId}/events`)
+    source.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as Record<string, unknown>
+        if (data.type === 'snapshot') {
+          const version = Number(data.version ?? documentSessionRef.current?.version ?? 1) || 1
+          rememberDocumentSession({ id: sessionId, version })
+          return
+        }
+        const eventVersion = typeof data.version === 'number' ? data.version : undefined
+        if (eventVersion !== undefined && eventVersion <= (documentSessionRef.current?.version ?? 0)) return
+        if (data.source === 'client_patch' && data.originClientId === documentClientIdRef.current) {
+          if (eventVersion !== undefined) rememberDocumentSession({ id: sessionId, version: eventVersion })
+          return
+        }
+        const nextDocJson = data.type === 'document_replace'
+          && data.docJson
+          && typeof data.docJson === 'object'
+          && !Array.isArray(data.docJson)
+          ? data.docJson as PMNodeJSON
+          : null
+        const nextPageConfig = data.type === 'page_config_changed'
+          && data.pageConfig
+          && typeof data.pageConfig === 'object'
+          && !Array.isArray(data.pageConfig)
+          ? data.pageConfig as PageConfig
+          : null
+        if (nextDocJson) {
+          applyDocumentState(nextDocJson, nextPageConfig ?? pageConfigRef.current)
+          clearImportedDocxCompatibility()
+        } else if (nextPageConfig) {
+          setPageConfig(nextPageConfig)
+          pageConfigRef.current = nextPageConfig
+          repaginate()
+        }
+        if (eventVersion !== undefined) rememberDocumentSession({ id: sessionId, version: eventVersion })
+      } catch (error) {
+        console.warn('解析当前文档会话事件失败', error)
+      }
+    }
+    source.onerror = () => {
+      console.warn('当前文档会话事件连接异常')
+    }
+    return () => source.close()
+  }, [applyDocumentState, clearImportedDocxCompatibility, documentSessionInfo?.id, rememberDocumentSession, repaginate])
 
   const cancelAICopilot = useCallback(() => {
     if (aiCopilotTimerRef.current) {
@@ -2574,6 +2718,23 @@ export const Editor: React.FC = () => {
       setDocumentFilesError(`读取文档设置失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }, [loadDocumentFiles, loadDocumentSettings])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
+      event.preventDefault()
+      if (event.repeat || fileModalMode) return
+      const targetName = currentDocumentName.trim()
+      if (targetName) {
+        void handleSaveDocument(targetName)
+      } else {
+        void openSaveFileModal()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [currentDocumentName, fileModalMode, handleSaveDocument, openSaveFileModal])
 
   const handleExportDocx = useCallback(async () => {
     const editorView = viewRef.current
@@ -3791,8 +3952,6 @@ export const Editor: React.FC = () => {
             view={view}
             editorState={editorState}
             pageConfig={pageConfig}
-            pageGap={PAGE_GAP}
-            getPageCanvasElement={() => canvasRef.current}
             templates={templates}
             activeTemplate={activeTemplate}
             onModelContextChange={(next) => {
@@ -3804,6 +3963,11 @@ export const Editor: React.FC = () => {
             onPageConfigChange={(newCfg) => {
               setPageConfig(newCfg)
               pageConfigRef.current = newCfg
+              repaginate()
+            }}
+            onApplyServerDocumentState={(docJson, nextPageConfig) => {
+              applyDocumentState(docJson as PMNodeJSON, nextPageConfig)
+              pageConfigRef.current = nextPageConfig
               repaginate()
             }}
             onDocumentStyleMutation={clearImportedDocxCompatibility}

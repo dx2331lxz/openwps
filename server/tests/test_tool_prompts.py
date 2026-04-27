@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from server.app.agents import build_agent_system_prompt
-from server.app.ai import PlannedToolExecution, SourceToolCall, _build_parallel_execution_batches
+from server.app.ai import PlannedToolExecution, SourceToolCall, _build_parallel_execution_batches, _get_model_tools_for_body
 from server.app.content import build_system_content
+from server.app.models import ChatRequest, OCRConfig, VisionConfig
 from server.app.tool_registry import TOOL_SEARCH_NAME, build_tool_guidance_section
 from server.app.tooling import (
     AGENT_TOOL_NAMES,
@@ -24,6 +26,13 @@ def _tool_names(tools: list[dict]) -> set[str]:
         str(tool.get("function", {}).get("name", ""))
         for tool in tools
     }
+
+
+def _find_tool(tools: list[dict], name: str) -> dict:
+    for tool in tools:
+        if str(tool.get("function", {}).get("name", "")) == name:
+            return tool
+    raise AssertionError(f"missing tool: {name}")
 
 
 def _base_tool(name: str) -> dict:
@@ -73,6 +82,81 @@ class ToolPromptInjectionTest(unittest.TestCase):
         self.assertEqual([definition.name for definition in matches], ["web_search"])
         empty = search_deferred_tool_definitions("agent", "select:not_a_tool", set())
         self.assertEqual(empty, [])
+
+    def test_runtime_tools_hide_vision_tools_without_runtime(self) -> None:
+        body = ChatRequest(
+            message="检查页面",
+            mode="agent",
+            providerId="siliconflow",
+            model="Qwen/Qwen2.5-72B-Instruct",
+        )
+        with (
+            patch("server.app.ai._headless_screenshot_available", return_value=True),
+            patch("server.app.ai._resolve_vision_config", return_value=VisionConfig(enabled=False)),
+            patch("server.app.ai._normalize_ocr_config", return_value=OCRConfig(enabled=False)),
+        ):
+            names = _tool_names(_get_model_tools_for_body(body, {"analyze_document_image"}))
+
+        self.assertNotIn("capture_page_screenshot", names)
+        self.assertNotIn("analyze_document_image", names)
+
+    def test_runtime_tools_allow_screenshot_with_vision_fallback(self) -> None:
+        body = ChatRequest(
+            message="检查页面",
+            mode="agent",
+            providerId="siliconflow",
+            model="Qwen/Qwen2.5-72B-Instruct",
+        )
+        with (
+            patch("server.app.ai._headless_screenshot_available", return_value=True),
+            patch(
+                "server.app.ai._resolve_vision_config",
+                return_value=VisionConfig(
+                    enabled=True,
+                    endpoint="https://vision.example/v1",
+                    model="vision-model",
+                    apiKey="key",
+                    hasApiKey=True,
+                ),
+            ),
+            patch("server.app.ai._normalize_ocr_config", return_value=OCRConfig(enabled=False)),
+        ):
+            tools = _get_model_tools_for_body(body, {"analyze_document_image"})
+            names = _tool_names(tools)
+
+        self.assertIn("capture_page_screenshot", names)
+        self.assertIn("analyze_document_image", names)
+        self.assertIn("后端多模态 fallback", _find_tool(tools, "capture_page_screenshot")["function"]["description"])
+
+    def test_runtime_tools_limit_document_image_to_ocr_when_only_ocr_available(self) -> None:
+        body = ChatRequest(
+            message="分析图片",
+            mode="agent",
+            providerId="siliconflow",
+            model="Qwen/Qwen2.5-72B-Instruct",
+        )
+        with (
+            patch("server.app.ai._headless_screenshot_available", return_value=True),
+            patch("server.app.ai._resolve_vision_config", return_value=VisionConfig(enabled=False)),
+            patch(
+                "server.app.ai._normalize_ocr_config",
+                return_value=OCRConfig(
+                    enabled=True,
+                    endpoint="https://ocr.example/v1",
+                    model="ocr-model",
+                    apiKey="key",
+                    hasApiKey=True,
+                ),
+            ),
+        ):
+            tools = _get_model_tools_for_body(body, {"analyze_document_image"})
+            names = _tool_names(tools)
+            image_tool = _find_tool(tools, "analyze_document_image")
+
+        self.assertNotIn("capture_page_screenshot", names)
+        self.assertIn("analyze_document_image", names)
+        analysis_mode = image_tool["function"]["parameters"]["properties"]["analysisMode"]
+        self.assertEqual(analysis_mode["enum"], ["ocr"])
 
     def test_execution_metadata_is_registry_derived(self) -> None:
         self.assertEqual(get_tool_metadata_payload("web_search")["executorLocation"], "server")

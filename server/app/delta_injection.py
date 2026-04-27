@@ -169,6 +169,8 @@ def reconstruct_workspace_docs_state(
 def compute_workspace_docs_delta(
     current_docs: list[dict],
     messages: list[Any],
+    *,
+    initial: bool = False,
 ) -> str | None:
     """Compute delta for workspace docs changes.
     
@@ -177,7 +179,9 @@ def compute_workspace_docs_delta(
     
     Returns formatted delta text, or None if no changes.
     """
+    prior_attachments = _find_attachment_messages(messages, WORKSPACE_DOCS_DELTA)
     announced_ids = reconstruct_workspace_docs_state(messages)
+    is_initial_announcement = initial or not prior_attachments
     
     current_ids = {doc.get("id") for doc in current_docs}
     current_map = {doc.get("id"): doc for doc in current_docs}
@@ -197,16 +201,20 @@ def compute_workspace_docs_delta(
         "type": WORKSPACE_DOCS_DELTA,
         "added": [{"id": d.get("id"), "name": d.get("name", "?")} for d in added_docs],
         "removed": removed_docs,
-        "is_initial": len(announced_ids) == 0,
+        "is_initial": is_initial_announcement,
     }
     parts.append(json.dumps(payload, ensure_ascii=False))
     
     # Human-readable text for the model
     parts.append("")
-    parts.append("[工作区文档变更]")
+    if is_initial_announcement:
+        parts.append("[当前工作区已有文档]")
+        parts.append("这些文档在会话开始时已经存在，是可选参考资料，不代表当前任务执行过程中新增或发现了新文件。除非用户要求引用资料，或任务确实需要参考外部文档，否则不要主动搜索无关文件。")
+    else:
+        parts.append("[工作区文档变更]")
     
     if added_docs:
-        parts.append("新增文档：")
+        parts.append("已有文档：" if is_initial_announcement else "新增文档：")
         for doc in added_docs:
             name = doc.get("name", "?")
             doc_id = doc.get("id", "?")
@@ -384,6 +392,7 @@ def compute_all_deltas(
         docs_delta = compute_workspace_docs_delta(
             context.get("workspaceDocs", []),
             [],  # empty → no prior state → full announcement
+            initial=True,
         )
         template_delta = compute_template_delta(
             context.get("activeTemplate"),
@@ -427,7 +436,7 @@ def build_initial_context_attachment(context: dict) -> str:
     """
     parts = []
     
-    docs_delta = compute_workspace_docs_delta(context.get("workspaceDocs", []), [])
+    docs_delta = compute_workspace_docs_delta(context.get("workspaceDocs", []), [], initial=True)
     if docs_delta:
         parts.append(docs_delta)
     

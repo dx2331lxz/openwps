@@ -43,7 +43,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
 - **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
 
-当你需要引用数据、法规条款、格式范文等外部参考时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。"""
+当你需要引用数据、法规条款、格式范文等外部参考时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文件是参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索。"""
 
     if mode == "edit":
         return """## 工作区（参考资料）
@@ -53,7 +53,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
 - **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
 
-当你需要引用数据、法规条款、参考资料等内容时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档在每轮对话上下文中会列出可用文件列表。"""
+当你需要引用数据、法规条款、参考资料等内容时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档在每轮对话上下文中会列出可用文件列表，但它们是参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索。"""
 
     # agent mode
     return """## 工作区（参考资料）
@@ -64,7 +64,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_read(doc_id, from_line, to_line)** — 读取某个工作区文档的完整内容或指定行范围
 - **web_search(query, topic, searchDepth, maxResults)** — 联网搜索最新网页、新闻和工作区外的公开资料
 
-工作区文档在每轮对话上下文中会列出可用文件列表。当你需要：
+工作区文档在每轮对话上下文中会列出可用文件列表；它们是参考资料，不代表当前任务进展。当你需要：
 - 查找具体数据、条款、引用 → 先 workspace_search 定位
 - 了解某篇参考文档的完整内容 → workspace_read 查看全文或分段阅读
 - 按照参考文档的格式/结构撰写内容 → 先读取参考文档，再据此编排
@@ -86,7 +86,7 @@ def _get_strategy_section(mode: str | None) -> str:
 2. 若 context.activeTemplate 存在 → 优先按模板 templateText 排版，不要先回退到通用批量样式
 3. 仅当没有激活模板时，使用 set_page_config + apply_style_batch 组合完成全文样式统一
 4. 若需局部微调 → 用 apply_style_batch，一次规则列表覆盖多个角色的样式
-5. 抽查 1-2 页 get_page_style_summary 确认无异常；若需要看完整格式可调 get_page_content(detail='format')
+5. 抽查 1-2 页 get_page_style_summary 确认无异常；如果需要多页样式分析，委托 layout-plan/verification 子代理并行按页检查，不要主 Agent 连续调用
 6. 回复结果
 
 **页面与分页**：
@@ -110,9 +110,9 @@ def _get_strategy_section(mode: str | None) -> str:
 
 **写新内容**：
 1. 确认插入位置（get_document_outline 快速定位，或用 context.selection.paragraphIndex）
-2. 调用 begin_streaming_write → 立刻输出 Markdown 正文（标题用 #/##/###，列表用 -/1.，表格用 |）
+2. 调用 begin_streaming_write，并把完整 Markdown 正文放入 markdown 参数（标题用 #/##/###，列表用 -/1.，表格用 |）
 3. Markdown 中不要插入 --- / *** 模拟分页，分页需求在正文完成后用排版工具处理
-4. 正文输出完毕后，不要结束；先验证写入结果，再决定是否还有剩余步骤
+4. 工具写入完毕后，不要结束；先验证写入结果，再决定是否还有剩余步骤
 
 **Mermaid 流程图**：
 - 当用户要求插入流程图/时序图/类图/甘特图/思维导图/关系图等图表时，使用 insert_mermaid 工具
@@ -131,7 +131,7 @@ def _get_strategy_section(mode: str | None) -> str:
 
 **图片输入**：
 - 若用户上传图片并要求复现正文或截图内容，优先根据图片直接生成可写入文档的正文、标题、列表或 Markdown 表格
-- 长内容优先 begin_streaming_write，调用后立刻输出内容
+- 长内容优先 begin_streaming_write，必须把完整 Markdown 放入工具参数
 - 严格遵循用户对图片的原始意图；描述、解释、识别、比较、问答类请求只需要回答，不要写入或改写当前文档
 - 若消息里已经给出 OCR 提取的标题层级、列表类型、强调或表格结构，生成正文时同步保留这些结构特征
 - 若消息里已经给出 OCR 的 blocks[*].styleHints，写正文时优先保留标题层级、列表类型、表单字段与占位结构，不要把它们压扁成普通段落"""
@@ -196,7 +196,7 @@ def _get_strategy_section(mode: str | None) -> str:
   - 怀疑分页/标题样式异常：get_page_style_summary(page=N)
 - 非平凡文档改动在回复完成前必须做独立校验：整体写作/重写、多段插入、3 次以上写入或样式工具调用、全文排版、模板适配、目录/分页/页面设置、图片/表格复现、或用户目标含多个验收条件时，调用 Agent(subagent_type="verification")
 - 调用 verification 时，把原始用户目标、已执行的写入/排版动作、关键段落或页码、你担心的风险点一并交给子代理；不要把未经确认的成功结论写进委托
-- 多页视觉验收时，先用 get_document_info 或 get_document_outline 确认总页数；然后在同一轮并行调用多个 Agent(subagent_type="verification")，每个子代理只负责一个具体页码，并要求它使用 capture_page_screenshot 查看该页真实视觉效果
+- 多页视觉验收时，先用 get_document_info 或 get_document_outline 确认总页数；然后在同一轮并行调用多个 Agent(subagent_type="verification")，每个子代理只负责一个具体页码，并要求它使用 capture_page_screenshot 查看该页真实视觉效果；如果截图工具提示视觉能力不可用，不要重试截图或搜索工作区补偿，改用结构化读取给出受限结论
 - verification 返回 FAIL 时，先修复问题再重新校验；返回 PARTIAL 时，说明已验证和未验证的部分；返回 PASS 后，结合工具快照或必要的轻量读取确认没有明显偏差，再向用户总结
 - 简单单步样式修改且工具返回快照已能证明结果时，不必额外调用 verification
 
@@ -217,8 +217,8 @@ def _get_tool_selection_section(mode: str | None) -> str:
 - 文档目录 → insert_table_of_contents；若章节还不是真实标题，先给标题段落设置 headingLevel
 - 用户提示词中的“任务列表 / 待办列表 / checklist”一律理解为文档正文里的任务列表，使用 set_paragraph_style(listType='task') 或 apply_style_batch
 - set_text_style / set_paragraph_style / clear_formatting 返回值已含受影响段落快照，无需额外 get_document_content 验证
-- 仅在怀疑结果异常时才调用 get_page_style_summary 抽查
-- 读取类工具（get_document_content / get_page_content / get_paragraph / get_document_info / get_document_outline）默认 detail='content'，只返回正文与粗略结构；只有需要检查字号/对齐/缩进/行距/列表样式异常时才传 detail='format'，避免准备阶段被格式信息干扰"""
+- 仅在怀疑结果异常时才调用 get_page_style_summary 抽查；它是唯一详细样式读取工具，每次只读一页
+- 读取类工具（get_document_content / get_page_content / get_paragraph / get_document_info / get_document_outline）默认只返回正文与粗略结构"""
 
     if mode == "agent":
         return """## 关键规则
@@ -230,8 +230,8 @@ def _get_tool_selection_section(mode: str | None) -> str:
 - 精确定位文字 → search_text 返回 matchIndex、段内 offset 和 text_ranges；按这些锁定范围改样式，避免因段落含词而误改整段
 - 目录 → insert_table_of_contents 是唯一正确工具；不得用 begin_streaming_write 或 insert_paragraph_after 写带点线和页码的文字目录
 - 用户提示词中的“任务列表 / 待办列表 / checklist”一律指正文里的任务列表，使用 set_paragraph_style(listType='task') / apply_style_batch
-- begin_streaming_write 只在准备好直接输出正文时调用，调用后立刻输出内容，不要再思考
-- begin_streaming_write 输出正文后，不要把这一轮纯文本当成结束；必须继续验证、必要时更新内部任务、完成剩余步骤
+- begin_streaming_write 只在已经准备好完整 Markdown 正文时调用，正文必须放入 markdown 参数，不要在工具调用后用普通 assistant 文本输出正文
+- begin_streaming_write 成功后必须继续验证、必要时更新内部任务、完成剩余步骤
 - 当用户明确要求"联网搜索/搜索网页/查最新信息"，或任务依赖实时外部资料时，优先调用 web_search
 - 如果当前问题可以完全依赖工作区文档回答，不要为了联网而联网；优先 workspace_search / workspace_read
 
@@ -240,7 +240,7 @@ def _get_tool_selection_section(mode: str | None) -> str:
 
 **长文档**：
 - 先 get_document_outline 概览 → 按需 get_page_content / get_document_content 深入
-- 读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；进入排版判断或抽查样式异常时再切 detail='format'
+- 读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；详细样式只用 get_page_style_summary(page=N) 单页读取。主 Agent 不要连续逐页调用样式工具；多页样式排查并行委托 layout-plan/verification 子代理，每个子代理只分析指定页
 
 **正式文档结构**（论文/策划书/报告）：
 - 封面单独占一页，后续章节用 pageBreakBefore 或 insert_page_break 分页
@@ -296,7 +296,7 @@ def _get_long_doc_section(mode: str | None) -> str:
         return ""
     return """## 长文档读取
 先 get_document_outline 概览 → 按需 get_page_content / get_document_content 深入，不要一开始就读全文。
-读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；进入排版判断或抽查样式异常时再切 detail='format'。"""
+读取类工具默认 detail='content'，只返回正文与粗略结构（heading/list/task/image/table）；详细样式只通过 get_page_style_summary(page=N) 单页读取。"""
 
 
 def _get_selection_section(mode: str | None) -> str:
@@ -388,7 +388,7 @@ def get_dynamic_context_section(context: dict) -> str:
     if preview and isinstance(preview, dict):
         parts.append("")
         parts.append("context.preview = " + json.dumps(preview, ensure_ascii=False, indent=2))
-        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content（默认 detail='content'，只在需要检查样式时调 detail='format'）。")
+        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content（默认只读正文结构；需要样式详情时用 get_page_style_summary(page=N)，一次只读一页）。")
     
     # Selection
     selection = context.get("selection")
@@ -416,7 +416,8 @@ def get_dynamic_context_section(context: dict) -> str:
     if workspace_docs and isinstance(workspace_docs, list):
         parts.append("")
         parts.append("[工作区文档列表]")
-        parts.append("以下为用户上传到工作区的参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        parts.append("以下为当前工作区已有参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中新增；任务已完成时不要因为列表中存在参考文档而继续探索。")
         for doc in workspace_docs:
             name = doc.get("name", "?")
             doc_id = doc.get("id", "?")

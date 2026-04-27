@@ -1319,7 +1319,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   type FileMenuAction = 'open' | 'save' | 'import' | 'export' | 'templates'
   const fileMenuItems: Array<{ title: string; label: string; icon: typeof FolderOpen; action: FileMenuAction }> = [
     { title: '打开文档目录文件', label: '打开', icon: FolderOpen, action: 'open' },
-    { title: '保存到文档目录', label: '保存', icon: Save, action: 'save' },
+    { title: '保存到文档目录 (Ctrl/⌘+S)', label: '保存', icon: Save, action: 'save' },
     { title: '导入 .docx / .md', label: '导入', icon: FileInput, action: 'import' },
     { title: '导出 .docx', label: '导出', icon: FileOutput, action: 'export' },
     { title: '打开模板库', label: '模板', icon: BookOpen, action: 'templates' },

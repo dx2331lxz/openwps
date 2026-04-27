@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -9,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, AsyncGenerator, TypedDict
 
 import httpx
@@ -43,14 +45,13 @@ from .agents import (
     save_agent_run,
     unregister_background_task,
 )
-from .models import ChatMessage, ChatRequest, ClientEventRequest, CompletionRequest, OCRCommandRequest, OCRConfig, ToolResultsRequest, VisionAnalyzeRequest, VisionConfig, VisionTestRequest
+from .models import ChatMessage, ChatRequest, CompletionRequest, OCRCommandRequest, OCRConfig, VisionAnalyzeRequest, VisionConfig, VisionTestRequest
 from .tool_registry import TOOL_SEARCH_NAME
 from .tooling import (
-    build_tooling_delta_attachment,
     get_deferred_tool_definitions,
+    get_tool_definitions,
     get_model_tools,
     get_tool_metadata_payload,
-    get_tools,
     search_deferred_tool_definitions,
 )
 from .content import (
@@ -62,8 +63,46 @@ from .content import (
     build_user_content,
     format_text_attachments_for_model,
 )
+from .doc_sessions import execute_ai_document_tool, is_document_tool
+from .tasks import create_task, get_task, list_tasks, update_task
+from .workspace import get_document_content as get_workspace_document_content
+from .workspace import search_workspace
 
 logger = logging.getLogger("uvicorn.error")
+
+
+class ReasoningContentChatOpenAI(ChatOpenAI):
+    """Preserve OpenAI-compatible reasoning_content in multi-turn messages."""
+
+    pass_empty_reasoning_content: bool = False
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        payload_messages = payload.get("messages")
+        if not isinstance(payload_messages, list):
+            return payload
+
+        try:
+            source_messages = self._convert_input(input_).to_messages()
+        except Exception:
+            return payload
+
+        for source, target in zip(source_messages, payload_messages):
+            if not isinstance(source, AIMessage) or not isinstance(target, dict):
+                continue
+            if "reasoning_content" not in source.additional_kwargs:
+                continue
+            reasoning = source.additional_kwargs.get("reasoning_content")
+            reasoning_text = _stringify_content(reasoning)
+            if reasoning_text.strip() or self.pass_empty_reasoning_content:
+                target["reasoning_content"] = reasoning_text
+        return payload
 
 
 def _looks_like_tool_result_json_leak(text: str) -> bool:
@@ -266,6 +305,29 @@ def _extract_reasoning(chunk: AIMessageChunk) -> str:
     return "".join(values)
 
 
+def _ai_reasoning_kwargs(reasoning_content: Any) -> dict[str, Any]:
+    if reasoning_content is None:
+        return {}
+    text = _stringify_content(reasoning_content)
+    return {"reasoning_content": text}
+
+
+def _build_ai_message(
+    content: Any,
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    reasoning_content: Any = "",
+) -> AIMessage:
+    additional_kwargs = _ai_reasoning_kwargs(reasoning_content)
+    if tool_calls is None:
+        return AIMessage(content=_stringify_content(content), additional_kwargs=additional_kwargs)
+    return AIMessage(
+        content=_stringify_content(content),
+        tool_calls=tool_calls,
+        additional_kwargs=additional_kwargs,
+    )
+
+
 def _extract_finish_reason(payload: Any) -> str:
     if payload is None or isinstance(payload, str):
         return ""
@@ -399,7 +461,11 @@ def _to_langchain_message(message: ChatMessage | dict[str, Any]) -> BaseMessage:
                 "args": args or {},
                 "type": "tool_call",
             })
-        return AIMessage(content=content, tool_calls=tool_calls)
+        return _build_ai_message(
+            content=content,
+            tool_calls=tool_calls,
+            reasoning_content=raw.get("thinking") or raw.get("reasoning_content") or "",
+        )
     if role == "tool":
         return ToolMessage(content=content, tool_call_id=str(raw.get("tool_call_id", "")))
     attachment_block = _format_text_attachments_for_model(attachments)
@@ -425,7 +491,7 @@ def _build_context_block(context: dict) -> str:
     if preview and isinstance(preview, dict):
         parts.append("")
         parts.append("context.preview = " + json.dumps(preview, ensure_ascii=False, indent=2))
-        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content。")
+        parts.append("以上是为长文档准备的紧凑预览，可用来决定是否继续调用 get_document_outline / get_page_content / get_document_content；需要样式详情时用 get_page_style_summary(page=N)，一次只读一页。")
 
     selection = context.get("selection")
     if selection and isinstance(selection, dict):
@@ -449,7 +515,8 @@ def _build_context_block(context: dict) -> str:
     if workspaceDocs and isinstance(workspaceDocs, list):
         parts.append("")
         parts.append("[工作区文档列表]")
-        parts.append("以下为用户上传到工作区的参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        parts.append("以下为当前工作区已有参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中新增；任务已完成时不要因为列表中存在参考文档而继续探索。")
         for doc in workspaceDocs:
             name = doc.get("name", "?")
             doc_id = doc.get("id", "?")
@@ -690,6 +757,175 @@ def _resolve_vision_runtime(provider_id: str | None = None, model: str | None = 
     return provider, vision_config.model, True
 
 
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    main_model_supports_vision: bool
+    vision_fallback_available: bool
+    vision_runtime_available: bool
+    ocr_available: bool
+    headless_screenshot_available: bool
+
+
+def _headless_screenshot_available() -> bool:
+    package_json = Path(__file__).resolve().parents[2] / "package.json"
+    try:
+        package_data = json.loads(package_json.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    deps = {
+        **(package_data.get("dependencies") if isinstance(package_data.get("dependencies"), dict) else {}),
+        **(package_data.get("devDependencies") if isinstance(package_data.get("devDependencies"), dict) else {}),
+    }
+    return "playwright" in deps
+
+
+def _vision_fallback_available() -> bool:
+    vision_config = _resolve_vision_config()
+    return bool(
+        vision_config.enabled
+        and vision_config.endpoint
+        and vision_config.model
+        and vision_config.hasApiKey
+    )
+
+
+def _ocr_runtime_available(body: ChatRequest) -> bool:
+    ocr_config = _normalize_ocr_config(body)
+    if not ocr_config.enabled:
+        return False
+    if not ocr_config.endpoint:
+        return False
+    if _ocr_backend_requires_model(ocr_config.backend):
+        return bool(ocr_config.model and ocr_config.hasApiKey)
+    return True
+
+
+def _resolve_runtime_capabilities(body: ChatRequest) -> RuntimeCapabilities:
+    provider, model = _resolve_provider_and_model(body)
+    main_model_supports_vision = _selected_model_supports_vision(provider, model)
+    vision_fallback_available = _vision_fallback_available()
+    return RuntimeCapabilities(
+        main_model_supports_vision=main_model_supports_vision,
+        vision_fallback_available=vision_fallback_available,
+        vision_runtime_available=main_model_supports_vision or vision_fallback_available,
+        ocr_available=_ocr_runtime_available(body),
+        headless_screenshot_available=_headless_screenshot_available(),
+    )
+
+
+def _tool_name_from_schema(tool: dict[str, Any]) -> str:
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    return str(function.get("name") or "")
+
+
+def _tool_available_for_runtime(tool_name: str, capabilities: RuntimeCapabilities) -> bool:
+    if tool_name == "capture_page_screenshot":
+        return capabilities.headless_screenshot_available and capabilities.vision_runtime_available
+    if tool_name == "analyze_document_image":
+        return capabilities.vision_runtime_available or capabilities.ocr_available
+    if tool_name == "analyze_image_with_ocr":
+        return capabilities.ocr_available
+    return True
+
+
+def _adjust_tool_schema_for_runtime(
+    tool: dict[str, Any],
+    capabilities: RuntimeCapabilities,
+) -> dict[str, Any] | None:
+    tool_name = _tool_name_from_schema(tool)
+    if not _tool_available_for_runtime(tool_name, capabilities):
+        return None
+
+    adjusted = copy.deepcopy(tool)
+    function = adjusted.get("function") if isinstance(adjusted.get("function"), dict) else {}
+    if tool_name == "capture_page_screenshot" and not capabilities.main_model_supports_vision:
+        function["description"] = (
+            "截取指定正文页并由后端多模态 fallback 模型直接完成视觉分析，返回文本结论和结构化元数据。"
+            "适合校验分页、图文混排、遮挡、重叠、表格/图片附近视觉效果。"
+        )
+    if tool_name == "analyze_document_image":
+        params = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
+        properties = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        analysis_mode = properties.get("analysisMode") if isinstance(properties.get("analysisMode"), dict) else None
+        if analysis_mode is not None:
+            if capabilities.vision_runtime_available and capabilities.ocr_available:
+                analysis_mode["enum"] = ["auto", "multimodal", "ocr", "both"]
+                analysis_mode["description"] = "分析路径，默认 auto。"
+            elif capabilities.vision_runtime_available:
+                analysis_mode["enum"] = ["auto", "multimodal"]
+                analysis_mode["description"] = "分析路径；当前运行时仅开放多模态视觉分析。"
+            else:
+                analysis_mode["enum"] = ["ocr"]
+                analysis_mode["description"] = "分析路径；当前运行时仅开放 OCR。"
+        if not capabilities.vision_runtime_available:
+            function["description"] = (
+                "使用 OCR 分析当前文档内的图片。可按 imageId 或 paragraphIndex+imageIndex 定位；"
+                "当前运行时没有可用多模态视觉模型。"
+            )
+    return adjusted
+
+
+def _filter_tool_schemas_for_runtime(
+    tools: list[dict[str, Any]],
+    capabilities: RuntimeCapabilities,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        adjusted = _adjust_tool_schema_for_runtime(tool, capabilities)
+        if adjusted is not None:
+            result.append(adjusted)
+    return result
+
+
+def _get_model_tools_for_body(
+    body: ChatRequest,
+    loaded_deferred_tools: set[str] | None = None,
+    *,
+    agent_type: str | None = None,
+) -> list[dict[str, Any]]:
+    filtered = _filter_tool_schemas_for_runtime(
+        get_model_tools(body.mode, loaded_deferred_tools or set(), agent_type=agent_type),
+        _resolve_runtime_capabilities(body),
+    )
+    if not _get_deferred_tool_definitions_for_body(body, loaded_deferred_tools or set()):
+        filtered = [tool for tool in filtered if _tool_name_from_schema(tool) != TOOL_SEARCH_NAME]
+    return filtered
+
+
+def _get_deferred_tool_definitions_for_body(
+    body: ChatRequest,
+    loaded_deferred_tools: set[str] | None = None,
+) -> list[Any]:
+    capabilities = _resolve_runtime_capabilities(body)
+    return [
+        definition
+        for definition in get_deferred_tool_definitions(body.mode, loaded_deferred_tools or set())
+        if _tool_available_for_runtime(definition.name, capabilities)
+    ]
+
+
+def _get_tool_definitions_for_body(body: ChatRequest) -> list[Any]:
+    capabilities = _resolve_runtime_capabilities(body)
+    return [
+        definition
+        for definition in get_tool_definitions(body.mode)
+        if _tool_available_for_runtime(definition.name, capabilities)
+    ]
+
+
+def _search_deferred_tool_definitions_for_body(
+    body: ChatRequest,
+    query: str,
+    loaded_deferred_tools: set[str] | None = None,
+) -> list[Any]:
+    capabilities = _resolve_runtime_capabilities(body)
+    return [
+        definition
+        for definition in search_deferred_tool_definitions(body.mode, query, loaded_deferred_tools or set())
+        if _tool_available_for_runtime(definition.name, capabilities)
+    ]
+
+
 def _parse_data_url_header(data_url: str) -> tuple[str, str] | None:
     if not isinstance(data_url, str) or not data_url.startswith("data:"):
         return None
@@ -751,7 +987,9 @@ def _validate_multimodal_request(body: ChatRequest) -> None:
 
 VISION_TEST_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAj0lEQVR4nGP8//8/Ay0BE01NZxgOFrAgc+QnUsfQh/nDNoi"
+    "w+pF4gDWEh34QMQ1MHGAH0bYI9tLDDFT2QbQtPi6lFkRjM444O4iwIBq3QUTYMfRTEdMgsGAp7hRJRGIl"
+    "zgdLsRlEXFYgOoiWohpHdEYjJScvJdbQwRbJQ7I0ladS7c8wHIKIcbRtSgjQPA4Avi8aW/avCLMAAAAASUVORK5CYII="
 )
 
 
@@ -2534,6 +2772,7 @@ class LoopState:
     budget_stagnation_warning_level: int = 0
     output_continuation_attempts: int = 0
     last_model_finish_reason: str = ""
+    vision_capability_blocked: bool = False
     # Delta tracking (Claude Code-style attachment system)
     previous_workspace_docs: list[dict] = field(default_factory=list)
     previous_template: dict | None = None
@@ -2555,6 +2794,30 @@ class StopEvaluation:
     decision: StopDecision
     reason: str = ""
     hint: str = ""
+
+
+def _tool_call_params_for_signature(tool_call: dict[str, Any]) -> Any:
+    if "params" in tool_call:
+        return tool_call.get("params") or {}
+    return tool_call.get("args") or {}
+
+
+def _tool_result_has_capability_block(payload: dict[str, Any], capability: str) -> bool:
+    if payload.get("capabilityBlocked") == capability:
+        return True
+    data = payload.get("data")
+    return isinstance(data, dict) and data.get("capabilityBlocked") == capability
+
+
+def _tool_results_have_capability_block(tool_results: list[dict[str, str]], capability: str) -> bool:
+    for item in tool_results:
+        try:
+            payload = json.loads(item.get("content", "{}"))
+        except Exception:
+            continue
+        if isinstance(payload, dict) and _tool_result_has_capability_block(payload, capability):
+            return True
+    return False
 
 
 class CompletionDecision(str, Enum):
@@ -2691,20 +2954,6 @@ def _build_parallel_execution_batches(executions: list[PlannedToolExecution]) ->
     return batches
 
 
-@dataclass(frozen=True)
-class PostedToolResult:
-    execution_id: str
-    content: str
-
-
-@dataclass(frozen=True)
-class PostedToolResults:
-    plan_id: str | None
-    round: int | None
-    results: list[PostedToolResult]
-    stop: bool = False
-
-
 @dataclass
 class SessionTrace:
     session_id: str
@@ -2722,13 +2971,18 @@ class SessionTrace:
 def _evaluate_stop_hooks(state: LoopState, tool_calls: list[dict[str, Any]],
                            tool_results: list[dict[str, str]]) -> StopEvaluation:
     """Evaluate whether the loop should stop, continue, or hint the LLM."""
+    # ── 0. Capability blocks are state, not prompt-level warnings ──
+    vision_blocked = _tool_results_have_capability_block(tool_results, "vision")
+    if vision_blocked:
+        state.vision_capability_blocked = True
+
     # ── 1. Tool-loop detection: same tool pattern 3 times in a row ──
     if tool_calls:
         # Build pattern from tool name + parameter hash to detect true duplicates
         pattern_parts = []
         for tc in sorted(tool_calls, key=lambda x: x["name"]):
             name = tc["name"]
-            args = tc.get("args", {})
+            args = _tool_call_params_for_signature(tc)
             # Hash the arguments to detect same call with same params
             args_str = json.dumps(args, sort_keys=True, default=str)
             pattern_parts.append(f"{name}:{args_str}")
@@ -2752,6 +3006,8 @@ def _evaluate_stop_hooks(state: LoopState, tool_calls: list[dict[str, Any]],
             continue
         tool_name = data.get("toolName", "")
         if not tool_name:
+            continue
+        if _tool_result_has_capability_block(data, "vision"):
             continue
         if data.get("success"):
             state.tool_failure_counts.pop(tool_name, None)
@@ -2823,8 +3079,21 @@ def _prepare_page_screenshot_tool_result(
     safe_payload = dict(payload)
     safe_payload["data"] = safe_data
     if body is not None and not _body_model_supports_vision(body):
+        block_data = {
+            "capabilityBlocked": "vision",
+            "recoverable": False,
+            "suggestedAction": "finalize_or_switch_vision_model",
+            "modelSupportsVision": False,
+            "guidance": "不要重试截图，也不要用工作区搜索补偿视觉能力；如结构化内容足够则总结，否则说明需要切换支持视觉的模型。",
+        }
+        safe_data.update(block_data)
+        safe_payload.update(block_data)
         safe_payload["success"] = False
-        safe_payload["message"] = "已截取页面截图，但当前子代理模型不支持 image_url 多模态输入；请切换到支持视觉的模型后重新验证。"
+        safe_payload["data"] = safe_data
+        safe_payload["message"] = (
+            "已截取页面截图，但当前模型不支持 image_url 多模态输入，无法进行真实视觉验收。"
+            "请不要重试截图；如果结构化页面内容已经足够，请直接总结；如果必须视觉验收，请切换到支持视觉的模型或配置视觉模型。"
+        )
         return json.dumps(safe_payload, ensure_ascii=False), None
 
     text_parts = [
@@ -2842,6 +3111,79 @@ def _prepare_page_screenshot_tool_result(
         {"type": "image_url", "image_url": {"url": data_url}},
     ])
     return json.dumps(safe_payload, ensure_ascii=False), image_message
+
+
+async def _prepare_page_screenshot_tool_result_for_runtime(
+    content: str,
+    body: ChatRequest,
+) -> tuple[str, HumanMessage | None]:
+    payload = _parse_tool_result_payload(content)
+    if payload.get("toolName") != "capture_page_screenshot":
+        return content, None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return content, None
+    data_url = str(data.get("dataUrl") or "").strip()
+    if not data_url:
+        return content, None
+
+    if _body_model_supports_vision(body):
+        return _prepare_page_screenshot_tool_result(content, body)
+
+    safe_data = dict(data)
+    safe_data.pop("dataUrl", None)
+
+    if _vision_fallback_available():
+        page = safe_data.get("page")
+        page_count = safe_data.get("pageCount")
+        instruction = _stringify_content(safe_data.get("instruction")).strip()
+        preview_text = _stringify_content(safe_data.get("previewText")).strip()
+        prompt = "\n".join([
+            "请对 openwps 文档页面截图做视觉验收，返回严格 JSON 对象。",
+            "字段：visualSummary, layoutIssues, overlapRisk, pass, confidence, warnings。",
+            f"页码：{page}/{page_count}" if page_count else f"页码：{page}",
+            f"页面文字预览：{preview_text}" if preview_text else "",
+            f"重点检查：{instruction}" if instruction else "重点检查分页、图文混排、遮挡、重叠和视觉一致性。",
+        ]).strip()
+        try:
+            provider, model, used_fallback = _resolve_vision_runtime(body.providerId, body.model)
+            raw_text = await _call_vision_chat(
+                provider,
+                model,
+                prompt,
+                data_url,
+                int(DEFAULT_VISION_CONFIG["timeoutSeconds"]),
+            )
+            parsed = _extract_json_object(raw_text)
+            visual_data = parsed if isinstance(parsed, dict) else {"visualSummary": raw_text}
+            safe_data.update({
+                "visionAnalyzed": True,
+                "usedVisionFallback": bool(used_fallback),
+                "visionModel": model,
+                "visionResult": visual_data,
+            })
+            safe_payload = dict(payload)
+            safe_payload["success"] = True
+            safe_payload["message"] = "已通过后端视觉模型完成页面截图验收"
+            safe_payload["data"] = safe_data
+            return json.dumps(safe_payload, ensure_ascii=False), None
+        except HTTPException as exc:
+            safe_payload = dict(payload)
+            block_data = {
+                "capabilityBlocked": "vision",
+                "recoverable": False,
+                "suggestedAction": "vision_runtime_failed",
+                "modelSupportsVision": False,
+                "visionError": _http_error_message(exc),
+            }
+            safe_data.update(block_data)
+            safe_payload.update(block_data)
+            safe_payload["success"] = False
+            safe_payload["message"] = f"后端视觉模型未能完成页面截图验收：{_http_error_message(exc)}"
+            safe_payload["data"] = safe_data
+            return json.dumps(safe_payload, ensure_ascii=False), None
+
+    return _prepare_page_screenshot_tool_result(content, body)
 
 
 def _extract_tasks_from_payload(payload: dict[str, Any]) -> list[dict[str, str]] | None:
@@ -2893,7 +3235,8 @@ def _tool_results_started_streaming_write(tool_results: list[dict[str, str]]) ->
         payload = _parse_tool_result_payload(item.get("content", ""))
         if payload.get("toolName") != "begin_streaming_write":
             continue
-        if payload.get("success") is True:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if payload.get("success") is True and data.get("awaitingMarkdown") is True:
             return True
     return False
 
@@ -2907,27 +3250,13 @@ def _tool_results_completed_subagent(tool_results: list[dict[str, str]]) -> bool
     return False
 
 
-def _build_stream_write_interruption_hint(event: dict[str, Any]) -> str:
-    event_type = str(event.get("eventType") or "stream_write_interrupted")
-    reason = str(event.get("reason") or event_type)
-    streaming_write_id = str(event.get("streamingWriteId") or "").strip()
-    last_applied_chars = int(event.get("lastAppliedChars") or 0)
-    id_text = f"写入会话 ID：{streaming_write_id}。" if streaming_write_id else ""
-    return "\n".join([
-        "前端报告：浏览器页面刷新或卸载导致 begin_streaming_write 的浏览器流式写入会话中断。",
-        f"中断原因：{reason}。{id_text}刷新前浏览器确认写入的字符数约为 {last_applied_chars}。",
-        "不要继续假设刚才流式输出的正文已经完整写入文档；刷新期间后续 token 可能只进入了会话日志，没有进入编辑器。",
-        "现在必须先调用 get_document_content 或 get_paragraph 重新读取并验证当前文档内容，再根据缺失部分重新调用 begin_streaming_write 或使用普通写入工具补写。",
-        "补写时避免重复写入已经存在的内容。",
-    ])
-
-
 def _build_follow_up_hint(
     needs_write_follow_up: bool,
     needs_agent_follow_up: bool,
     needs_content_verification: bool,
     needs_task_check: bool,
     incomplete_tasks: list[dict[str, str]],
+    vision_capability_blocked: bool = False,
 ) -> tuple[str, str]:
     parts: list[str] = []
     reasons: list[str] = []
@@ -2952,7 +3281,15 @@ def _build_follow_up_hint(
         parts.append("你最近更新过内部任务，但还没有再次调用 TaskList 核对最终状态。")
         parts.append("结束前必须先确认当前任务列表，不能直接假设任务已经全部完成。")
 
-    if incomplete_tasks:
+    if incomplete_tasks and vision_capability_blocked:
+        reasons.append("task_incomplete_due_to_vision_block")
+        preview_titles = [task.get("subject", "") for task in incomplete_tasks if task.get("subject")][:3]
+        title_text = f" 未完成项示例：{'；'.join(preview_titles)}。" if preview_titles else ""
+        parts.append(
+            f"当前任务列表仍有 {len(incomplete_tasks)} 个未完成项，但当前模型缺少视觉能力。{title_text}"
+            "如果这些未完成项依赖截图或图片视觉验收，请调用 TaskUpdate 标记为 blocked，或直接向用户给出受限结论；不要继续读取全文或搜索工作区来拖延。"
+        )
+    elif incomplete_tasks:
         reasons.append("task_incomplete")
         preview_titles = [task.get("subject", "") for task in incomplete_tasks if task.get("subject")][:3]
         title_text = f" 未完成项示例：{'；'.join(preview_titles)}。" if preview_titles else ""
@@ -2962,7 +3299,10 @@ def _build_follow_up_hint(
     else:
         parts.append("如果本轮没有内部任务，也至少先调用验证工具确认写入结果，再决定是否结束。")
 
-    parts.append("只有在验证完成，且 TaskList 显示不存在 pending / in_progress 后，才能结束并向用户总结。")
+    if vision_capability_blocked:
+        parts.append("视觉能力不可用时，不要把视觉验收作为继续循环的理由；完成可完成的结构化验证后即可总结限制并结束。")
+    else:
+        parts.append("只有在验证完成，且 TaskList 显示不存在 pending / in_progress 后，才能结束并向用户总结。")
     return "\n".join(parts), reasons[0] if reasons else "continue_required"
 
 
@@ -3017,12 +3357,13 @@ def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str,
 
 def _needs_forced_continuation(state: LoopState, messages: list[BaseMessage]) -> tuple[bool, list[dict[str, str]]]:
     incomplete_tasks = _get_incomplete_tasks(messages)
+    incomplete_tasks_require_continuation = bool(incomplete_tasks) and not state.vision_capability_blocked
     needs_continue = any([
         state.pending_write_follow_up,
         state.pending_agent_follow_up,
         state.requires_content_verification,
         state.requires_task_check,
-        bool(incomplete_tasks),
+        incomplete_tasks_require_continuation,
     ])
     return needs_continue, incomplete_tasks
 
@@ -3049,6 +3390,7 @@ def _evaluate_completion_policy(state: LoopState, messages: list[BaseMessage]) -
         state.requires_content_verification,
         state.requires_task_check,
         incomplete_tasks,
+        state.vision_capability_blocked,
     )
     return CompletionEvaluation(
         decision=CompletionDecision.CONTINUE_WITH_HINT,
@@ -3173,6 +3515,7 @@ def _build_budget_progress_signature(state: LoopState, messages: list[BaseMessag
             "requiresTaskCheck": state.requires_task_check,
             "incompleteTaskCount": len(incomplete_tasks),
             "lastMutationTools": list(state.last_mutation_tools),
+            "visionCapabilityBlocked": state.vision_capability_blocked,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -3330,6 +3673,7 @@ def _snapshot_completion_gate(state: LoopState, messages: list[BaseMessage]) -> 
         "stagnantBudgetRounds": state.stagnant_budget_rounds,
         "budgetStagnationWarningLevel": state.budget_stagnation_warning_level,
         "outputContinuationAttempts": state.output_continuation_attempts,
+        "visionCapabilityBlocked": state.vision_capability_blocked,
     }
 
 
@@ -3496,11 +3840,13 @@ def _select_model_tools_by_names(
     tool_names: list[str],
     *,
     loaded_deferred_tools: set[str],
+    body: ChatRequest,
     agent_type: str | None = None,
 ) -> list[dict[str, Any]]:
     requested = set(tool_names)
     selected: list[dict[str, Any]] = []
-    for tool in get_model_tools("agent", loaded_deferred_tools, agent_type=agent_type):
+    body_for_mode = body.model_copy(update={"mode": "agent"})
+    for tool in _get_model_tools_for_body(body_for_mode, loaded_deferred_tools, agent_type=agent_type):
         name = str(tool.get("function", {}).get("name", ""))
         if name in requested or name == TOOL_SEARCH_NAME:
             selected.append(tool)
@@ -3534,10 +3880,7 @@ def _split_execution_plan(plan: ToolExecutionPlan) -> tuple[list[PlannedToolExec
     server_executions: list[PlannedToolExecution] = []
     client_executions: list[PlannedToolExecution] = []
     for execution in plan.executions:
-        if _is_server_side_tool(execution.tool_name):
-            server_executions.append(execution)
-        else:
-            client_executions.append(execution)
+        server_executions.append(execution)
     return server_executions, client_executions
 
 
@@ -3848,10 +4191,358 @@ async def _run_web_search_tool(params: dict[str, Any]) -> str:
     )
 
 
+def _task_stats(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    pending = sum(1 for task in tasks if str(task.get("status") or "").lower() == "pending")
+    in_progress = sum(1 for task in tasks if str(task.get("status") or "").lower() == "in_progress")
+    completed = sum(1 for task in tasks if str(task.get("status") or "").lower() == "completed")
+    blocked = sum(1 for task in tasks if str(task.get("status") or "").lower() == "blocked")
+    return {
+        "taskCount": len(tasks),
+        "pendingCount": pending,
+        "inProgressCount": in_progress,
+        "completedCount": completed,
+        "blockedCount": blocked,
+    }
+
+
+def _http_error_message(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, str):
+        return detail
+    return _stringify_content(detail) or f"HTTP {exc.status_code}"
+
+
+async def _run_task_tool(tool_name: str, params: dict[str, Any], conversation_id: str | None) -> str:
+    if not conversation_id:
+        return _serialize_tool_result_payload(
+            tool_name=tool_name,
+            success=False,
+            message="当前会话尚未创建，无法执行任务工具",
+            executed_params=params,
+            original_params=params,
+        )
+
+    try:
+        if tool_name == "TaskCreate":
+            task = create_task(conversation_id, params)
+            tasks = list_tasks(conversation_id)
+            data = {"task": task, "tasks": tasks, **_task_stats(tasks)}
+            message = f"任务 #{task.get('id')} 已创建：{task.get('subject', '')}"
+        elif tool_name == "TaskGet":
+            task_id = str(params.get("taskId") or params.get("id") or "").strip()
+            if not task_id:
+                raise HTTPException(status_code=400, detail="TaskGet 缺少 taskId")
+            task = get_task(conversation_id, task_id)
+            data = {"task": task}
+            message = f"已读取任务 #{task.get('id')}"
+        elif tool_name == "TaskList":
+            tasks = list_tasks(conversation_id)
+            data = {"tasks": tasks, **_task_stats(tasks)}
+            message = f"当前有 {len(tasks)} 个任务" if tasks else "当前还没有任务计划"
+        elif tool_name == "TaskUpdate":
+            task_id = str(params.get("taskId") or params.get("id") or "").strip()
+            if not task_id:
+                raise HTTPException(status_code=400, detail="TaskUpdate 缺少 taskId")
+            task = update_task(conversation_id, task_id, params)
+            tasks = list_tasks(conversation_id)
+            data = {"task": task, "tasks": tasks, **_task_stats(tasks)}
+            message = f"任务 #{task.get('id')} 已更新为 {task.get('status')}"
+        else:
+            return _serialize_tool_result_payload(
+                tool_name=tool_name,
+                success=False,
+                message=f"未知任务工具：{tool_name}",
+                executed_params=params,
+                original_params=params,
+            )
+    except HTTPException as exc:
+        return _serialize_tool_result_payload(
+            tool_name=tool_name,
+            success=False,
+            message=_http_error_message(exc),
+            executed_params=params,
+            original_params=params,
+        )
+
+    return _serialize_tool_result_payload(
+        tool_name=tool_name,
+        success=True,
+        message=message,
+        data=data,
+        executed_params=params,
+        original_params=params,
+    )
+
+
+def _workspace_tool_cache_key(tool_name: str, params: dict[str, Any]) -> str:
+    if tool_name == "workspace_search":
+        query = _stringify_content(params.get("query")).strip()
+        doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+        context_lines = str(params.get("context_lines") or params.get("contextLines") or 3)
+        return f"{tool_name}:{query}:{doc_id}:{context_lines}"
+    if tool_name == "workspace_read":
+        doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+        from_line = params.get("from_line", params.get("fromLine"))
+        to_line = params.get("to_line", params.get("toLine"))
+        return f"{tool_name}:{doc_id}:{from_line}:{to_line}"
+    return f"{tool_name}:{json.dumps(params, ensure_ascii=False, sort_keys=True)}"
+
+
+async def _run_workspace_tool(tool_name: str, params: dict[str, Any], cache: set[str] | None = None) -> str:
+    try:
+        cache_key = _workspace_tool_cache_key(tool_name, params)
+        if cache is not None and cache_key in cache:
+            return _serialize_tool_result_payload(
+                tool_name=tool_name,
+                success=True,
+                message="本次 ReAct 会话中已经执行过相同的工作区读取/搜索，已省略重复内容。",
+                data={
+                    "deduplicated": True,
+                    "cacheKey": cache_key,
+                    "guidance": "请使用前一次相同 workspace 工具调用的结果；只有工作区 delta 明确提示文件变化时才需要重新读取。",
+                },
+                executed_params=params,
+                original_params=params,
+            )
+        if tool_name == "workspace_search":
+            query = _stringify_content(params.get("query")).strip()
+            if not query:
+                raise HTTPException(status_code=400, detail="workspace_search 缺少 query")
+            doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip() or None
+            context_lines = int(params.get("context_lines") or params.get("contextLines") or 3)
+            data = search_workspace(query, doc_id, context_lines)
+            message = f"工作区搜索完成，匹配 {data.get('matchedDocs', 0)} 个文档"
+        elif tool_name == "workspace_read":
+            doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+            if not doc_id:
+                raise HTTPException(status_code=400, detail="workspace_read 缺少 doc_id")
+            from_line = params.get("from_line", params.get("fromLine"))
+            to_line = params.get("to_line", params.get("toLine"))
+            data = get_workspace_document_content(
+                doc_id,
+                int(from_line) if from_line is not None else None,
+                int(to_line) if to_line is not None else None,
+            )
+            message = f"已读取工作区文档 {doc_id}"
+        else:
+            return _serialize_tool_result_payload(
+                tool_name=tool_name,
+                success=False,
+                message=f"未知工作区工具：{tool_name}",
+                executed_params=params,
+                original_params=params,
+            )
+    except HTTPException as exc:
+        return _serialize_tool_result_payload(
+            tool_name=tool_name,
+            success=False,
+            message=_http_error_message(exc),
+            executed_params=params,
+            original_params=params,
+        )
+
+    if cache is not None:
+        cache.add(cache_key)
+    return _serialize_tool_result_payload(
+        tool_name=tool_name,
+        success=True,
+        message=message,
+        data=data,
+        executed_params=params,
+        original_params=params,
+    )
+
+
+async def _run_ocr_attachment_tool(params: dict[str, Any], body: ChatRequest) -> str:
+    images = body.images or []
+    if not images:
+        return _serialize_tool_result_payload(
+            tool_name="analyze_image_with_ocr",
+            success=False,
+            message="当前轮没有可供 OCR 分析的图片",
+            executed_params=params,
+            original_params=params,
+        )
+    image_indices = params.get("imageIndices")
+    if not isinstance(image_indices, list):
+        image_indices = []
+    try:
+        result = await analyze_images_with_ocr(OCRCommandRequest(
+            images=images,
+            taskType=_normalize_ocr_task_type(params.get("taskType")),
+            instruction=_stringify_content(params.get("instruction")).strip() or None,
+            imageIndices=[int(value) for value in image_indices if str(value).strip()],
+            ocrConfig=body.ocrConfig,
+        ))
+    except HTTPException as exc:
+        return _serialize_tool_result_payload(
+            tool_name="analyze_image_with_ocr",
+            success=False,
+            message=_http_error_message(exc),
+            executed_params=params,
+            original_params=params,
+        )
+
+    return _serialize_tool_result_payload(
+        tool_name="analyze_image_with_ocr",
+        success=True,
+        message=f"已完成 OCR 识别（{result.get('taskType')}，{result.get('imageCount')} 张图片）",
+        data=result,
+        executed_params=params,
+        original_params=params,
+    )
+
+
+def _choose_document_image_mode(target: dict[str, Any], requested_mode: str, task_type: str) -> str:
+    if requested_mode in {"multimodal", "ocr", "both"}:
+        return requested_mode
+    context_text = " ".join([
+        _stringify_content(target.get("alt")),
+        _stringify_content(target.get("title")),
+        _stringify_content(target.get("paragraphText")),
+        _stringify_content(target.get("beforeText")),
+        _stringify_content(target.get("afterText")),
+    ]).lower()
+    if task_type in {"table", "formula", "handwriting", "document_text"}:
+        return "ocr"
+    if re.search(r"扫描|表格|公式|手写|ocr|文字|正文|document|table|formula|handwriting", context_text, re.I):
+        return "ocr"
+    if re.search(r"图表|截图|chart|graph|dashboard|报表", context_text, re.I):
+        return "both"
+    return "multimodal"
+
+
+async def _run_document_image_analysis_tool(params: dict[str, Any], body: ChatRequest, context: dict[str, Any]) -> str:
+    located = await execute_ai_document_tool("analyze_document_image", params, context)
+    if located.get("success") is not True:
+        return _serialize_tool_result_payload(
+            tool_name="analyze_document_image",
+            success=False,
+            message=str(located.get("message") or "未找到指定的文档图片"),
+            data=located.get("data"),
+            executed_params=params,
+            original_params=params,
+        )
+
+    location_data = located.get("data") if isinstance(located.get("data"), dict) else {}
+    target = location_data.get("target") if isinstance(location_data.get("target"), dict) else {}
+    data_url = str(target.get("dataUrl") or "").strip()
+    if not data_url.startswith("data:"):
+        return _serialize_tool_result_payload(
+            tool_name="analyze_document_image",
+            success=False,
+            message="当前图片不是内嵌 data URL，暂不能从文档内直接发送给图片分析模型",
+            data={key: value for key, value in target.items() if key != "dataUrl"},
+            executed_params=params,
+            original_params=params,
+        )
+
+    task_type = _normalize_ocr_task_type(params.get("taskType"))
+    mode_used = _choose_document_image_mode(target, str(params.get("analysisMode") or "auto"), task_type)
+    instruction = _stringify_content(params.get("instruction")).strip()
+    visual_result: dict[str, Any] = {}
+    ocr_response: dict[str, Any] | None = None
+    warnings: list[str] = []
+
+    if mode_used in {"multimodal", "both"}:
+        try:
+            vision = await analyze_image_with_vision(VisionAnalyzeRequest(
+                image={
+                    "name": target.get("alt") or target.get("title") or target.get("imageId"),
+                    "type": data_url.split(";", 1)[0].replace("data:", "") or "image/png",
+                    "dataUrl": data_url,
+                },
+                providerId=body.providerId,
+                model=body.model,
+                instruction=instruction or None,
+                context={key: value for key, value in target.items() if key != "dataUrl"},
+            ))
+            result = vision.get("result")
+            if isinstance(result, dict):
+                visual_result = result
+        except HTTPException as exc:
+            if mode_used == "multimodal":
+                message = _http_error_message(exc)
+                return _serialize_tool_result_payload(
+                    tool_name="analyze_document_image",
+                    success=False,
+                    message=(
+                        f"{message}。当前文档图片分析请求依赖多模态视觉能力，但当前模型/视觉配置不可用。"
+                        "不要反复重试图片分析；如 OCR 或结构化上下文不足，请向用户说明需要切换支持视觉的模型或配置视觉模型。"
+                    ),
+                    data={
+                        "capabilityBlocked": "vision",
+                        "recoverable": False,
+                        "suggestedAction": "finalize_or_switch_vision_model",
+                        "modeUsed": mode_used,
+                        "guidance": "不要继续调用 analyze_document_image 或 workspace_search 补偿视觉能力；请基于已有文本证据收口。",
+                    },
+                    executed_params=params,
+                    original_params=params,
+                )
+            warnings.append(_http_error_message(exc))
+
+    if mode_used in {"ocr", "both"}:
+        try:
+            ocr_response = await analyze_images_with_ocr(OCRCommandRequest(
+                images=[{
+                    "id": target.get("imageId"),
+                    "name": target.get("alt") or target.get("title") or target.get("imageId"),
+                    "type": data_url.split(";", 1)[0].replace("data:", "") or "image/png",
+                    "dataUrl": data_url,
+                }],
+                taskType=task_type,
+                instruction=instruction or None,
+                ocrConfig=body.ocrConfig,
+            ))
+        except HTTPException as exc:
+            if mode_used == "ocr":
+                return _serialize_tool_result_payload(
+                    tool_name="analyze_document_image",
+                    success=False,
+                    message=_http_error_message(exc),
+                    executed_params=params,
+                    original_params=params,
+                )
+            warnings.append(_http_error_message(exc))
+
+    first_ocr = (ocr_response.get("results") or [{}])[0] if isinstance(ocr_response, dict) else {}
+    if not isinstance(first_ocr, dict):
+        first_ocr = {}
+    data = {
+        "imageId": target.get("imageId"),
+        "fingerprint": target.get("fingerprint"),
+        "paragraphIndex": target.get("paragraphIndex"),
+        "imageIndex": target.get("imageIndex"),
+        "page": target.get("page"),
+        "modeUsed": mode_used,
+        "visualSummary": str(visual_result.get("visualSummary") or visual_result.get("summary") or ""),
+        "ocrText": first_ocr.get("markdown") or first_ocr.get("plainText") or first_ocr.get("handwritingText") or "",
+        "tables": first_ocr.get("tables") or [],
+        "detectedObjects": visual_result.get("detectedObjects") if isinstance(visual_result.get("detectedObjects"), list) else [],
+        "chartSummary": visual_result.get("chartSummary") or "\n".join(str(chart.get("summary") or "") for chart in (first_ocr.get("charts") or []) if isinstance(chart, dict)),
+        "styleHints": visual_result.get("styleHints") if isinstance(visual_result.get("styleHints"), dict) else {},
+        "warnings": [
+            *warnings,
+            *([str(item) for item in visual_result.get("warnings", [])] if isinstance(visual_result.get("warnings"), list) else []),
+            *([str(item) for item in first_ocr.get("warnings", [])] if isinstance(first_ocr.get("warnings"), list) else []),
+        ],
+        "confidence": visual_result.get("confidence") if isinstance(visual_result.get("confidence"), (int, float)) else (0.8 if first_ocr else 0.7),
+    }
+    return _serialize_tool_result_payload(
+        tool_name="analyze_document_image",
+        success=True,
+        message=f"已完成文档图片分析：{data['imageId']}（{mode_used}）",
+        data=data,
+        executed_params=params,
+        original_params=params,
+    )
+
+
 def _run_tool_search_tool(
     params: dict[str, Any],
     *,
-    mode: str | None,
+    body: ChatRequest,
     loaded_deferred_tools: set[str],
 ) -> str:
     query = _stringify_content(params.get("query")).strip()
@@ -3864,7 +4555,7 @@ def _run_tool_search_tool(
             original_params=params,
         )
 
-    matches = search_deferred_tool_definitions(mode, query, loaded_deferred_tools)
+    matches = _search_deferred_tool_definitions_for_body(body, query, loaded_deferred_tools)
     loaded_names = [definition.name for definition in matches]
     loaded_deferred_tools.update(loaded_names)
     schemas = [definition.to_openai_tool() for definition in matches]
@@ -3881,7 +4572,7 @@ def _run_tool_search_tool(
                 "functions": [],
                 "remainingDeferredTools": [
                     definition.to_deferred_summary()
-                    for definition in get_deferred_tool_definitions(mode, loaded_deferred_tools)
+                    for definition in _get_deferred_tool_definitions_for_body(body, loaded_deferred_tools)
                 ],
             },
         )
@@ -3901,12 +4592,12 @@ def _run_tool_search_tool(
             "query": query,
             "loadedToolNames": loaded_names,
             "functions": schemas,
-            "remainingDeferredTools": [
-                definition.to_deferred_summary()
-                for definition in get_deferred_tool_definitions(mode, loaded_deferred_tools)
-            ],
-        },
-    )
+                "remainingDeferredTools": [
+                    definition.to_deferred_summary()
+                    for definition in _get_deferred_tool_definitions_for_body(body, loaded_deferred_tools)
+                ],
+            },
+        )
 
 
 def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -> ToolExecutionPlan:
@@ -4016,38 +4707,6 @@ def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -
     )
 
 
-def _serialize_execution_plan(plan: ToolExecutionPlan) -> dict[str, Any]:
-    return {
-        "type": "tool_plan",
-        "planId": plan.plan_id,
-        "round": plan.round,
-        "executions": [
-            {
-                "executionId": execution.execution_id,
-                "toolName": execution.tool_name,
-                "params": execution.params,
-                "sourceToolCallIds": [source.id for source in execution.source_calls],
-                "mergeStrategy": execution.merge_strategy,
-                "continueOnError": execution.continue_on_error,
-                "parallelGroup": execution.parallel_group,
-                "executorLocation": execution.executor_location,
-                "readOnly": execution.read_only,
-                "allowedForAgent": execution.allowed_for_agent,
-                "parallelSafe": execution.parallel_safe,
-            }
-            for execution in plan.executions
-        ],
-    }
-
-
-def _serialize_agent_execution_plan(agent_id: str, agent_type: str, plan: ToolExecutionPlan) -> dict[str, Any]:
-    payload = _serialize_execution_plan(plan)
-    payload["type"] = "agent_tool_plan"
-    payload["agentId"] = agent_id
-    payload["agentType"] = agent_type
-    return payload
-
-
 def _decorate_tool_result_content(
     content: str,
     execution: PlannedToolExecution,
@@ -4077,30 +4736,23 @@ class ReactSession:
     """Manages a single ReAct loop session with state-machine-driven control."""
 
     __slots__ = (
-        "session_id", "body", "messages", "tool_result_queue",
-        "state", "finished", "expected_plan", "trace", "latest_context",
-        "agent_tool_result_queues", "agent_expected_plans", "loaded_deferred_tools",
-        "wait_for_client_tools", "client_events", "client_event_ids", "pending_client_hints",
-        "stream_write_interrupted_event",
+        "session_id", "body", "messages",
+        "state", "finished", "trace", "latest_context",
+        "loaded_deferred_tools", "server_streaming_write", "workspace_tool_cache",
     )
 
     def __init__(self, session_id: str, body: ChatRequest, messages: list[BaseMessage]):
         self.session_id = session_id
         self.body = body
         self.messages = messages
-        self.tool_result_queue: asyncio.Queue[PostedToolResults | None] = asyncio.Queue()
         self.state = LoopState()
         self.finished = False
-        self.expected_plan: ToolExecutionPlan | None = None
-        self.latest_context: dict[str, Any] = body.context or {}  # Updated each round
-        self.agent_tool_result_queues: dict[str, asyncio.Queue[PostedToolResults | None]] = {}
-        self.agent_expected_plans: dict[str, ToolExecutionPlan] = {}
+        self.latest_context: dict[str, Any] = dict(body.context or {})  # Updated each round
+        if body.documentSessionId:
+            self.latest_context["documentSessionId"] = body.documentSessionId
         self.loaded_deferred_tools: set[str] = set()
-        self.wait_for_client_tools = False
-        self.client_events: list[dict[str, Any]] = []
-        self.client_event_ids: set[str] = set()
-        self.pending_client_hints: list[dict[str, str]] = []
-        self.stream_write_interrupted_event: dict[str, Any] | None = None
+        self.server_streaming_write: dict[str, Any] | None = None
+        self.workspace_tool_cache: set[str] = set()
         self.trace = SessionTrace(
             session_id=session_id,
             conversation_id=body.conversationId,
@@ -4124,11 +4776,6 @@ class ReactGatewayRun:
     events: list[dict[str, Any]] = field(default_factory=list)
     status: str = "running"
     error: str | None = None
-    pending_plan: dict[str, Any] | None = None
-    client_events: list[dict[str, Any]] = field(default_factory=list)
-    client_event_ids: set[str] = field(default_factory=set)
-    stream_write_state: str = "idle"
-    interrupted_streaming_write: dict[str, Any] | None = None
     task: asyncio.Task[None] | None = None
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     created_at: str = field(default_factory=_now_iso)
@@ -4147,40 +4794,14 @@ class ReactGatewayRun:
         self.last_seq += 1
         item = {"seq": self.last_seq, **event}
         event_type = str(item.get("type") or "")
-        if event_type in {"awaiting_tool_results", "tool_plan"}:
-            self.pending_plan = item
-            if event_type == "awaiting_tool_results":
-                self.status = "awaiting_client"
-        elif event_type == "agent_progress" and item.get("phase") == "awaiting_tool_results":
-            self.pending_plan = item
-            self.status = "awaiting_client"
-        elif event_type in {"tool_result", "agent_tool_result", "round_start", "content", "thinking"}:
+        if event_type in {"tool_result", "agent_tool_result", "round_start", "content", "thinking"}:
             if self.status != "completed":
-                self.status = "running"
-            if event_type == "tool_result" and item.get("name") == "begin_streaming_write":
-                result = item.get("result")
-                if isinstance(result, dict) and result.get("success") is True:
-                    self.stream_write_state = "active"
-                    self.interrupted_streaming_write = None
-        elif event_type == "client_event":
-            client_event_type = str(item.get("eventType") or "")
-            if client_event_type in {"page_refresh", "stream_write_interrupted"}:
-                self.stream_write_state = "interrupted"
-                self.interrupted_streaming_write = item
-            elif client_event_type == "stream_write_closed":
-                self.stream_write_state = "closed"
-                self.interrupted_streaming_write = None
-            if self.status not in {"completed", "failed"}:
                 self.status = "running"
         elif event_type == "done":
             self.status = "completed"
-            self.pending_plan = None
-            if self.stream_write_state == "active":
-                self.stream_write_state = "closed"
         elif event_type == "error":
             self.status = "failed"
             self.error = str(item.get("message") or "AI 请求失败")
-            self.pending_plan = None
 
         self.updated_at = _now_iso()
         self.events.append(item)
@@ -4199,9 +4820,6 @@ class ReactGatewayRun:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "lastSeq": self.last_seq,
-            "pendingPlan": self.pending_plan,
-            "streamWriteState": self.stream_write_state,
-            "interruptedStreamingWrite": self.interrupted_streaming_write,
         }
 
 
@@ -4221,7 +4839,6 @@ def create_react_session(body: ChatRequest) -> ReactSession:
 
 async def create_react_gateway_run(body: ChatRequest) -> ReactGatewayRun:
     session = create_react_session(body)
-    session.wait_for_client_tools = True
     run = ReactGatewayRun(session=session)
     _react_gateway_runs[session.session_id] = run
     if body.conversationId:
@@ -4235,7 +4852,6 @@ async def create_react_gateway_run(body: ChatRequest) -> ReactGatewayRun:
             await run.append_event({"type": "error", "message": exc.detail})
         except asyncio.CancelledError:
             await run.append_event({"type": "done", "reason": "stopped_by_client"})
-            submit_react_tool_results(session, ToolResultsRequest(stop=True))
             raise
         except Exception as exc:
             logger.exception("[openwps.ai] gateway run %s failed", session.session_id)
@@ -4290,80 +4906,8 @@ def cancel_react_gateway_run(session_id: str) -> None:
     run = _react_gateway_runs.get(session_id)
     if not run:
         raise HTTPException(status_code=404, detail="React run not found or expired")
-    submit_react_tool_results(run.session, ToolResultsRequest(stop=True))
     if run.task and not run.task.done():
         run.task.cancel()
-
-
-async def submit_react_client_event(session_id: str, body: ClientEventRequest) -> dict[str, Any]:
-    run = _react_gateway_runs.get(session_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="React run not found or expired")
-
-    event_id = str(body.eventId or "").strip()
-    event_type = str(body.eventType or "").strip()
-    if not event_id:
-        raise HTTPException(status_code=400, detail="eventId 不能为空")
-    if event_type not in {"page_refresh", "stream_write_interrupted", "stream_write_closed"}:
-        raise HTTPException(status_code=400, detail=f"未知 client event: {event_type}")
-
-    if event_id in run.client_event_ids or event_id in run.session.client_event_ids:
-        return {"success": True, "duplicate": True, "run": run.snapshot()}
-
-    event = {
-        "eventId": event_id,
-        "eventType": event_type,
-        "conversationId": body.conversationId,
-        "toolName": body.toolName,
-        "streamingWriteId": body.streamingWriteId,
-        "reason": body.reason,
-        "lastAppliedChars": max(0, int(body.lastAppliedChars or 0)),
-        "createdAt": body.createdAt or _now_iso(),
-        "metadata": body.metadata or {},
-    }
-    run.client_event_ids.add(event_id)
-    run.client_events.append(event)
-    if len(run.client_events) > MAX_REACT_RUN_EVENTS:
-        run.client_events = run.client_events[-MAX_REACT_RUN_EVENTS:]
-    run.session.client_event_ids.add(event_id)
-    run.session.client_events.append(event)
-    if len(run.session.client_events) > MAX_REACT_RUN_EVENTS:
-        run.session.client_events = run.session.client_events[-MAX_REACT_RUN_EVENTS:]
-
-    message = "已记录前端事件"
-    if event_type in {"page_refresh", "stream_write_interrupted"}:
-        message = "页面刷新导致流式写入中断，已提示模型重新验证并重试"
-        run.stream_write_state = "interrupted"
-        run.interrupted_streaming_write = event
-        run.session.stream_write_interrupted_event = event
-        run.session.pending_client_hints.append({
-            "eventId": event_id,
-            "content": _build_stream_write_interruption_hint(event),
-        })
-        run.session.state.pending_write_follow_up = True
-        run.session.state.requires_content_verification = True
-    elif event_type == "stream_write_closed":
-        message = "流式写入会话已正常关闭"
-        if run.stream_write_state != "interrupted":
-            run.stream_write_state = "closed"
-        if run.session.stream_write_interrupted_event is not None:
-            run.session.stream_write_interrupted_event = None
-
-    _record_trace_event(
-        run.session,
-        "client_event",
-        eventId=event_id,
-        eventType=event_type,
-        streamingWriteId=body.streamingWriteId,
-        reason=body.reason,
-        lastAppliedChars=max(0, int(body.lastAppliedChars or 0)),
-    )
-    await run.append_event({
-        "type": "client_event",
-        **event,
-        "message": message,
-    })
-    return {"success": True, "duplicate": False, "run": run.snapshot()}
 
 
 def get_react_session(session_id: str) -> ReactSession | None:
@@ -4445,136 +4989,6 @@ def list_conversation_react_traces(conversation_id: str) -> list[dict[str, Any]]
 
     traces.sort(key=lambda item: str(item.get("createdAt", "")))
     return traces
-
-
-def submit_react_tool_results(session: ReactSession, body: ToolResultsRequest) -> None:
-    agent_id = str(body.agent_id or "").strip()
-    if agent_id:
-        if body.stop:
-            queue = session.agent_tool_result_queues.get(agent_id)
-            if queue is None:
-                raise HTTPException(status_code=409, detail="当前 Agent 不在等待工具结果")
-            queue.put_nowait(None)
-            return
-
-        if body.context is not None:
-            session.latest_context = body.context
-
-        expected_plan = session.agent_expected_plans.get(agent_id)
-        if expected_plan is None:
-            raise HTTPException(status_code=409, detail="当前 Agent 不在等待工具结果")
-        if body.plan_id and body.plan_id != expected_plan.plan_id:
-            raise HTTPException(status_code=409, detail="Agent tool result planId 与当前执行计划不匹配")
-        if body.round is not None and body.round != expected_plan.round:
-            raise HTTPException(status_code=409, detail="Agent tool result round 与当前轮次不匹配")
-        if not body.results:
-            raise HTTPException(status_code=400, detail="results 不能为空")
-
-        valid_execution_ids = {execution.execution_id for execution in expected_plan.executions}
-        seen_execution_ids: set[str] = set()
-        posted_results: list[PostedToolResult] = []
-        for item in body.results:
-            execution_id = str(item.execution_id or item.tool_call_id or "").strip()
-            if not execution_id:
-                raise HTTPException(status_code=400, detail="每条 tool result 都必须包含 execution_id")
-            if execution_id not in valid_execution_ids:
-                raise HTTPException(status_code=409, detail=f"未知 Agent execution_id: {execution_id}")
-            if execution_id in seen_execution_ids:
-                raise HTTPException(status_code=409, detail=f"重复的 Agent execution_id: {execution_id}")
-            seen_execution_ids.add(execution_id)
-            posted_results.append(PostedToolResult(
-                execution_id=execution_id,
-                content=item.content,
-            ))
-        missing_execution_ids = valid_execution_ids - seen_execution_ids
-        if missing_execution_ids:
-            missing_text = ", ".join(sorted(missing_execution_ids))
-            raise HTTPException(status_code=409, detail=f"缺少 Agent execution result: {missing_text}")
-
-        queue = session.agent_tool_result_queues.get(agent_id)
-        if queue is None:
-            raise HTTPException(status_code=409, detail="当前 Agent 结果队列不存在")
-        queue.put_nowait(PostedToolResults(
-            plan_id=body.plan_id,
-            round=body.round,
-            results=posted_results,
-            stop=False,
-        ))
-        gateway_run = _react_gateway_runs.get(session.session_id)
-        if gateway_run:
-            gateway_run.status = "running"
-            gateway_run.pending_plan = None
-        _record_trace_event(
-            session,
-            "agent_tool_results_posted",
-            agentId=agent_id,
-            planId=body.plan_id,
-            round=body.round,
-            executionCount=len(posted_results),
-        )
-        return
-
-    if body.stop:
-        _record_trace_event(session, "client_stop_requested")
-        session.tool_result_queue.put_nowait(None)
-        return
-
-    # Update session's latest context from frontend
-    if body.context is not None:
-        session.latest_context = body.context
-
-    expected_plan = session.expected_plan
-    if expected_plan is None:
-        raise HTTPException(status_code=409, detail="当前 session 不在等待工具结果")
-
-    if body.plan_id and body.plan_id != expected_plan.plan_id:
-        raise HTTPException(status_code=409, detail="tool result planId 与当前执行计划不匹配")
-    if body.round is not None and body.round != expected_plan.round:
-        raise HTTPException(status_code=409, detail="tool result round 与当前轮次不匹配")
-
-    if not body.results:
-        raise HTTPException(status_code=400, detail="results 不能为空")
-
-    valid_execution_ids = {execution.execution_id for execution in expected_plan.executions}
-    seen_execution_ids: set[str] = set()
-    posted_results: list[PostedToolResult] = []
-
-    for item in body.results:
-        execution_id = str(item.execution_id or item.tool_call_id or "").strip()
-        if not execution_id:
-            raise HTTPException(status_code=400, detail="每条 tool result 都必须包含 execution_id")
-        if execution_id not in valid_execution_ids:
-            raise HTTPException(status_code=409, detail=f"未知 execution_id: {execution_id}")
-        if execution_id in seen_execution_ids:
-            raise HTTPException(status_code=409, detail=f"重复的 execution_id: {execution_id}")
-        seen_execution_ids.add(execution_id)
-        posted_results.append(PostedToolResult(
-            execution_id=execution_id,
-            content=item.content,
-        ))
-
-    missing_execution_ids = valid_execution_ids - seen_execution_ids
-    if missing_execution_ids:
-        missing_text = ", ".join(sorted(missing_execution_ids))
-        raise HTTPException(status_code=409, detail=f"缺少 execution result: {missing_text}")
-
-    session.tool_result_queue.put_nowait(PostedToolResults(
-        plan_id=body.plan_id,
-        round=body.round,
-        results=posted_results,
-        stop=False,
-    ))
-    gateway_run = _react_gateway_runs.get(session.session_id)
-    if gateway_run:
-        gateway_run.status = "running"
-        gateway_run.pending_plan = None
-    _record_trace_event(
-        session,
-        "tool_results_posted",
-        planId=body.plan_id,
-        round=body.round,
-        executionCount=len(posted_results),
-    )
 
 
 def _compress_tool_content(content: str, max_len: int = 200) -> str:
@@ -4906,22 +5320,57 @@ def _determine_compression_tier(messages: list[BaseMessage], current_tier: int) 
 def _record_tooling_delta_message(
     messages: list[BaseMessage],
     *,
-    mode: str | None,
+    body: ChatRequest,
     loaded_deferred_tools: set[str],
     content_events: list[dict[str, Any]] | None = None,
 ) -> None:
-    attachment = build_tooling_delta_attachment(mode, loaded_deferred_tools)
-    deferred_count = len(get_deferred_tool_definitions(mode, loaded_deferred_tools))
+    attachment = _build_tooling_delta_attachment_for_body(body, loaded_deferred_tools)
+    deferred_count = len(_get_deferred_tool_definitions_for_body(body, loaded_deferred_tools))
     if content_events is not None:
         content_events.append({
             "type": "tooling_delta",
-            "mode": mode or "layout",
+            "mode": body.mode or "layout",
             "deferredToolCount": deferred_count,
             "loadedDeferredToolCount": len(loaded_deferred_tools),
             "contentChars": len(attachment),
         })
     if attachment:
         messages.append(HumanMessage(content=attachment))
+
+
+def _build_tooling_delta_attachment_for_body(
+    body: ChatRequest,
+    loaded_deferred_tools: set[str] | None = None,
+) -> str:
+    loaded = sorted(set(loaded_deferred_tools or set()))
+    deferred = [
+        definition.to_deferred_summary()
+        for definition in _get_deferred_tool_definitions_for_body(body, set(loaded))
+    ]
+    if not deferred and not loaded:
+        return ""
+    payload = {
+        "type": "tooling_delta",
+        "mode": body.mode or "layout",
+        "availableToolCount": len(_get_tool_definitions_for_body(body)),
+        "deferredTools": deferred,
+        "loadedDeferredTools": loaded,
+        "mcpInstructionsDelta": [],
+        "skillDiscoveryDelta": [],
+    }
+    lines = [
+        "[系统附件] type=tooling_delta",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+    ]
+    if deferred:
+        lines.append("")
+        lines.append("[延迟工具摘要]")
+        lines.extend(
+            f"- {item['name']} ({item['category']}): {item.get('searchHint') or item.get('description')}"
+            for item in deferred
+        )
+        lines.append("需要其中任一工具时，先调用 ToolSearch 加载完整 schema。")
+    return "\n".join(lines)
 
 
 def build_messages(
@@ -4931,18 +5380,18 @@ def build_messages(
 ) -> list[BaseMessage]:
     provider, _ = _resolve_provider_and_model(body)
     loaded = set(loaded_deferred_tools or set())
-    selected_tools = get_model_tools(body.mode, loaded)
+    selected_tools = _get_model_tools_for_body(body, loaded)
     system_content = build_system_content(
         body.mode,
         provider,
         selected_tools,
-        deferred_tool_count=len(get_deferred_tool_definitions(body.mode, loaded)),
+        deferred_tool_count=len(_get_deferred_tool_definitions_for_body(body, loaded)),
         loaded_deferred_tool_count=len(loaded),
     )
     messages: list[BaseMessage] = [SystemMessage(content=system_content.prompt)]
     if content_events is not None:
         content_events.append(system_content.trace)
-    _record_tooling_delta_message(messages, mode=body.mode, loaded_deferred_tools=loaded, content_events=content_events)
+    _record_tooling_delta_message(messages, body=body, loaded_deferred_tools=loaded, content_events=content_events)
 
     # Inject initial context as delta attachment (full state announcement)
     context = body.context or {}
@@ -4991,6 +5440,30 @@ def build_messages(
     return messages
 
 
+def _should_pass_empty_reasoning_content(provider: dict[str, Any], model: str, endpoint: str) -> bool:
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (
+            provider.get("id"),
+            provider.get("label"),
+            provider.get("name"),
+            endpoint,
+            model,
+        )
+    )
+    return any(
+        marker in haystack
+        for marker in (
+            "deepseek",
+            "siliconflow",
+            "dashscope",
+            "qwen",
+            "aliyun",
+            "alibaba",
+        )
+    )
+
+
 def build_llm(
     streaming: bool,
     body: ChatRequest,
@@ -5003,22 +5476,23 @@ def build_llm(
     endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
     if not model:
         model = "Qwen/Qwen2.5-72B-Instruct"
-    selected_tools = tools if tools is not None else get_model_tools(body.mode, loaded_deferred_tools or set(), agent_type=agent_type)
+    selected_tools = tools if tools is not None else _get_model_tools_for_body(body, loaded_deferred_tools or set(), agent_type=agent_type)
     system_content = build_system_content(
         body.mode,
         provider,
         selected_tools,
-        deferred_tool_count=len(get_deferred_tool_definitions(body.mode, loaded_deferred_tools or set())),
+        deferred_tool_count=len(_get_deferred_tool_definitions_for_body(body, loaded_deferred_tools or set())),
         loaded_deferred_tool_count=len(loaded_deferred_tools or set()),
     )
     model_kwargs = dict(system_content.prompt_cache.get("modelKwargs") or {})
 
-    llm = ChatOpenAI(
+    llm = ReasoningContentChatOpenAI(
         model=model,
         api_key=api_key or "not-needed",
         base_url=endpoint,
         temperature=0.3,
         streaming=streaming,
+        pass_empty_reasoning_content=_should_pass_empty_reasoning_content(provider, model, endpoint),
         **({"model_kwargs": model_kwargs} if model_kwargs else {}),
     )
     return llm.bind_tools(selected_tools) if selected_tools else llm
@@ -5076,7 +5550,7 @@ def build_completion_llm(body: CompletionRequest, candidate_count: int) -> ChatO
     activity = _normalize_completion_activity(body.activity)
     temperature = float(COMPLETION_ACTIVITY_CONFIG[activity]["temperature"])
 
-    return ChatOpenAI(
+    return ReasoningContentChatOpenAI(
         model=model,
         api_key=api_key or "not-needed",
         base_url=endpoint,
@@ -5084,6 +5558,7 @@ def build_completion_llm(body: CompletionRequest, candidate_count: int) -> ChatO
         streaming=False,
         n=candidate_count,
         max_tokens=96,
+        pass_empty_reasoning_content=_should_pass_empty_reasoning_content(provider, model, endpoint),
         extra_body=_completion_extra_body(provider, endpoint),
     )
 
@@ -5455,6 +5930,7 @@ async def _run_llm_round(
     """
     tool_call_acc: dict[int, dict[str, Any]] = {}
     assistant_content = ""
+    assistant_reasoning = ""
     finish_reason = ""
 
     try:
@@ -5478,6 +5954,7 @@ async def _run_llm_round(
 
             reasoning = _extract_reasoning(chunk)
             if reasoning:
+                assistant_reasoning += reasoning
                 yield {"type": "thinking", "content": reasoning}
 
             content = _strip_tool_result_json_leaks(_stringify_content(chunk.content))
@@ -5530,6 +6007,7 @@ async def _run_llm_round(
     yield {
         "type": "_round_result",
         "content": assistant_content,
+        "reasoning_content": assistant_reasoning,
         "tool_calls": parsed_tool_calls,
         "finish_reason": finish_reason,
     }
@@ -5542,30 +6020,6 @@ class QueryCoordinator:
         self.session = session
         self.state = session.state
 
-    def _summarize_execution_results(
-        self,
-        plan: ToolExecutionPlan,
-        posted_results: PostedToolResults,
-    ) -> list[dict[str, Any]]:
-        results_by_execution = {
-            item.execution_id: item
-            for item in posted_results.results
-        }
-        summary: list[dict[str, Any]] = []
-
-        for execution in plan.executions:
-            posted = results_by_execution.get(execution.execution_id)
-            payload = _parse_tool_result_payload(posted.content if posted else "")
-            summary.append({
-                "executionId": execution.execution_id,
-                "toolName": execution.tool_name,
-                "success": payload.get("success") is True,
-                "message": _truncate_preview(payload.get("message", ""), 120),
-                "mergeStrategy": execution.merge_strategy,
-                "sourceToolCallCount": len(execution.source_calls),
-            })
-        return summary
-
     def _make_recovery_event(self, action: str, **data: Any) -> dict[str, Any]:
         _record_trace_event(self.session, "recovery", round=self.state.round, action=action, **data)
         return {
@@ -5574,24 +6028,15 @@ class QueryCoordinator:
             **data,
         }
 
-    def _pop_client_hints(self) -> list[dict[str, str]]:
-        hints = list(self.session.pending_client_hints)
-        self.session.pending_client_hints.clear()
-        return hints
-
-    def _inject_client_hints(self, hints: list[dict[str, str]]) -> str:
-        content = "\n\n".join(hint["content"] for hint in hints if hint.get("content"))
-        if content:
-            self.session.messages.append(HumanMessage(content=content))
-        return content
-
     async def _run_model_round(self, messages: list[BaseMessage]) -> AsyncGenerator[dict[str, Any], None]:
         round_content = ""
+        round_reasoning = ""
         round_tool_calls: list[dict[str, Any]] = []
         round_finish_reason = ""
 
         for attempt in range(MAX_RETRIES_PER_ROUND + 1):
             round_content = ""
+            round_reasoning = ""
             round_tool_calls = []
             round_finish_reason = ""
             llm = build_llm(
@@ -5605,6 +6050,7 @@ class QueryCoordinator:
                 async for event in _run_llm_round(graph, messages, self.session.body, self.state.round):
                     if event["type"] == "_round_result":
                         round_content = event["content"]
+                        round_reasoning = str(event.get("reasoning_content", "") or "")
                         round_tool_calls = event["tool_calls"]
                         round_finish_reason = str(event.get("finish_reason", "") or "")
                     else:
@@ -5613,6 +6059,7 @@ class QueryCoordinator:
                 yield {
                     "type": "_round_result",
                     "content": round_content,
+                    "reasoning_content": round_reasoning,
                     "tool_calls": round_tool_calls,
                     "finish_reason": round_finish_reason,
                 }
@@ -5662,48 +6109,10 @@ class QueryCoordinator:
         yield {
             "type": "_round_result",
             "content": round_content,
+            "reasoning_content": round_reasoning,
             "tool_calls": round_tool_calls,
             "finish_reason": round_finish_reason,
         }
-
-    def _apply_execution_results(
-        self,
-        plan: ToolExecutionPlan,
-        posted_results: PostedToolResults,
-    ) -> list[dict[str, str]]:
-        results_by_execution = {
-            item.execution_id: item
-            for item in posted_results.results
-        }
-        execution_results: list[dict[str, str]] = []
-
-        for execution in plan.executions:
-            posted_result = results_by_execution[execution.execution_id]
-            safe_content, image_message = _prepare_page_screenshot_tool_result(
-                posted_result.content,
-                self.session.body,
-            )
-            execution_results.append({
-                "execution_id": execution.execution_id,
-                "content": safe_content,
-            })
-            for source_call in execution.source_calls:
-                self.session.messages.append(ToolMessage(
-                    content=_decorate_tool_result_content(safe_content, execution, source_call),
-                    tool_call_id=source_call.id,
-                ))
-            if image_message is not None:
-                self.session.messages.append(image_message)
-
-        _record_content_event(self.session, {
-            "type": "tool_results",
-            "source": "frontend",
-            "planId": plan.plan_id,
-            "round": plan.round,
-            "executionCount": len(execution_results),
-            "contentChars": sum(len(item["content"]) for item in execution_results),
-        })
-        return execution_results
 
     async def _execute_server_execution(
         self,
@@ -5713,12 +6122,43 @@ class QueryCoordinator:
             before_loaded = set(self.session.loaded_deferred_tools)
             content = _run_tool_search_tool(
                 execution.params,
-                mode=self.session.body.mode,
+                body=self.session.body,
                 loaded_deferred_tools=self.session.loaded_deferred_tools,
             )
             newly_loaded = sorted(self.session.loaded_deferred_tools - before_loaded)
+        elif execution.tool_name in {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
+            content = await _run_task_tool(execution.tool_name, execution.params, self.session.body.conversationId)
+            newly_loaded = []
+        elif execution.tool_name in {"workspace_search", "workspace_read"}:
+            content = await _run_workspace_tool(execution.tool_name, execution.params, self.session.workspace_tool_cache)
+            newly_loaded = []
+        elif execution.tool_name == "analyze_image_with_ocr":
+            content = await _run_ocr_attachment_tool(execution.params, self.session.body)
+            newly_loaded = []
         elif execution.tool_name == "web_search":
             content = await _run_web_search_tool(execution.params)
+            newly_loaded = []
+        elif execution.tool_name == "analyze_document_image":
+            content = await _run_document_image_analysis_tool(
+                execution.params,
+                self.session.body,
+                self.session.latest_context or self.session.body.context or {},
+            )
+            newly_loaded = []
+        elif is_document_tool(execution.tool_name):
+            tool_result = await execute_ai_document_tool(
+                execution.tool_name,
+                execution.params,
+                self.session.latest_context or self.session.body.context or {},
+            )
+            content = _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=tool_result.get("success") is True,
+                message=str(tool_result.get("message") or ""),
+                data=tool_result.get("data"),
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
             newly_loaded = []
         else:
             content = _serialize_tool_result_payload(
@@ -5729,10 +6169,11 @@ class QueryCoordinator:
                 original_params=execution.params,
             )
 
-        payload = _parse_tool_result_payload(content)
+        safe_content, image_message = await _prepare_page_screenshot_tool_result_for_runtime(content, self.session.body)
+        payload = _parse_tool_result_payload(safe_content)
         result = {
             "execution_id": execution.execution_id,
-            "content": content,
+            "content": safe_content,
         }
         summary = {
             "executionId": execution.execution_id,
@@ -5746,10 +6187,12 @@ class QueryCoordinator:
         events: list[dict[str, Any]] = []
         for source_call in execution.source_calls:
             self.session.messages.append(ToolMessage(
-                content=_decorate_tool_result_content(content, execution, source_call),
+                content=_decorate_tool_result_content(safe_content, execution, source_call),
                 tool_call_id=source_call.id,
             ))
             events.append(_build_tool_result_event(execution, source_call, payload))
+        if image_message is not None:
+            self.session.messages.append(image_message)
 
         _record_content_event(self.session, {
             "type": "tool_results",
@@ -5757,7 +6200,7 @@ class QueryCoordinator:
             "toolName": execution.tool_name,
             "executionCount": 1,
             "sourceToolCallCount": len(execution.source_calls),
-            "contentChars": len(content),
+            "contentChars": len(safe_content),
         })
         if execution.tool_name == TOOL_SEARCH_NAME:
             _record_content_event(self.session, {
@@ -5766,15 +6209,35 @@ class QueryCoordinator:
                 "source": "ToolSearch",
                 "loadedToolNamesHash": _stable_short_hash(newly_loaded),
                 "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
-                "deferredToolCount": len(get_deferred_tool_definitions(self.session.body.mode, self.session.loaded_deferred_tools)),
+                "deferredToolCount": len(_get_deferred_tool_definitions_for_body(self.session.body, self.session.loaded_deferred_tools)),
             })
             events.append({
                 "type": "tooling_delta",
                 "loadedToolNames": newly_loaded,
                 "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
-                "deferredToolCount": len(get_deferred_tool_definitions(self.session.body.mode, self.session.loaded_deferred_tools)),
+                "deferredToolCount": len(_get_deferred_tool_definitions_for_body(self.session.body, self.session.loaded_deferred_tools)),
             })
         return result, summary, events
+
+    async def _commit_server_streaming_write(self, markdown: str) -> dict[str, Any]:
+        pending = self.session.server_streaming_write
+        self.session.server_streaming_write = None
+        if not pending:
+            return {"success": False, "message": "没有待提交的服务端流式写入"}
+        params = {**pending, "markdown": markdown}
+        result = await execute_ai_document_tool(
+            "begin_streaming_write",
+            params,
+            self.session.latest_context or self.session.body.context or {},
+        )
+        success = result.get("success") is True
+        _record_content_event(self.session, {
+            "type": "server_streaming_write_committed",
+            "success": success,
+            "message": str(result.get("message") or ""),
+            "contentChars": len(markdown),
+        })
+        return result
 
     async def _run_subagent(
         self,
@@ -5786,17 +6249,18 @@ class QueryCoordinator:
         model_override: str | None = None,
         background: bool = False,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        available_tool_names = {
-            str(tool.get("function", {}).get("name", ""))
-            for tool in get_tools("agent")
-        }
-        tool_names = resolve_agent_tool_names(agent, available_tool_names, background=background)
         child_loaded_deferred_tools: set[str] = set()
         body_data = self.session.body.model_dump()
         selected_model = str(model_override or agent.model or self.session.body.model or "").strip()
         if selected_model:
             body_data["model"] = selected_model
         child_body = ChatRequest(**body_data)
+        agent_body = child_body.model_copy(update={"mode": "agent"})
+        available_tool_names = {
+            definition.name
+            for definition in _get_tool_definitions_for_body(agent_body)
+        }
+        tool_names = resolve_agent_tool_names(agent, available_tool_names, background=background)
         subagent_content = build_subagent_content(
             agent=agent,
             tool_names=tool_names,
@@ -5833,10 +6297,12 @@ class QueryCoordinator:
             }
 
             round_content = ""
+            round_reasoning = ""
             round_tool_calls: list[dict[str, Any]] = []
             child_tools = _select_model_tools_by_names(
                 tool_names,
                 loaded_deferred_tools=child_loaded_deferred_tools,
+                body=child_body,
                 agent_type=agent.agent_type,
             )
             graph = build_graph(build_llm(
@@ -5850,6 +6316,7 @@ class QueryCoordinator:
                 event_type = event["type"]
                 if event_type == "_round_result":
                     round_content = event["content"]
+                    round_reasoning = str(event.get("reasoning_content", "") or "")
                     round_tool_calls = event["tool_calls"]
                     continue
                 if event_type == "content":
@@ -5882,15 +6349,19 @@ class QueryCoordinator:
 
             if not round_tool_calls:
                 final_text = round_content.strip()
-                child_messages.append(AIMessage(content=round_content))
+                child_messages.append(_build_ai_message(
+                    content=round_content,
+                    reasoning_content=round_reasoning,
+                ))
                 break
 
-            child_messages.append(AIMessage(
+            child_messages.append(_build_ai_message(
                 content=round_content,
                 tool_calls=[
                     {"id": tool_call["id"], "name": tool_call["name"], "args": tool_call["params"], "type": "tool_call"}
                     for tool_call in round_tool_calls
                 ],
+                reasoning_content=round_reasoning,
             ))
 
             execution_plan = _build_execution_plan(child_round, round_tool_calls)
@@ -5914,11 +6385,41 @@ class QueryCoordinator:
                 if server_execution.tool_name == TOOL_SEARCH_NAME:
                     server_content = _run_tool_search_tool(
                         server_execution.params,
-                        mode="agent",
+                        body=child_body,
                         loaded_deferred_tools=child_loaded_deferred_tools,
                     )
+                elif server_execution.tool_name in {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
+                    server_content = await _run_task_tool(
+                        server_execution.tool_name,
+                        server_execution.params,
+                        self.session.body.conversationId,
+                    )
+                elif server_execution.tool_name in {"workspace_search", "workspace_read"}:
+                    server_content = await _run_workspace_tool(server_execution.tool_name, server_execution.params, self.session.workspace_tool_cache)
+                elif server_execution.tool_name == "analyze_image_with_ocr":
+                    server_content = await _run_ocr_attachment_tool(server_execution.params, self.session.body)
                 elif server_execution.tool_name == "web_search":
                     server_content = await _run_web_search_tool(server_execution.params)
+                elif server_execution.tool_name == "analyze_document_image":
+                    server_content = await _run_document_image_analysis_tool(
+                        server_execution.params,
+                        self.session.body,
+                        self.session.latest_context or self.session.body.context or {},
+                    )
+                elif is_document_tool(server_execution.tool_name):
+                    tool_result = await execute_ai_document_tool(
+                        server_execution.tool_name,
+                        server_execution.params,
+                        self.session.latest_context or self.session.body.context or {},
+                    )
+                    server_content = _serialize_tool_result_payload(
+                        tool_name=server_execution.tool_name,
+                        success=tool_result.get("success") is True,
+                        message=str(tool_result.get("message") or ""),
+                        data=tool_result.get("data"),
+                        executed_params=server_execution.params,
+                        original_params=server_execution.params,
+                    )
                 else:
                     server_content = _serialize_tool_result_payload(
                         tool_name=server_execution.tool_name,
@@ -5927,10 +6428,11 @@ class QueryCoordinator:
                         executed_params=server_execution.params,
                         original_params=server_execution.params,
                     )
-                server_payload = _parse_tool_result_payload(server_content)
+                server_safe_content, server_image_message = await _prepare_page_screenshot_tool_result_for_runtime(server_content, self.session.body)
+                server_payload = _parse_tool_result_payload(server_safe_content)
                 for source_call in server_execution.source_calls:
                     child_messages.append(ToolMessage(
-                        content=_decorate_tool_result_content(server_content, server_execution, source_call),
+                        content=_decorate_tool_result_content(server_safe_content, server_execution, source_call),
                         tool_call_id=source_call.id,
                     ))
                     yield {
@@ -5939,79 +6441,22 @@ class QueryCoordinator:
                         "agentType": agent.agent_type,
                         "toolResult": _build_tool_result_event(server_execution, source_call, server_payload),
                     }
+                if server_image_message is not None:
+                    child_messages.append(server_image_message)
 
-            if client_executions:
-                if background:
-                    for client_execution in client_executions:
-                        content = _serialize_tool_result_payload(
-                            tool_name=client_execution.tool_name,
-                            success=False,
-                            message="后台子代理不能请求前端实时工具；请改用同步子代理或基于上下文快照分析。",
-                            executed_params=client_execution.params,
-                            original_params=client_execution.params,
-                        )
-                        for source_call in client_execution.source_calls:
-                            child_messages.append(ToolMessage(
-                                content=_decorate_tool_result_content(content, client_execution, source_call),
-                                tool_call_id=source_call.id,
-                            ))
-                    continue
-
-                client_plan = ToolExecutionPlan(
-                    plan_id=execution_plan.plan_id,
-                    round=execution_plan.round,
-                    executions=client_executions,
+            for client_execution in client_executions:
+                content = _serialize_tool_result_payload(
+                    tool_name=client_execution.tool_name,
+                    success=False,
+                    message=f"工具 {client_execution.tool_name} 未实现服务端执行器，前端工具执行路径已删除。",
+                    executed_params=client_execution.params,
+                    original_params=client_execution.params,
                 )
-                self.session.agent_expected_plans[agent_id] = client_plan
-                self.session.agent_tool_result_queues[agent_id] = asyncio.Queue()
-                yield _serialize_agent_execution_plan(agent_id, agent.agent_type, client_plan)
-                yield {
-                    "type": "agent_progress",
-                    "agentId": agent_id,
-                    "agentType": agent.agent_type,
-                    "phase": "awaiting_tool_results",
-                    "round": client_plan.round,
-                    "planId": client_plan.plan_id,
-                    "count": len(client_plan.executions),
-                }
-
-                try:
-                    if self.session.wait_for_client_tools:
-                        posted_results = await self.session.agent_tool_result_queues[agent_id].get()
-                    else:
-                        posted_results = await asyncio.wait_for(
-                            self.session.agent_tool_result_queues[agent_id].get(),
-                            timeout=TOOL_RESULT_TIMEOUT,
-                        )
-                except asyncio.TimeoutError:
-                    self.session.agent_expected_plans.pop(agent_id, None)
-                    self.session.agent_tool_result_queues.pop(agent_id, None)
-                    raise HTTPException(status_code=504, detail="等待子代理工具结果超时")
-                finally:
-                    self.session.agent_expected_plans.pop(agent_id, None)
-                    self.session.agent_tool_result_queues.pop(agent_id, None)
-
-                if posted_results is None:
-                    final_text = "子代理已被用户停止。"
-                    break
-
-                results_by_execution = {
-                    item.execution_id: item
-                    for item in posted_results.results
-                }
-                for client_execution in client_plan.executions:
-                    posted = results_by_execution[client_execution.execution_id]
-                    safe_content, image_message = _prepare_page_screenshot_tool_result(
-                        posted.content,
-                        child_body,
-                    )
-                    for source_call in client_execution.source_calls:
-                        child_messages.append(ToolMessage(
-                            content=_decorate_tool_result_content(safe_content, client_execution, source_call),
-                            tool_call_id=source_call.id,
-                        ))
-                    if image_message is not None:
-                        child_messages.append(image_message)
+                for source_call in client_execution.source_calls:
+                    child_messages.append(ToolMessage(
+                        content=_decorate_tool_result_content(content, client_execution, source_call),
+                        tool_call_id=source_call.id,
+                    ))
 
         if not final_text:
             final_text = f"子代理 {agent.agent_type} 已达到最大轮次，未形成完整结论。"
@@ -6298,22 +6743,6 @@ class QueryCoordinator:
                 _record_trace_event(self.session, "round_start", round=self.state.round)
                 yield {"type": "round_start", "round": self.state.round}
 
-                client_hints = self._pop_client_hints()
-                if client_hints:
-                    hint_text = self._inject_client_hints(client_hints)
-                    _record_trace_event(
-                        self.session,
-                        "client_event_hint_injected",
-                        round=self.state.round,
-                        eventIds=[hint.get("eventId") for hint in client_hints],
-                    )
-                    yield self._make_recovery_event(
-                        "client_event",
-                        message="页面刷新导致流式写入中断，正在让模型重新验证并重试。",
-                        eventIds=[hint.get("eventId") for hint in client_hints],
-                        hintChars=len(hint_text),
-                    )
-
                 previous_tier = self.state.compression_tier
                 self.state.compression_tier = _determine_compression_tier(
                     self.session.messages,
@@ -6346,11 +6775,13 @@ class QueryCoordinator:
                 self.state.consecutive_empty_content = 0
 
                 round_content = ""
+                round_reasoning = ""
                 round_tool_calls: list[dict[str, Any]] = []
                 round_finish_reason = ""
                 async for event in self._run_model_round(compressed_messages):
                     if event["type"] == "_round_result":
                         round_content = event["content"]
+                        round_reasoning = str(event.get("reasoning_content", "") or "")
                         round_tool_calls = event["tool_calls"]
                         round_finish_reason = str(event.get("finish_reason", "") or "")
                     else:
@@ -6360,42 +6791,11 @@ class QueryCoordinator:
                 if round_tool_calls or not _is_output_truncated_finish_reason(round_finish_reason):
                     self.state.output_continuation_attempts = 0
 
-                client_hints = self._pop_client_hints()
-                if client_hints and round_tool_calls:
-                    self.session.pending_client_hints = client_hints + self.session.pending_client_hints
-                elif client_hints:
-                    self.session.messages.append(AIMessage(content=round_content))
-                    hint_text = self._inject_client_hints(client_hints)
-                    self.state.pending_write_follow_up = False
-                    self.state.pending_agent_follow_up = False
-                    self.state.transition = Transition.FOLLOW_UP_CONTINUE
-                    _record_round_checkpoint(
-                        self.session,
-                        round_number=self.state.round,
-                        kind="text_round",
-                        assistant_preview=_truncate_preview(round_content),
-                        transition=self.state.transition,
-                        reason="client_stream_write_interrupted",
-                        model_finish_reason=round_finish_reason,
-                    )
-                    _record_trace_event(
-                        self.session,
-                        "round_complete",
-                        round=self.state.round,
-                        reason="client_stream_write_interrupted",
-                        eventIds=[hint.get("eventId") for hint in client_hints],
-                    )
-                    yield {
-                        "type": "round_complete",
-                        "reason": "client_stream_write_interrupted",
-                        "message": "页面刷新导致流式写入中断，正在让模型重新验证并重试。",
-                        "eventIds": [hint.get("eventId") for hint in client_hints],
-                        "hintChars": len(hint_text),
-                    }
-                    continue
-
                 if not round_tool_calls:
-                    self.session.messages.append(AIMessage(content=round_content))
+                    self.session.messages.append(_build_ai_message(
+                        content=round_content,
+                        reasoning_content=round_reasoning,
+                    ))
                     truncation_decision = _decide_output_truncation(self.state, round_finish_reason, round_tool_calls)
                     if truncation_decision is not None:
                         if truncation_decision.action == RoundDecisionAction.ERROR:
@@ -6535,12 +6935,13 @@ class QueryCoordinator:
                     yield {"type": "done", "reason": round_decision.finish_reason}
                     break
 
-                self.session.messages.append(AIMessage(
+                self.session.messages.append(_build_ai_message(
                     content=round_content,
                     tool_calls=[
                         {"id": tool_call["id"], "name": tool_call["name"], "args": tool_call["params"], "type": "tool_call"}
                         for tool_call in round_tool_calls
                     ],
+                    reasoning_content=round_reasoning,
                 ))
 
                 execution_plan = _build_execution_plan(self.state.round, round_tool_calls)
@@ -6566,56 +6967,38 @@ class QueryCoordinator:
                 execution_results = list(server_execution_results)
                 execution_summary = list(server_execution_summary)
 
-                if client_executions:
-                    client_plan = ToolExecutionPlan(
-                        plan_id=execution_plan.plan_id,
-                        round=execution_plan.round,
-                        executions=client_executions,
+                for client_execution in client_executions:
+                    content = _serialize_tool_result_payload(
+                        tool_name=client_execution.tool_name,
+                        success=False,
+                        message=f"工具 {client_execution.tool_name} 未实现服务端执行器，前端工具执行路径已删除。",
+                        executed_params=client_execution.params,
+                        original_params=client_execution.params,
                     )
-                    self.session.expected_plan = client_plan
-                    yield _serialize_execution_plan(client_plan)
-                    _record_trace_event(
-                        self.session,
-                        "awaiting_tool_results",
-                        round=self.state.round,
-                        planId=client_plan.plan_id,
-                        executionCount=len(client_plan.executions),
-                    )
-                    yield {
-                        "type": "awaiting_tool_results",
-                        "round": client_plan.round,
-                        "planId": client_plan.plan_id,
-                        "count": len(client_plan.executions),
-                        "toolCallCount": len(round_tool_calls),
-                    }
-
-                    try:
-                        if self.session.wait_for_client_tools:
-                            posted_results = await self.session.tool_result_queue.get()
-                        else:
-                            posted_results = await asyncio.wait_for(
-                                self.session.tool_result_queue.get(),
-                                timeout=TOOL_RESULT_TIMEOUT,
-                            )
-                    except asyncio.TimeoutError:
-                        self.session.expected_plan = None
-                        self.state.transition = Transition.TIMEOUT
-                        _record_trace_event(self.session, "error", round=self.state.round, message="等待工具结果超时")
-                        yield {"type": "error", "message": "等待工具结果超时"}
-                        self.session.finished = True
-                        break
-
-                    if posted_results is None:
-                        self.session.expected_plan = None
-                        self.state.transition = Transition.STOPPED_BY_CLIENT
-                        self.session.finished = True
-                        _record_trace_event(self.session, "done", round=self.state.round, reason="stopped_by_client")
-                        yield {"type": "done", "reason": "stopped_by_client"}
-                        break
-
-                    execution_results.extend(self._apply_execution_results(client_plan, posted_results))
-                    execution_summary.extend(self._summarize_execution_results(client_plan, posted_results))
-                    self.session.expected_plan = None
+                    payload = _parse_tool_result_payload(content)
+                    execution_results.append({
+                        "execution_id": client_execution.execution_id,
+                        "content": content,
+                    })
+                    execution_summary.append({
+                        "executionId": client_execution.execution_id,
+                        "toolName": client_execution.tool_name,
+                        "success": False,
+                        "message": _truncate_preview(payload.get("message", ""), 120),
+                        "mergeStrategy": client_execution.merge_strategy,
+                        "sourceToolCallCount": len(client_execution.source_calls),
+                    })
+                    for source_call in client_execution.source_calls:
+                        self.session.messages.append(ToolMessage(
+                            content=_decorate_tool_result_content(content, client_execution, source_call),
+                            tool_call_id=source_call.id,
+                        ))
+                        yield {
+                            "type": "tool_result",
+                            "id": source_call.id,
+                            "name": source_call.name,
+                            "result": _build_tool_result_event(client_execution, source_call, payload)["result"],
+                        }
                 _update_completion_gate_state(self.state, execution_results)
                 self.state.pending_write_follow_up = _tool_results_started_streaming_write(execution_results)
                 self.state.pending_agent_follow_up = _tool_results_completed_subagent(execution_results)
@@ -6752,11 +7135,11 @@ class QueryCoordinator:
                 "stagnantBudgetRounds": self.state.stagnant_budget_rounds,
                 "budgetStagnationWarningLevel": self.state.budget_stagnation_warning_level,
                 "outputContinuationAttempts": self.state.output_continuation_attempts,
+                "visionCapabilityBlocked": self.state.vision_capability_blocked,
                 "lastModelFinishReason": self.state.last_model_finish_reason,
                 "completionGate": _snapshot_completion_gate(self.state, self.session.messages),
             }
             _store_completed_trace(self.session)
-            self.session.expected_plan = None
             _remove_session(self.session.session_id)
 
 
