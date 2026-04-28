@@ -2117,10 +2117,6 @@ export default function AISidebar({
   const tasksRef = useRef<TaskItem[]>([])
   const taskHideTimerRef = useRef<number | null>(null)
 
-  const activeProvider = useMemo(
-    () => providers.find(provider => provider.id === activeProviderId) ?? null,
-    [providers, activeProviderId],
-  )
   const activeOcrProvider = useMemo(
     () => providers.find(provider => provider.id === ocrConfig.providerId) ?? null,
     [ocrConfig.providerId, providers],
@@ -2129,12 +2125,6 @@ export default function AISidebar({
     () => providers.find(provider => provider.id === visionConfig.providerId) ?? null,
     [providers, visionConfig.providerId],
   )
-  const activeProviderSupportsVision = Boolean(activeProvider?.supportsVision)
-  const currentModelId = selectedModel || modelName
-  const currentModelSupportsVision = useMemo(() => {
-    const matched = availableModels.find(model => model.id === currentModelId)
-    return matched?.supportsVision ?? activeProviderSupportsVision
-  }, [activeProviderSupportsVision, availableModels, currentModelId])
   const effectiveOcrEndpoint = ocrConfig.endpoint || activeOcrProvider?.endpoint || ''
   const effectiveOcrHasApiKey = ocrConfig.hasApiKey || Boolean(activeOcrProvider?.hasApiKey)
   const ocrBackendRequiresModel = ocrConfig.backend === 'compat_chat'
@@ -4783,14 +4773,17 @@ export default function AISidebar({
         )}
       </div>
 
-      <div className="border-t border-gray-200 p-2.5 flex-shrink-0">
+      <div className="border-t border-white bg-white p-2.5 flex-shrink-0">
         {(() => {
           const sel = editorState ? serializeSelection(editorState) : null
           const hasTopContent = Boolean(sel) || pendingAttachments.length > 0
           const hasPendingImageAttachment = pendingAttachments.some(isImageAttachment)
+          const shouldShowOcrWarning = hasPendingImageAttachment
+            && !isOcrReady
+            && /(^\/ocr\b)|(识别|提取|解析|读取).*(表格|图表|手写|公式|扫描件|文档文字)/.test(input.trim())
 
           return (
-            <div className="rounded-[24px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.06)] overflow-hidden">
+            <div className="rounded-[24px] border border-white bg-white shadow-[0_10px_30px_rgba(15,23,42,0.06)] overflow-hidden">
               <input
                 ref={imageInputRef}
                 type="file"
@@ -4807,78 +4800,74 @@ export default function AISidebar({
                 }}
               />
 
-              <div className="border-b border-slate-100 bg-slate-50/80 px-3 py-2">
-                {hasTopContent ? (
-                  <div className="flex flex-wrap gap-2">
-                    {pendingAttachments.map(attachment => (
-                      <div
-                        key={attachment.id}
-                        className="group flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-2 py-2 shadow-sm"
-                      >
-                        {isImageAttachment(attachment) ? (
-                          <img
-                            src={attachment.dataUrl}
-                            alt={attachment.name}
-                            className="h-10 w-10 rounded-xl object-cover border border-slate-200 bg-slate-100"
-                          />
-                        ) : (
-                          <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-                            {getAttachmentBadge(attachment)}
+              {(hasTopContent || shouldShowOcrWarning) && (
+                <div className="bg-white px-3 py-2">
+                  {hasTopContent ? (
+                    <div className="flex flex-wrap gap-2">
+                      {pendingAttachments.map(attachment => (
+                        <div
+                          key={attachment.id}
+                          className="group flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-2 py-2 shadow-sm"
+                        >
+                          {isImageAttachment(attachment) ? (
+                            <img
+                              src={attachment.dataUrl}
+                              alt={attachment.name}
+                              className="h-10 w-10 rounded-xl object-cover border border-slate-200 bg-slate-100"
+                            />
+                          ) : (
+                            <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                              {getAttachmentBadge(attachment)}
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <div className="max-w-[160px] truncate text-xs font-medium text-slate-700">{attachment.name}</div>
+                            <div className="text-[11px] text-slate-400">{getAttachmentBadge(attachment)} · {formatFileSize(attachment.size)}</div>
                           </div>
-                        )}
-                        <div className="min-w-0">
-                          <div className="max-w-[160px] truncate text-xs font-medium text-slate-700">{attachment.name}</div>
-                          <div className="text-[11px] text-slate-400">{getAttachmentBadge(attachment)} · {formatFileSize(attachment.size)}</div>
+                          <button
+                            type="button"
+                            onClick={() => removePendingAttachment(attachment.id)}
+                            className="flex h-6 w-6 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+                            title="移除附件"
+                          >
+                            ×
+                          </button>
                         </div>
+                      ))}
+
+                      {sel && (
                         <button
                           type="button"
-                          onClick={() => removePendingAttachment(attachment.id)}
-                          className="flex h-6 w-6 items-center justify-center rounded-full text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
-                          title="移除附件"
+                          onMouseDown={event => {
+                            event.preventDefault()
+                            setIncludeSelection(prev => !prev)
+                          }}
+                          className={`inline-flex max-w-full items-center gap-2 rounded-2xl border px-3 py-2 text-left text-xs transition-colors ${includeSelection
+                            ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                            : 'border-slate-200 bg-slate-100 text-slate-400 hover:bg-slate-200 line-through'
+                            }`}
+                          title={includeSelection ? '点击取消携带选中内容' : '点击携带选中内容'}
                         >
-                          ×
+                          <span className="text-sm">“</span>
+                          <span className="max-w-[180px] truncate">
+                            {sel.selectedText.length > 36
+                              ? `${sel.selectedText.slice(0, 36)}…`
+                              : sel.selectedText}
+                          </span>
+                          <span className="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px] text-current">
+                            引用 P{sel.paragraphIndex + 1}
+                          </span>
                         </button>
-                      </div>
-                    ))}
-
-                    {sel && (
-                      <button
-                        type="button"
-                        onMouseDown={event => {
-                          event.preventDefault()
-                          setIncludeSelection(prev => !prev)
-                        }}
-                        className={`inline-flex max-w-full items-center gap-2 rounded-2xl border px-3 py-2 text-left text-xs transition-colors ${includeSelection
-                          ? 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'
-                          : 'border-slate-200 bg-slate-100 text-slate-400 hover:bg-slate-200 line-through'
-                          }`}
-                        title={includeSelection ? '点击取消携带选中内容' : '点击携带选中内容'}
-                      >
-                        <span className="text-sm">“</span>
-                        <span className="max-w-[180px] truncate">
-                          {sel.selectedText.length > 36
-                            ? `${sel.selectedText.slice(0, 36)}…`
-                            : sel.selectedText}
-                        </span>
-                        <span className="rounded-full bg-white/80 px-1.5 py-0.5 text-[10px] text-current">
-                          引用 P{sel.paragraphIndex + 1}
-                        </span>
-                      </button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="text-xs text-slate-400">
-                    {currentModelSupportsVision
-                      ? '上传图片、文本或 DOCX 附件后会随本轮请求一起发送；表格、图表、手写识别可继续用 /ocr。'
-                      : '当前模型未明确标记为多模态，图片仍会尝试发送；文本和 DOCX 附件会先提取内容再发送。'}
-                  </div>
-                )}
-                {hasPendingImageAttachment && !isOcrReady && /(^\/ocr\b)|(识别|提取|解析|读取).*(表格|图表|手写|公式|扫描件|文档文字)/.test(input.trim()) && (
-                  <div className="mt-2 text-[11px] text-amber-600">
-                    当前命中了 OCR 专用识别请求，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。
-                  </div>
-                )}
-              </div>
+                      )}
+                    </div>
+                  ) : null}
+                  {shouldShowOcrWarning && (
+                    <div className="mt-2 text-[11px] text-amber-600">
+                      当前命中了 OCR 专用识别请求，但 OCR 配置未就绪；请先在设置中补充 OCR 模型、端点和 API Key。
+                    </div>
+                  )}
+                </div>
+              )}
 
               {slashMenuOpen && (
                 <div className="border-b border-slate-100 bg-white px-2 py-2">
