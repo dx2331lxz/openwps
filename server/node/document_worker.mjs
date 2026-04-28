@@ -164,6 +164,8 @@ const FONT_MAP = {
   'Times New Roman': '"Times New Roman", Times, serif',
 }
 
+const HEADLESS_PAGE_GAP = 32
+
 const DEFAULT_PARAGRAPH_ATTRS = {
   align: 'left',
   firstLineIndent: 0,
@@ -815,81 +817,27 @@ async function renderMermaidDataUrl(code) {
   }
 }
 
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
-}
-
-function docToHtml(doc, pageConfig, options = {}) {
-  const body = doc.content.content.map((node, blockIndex) => {
-    const blockAttr = `data-block-index="${blockIndex}"`
-    if (node.type.name === 'paragraph') {
-      const align = escapeHtml(node.attrs.align ?? 'left')
-      const content = node.content.content.map(child => {
-        if (child.type.name === 'image') {
-          if (options.omitImageSources) {
-            const width = Number(child.attrs.width ?? 160) || 160
-            const height = Number(child.attrs.height ?? 90) || 90
-            const placeholderHeight = Math.max(24, height)
-            return `<span class="image-placeholder" style="width:${Math.max(24, width)}px;height:${placeholderHeight}px;line-height:${placeholderHeight}px">[图片]</span>`
-          }
-          return `<img src="${escapeHtml(child.attrs.src)}" alt="${escapeHtml(child.attrs.alt ?? '')}">`
-        }
-        return escapeHtml(child.text ?? '')
-      }).join('')
-      return `<p ${blockAttr} style="text-align:${align}">${content || '<br>'}</p>`
-    }
-    if (node.type.name === 'horizontal_rule') return `<hr ${blockAttr}>`
-    if (node.type.name === 'table_of_contents') return `<section ${blockAttr} class="toc">${escapeHtml(node.attrs.title ?? '目录')}</section>`
-    if (node.type.name === 'table') {
-      return `<table ${blockAttr}>${node.content.content.map(row => `<tr>${row.content.content.map(cell => `<td>${escapeHtml(cell.textContent || '')}</td>`).join('')}</tr>`).join('')}</table>`
-    }
-    return `<section ${blockAttr}>${escapeHtml(node.textContent || '')}</section>`
-  }).join('')
-  return `<!doctype html><html><head><meta charset="utf-8"><style>
-    body{margin:0;background:#f3f4f6;font-family:SimSun,"Songti SC",serif;color:#111827}
-    .page{box-sizing:border-box;width:${pageConfig.pageWidth}px;min-height:${pageConfig.pageHeight}px;background:white;padding:${pageConfig.marginTop}px ${pageConfig.marginRight}px ${pageConfig.marginBottom}px ${pageConfig.marginLeft}px}
-    p{margin:0 0 10px;line-height:1.5;font-size:16px;white-space:pre-wrap}
-    img{max-width:100%;height:auto;display:inline-block}
-    .image-placeholder{display:inline-block;border:1px dashed #cbd5e1;background:#f8fafc;color:#64748b;text-align:center;vertical-align:middle}
-    table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px}
-    td{border:1px solid #cbd5e1;padding:6px;vertical-align:top}
-    hr{border:0;border-top:1px solid #cbd5e1;margin:12px 0}
-    .toc{font-weight:700;margin-bottom:12px}
-  </style></head><body><main class="page">${body}</main></body></html>`
-}
-
 async function measurePageBlockIndexes(doc, pageConfig, pageNumber) {
   const { chromium } = await import('playwright')
   const browser = await chromium.launch({ headless: true })
+  let renderPage = null
+  let staticServer = null
   try {
-    const page = await browser.newPage({ viewport: { width: pageConfig.pageWidth, height: pageConfig.pageHeight }, deviceScaleFactor: 1 })
-    await page.setContent(docToHtml(doc, pageConfig, { omitImageSources: true }), { waitUntil: 'load', timeout: 10000 })
-    return await page.evaluate(({ requestedPage, pageHeight }) => {
-      const root = document.querySelector('.page')
-      const rootTop = root?.getBoundingClientRect().top ?? 0
-      const totalHeight = Math.max(
-        pageHeight,
-        Math.ceil(root?.scrollHeight || document.documentElement.scrollHeight || pageHeight)
-      )
-      const pageCount = Math.max(1, Math.ceil(totalHeight / pageHeight))
-      const start = (requestedPage - 1) * pageHeight
-      const end = requestedPage * pageHeight
-      const blockIndexes = Array.from(document.querySelectorAll('[data-block-index]'))
-        .map(el => {
-          const rect = el.getBoundingClientRect()
-          const top = rect.top - rootTop
-          const bottom = top + Math.max(1, rect.height)
-          return {
-            blockIndex: Number(el.getAttribute('data-block-index')),
-            top,
-            bottom,
-          }
-        })
-        .filter(item => Number.isInteger(item.blockIndex) && item.top < end && item.bottom > start)
-        .map(item => item.blockIndex)
-      return { pageCount, blockIndexes: [...new Set(blockIndexes)] }
-    }, { requestedPage: pageNumber, pageHeight: pageConfig.pageHeight })
+    const opened = await openFrontendRendererPage(browser, doc.toJSON(), pageConfig)
+    renderPage = opened.renderPage
+    staticServer = opened.staticServer
+    const renderError = await renderPage.evaluate(() => window.__OPENWPS_HEADLESS_ERROR__ ?? null)
+    if (renderError) throw new Error(`前端 headless 渲染失败：${renderError}`)
+    const metrics = await renderPage.evaluate(() => window.__OPENWPS_HEADLESS_READY__)
+    const pageCount = Math.max(1, Number(metrics?.pageCount ?? 1) || 1)
+    const blockIndexesByPage = Array.isArray(metrics?.blockIndexesByPage) ? metrics.blockIndexesByPage : []
+    const blockIndexes = Array.isArray(blockIndexesByPage[pageNumber - 1])
+      ? blockIndexesByPage[pageNumber - 1].filter(index => Number.isInteger(index))
+      : []
+    return { pageCount, blockIndexes: [...new Set(blockIndexes)] }
   } finally {
+    if (renderPage) await renderPage.close().catch(() => undefined)
+    if (staticServer) await new Promise(resolveClose => staticServer.close(resolveClose))
     await browser.close()
   }
 }
@@ -953,26 +901,128 @@ async function getPageStyleSummary(doc, pageConfig, params) {
   })
 }
 
+function appendHeadlessRenderParam(url) {
+  const parsed = new URL(url)
+  parsed.searchParams.set('openwpsHeadlessRender', '1')
+  return parsed.toString()
+}
+
+function contentTypeForPath(filePath) {
+  if (filePath.endsWith('.html')) return 'text/html; charset=utf-8'
+  if (filePath.endsWith('.js')) return 'text/javascript; charset=utf-8'
+  if (filePath.endsWith('.css')) return 'text/css; charset=utf-8'
+  if (filePath.endsWith('.svg')) return 'image/svg+xml'
+  if (filePath.endsWith('.png')) return 'image/png'
+  if (filePath.endsWith('.ico')) return 'image/x-icon'
+  return 'application/octet-stream'
+}
+
+async function startStaticDistRendererServer() {
+  const { createServer } = await import('node:http')
+  const { readFile, stat } = await import('node:fs/promises')
+  const { resolve, join } = await import('node:path')
+  const distRoot = resolve('dist')
+  await stat(join(distRoot, 'index.html'))
+
+  const server = createServer(async (request, response) => {
+    try {
+      const parsed = new URL(request.url ?? '/', 'http://127.0.0.1')
+      const pathname = decodeURIComponent(parsed.pathname).replace(/^\/+/, '')
+      let filePath = resolve(distRoot, pathname || 'index.html')
+      if (!filePath.startsWith(distRoot)) {
+        response.writeHead(403)
+        response.end('Forbidden')
+        return
+      }
+      try {
+        const info = await stat(filePath)
+        if (info.isDirectory()) filePath = join(filePath, 'index.html')
+      } catch {
+        filePath = join(distRoot, 'index.html')
+      }
+      const data = await readFile(filePath)
+      response.writeHead(200, { 'Content-Type': contentTypeForPath(filePath) })
+      response.end(data)
+    } catch (error) {
+      response.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      response.end(error instanceof Error ? error.message : String(error))
+    }
+  })
+
+  await new Promise((resolveListen, rejectListen) => {
+    server.once('error', rejectListen)
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', rejectListen)
+      resolveListen()
+    })
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('无法启动前端 headless 静态渲染服务')
+  return {
+    server,
+    url: `http://127.0.0.1:${address.port}/?openwpsHeadlessRender=1`,
+  }
+}
+
+async function openFrontendRendererPage(browser, docJson, pageConfig) {
+  const renderPage = await browser.newPage({
+    viewport: { width: pageConfig.pageWidth, height: pageConfig.pageHeight },
+    deviceScaleFactor: 1,
+  })
+  const payload = { docJson, pageConfig }
+  await renderPage.addInitScript(value => {
+    window.__OPENWPS_HEADLESS_PAYLOAD__ = value
+    window.sessionStorage.setItem('openwps.headless.payload', JSON.stringify(value))
+  }, payload)
+
+  let lastError = null
+  try {
+    await renderPage.goto(appendHeadlessRenderParam(process.env.OPENWPS_HEADLESS_RENDERER_URL || 'http://localhost:5174/'), {
+      waitUntil: 'networkidle',
+      timeout: 10000,
+    })
+    await renderPage.waitForFunction(() => window.__OPENWPS_HEADLESS_READY__ || window.__OPENWPS_HEADLESS_ERROR__, null, { timeout: 10000 })
+    return { renderPage, staticServer: null }
+  } catch (error) {
+    lastError = error
+  }
+
+  const staticRenderer = await startStaticDistRendererServer()
+  try {
+    await renderPage.goto(staticRenderer.url, { waitUntil: 'networkidle', timeout: 10000 })
+    await renderPage.waitForFunction(() => window.__OPENWPS_HEADLESS_READY__ || window.__OPENWPS_HEADLESS_ERROR__, null, { timeout: 10000 })
+    return { renderPage, staticServer: staticRenderer.server }
+  } catch (error) {
+    await new Promise(resolveClose => staticRenderer.server.close(resolveClose))
+    throw error || lastError
+  }
+}
+
 async function capturePageScreenshot(doc, pageConfig, params) {
   const pageNumber = Number(params.page ?? 1)
   if (!Number.isInteger(pageNumber) || pageNumber < 1) return fail('page 必须是从 1 开始的整数')
   const { chromium } = await import('playwright')
   const browser = await chromium.launch({ headless: true })
+  let renderPage = null
+  let staticServer = null
   try {
-    const page = await browser.newPage({ viewport: { width: pageConfig.pageWidth, height: pageConfig.pageHeight }, deviceScaleFactor: 1 })
-    await page.setContent(docToHtml(doc, pageConfig), { waitUntil: 'networkidle' })
-    const metrics = await page.evaluate(() => {
-      const el = document.querySelector('.page')
-      return {
-        width: Math.ceil(el?.scrollWidth || document.documentElement.scrollWidth || 0),
-        height: Math.ceil(el?.scrollHeight || document.documentElement.scrollHeight || 0),
-      }
-    })
-    const pageCount = Math.max(1, Math.ceil(Number(metrics.height || pageConfig.pageHeight) / pageConfig.pageHeight))
+    const opened = await openFrontendRendererPage(browser, doc.toJSON(), pageConfig)
+    renderPage = opened.renderPage
+    staticServer = opened.staticServer
+    const renderError = await renderPage.evaluate(() => window.__OPENWPS_HEADLESS_ERROR__ ?? null)
+    if (renderError) return fail(`前端 headless 渲染失败：${renderError}`)
+    await renderPage.evaluate(() => document.fonts?.ready)
+    const metrics = await renderPage.evaluate(() => window.__OPENWPS_HEADLESS_READY__)
+    const pageCount = Math.max(1, Number(metrics?.pageCount ?? 1) || 1)
     if (pageNumber > pageCount) return fail(`未找到第 ${pageNumber} 页，当前服务端渲染约 ${pageCount} 页`)
-    const clipY = (pageNumber - 1) * pageConfig.pageHeight
-    await page.setViewportSize({ width: pageConfig.pageWidth, height: pageConfig.pageHeight })
-    const bytes = await page.screenshot({
+    const pageGap = Number(metrics?.pageGap ?? HEADLESS_PAGE_GAP) || HEADLESS_PAGE_GAP
+    const clipY = (pageNumber - 1) * (pageConfig.pageHeight + pageGap)
+    const totalHeight = pageCount * pageConfig.pageHeight + Math.max(0, pageCount - 1) * pageGap
+    await renderPage.setViewportSize({
+      width: pageConfig.pageWidth,
+      height: Math.max(pageConfig.pageHeight, Math.min(totalHeight, 16000)),
+    })
+    const bytes = await renderPage.screenshot({
       type: 'png',
       clip: {
         x: 0,
@@ -992,9 +1042,14 @@ async function capturePageScreenshot(doc, pageConfig, params) {
       width: pageConfig.pageWidth,
       height: pageConfig.pageHeight,
       instruction: String(params.instruction ?? ''),
+      renderer: 'frontend-pretext-headless',
       dataUrl,
     })
+  } catch (error) {
+    return fail(`服务端页面截图失败：${error instanceof Error ? error.message : String(error)}`)
   } finally {
+    if (renderPage) await renderPage.close().catch(() => undefined)
+    if (staticServer) await new Promise(resolveClose => staticServer.close(resolveClose))
     await browser.close()
   }
 }
