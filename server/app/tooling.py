@@ -182,7 +182,6 @@ TOOLS = [
                         "type": "string",
                         "description": "Agent 类型，如 general-purpose、document-research、writing-plan、layout-plan、verification",
                     },
-                    "model": {"type": "string", "description": "可选模型名；不填则继承当前会话模型或 Agent 默认模型"},
                     "run_in_background": {"type": "boolean", "description": "是否后台运行；后台 Agent 使用当前上下文快照和服务端工具"},
                 },
                 "required": ["description", "prompt"],
@@ -533,6 +532,110 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "delete_table",
+            "description": "删除指定的整个表格。先用 get_document_content 或 get_page_content 读取 tableIndex，再传入 tableIndex。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "要删除的表格索引，从 0 开始；来自读取工具返回的 tableIndex"},
+                },
+                "required": ["tableIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table_row_before",
+            "description": "在指定表格的指定行上方插入一行。tableIndex/rowIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "rowIndex": {"type": "integer", "description": "目标行索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "rowIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table_row_after",
+            "description": "在指定表格的指定行下方插入一行。tableIndex/rowIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "rowIndex": {"type": "integer", "description": "目标行索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "rowIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_table_row",
+            "description": "删除指定表格的指定整行。tableIndex/rowIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "rowIndex": {"type": "integer", "description": "要删除的行索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "rowIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table_column_before",
+            "description": "在指定表格的指定列左侧插入一列。tableIndex/columnIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "columnIndex": {"type": "integer", "description": "目标列索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "columnIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_table_column_after",
+            "description": "在指定表格的指定列右侧插入一列。tableIndex/columnIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "columnIndex": {"type": "integer", "description": "目标列索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "columnIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_table_column",
+            "description": "删除指定表格的指定整列。tableIndex/columnIndex 来自 get_document_content 或 get_page_content 返回的表格结构。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tableIndex": {"type": "integer", "description": "表格索引，从 0 开始"},
+                    "columnIndex": {"type": "integer", "description": "要删除的列索引，从 0 开始"},
+                },
+                "required": ["tableIndex", "columnIndex"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "begin_streaming_write",
             "description": "一次性写入后端权威 Markdown 正文。必须把完整正文放在 markdown 参数中；不要先声明位置后再把侧边栏回复当正文输出。适合新增长段落、表格、分割线或整体改写整段。",
             "parameters": {
@@ -770,7 +873,7 @@ TOOLS = [
             "description": (
                 "在用户上传的工作区参考文档中搜索关键词。返回所有文档中包含该关键词的片段及上下文。"
                 "多个关键词用空格分隔，采用AND逻辑（所有关键词都需匹配）。"
-                "用于在写文档时查找参考资料、数据、法规条款等。"
+                "仅在用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时使用；不要因工作区列表存在而主动搜索。"
             ),
             "parameters": {
                 "type": "object",
@@ -833,7 +936,7 @@ TOOLS = [
             "name": "workspace_read",
             "description": (
                 "读取工作区中某个参考文档的完整内容或指定行范围的内容。"
-                "用于详细查看某篇参考文档的内容。"
+                "仅在用户要求引用/处理该资料，或当前任务确实需要全文证据时使用；不要读取未使用的参考文件来凑进度。"
             ),
             "parameters": {
                 "type": "object",
@@ -875,6 +978,12 @@ LAYOUT_TOOL_NAMES = {
     "insert_horizontal_rule",
     "insert_table_of_contents",
     "insert_table",
+    "insert_table_row_before",
+    "insert_table_row_after",
+    "delete_table_row",
+    "insert_table_column_before",
+    "insert_table_column_after",
+    "delete_table_column",
     "apply_style_batch",
 }
 
@@ -895,6 +1004,7 @@ EDIT_TOOL_NAMES = {
     "replace_selection_text",
     "delete_selection_text",
     "delete_paragraph",
+    "delete_table",
     "insert_image",
     "insert_mermaid",
 }

@@ -120,6 +120,12 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "insert_page_break": ToolMetadata("write", "write", "在指定段落后插入分页符。", "大章节段前分页也可用 set_paragraph_style(pageBreakBefore=true)。", search_hint="分页符 换页", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
     "insert_horizontal_rule": ToolMetadata("write", "write", "插入水平分割线。", "不要用 Markdown --- 模拟分页。", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
     "insert_table": ToolMetadata("write", "write", "插入表格；有完整数据时优先一次传 data 二维数组。", "不要先插空表再逐格补内容。", search_hint="表格 插入表格 data", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "insert_table_row_before": ToolMetadata("write", "write", "按 tableIndex/rowIndex 在表格目标行上方插入一行。", "先用读取工具确认表格索引和行索引。", search_hint="表格 插入行 行索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "insert_table_row_after": ToolMetadata("write", "write", "按 tableIndex/rowIndex 在表格目标行下方插入一行。", "先用读取工具确认表格索引和行索引。", search_hint="表格 插入行 行索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "delete_table_row": ToolMetadata("delete", "delete", "按 tableIndex/rowIndex 删除表格整行。", "不要用 delete_paragraph 删除表格行。先用读取工具确认表格索引和行索引。", search_hint="表格 删除行 行索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "insert_table_column_before": ToolMetadata("write", "write", "按 tableIndex/columnIndex 在表格目标列左侧插入一列。", "先用读取工具确认表格索引和列索引。", search_hint="表格 插入列 列索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "insert_table_column_after": ToolMetadata("write", "write", "按 tableIndex/columnIndex 在表格目标列右侧插入一列。", "先用读取工具确认表格索引和列索引。", search_hint="表格 插入列 列索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
+    "delete_table_column": ToolMetadata("delete", "delete", "按 tableIndex/columnIndex 删除表格整列。", "不要用 delete_paragraph 删除表格列。先用读取工具确认表格索引和列索引。", search_hint="表格 删除列 列索引", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_LAYOUT_AGENT),
     "begin_streaming_write": ToolMetadata("write", "write", "长段、多段、表格 Markdown 或整体改写时一次性传入 markdown 写入。", "必须把完整正文放入 markdown 参数；不要把侧边栏回复当作文档正文。", "写完后需要用读取工具验证内容。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
     "insert_text": ToolMetadata("write", "write", "在段落末尾追加短文本。", "新增多段正文用 begin_streaming_write 或 insert_paragraph_after。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
     "insert_paragraph_after": ToolMetadata("write", "write", "在指定段落后插入一个短段落。", "长内容或多段用 begin_streaming_write。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
@@ -127,11 +133,12 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "replace_selection_text": ToolMetadata("write", "write", "替换当前选区文字；range 必须来自 context.selection。", "无选区时不要猜测 selection 范围。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
     "delete_selection_text": ToolMetadata("delete", "delete", "删除当前选区文字。", "无选区时不要调用。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
     "delete_paragraph": ToolMetadata("delete", "delete", "删除一个或多个整段；多段优先一次传 indices。", "删除前确认段落索引，避免索引漂移。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
+    "delete_table": ToolMetadata("delete", "delete", "按 tableIndex 删除整个表格。", "删除整表不要用 delete_paragraph；先用 get_document_content 或 get_page_content 确认 tableIndex。", search_hint="表格 删除整个表格 tableIndex", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_EDIT_AGENT),
     "apply_style_batch": ToolMetadata("style", "style", "全文排版、多范围样式、按角色设置标题/正文时优先使用。", "不要用多次单段样式工具替代可批量完成的操作。", "返回受影响快照。", batch_hint="推荐批量", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_LAYOUT_AGENT),
     "insert_image": ToolMetadata("write", "write", "插入已有 URL 或 data URL 图片。", "流程图/思维导图等应使用 insert_mermaid。", search_hint="图片 插入图片 URL data URL", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_EDIT_AGENT),
     "insert_mermaid": ToolMetadata("write", "write", "插入流程图、时序图、类图、甘特图、思维导图等 Mermaid 图表。", "不要用文字/表格模拟图表。", search_hint="Mermaid 流程图 时序图 思维导图", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_EDIT_AGENT),
-    "workspace_search": ToolMetadata("search", "search", "在工作区参考文档中先定位关键词、条款、数据或范文。", "工作区文档能回答时不要先联网。", search_hint="工作区 参考文档 搜索", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
-    "workspace_read": ToolMetadata("read", "read", "按 doc_id 读取工作区文档全文或行范围。", "先用 workspace_search 定位后再读取更稳。", search_hint="读取工作区文档 doc_id", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_search": ToolMetadata("search", "search", "用户要求引用/处理工作区资料，或任务确实缺少外部参考时，在工作区参考文档中定位关键词、条款、数据或范文。", "工作区文档能回答时不要先联网；不要因文件列表存在而主动搜索。", search_hint="工作区 参考文档 搜索", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_read": ToolMetadata("read", "read", "用户要求引用/处理某篇工作区资料，或任务确实需要全文证据时，按 doc_id 读取全文或行范围。", "先用 workspace_search 定位后再读取更稳；不要读取未使用的参考文件来凑进度。", search_hint="读取工作区文档 doc_id", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
     "web_search": ToolMetadata("search", "web", "任务依赖最新信息、公开网页或工作区外事实时使用。", "当前文档或工作区资料足够时不要联网。", search_hint="联网 搜索 网页 最新 新闻", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
 }
 
@@ -258,7 +265,7 @@ def build_tool_guidance_section(
         if enabled & {"apply_style_batch", "set_text_style", "set_paragraph_style", "clear_formatting", "set_page_config", "insert_table_of_contents"}:
             lines.append("- 排版阶梯：全文或多范围样式优先 apply_style_batch；只改文字片段用 set_text_style；改对齐/缩进/标题级别用 set_paragraph_style；目录必须 insert_table_of_contents。")
         if enabled & {"workspace_search", "workspace_read", "web_search"}:
-            lines.append("- 资料检索：工作区资料优先 workspace_search 再 workspace_read；只有用户要求引用资料或当前任务确实依赖外部参考时才搜索工作区，不要把会话开始时已有的工作区文件当成任务进展。")
+            lines.append("- 资料检索：只有用户要求引用/处理工作区资料，或当前任务确实依赖外部参考时才搜索工作区；工作区 manifest 不是新增事件，不要把已有文件当成任务进展或最终回复的主动建议。")
         if "Agent" in enabled:
             lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，文档内图片语义用 image-analysis，复杂验收用 verification。")
             lines.append("- 多页视觉验收时，先读取页数；然后在同一轮并行发起多个 Agent(subagent_type='verification')，每个委托只指定一个页码和对应验收标准。")

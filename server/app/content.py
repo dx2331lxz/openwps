@@ -183,8 +183,14 @@ def build_delta_content(
     messages: list[Any],
     *,
     force_full: bool = False,
+    previous_workspace_docs: list[dict[str, Any]] | None = None,
 ) -> ContentBuildResult:
-    deltas = compute_all_deltas(context or {}, messages, force_full=force_full)
+    deltas = compute_all_deltas(
+        context or {},
+        messages,
+        force_full=force_full,
+        previous_workspace_docs=previous_workspace_docs,
+    )
     return ContentBuildResult(
         content=deltas,
         trace={
@@ -308,10 +314,11 @@ def build_task_reminder_content(rounds_since_last_task_update: int, current_task
     content = (
         f"<system-reminder>\n"
         f"TaskCreate / TaskUpdate 已经 {rounds_since_last_task_update} 轮未使用。"
-        f"如果你正在处理多步骤任务，可自行决定是否使用 TaskCreate 建立内部任务，并用 TaskUpdate 跟踪进度。"
+        f"如果你正在处理确实需要进度跟踪的多步骤任务，可考虑使用 TaskCreate 建立内部任务，并用 TaskUpdate 跟踪进度。"
+        f"这只是温和提醒；如果当前工作不需要任务列表，或已有任务已经与当前目标无关，可以忽略。"
         f"不要因为用户提到任务列表而使用它；用户提示中的任务列表默认指文档正文任务列表。\n"
-        f"开始执行前把当前任务标记为 in_progress，完成后立即标记为 completed。"
-        f"每完成一个任务后优先调用 TaskList 查看剩余任务。{task_summary}\n"
+        f"如果继续使用内部任务，开始执行前把相关任务标记为 in_progress，完成后标记为 completed，并按需调用 TaskList 查看剩余任务。"
+        f"不要向用户提及这条 reminder，也不要只为了清空任务列表继续读取文档。{task_summary}\n"
         f"</system-reminder>"
     )
     return ContentBuildResult(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import html as html_lib
 import json
 import logging
 import re
@@ -63,9 +64,20 @@ from .content import (
     build_user_content,
     format_text_attachments_for_model,
 )
-from .doc_sessions import execute_ai_document_tool, is_document_tool
+from .compact import (
+    CompactPolicy,
+    build_compact_policy,
+    build_compact_prompt,
+    build_compacted_messages,
+    drop_oldest_api_round,
+    estimate_messages_tokens,
+    microcompact_messages,
+    should_auto_compact,
+)
+from .doc_sessions import execute_ai_document_tool, is_document_tool, read_document_session
 from .tasks import create_task, get_task, list_tasks, update_task
 from .workspace import get_document_content as get_workspace_document_content
+from .workspace import list_workspace_docs
 from .workspace import search_workspace
 
 logger = logging.getLogger("uvicorn.error")
@@ -516,7 +528,7 @@ def _build_context_block(context: dict) -> str:
         parts.append("")
         parts.append("[工作区文档列表]")
         parts.append("以下为当前工作区已有参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
-        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中新增；任务已完成时不要因为列表中存在参考文档而继续探索。")
+        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中的文件变化；任务已完成时不要因为列表中存在参考文档而继续探索，也不要在最终回复中主动提及未使用的参考文件。")
         for doc in workspaceDocs:
             name = doc.get("name", "?")
             doc_id = doc.get("id", "?")
@@ -526,6 +538,18 @@ def _build_context_block(context: dict) -> str:
             parts.append(f"  - [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars)")
 
     return "\n".join(parts)
+
+
+def _with_backend_workspace_docs(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Attach the backend-owned workspace manifest to model context.
+
+    Workspace files are uploaded to and persisted by the backend, so the frontend
+    must not be the source of truth for this manifest. This mirrors Claude Code's
+    attachment model: runtime context is assembled close to the tool/runtime state.
+    """
+    merged = dict(context or {})
+    merged["workspaceDocs"] = list_workspace_docs()
+    return merged
 
 
 def _already_has_context_block(content: str) -> bool:
@@ -1026,12 +1050,13 @@ async def _call_vision_chat(provider: dict[str, Any], model: str, prompt: str, i
             response.raise_for_status()
             body = response.json()
         except httpx.HTTPStatusError as exc:
-            detail = exc.response.text.strip() or str(exc)
-            if _looks_like_multimodal_capability_error(detail):
-                raise HTTPException(status_code=400, detail=f"多模态模型未配置或不支持图片输入：{_compact_text_preview(detail, 180)}") from exc
+            raw_detail = exc.response.text.strip() or str(exc)
+            detail = _sanitize_upstream_error_detail(raw_detail, status_code=exc.response.status_code)
+            if _looks_like_multimodal_capability_error(raw_detail):
+                raise HTTPException(status_code=400, detail=f"多模态模型未配置或不支持图片输入：{_sanitize_upstream_error_detail(raw_detail, status_code=exc.response.status_code, limit=180)}") from exc
             raise HTTPException(status_code=502, detail=f"多模态模型请求失败: {detail}") from exc
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"多模态模型请求失败: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"多模态模型请求失败: {_sanitize_upstream_error_detail(str(exc))}") from exc
 
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(choices, list) or not choices:
@@ -1155,6 +1180,53 @@ def _looks_like_multimodal_capability_error(detail: str) -> bool:
     return any(hint in normalized for hint in hints)
 
 
+def _looks_like_html_error_text(detail: str) -> bool:
+    normalized = detail.strip().lower()
+    if not normalized:
+        return False
+    return (
+        "<!doctype html" in normalized
+        or "<html" in normalized
+        or ("<head" in normalized and "<body" in normalized)
+        or ("content-security-policy" in normalized and "</html>" in normalized)
+    )
+
+
+def _html_text_preview(detail: str, limit: int = 260) -> str:
+    unescaped = html_lib.unescape(detail)
+    without_assets = re.sub(r"(?is)<(script|style|svg|noscript)[^>]*>.*?</\1>", " ", unescaped)
+    without_tags = re.sub(r"(?is)<[^>]+>", " ", without_assets)
+    without_data_urls = re.sub(r"data:image/[^\\s\"')]+", "data:image/...省略", without_tags)
+    return _compact_text_preview(without_data_urls, limit)
+
+
+def _sanitize_upstream_error_detail(detail: Any, *, status_code: int | None = None, limit: int = 900) -> str:
+    text = _stringify_content(detail).strip() or "未知错误"
+    if _looks_like_html_error_text(text):
+        normalized = text.lower()
+        title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+        title = _compact_text_preview(html_lib.unescape(title_match.group(1)), 120) if title_match else ""
+        status_text = f"HTTP {status_code}，" if status_code else ""
+        if "cloudflare" in normalized or "challenges.cloudflare.com" in normalized or "just a moment" in normalized:
+            base = f"{status_text}上游返回了 Cloudflare 人机验证/挑战 HTML 页面，而不是模型 API JSON/SSE 响应。"
+        else:
+            base = f"{status_text}上游返回了 HTML 页面，而不是模型 API JSON/SSE 响应。"
+        title_text = f" title={title!r}。" if title else ""
+        preview = _html_text_preview(text, 240)
+        preview_text = f"页面文本摘要：{preview}" if preview else ""
+        return _compact_text_preview(f"{base}{title_text}{preview_text}", limit)
+    return _compact_text_preview(text, limit)
+
+
+def _sanitize_tool_result_message(message: Any, *, success: bool) -> str:
+    text = _stringify_content(message).strip()
+    if not text:
+        return ""
+    if _looks_like_html_error_text(text):
+        return _sanitize_upstream_error_detail(text, limit=900)
+    return _compact_text_preview(text, 1200 if success else 900)
+
+
 def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
     text = detail.strip() or "未知错误"
     normalized = text.lower()
@@ -1176,23 +1248,23 @@ def _normalize_ai_api_error_detail(body: ChatRequest, detail: str) -> str:
             "当前端点不能被后端作为模型 API 直接调用，请在 AI 设置中切换到可直连的服务商/端点，或更换当前 API 网关。"
         )
 
-    if "<!doctype html" in normalized or "<html" in normalized:
+    if _looks_like_html_error_text(text):
         return (
             f"{provider_name}{endpoint_hint} 返回了 HTML 页面，而不是模型 API 的 JSON/SSE 响应。"
-            f"请检查端点是否填到了 API base URL；上游返回摘要：{_compact_text_preview(text, 180)}"
+            f"请检查端点是否填到了 API base URL；上游返回摘要：{_sanitize_upstream_error_detail(text, limit=220)}"
         )
 
     images = body.images or []
     if not images:
-        return text
+        return _sanitize_upstream_error_detail(text, limit=1200)
     if not _looks_like_multimodal_capability_error(text):
-        return text
+        return _sanitize_upstream_error_detail(text, limit=1200)
 
     model_text = model_name or str(provider.get("defaultModel") or "当前模型")
     return (
         f"当前模型 {model_text} 未接受图片输入，或 {provider_name} 接口不兼容 image_url 图片格式。"
         f"系统已按多模态路径尝试发送图片，但上游返回不支持。"
-        f"请切换到明确支持视觉的模型，或改用 /ocr 命令 / OCR 工具处理识别型任务。上游错误：{_compact_text_preview(text, 160)}"
+        f"请切换到明确支持视觉的模型，或改用 /ocr 命令 / OCR 工具处理识别型任务。上游错误：{_sanitize_upstream_error_detail(text, limit=180)}"
     )
 
 
@@ -1889,7 +1961,7 @@ async def _call_ocr_style_analysis_for_image(
                 response.raise_for_status()
                 body = response.json()
             except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip() or str(exc)
+                detail = _sanitize_upstream_error_detail(exc.response.text.strip() or str(exc), status_code=exc.response.status_code)
                 last_error = detail
                 logger.warning(
                     "[openwps.ocr] image=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
@@ -2246,7 +2318,7 @@ async def _call_paddleocr_service_layout_parsing(
             response.raise_for_status()
             body = response.json()
         except httpx.HTTPStatusError as exc:
-            detail = exc.response.text.strip() or str(exc)
+            detail = _sanitize_upstream_error_detail(exc.response.text.strip() or str(exc), status_code=exc.response.status_code)
             logger.warning(
                 "[openwps.ocr.service] image=%s task=%s http_error status=%s endpoint=%s detail=%s",
                 index,
@@ -2264,7 +2336,7 @@ async def _call_paddleocr_service_layout_parsing(
                 endpoint,
                 exc,
             )
-            raise HTTPException(status_code=502, detail=f"PaddleOCR 服务请求失败: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"PaddleOCR 服务请求失败: {_sanitize_upstream_error_detail(str(exc))}") from exc
 
     results = _extract_paddleocr_service_results(body if isinstance(body, dict) else {})
     if not results:
@@ -2377,7 +2449,7 @@ async def _call_ocr_model_for_image(ocr_config: OCRConfig, image: dict[str, Any]
                 response.raise_for_status()
                 body = response.json()
             except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip() or str(exc)
+                detail = _sanitize_upstream_error_detail(exc.response.text.strip() or str(exc), status_code=exc.response.status_code)
                 last_error = detail
                 logger.warning(
                     "[openwps.ocr] image=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
@@ -2400,7 +2472,7 @@ async def _call_ocr_model_for_image(ocr_config: OCRConfig, image: dict[str, Any]
                     ocr_config.model,
                     exc,
                 )
-                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {exc}") from exc
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {_sanitize_upstream_error_detail(str(exc))}") from exc
 
             content, finish_reason = _extract_ocr_response_content(body)
             logger.info(
@@ -2514,7 +2586,7 @@ async def _call_ocr_model_for_task(
                 response.raise_for_status()
                 body = response.json()
             except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip() or str(exc)
+                detail = _sanitize_upstream_error_detail(exc.response.text.strip() or str(exc), status_code=exc.response.status_code)
                 last_error = detail
                 logger.warning(
                     "[openwps.ocr.task] image=%s task=%s attempt=%s http_error status=%s endpoint=%s model=%s detail=%s",
@@ -2539,7 +2611,7 @@ async def _call_ocr_model_for_task(
                     ocr_config.model,
                     exc,
                 )
-                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {exc}") from exc
+                raise HTTPException(status_code=502, detail=f"OCR 模型请求失败: {_sanitize_upstream_error_detail(str(exc))}") from exc
 
             content, finish_reason = _extract_ocr_response_content(body)
             parsed = _extract_json_object(content)
@@ -2691,42 +2763,50 @@ def _log_final_user_message(body: ChatRequest, messages: list[BaseMessage]) -> N
 # ─── Session-based ReAct infrastructure ──────────────────────────────────────
 
 MAX_REACT_ROUNDS = 50
-KEEP_FULL_ROUNDS = 3
 TOOL_RESULT_TIMEOUT = 300  # seconds
 MAX_RETRIES_PER_ROUND = 2
 MAX_FORCED_FOLLOW_UPS = 3
 MAX_OUTPUT_CONTINUATIONS = 3
+MAX_COMPACT_RETRIES = 3
+MAX_CONTEXT_OVERFLOW_RETRIES = 3
+MAX_READ_ONLY_STAGNANT_ROUNDS = 3
 MAX_MULTIMODAL_IMAGES = 5
 TODO_REMINDER_INTERVAL = 10  # turns between task reminders (Claude Code pattern)
 MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 RETRY_DELAYS = [1.0, 2.0, 4.0]
-# Token budget: trigger compression when estimated input tokens exceed this
-TOKEN_BUDGET_SOFT = 24_000   # tier-1 compression kicks in
-TOKEN_BUDGET_HARD = 48_000   # tier-2 round summary
-TOKEN_BUDGET_CRITICAL = 80_000  # tier-3 aggressive truncation
+LAYOUT_PREFLIGHT_BATCH_SIZE = 3
 
+LAYOUT_PREFLIGHT_STYLE_TOOLS = {
+    "apply_style_batch",
+    "set_page_config",
+    "set_text_style",
+    "set_paragraph_style",
+    "clear_formatting",
+}
 
-# ─── Token Estimation ─────────────────────────────────────────────────────────
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token count: ~1.5 chars/token for CJK, ~4 chars/token for Latin."""
-    if not text:
-        return 0
-    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-    other = len(text) - cjk
-    return int(cjk / 1.5 + other / 4)
-
-
-def _estimate_messages_tokens(messages: list[BaseMessage]) -> int:
-    total = 0
-    for msg in messages:
-        total += _estimate_tokens(_stringify_content(msg.content))
-        if isinstance(msg, AIMessage):
-            for tc in msg.tool_calls:
-                total += _estimate_tokens(json.dumps(tc.get("args", {}), ensure_ascii=False))
-        total += 4  # per-message overhead
-    return total
+LAYOUT_LOCKED_CONTENT_TOOLS = {
+    "begin_streaming_write",
+    "insert_text",
+    "insert_paragraph_after",
+    "replace_paragraph_text",
+    "replace_selection_text",
+    "delete_selection_text",
+    "delete_paragraph",
+    "delete_table",
+    "insert_page_break",
+    "insert_image",
+    "insert_mermaid",
+    "insert_horizontal_rule",
+    "insert_table_of_contents",
+    "insert_table",
+    "insert_table_row_before",
+    "insert_table_row_after",
+    "delete_table_row",
+    "insert_table_column_before",
+    "insert_table_column_after",
+    "delete_table_column",
+}
 
 
 # ─── State Machine ─────────────────────────────────────────────────────────────
@@ -2753,8 +2833,12 @@ class LoopState:
     round: int = 0
     retries_this_round: int = 0
     consecutive_errors: int = 0
-    compression_tier: int = 0  # 0=none, 1=tool_compress, 2=round_summary, 3=aggressive
     estimated_tokens: int = 0
+    last_compact_source: str = ""
+    last_compact_pre_tokens: int = 0
+    last_compact_post_tokens: int = 0
+    compact_failure_count: int = 0
+    microcompact_count: int = 0
     pending_write_follow_up: bool = False
     pending_agent_follow_up: bool = False
     forced_follow_up_attempts: int = 0
@@ -2766,13 +2850,20 @@ class LoopState:
     requires_task_check: bool = False
     last_mutation_tools: list[str] = field(default_factory=list)
     round_budget_warning_level: int = 0
-    last_token_budget_warning_tier: int = 0
+    last_compact_warning_source: str = ""
     last_budget_progress_signature: str = ""
     stagnant_budget_rounds: int = 0
     budget_stagnation_warning_level: int = 0
+    read_only_stagnant_rounds: int = 0
     output_continuation_attempts: int = 0
     last_model_finish_reason: str = ""
     vision_capability_blocked: bool = False
+    layout_preflight_required: bool = False
+    layout_preflight_completed: bool = False
+    layout_preflight_failed: bool = False
+    content_locked_for_layout: bool = False
+    layout_style_dossier: dict[str, Any] = field(default_factory=dict)
+    layout_preflight_signature: dict[str, Any] = field(default_factory=dict)
     # Delta tracking (Claude Code-style attachment system)
     previous_workspace_docs: list[dict] = field(default_factory=list)
     previous_template: dict | None = None
@@ -3282,27 +3373,25 @@ def _build_follow_up_hint(
         parts.append("结束前必须先确认当前任务列表，不能直接假设任务已经全部完成。")
 
     if incomplete_tasks and vision_capability_blocked:
-        reasons.append("task_incomplete_due_to_vision_block")
         preview_titles = [task.get("subject", "") for task in incomplete_tasks if task.get("subject")][:3]
         title_text = f" 未完成项示例：{'；'.join(preview_titles)}。" if preview_titles else ""
         parts.append(
-            f"当前任务列表仍有 {len(incomplete_tasks)} 个未完成项，但当前模型缺少视觉能力。{title_text}"
-            "如果这些未完成项依赖截图或图片视觉验收，请调用 TaskUpdate 标记为 blocked，或直接向用户给出受限结论；不要继续读取全文或搜索工作区来拖延。"
+            f"内部任务列表仍有 {len(incomplete_tasks)} 个未完成项，但当前模型缺少视觉能力。{title_text}"
+            "这只是进度提醒，不是继续循环的理由；如果目标已能解释清楚，请总结限制并结束，不要继续读取全文或搜索工作区来拖延。"
         )
     elif incomplete_tasks:
-        reasons.append("task_incomplete")
         preview_titles = [task.get("subject", "") for task in incomplete_tasks if task.get("subject")][:3]
         title_text = f" 未完成项示例：{'；'.join(preview_titles)}。" if preview_titles else ""
         parts.append(
-            f"当前任务列表仍有 {len(incomplete_tasks)} 个未完成项（pending / in_progress）。{title_text}"
+            f"内部任务列表仍有 {len(incomplete_tasks)} 个未完成项（pending / in_progress）。{title_text}"
+            "这只是工作记忆提醒，不是继续循环的理由；如果任务仍与当前目标相关，请用 TaskUpdate 更新状态。"
+            "如果已经不相关或用户没有新的编辑指令，可以忽略它并直接回复用户，不要只为了清空任务列表继续读取文档。"
         )
-    else:
-        parts.append("如果本轮没有内部任务，也至少先调用验证工具确认写入结果，再决定是否结束。")
 
     if vision_capability_blocked:
         parts.append("视觉能力不可用时，不要把视觉验收作为继续循环的理由；完成可完成的结构化验证后即可总结限制并结束。")
     else:
-        parts.append("只有在验证完成，且 TaskList 显示不存在 pending / in_progress 后，才能结束并向用户总结。")
+        parts.append("完成上述必要验证或 TaskList 核对后，如果没有新的工具动作，就直接向用户总结；不要因为仍有 pending / in_progress 内部任务而继续循环。")
     return "\n".join(parts), reasons[0] if reasons else "continue_required"
 
 
@@ -3323,6 +3412,7 @@ CONTENT_VERIFICATION_TOOLS = {
 
 TASK_MUTATION_TOOLS = {"TaskCreate", "TaskUpdate"}
 TASK_CHECK_TOOLS = {"TaskList"}
+READ_ONLY_STAGNATION_TOOLS = {"TaskList", "TaskGet", "get_paragraph", "get_document_content", "search_text"}
 
 
 def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str, str]]) -> None:
@@ -3357,13 +3447,11 @@ def _update_completion_gate_state(state: LoopState, tool_results: list[dict[str,
 
 def _needs_forced_continuation(state: LoopState, messages: list[BaseMessage]) -> tuple[bool, list[dict[str, str]]]:
     incomplete_tasks = _get_incomplete_tasks(messages)
-    incomplete_tasks_require_continuation = bool(incomplete_tasks) and not state.vision_capability_blocked
     needs_continue = any([
         state.pending_write_follow_up,
         state.pending_agent_follow_up,
         state.requires_content_verification,
         state.requires_task_check,
-        incomplete_tasks_require_continuation,
     ])
     return needs_continue, incomplete_tasks
 
@@ -3424,10 +3512,7 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
     if (
         stagnant_rounds >= 2
         and state.budget_stagnation_warning_level < 1
-        and (
-            remaining_rounds <= 5
-            or (state.compression_tier >= 2 and state.estimated_tokens >= TOKEN_BUDGET_HARD)
-        )
+        and remaining_rounds <= 5
     ):
         return BudgetEvaluation(
             should_warn=True,
@@ -3448,19 +3533,6 @@ def _evaluate_budget_policy(state: LoopState, messages: list[BaseMessage]) -> Bu
             hint=(
                 f"自动执行轮次仅剩 {remaining_rounds} 轮。后续必须收敛到最小动作："
                 f"优先完成验证、TaskList 核对和最终总结，不要再扩散任务或重新读取大段内容。"
-            ),
-            remaining_rounds=remaining_rounds,
-            estimated_tokens=state.estimated_tokens,
-            stagnant_rounds=stagnant_rounds,
-        )
-
-    if state.compression_tier >= 2 and state.estimated_tokens >= TOKEN_BUDGET_HARD and state.last_token_budget_warning_tier < state.compression_tier:
-        return BudgetEvaluation(
-            should_warn=True,
-            reason="compressed_context_budget",
-            hint=(
-                f"上下文已进入压缩阶段（级别 {state.compression_tier}）。"
-                f"接下来只执行必要动作：优先验证、TaskList 核对和总结，不要再扩展新的探索步骤。"
             ),
             remaining_rounds=remaining_rounds,
             estimated_tokens=state.estimated_tokens,
@@ -3503,17 +3575,13 @@ def _mark_budget_warning_emitted(state: LoopState, evaluation: BudgetEvaluation)
     if evaluation.reason == "critical_round_budget":
         state.round_budget_warning_level = max(state.round_budget_warning_level, 2)
         return
-    if evaluation.reason == "compressed_context_budget":
-        state.last_token_budget_warning_tier = max(state.last_token_budget_warning_tier, state.compression_tier)
 
 
 def _build_budget_progress_signature(state: LoopState, messages: list[BaseMessage]) -> str:
-    incomplete_tasks = _get_incomplete_tasks(messages)
     return json.dumps(
         {
             "requiresContentVerification": state.requires_content_verification,
             "requiresTaskCheck": state.requires_task_check,
-            "incompleteTaskCount": len(incomplete_tasks),
             "lastMutationTools": list(state.last_mutation_tools),
             "visionCapabilityBlocked": state.vision_capability_blocked,
         },
@@ -3543,6 +3611,50 @@ def _track_budget_progress(state: LoopState, messages: list[BaseMessage], needs_
     state.stagnant_budget_rounds = 0
     state.budget_stagnation_warning_level = 0
     return 0
+
+
+def _build_gate_progress_signature(state: LoopState, messages: list[BaseMessage]) -> str:
+    incomplete_tasks = _get_incomplete_tasks(messages)
+    return json.dumps(
+        {
+            "pendingWriteFollowUp": state.pending_write_follow_up,
+            "pendingAgentFollowUp": state.pending_agent_follow_up,
+            "requiresContentVerification": state.requires_content_verification,
+            "requiresTaskCheck": state.requires_task_check,
+            "incompleteTaskCount": len(incomplete_tasks),
+            "lastMutationTools": list(state.last_mutation_tools),
+            "visionCapabilityBlocked": state.vision_capability_blocked,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _tool_round_is_read_only_stagnation_candidate(tool_calls: list[dict[str, Any]]) -> bool:
+    if not tool_calls:
+        return False
+    return all(str(tool_call.get("name") or "") in READ_ONLY_STAGNATION_TOOLS for tool_call in tool_calls)
+
+
+def _record_tool_round_progress(
+    state: LoopState,
+    messages: list[BaseMessage],
+    tool_calls: list[dict[str, Any]],
+    before_signature: str,
+) -> bool:
+    after_signature = _build_gate_progress_signature(state, messages)
+    gate_changed = before_signature != after_signature
+    if gate_changed:
+        state.forced_follow_up_attempts = 0
+        state.read_only_stagnant_rounds = 0
+        return True
+
+    needs_continue, incomplete_tasks = _needs_forced_continuation(state, messages)
+    if _tool_round_is_read_only_stagnation_candidate(tool_calls) and (needs_continue or incomplete_tasks):
+        state.read_only_stagnant_rounds += 1
+    else:
+        state.read_only_stagnant_rounds = 0
+    return False
 
 
 def _build_output_continue_hint(attempt: int) -> str:
@@ -3641,6 +3753,17 @@ def _decide_tool_round(
             finish_reason=stop_evaluation.reason,
         )
 
+    if state.read_only_stagnant_rounds >= MAX_READ_ONLY_STAGNANT_ROUNDS:
+        return RoundDecision(
+            action=RoundDecisionAction.ERROR,
+            transition=Transition.FATAL_ERROR,
+            reason="read_only_stagnation",
+            error_message=(
+                "AI 连续执行只读检查但没有推进必要的收口状态，已停止当前自动链路。"
+                "请根据当前结果继续下达下一步指令。"
+            ),
+        )
+
     if stop_evaluation.decision == StopDecision.RETRY_WITH_HINT:
         return RoundDecision(
             action=RoundDecisionAction.CONTINUE,
@@ -3672,8 +3795,12 @@ def _snapshot_completion_gate(state: LoopState, messages: list[BaseMessage]) -> 
         "forcedFollowUpAttempts": state.forced_follow_up_attempts,
         "stagnantBudgetRounds": state.stagnant_budget_rounds,
         "budgetStagnationWarningLevel": state.budget_stagnation_warning_level,
+        "readOnlyStagnantRounds": state.read_only_stagnant_rounds,
         "outputContinuationAttempts": state.output_continuation_attempts,
         "visionCapabilityBlocked": state.vision_capability_blocked,
+        "layoutPreflightRequired": state.layout_preflight_required,
+        "layoutPreflightCompleted": state.layout_preflight_completed,
+        "contentLockedForLayout": state.content_locked_for_layout,
     }
 
 
@@ -3695,6 +3822,177 @@ def _record_content_event(session: "ReactSession", event: dict[str, Any]) -> Non
 def _record_content_events(session: "ReactSession", events: list[dict[str, Any]]) -> None:
     for event in events:
         _record_content_event(session, event)
+
+
+def _message_text_for_intent(body: ChatRequest) -> str:
+    return _stringify_content(body.message).lower()
+
+
+def _has_document_session_context(body: ChatRequest, context: dict[str, Any] | None = None) -> bool:
+    ctx = context or body.context or {}
+    return bool(str(body.documentSessionId or ctx.get("documentSessionId") or "").strip())
+
+
+def _layout_content_mutation_explicitly_requested(body: ChatRequest) -> bool:
+    text = _message_text_for_intent(body)
+    return bool(re.search(r"(删除|删掉|移除|清空|写入|撰写|生成|续写|改写|替换|插入|新增|添加|加入|目录|表格|图片|图表|mermaid)", text))
+
+
+def _should_require_layout_preflight(body: ChatRequest, context: dict[str, Any] | None = None) -> bool:
+    if not _has_document_session_context(body, context):
+        return False
+    text = _message_text_for_intent(body)
+    broad_layout = bool(re.search(r"(按模板|模板排版|全文排版|整体排版|统一排版|统一格式|统一样式|排版|版式|页面设置|页边距|批量样式|全文格式|整体格式)", text))
+    if not broad_layout and str(body.mode or "").strip() == "layout":
+        broad_layout = bool(re.search(r"(全文|整体|模板|统一|页面|页边距|标题|正文|样式|格式)", text))
+    if not broad_layout:
+        return False
+
+    local_edit = bool(re.search(r"(第\s*\d+\s*段|选中|当前选区|这个词|这句话|局部|单段)", text))
+    if local_edit and not re.search(r"(全文|整体|模板|统一)", text):
+        return False
+    return True
+
+
+def _coerce_context_page_count(context: dict[str, Any] | None) -> int:
+    value = (context or {}).get("pageCount")
+    try:
+        parsed = int(value)
+    except Exception:
+        return 1
+    return max(1, min(parsed, 200))
+
+
+def _tool_call_touches_multiple_ranges(params: dict[str, Any]) -> bool:
+    range_value = params.get("range")
+    if not isinstance(range_value, dict):
+        return False
+    indexes = _extract_paragraph_indexes_for_merge(range_value)
+    if indexes and len(set(indexes)) > 1:
+        return True
+    if str(range_value.get("type") or "") in {"all", "paragraphs", "heading_role", "role"}:
+        return True
+    return False
+
+
+def _is_preflight_guarded_style_execution(execution: PlannedToolExecution) -> bool:
+    if execution.tool_name in {"apply_style_batch", "set_page_config"}:
+        return True
+    if execution.tool_name in {"set_text_style", "set_paragraph_style", "clear_formatting"}:
+        if len(execution.source_calls) > 1:
+            return True
+        return _tool_call_touches_multiple_ranges(execution.params)
+    return False
+
+
+def _is_layout_content_tool_blocked(tool_name: str) -> bool:
+    return tool_name in LAYOUT_LOCKED_CONTENT_TOOLS
+
+
+def _compact_dossier_result(value: str, max_len: int = 1800) -> str:
+    text = value.strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "\n...（已截断）"
+
+
+def _build_layout_preflight_prompt(page: int, page_count: int, *, screenshot_available: bool) -> str:
+    screenshot_step = (
+        f"3. 必须调用 capture_page_screenshot(page={page}, instruction='检查本页真实视觉排版、标题层级、分页、遮挡、表格/图片附近效果')。"
+        if screenshot_available
+        else "3. 当前运行时未暴露截图工具，不要要求截图；只基于结构化内容和样式摘要分析。"
+    )
+    return "\n".join([
+        f"父代理准备执行全文排版。你只分析第 {page}/{page_count} 页，不能修改文档，不能分析其他页。",
+        "必须按顺序完成：",
+        f"1. 调用 get_page_content(page={page}) 获取页内正文结构和文字。",
+        f"2. 调用 get_page_style_summary(page={page}) 获取本页样式摘要。",
+        screenshot_step,
+        "输出固定字段：page、storyTitles、styleSummary、styleAnomalies、recommendedFormattingActions、preserveContentNotes。",
+        "重点识别多故事/多章节边界：不要建议删除、合并或重写故事正文；只给样式和页面设置建议。",
+    ])
+
+
+def _format_layout_dossier_for_model(dossier: dict[str, Any]) -> str:
+    compact = {
+        "pageCount": dossier.get("pageCount"),
+        "visualEnabled": dossier.get("visualEnabled"),
+        "contentLockedForLayout": True,
+        "pages": [
+            {
+                "page": page.get("page"),
+                "success": page.get("success"),
+                "result": _compact_dossier_result(str(page.get("result") or ""), 1200),
+            }
+            for page in dossier.get("pages", [])
+            if isinstance(page, dict)
+        ],
+    }
+    return "\n".join([
+        "[Layout Preflight 完成]",
+        "以下是后端逐页样式预检生成的 layoutStyleDossier。接下来只能基于这些证据做样式和页面设置修改。",
+        "正文结构已锁定：排版阶段不得删除、重写、合并或插入故事正文；除非用户明确要求内容编辑。",
+        json.dumps(compact, ensure_ascii=False, indent=2),
+    ])
+
+
+def _doc_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    content = value.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(_doc_text(item) for item in content)
+
+
+def _layout_content_signature_from_doc(doc_json: dict[str, Any]) -> dict[str, Any]:
+    content = doc_json.get("content") if isinstance(doc_json.get("content"), list) else []
+    top_level_types: list[str] = []
+    paragraph_texts: list[str] = []
+    table_texts: list[list[list[str]]] = []
+    full_text_parts: list[str] = []
+    for node in content:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "")
+        top_level_types.append(node_type)
+        full_text_parts.append(_doc_text(node))
+        if node_type == "paragraph":
+            paragraph_texts.append(_doc_text(node))
+        elif node_type == "table":
+            rows: list[list[str]] = []
+            for row in node.get("content") or []:
+                if not isinstance(row, dict):
+                    continue
+                rows.append([
+                    _doc_text(cell)
+                    for cell in row.get("content") or []
+                    if isinstance(cell, dict)
+                ])
+            table_texts.append(rows)
+    return {
+        "topLevelTypes": top_level_types,
+        "paragraphCount": len(paragraph_texts),
+        "tableCount": len(table_texts),
+        "paragraphTextsHash": hashlib.sha256(json.dumps(paragraph_texts, ensure_ascii=False).encode("utf-8")).hexdigest(),
+        "tableTextsHash": hashlib.sha256(json.dumps(table_texts, ensure_ascii=False).encode("utf-8")).hexdigest(),
+        "fullTextHash": hashlib.sha256("\n".join(full_text_parts).encode("utf-8")).hexdigest(),
+    }
+
+
+async def _read_layout_content_signature(context: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(context.get("documentSessionId") or "").strip()
+    if not session_id:
+        return {}
+    try:
+        snapshot = await read_document_session(session_id)
+    except Exception:
+        return {}
+    doc_json = snapshot.get("docJson") if isinstance(snapshot.get("docJson"), dict) else {}
+    return _layout_content_signature_from_doc(doc_json)
 
 
 def _record_round_checkpoint(
@@ -3723,10 +4021,12 @@ def _record_round_checkpoint(
         "reason": reason,
         "modelFinishReason": model_finish_reason or session.state.last_model_finish_reason,
         "estimatedTokens": session.state.estimated_tokens,
-        "compressionTier": session.state.compression_tier,
+        "compactSource": session.state.last_compact_source,
+        "lastCompactPreTokens": session.state.last_compact_pre_tokens,
+        "lastCompactPostTokens": session.state.last_compact_post_tokens,
+        "microcompactCount": session.state.microcompact_count,
         "remainingRounds": max(MAX_REACT_ROUNDS - session.state.round, 0),
         "roundBudgetWarningLevel": session.state.round_budget_warning_level,
-        "lastTokenBudgetWarningTier": session.state.last_token_budget_warning_tier,
         "stagnantBudgetRounds": session.state.stagnant_budget_rounds,
         "budgetStagnationWarningLevel": session.state.budget_stagnation_warning_level,
         "outputContinuationAttempts": session.state.output_continuation_attempts,
@@ -3926,7 +4226,7 @@ def _serialize_tool_result_payload(
 ) -> str:
     payload: dict[str, Any] = {
         "success": success,
-        "message": message,
+        "message": _sanitize_tool_result_message(message, success=success),
         "data": data,
         "toolName": tool_name,
         "originalParams": original_params if original_params is not None else None,
@@ -4208,8 +4508,8 @@ def _task_stats(tasks: list[dict[str, Any]]) -> dict[str, int]:
 def _http_error_message(exc: HTTPException) -> str:
     detail = exc.detail
     if isinstance(detail, str):
-        return detail
-    return _stringify_content(detail) or f"HTTP {exc.status_code}"
+        return _sanitize_upstream_error_detail(detail, status_code=exc.status_code)
+    return _sanitize_upstream_error_detail(_stringify_content(detail) or f"HTTP {exc.status_code}", status_code=exc.status_code)
 
 
 async def _run_task_tool(tool_name: str, params: dict[str, Any], conversation_id: str | None) -> str:
@@ -4747,9 +5047,12 @@ class ReactSession:
         self.messages = messages
         self.state = LoopState()
         self.finished = False
-        self.latest_context: dict[str, Any] = dict(body.context or {})  # Updated each round
+        self.latest_context: dict[str, Any] = _with_backend_workspace_docs(body.context)  # Updated each round
         if body.documentSessionId:
             self.latest_context["documentSessionId"] = body.documentSessionId
+        workspace_docs = self.latest_context.get("workspaceDocs")
+        if isinstance(workspace_docs, list):
+            self.state.previous_workspace_docs = list(workspace_docs)
         self.loaded_deferred_tools: set[str] = set()
         self.server_streaming_write: dict[str, Any] | None = None
         self.workspace_tool_cache: set[str] = set()
@@ -4761,6 +5064,115 @@ class ReactSession:
             provider_id=body.providerId,
             created_at=_now_iso(),
         )
+
+
+def _build_task_snapshot_attachment(messages: list[BaseMessage]) -> HumanMessage | None:
+    tasks = _get_latest_tasks(messages)
+    if not tasks:
+        return None
+    payload = {
+        "type": "task_snapshot",
+        "mode": "snapshot",
+        "tasks": tasks,
+        "note": "这是压缩恢复后的内部任务快照。任务列表是模型组织工作的软约束，不是强制续跑条件。",
+    }
+    return HumanMessage(content="[系统附件] type=task_snapshot\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _build_document_snapshot_attachment(context: dict[str, Any]) -> HumanMessage | None:
+    payload: dict[str, Any] = {
+        "type": "document_snapshot",
+        "mode": "snapshot",
+        "documentSessionId": context.get("documentSessionId"),
+        "documentId": context.get("documentId"),
+        "title": context.get("documentTitle") or context.get("title"),
+        "pageCount": context.get("pageCount"),
+        "paragraphCount": context.get("paragraphCount"),
+        "wordCount": context.get("wordCount"),
+        "selection": context.get("selection"),
+        "activeTemplate": context.get("activeTemplate"),
+        "previewContext": context.get("previewContext"),
+        "note": "这是压缩恢复上下文，不是新增文档或新增内容。",
+    }
+    cleaned = {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+    if len(cleaned) <= 3:
+        return None
+    return HumanMessage(content="[系统附件] type=document_snapshot\n" + json.dumps(cleaned, ensure_ascii=False, sort_keys=True))
+
+
+def _build_recent_read_snapshot_attachment(messages: list[BaseMessage], *, limit: int = 3) -> HumanMessage | None:
+    read_tool_names = {
+        "get_document_content",
+        "get_page_content",
+        "get_page_style_summary",
+        "get_paragraph",
+        "search_text",
+        "workspace_read",
+        "workspace_search",
+    }
+    summaries: list[dict[str, Any]] = []
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        payload = _parse_tool_result_payload(message.content)
+        tool_name = str(payload.get("toolName") or "").strip()
+        if tool_name not in read_tool_names:
+            continue
+        summaries.append({
+            "toolName": tool_name,
+            "success": payload.get("success"),
+            "message": _truncate_preview(payload.get("message", ""), 160),
+            "preview": _compact_dossier_result(
+                json.dumps(payload.get("data", payload), ensure_ascii=False),
+                700,
+            ),
+        })
+        if len(summaries) >= limit:
+            break
+    if not summaries:
+        return None
+    payload = {
+        "type": "recent_read_snapshot",
+        "mode": "snapshot",
+        "items": list(reversed(summaries)),
+        "note": "这是最近读取结果摘要。需要原文时按任务需要重新读取，不要无意义重复搜索。",
+    }
+    return HumanMessage(content="[系统附件] type=recent_read_snapshot\n" + json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _build_post_compact_restore_attachments(session: ReactSession) -> list[BaseMessage]:
+    attachments: list[BaseMessage] = []
+    context = _with_backend_workspace_docs(session.latest_context)
+    session.latest_context = context
+
+    previous_workspace_docs = list(context.get("workspaceDocs") or [])
+    delta_content = build_delta_content(
+        context,
+        [],
+        force_full=True,
+        previous_workspace_docs=previous_workspace_docs,
+    )
+    _record_content_event(session, delta_content.trace)
+    for item in delta_content.content or []:
+        attachments.append(HumanMessage(content=item))
+    current_workspace_docs = context.get("workspaceDocs")
+    if isinstance(current_workspace_docs, list):
+        session.state.previous_workspace_docs = list(current_workspace_docs)
+
+    document_snapshot = _build_document_snapshot_attachment(context)
+    if document_snapshot is not None:
+        attachments.append(document_snapshot)
+    task_snapshot = _build_task_snapshot_attachment(session.messages)
+    if task_snapshot is not None:
+        attachments.append(task_snapshot)
+    recent_read_snapshot = _build_recent_read_snapshot_attachment(session.messages)
+    if recent_read_snapshot is not None:
+        attachments.append(recent_read_snapshot)
+
+    tooling_delta = _build_tooling_delta_attachment_for_body(session.body, session.loaded_deferred_tools)
+    if tooling_delta:
+        attachments.append(HumanMessage(content=tooling_delta))
+    return attachments
 
 
 _active_sessions: dict[str, ReactSession] = {}
@@ -4849,13 +5261,13 @@ async def create_react_gateway_run(body: ChatRequest) -> ReactGatewayRun:
             async for event in stream_react_session(session):
                 await run.append_event(event)
         except HTTPException as exc:
-            await run.append_event({"type": "error", "message": exc.detail})
+            await run.append_event({"type": "error", "message": _http_error_message(exc)})
         except asyncio.CancelledError:
             await run.append_event({"type": "done", "reason": "stopped_by_client"})
             raise
         except Exception as exc:
             logger.exception("[openwps.ai] gateway run %s failed", session.session_id)
-            await run.append_event({"type": "error", "message": str(exc)})
+            await run.append_event({"type": "error", "message": _sanitize_upstream_error_detail(str(exc))})
 
     run.task = asyncio.create_task(runner())
     return run
@@ -4991,332 +5403,6 @@ def list_conversation_react_traces(conversation_id: str) -> list[dict[str, Any]]
     return traces
 
 
-def _compress_tool_content(content: str, max_len: int = 200) -> str:
-    """Compress a tool result content string, keeping key status info."""
-    try:
-        data = json.loads(content)
-        compressed: dict[str, Any] = {
-            "success": data.get("success"),
-            "message": str(data.get("message", ""))[:120],
-            "toolName": data.get("toolName", ""),
-        }
-        return json.dumps(compressed, ensure_ascii=False)
-    except Exception:
-        return content[:max_len] + "..." if len(content) > max_len else content
-
-
-@dataclass(frozen=True)
-class CompressionOutcome:
-    messages: list[BaseMessage]
-    source: str = "none"
-    summarized_rounds: list[int] = field(default_factory=list)
-
-
-def _latest_round_checkpoints(checkpoints: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if not checkpoints:
-        return []
-    latest_by_round: dict[int, dict[str, Any]] = {}
-    for checkpoint in checkpoints:
-        try:
-            round_number = int(checkpoint.get("round"))
-        except Exception:
-            continue
-        latest_by_round[round_number] = checkpoint
-    return [latest_by_round[round_number] for round_number in sorted(latest_by_round)]
-
-
-def _build_message_round_summary(
-    messages: list[BaseMessage],
-    collapse_ranges: list[tuple[int, int]],
-    *,
-    compact: bool,
-) -> tuple[str, list[int]]:
-    summary_parts: list[str] = []
-    summarized_rounds: list[int] = []
-    for round_index, (start, end) in enumerate(collapse_ranges, start=1):
-        ai_msg = messages[start]
-        if not isinstance(ai_msg, AIMessage):
-            continue
-        summarized_rounds.append(round_index)
-        tool_names = [tc.get("name", "?") for tc in ai_msg.tool_calls]
-        ok = fail = 0
-        for idx in range(start + 1, end + 1):
-            tm = messages[idx]
-            if isinstance(tm, ToolMessage):
-                try:
-                    payload = json.loads(tm.content)
-                    if payload.get("success"):
-                        ok += 1
-                    else:
-                        fail += 1
-                except Exception:
-                    ok += 1
-        content_preview = _truncate_preview(ai_msg.content, 60)
-        if compact:
-            part = f"R{round_index}:tools={tool_names}"
-            if fail:
-                part += f" fail={fail}"
-            summary_parts.append(part)
-        else:
-            summary_parts.append(
-                f"[Round {round_index}] tools={tool_names} ok={ok} fail={fail}"
-                + (f' text="{content_preview}"' if content_preview else "")
-            )
-    prefix = "[历史操作摘要] " if compact else "[历史操作摘要]\n"
-    separator = "; " if compact else "\n"
-    return prefix + separator.join(summary_parts), summarized_rounds
-
-
-def _build_checkpoint_round_summary(
-    checkpoints: list[dict[str, Any]],
-    *,
-    compact: bool,
-) -> tuple[str, list[int]]:
-    summary_parts: list[str] = []
-    summarized_rounds: list[int] = []
-
-    for checkpoint in checkpoints:
-        try:
-            round_number = int(checkpoint.get("round"))
-        except Exception:
-            continue
-        summarized_rounds.append(round_number)
-        tool_calls = [str(item) for item in checkpoint.get("toolCalls", []) if str(item)]
-        tool_results = checkpoint.get("toolResults", [])
-        success_count = sum(1 for item in tool_results if isinstance(item, dict) and item.get("success") is True)
-        failure_count = sum(1 for item in tool_results if isinstance(item, dict) and item.get("success") is False)
-        transition = str(checkpoint.get("transition", ""))
-        reason = str(checkpoint.get("reason", "")).strip()
-        assistant_preview = _truncate_preview(checkpoint.get("assistantPreview", ""), 60)
-        completion_gate = checkpoint.get("completionGate") if isinstance(checkpoint.get("completionGate"), dict) else {}
-        task_count = int(completion_gate.get("incompleteTaskCount", 0) or 0)
-
-        if compact:
-            part = f"R{round_number}:"
-            part += ",".join(tool_calls) if tool_calls else str(checkpoint.get("kind", "text"))
-            if transition:
-                part += f"->{transition}"
-            if failure_count:
-                part += f" fail={failure_count}"
-            if task_count:
-                part += f" task={task_count}"
-            summary_parts.append(part)
-            continue
-
-        part = f"[Round {round_number}] kind={checkpoint.get('kind', 'unknown')}"
-        if tool_calls:
-            part += f" tools={tool_calls}"
-        if success_count or failure_count:
-            part += f" ok={success_count} fail={failure_count}"
-        if transition:
-            part += f" transition={transition}"
-        if reason:
-            part += f" reason={reason}"
-        if task_count:
-            part += f" incompleteTask={task_count}"
-        if assistant_preview:
-            part += f' text="{assistant_preview}"'
-        summary_parts.append(part)
-
-    prefix = "[历史操作摘要] " if compact else "[历史操作摘要]\n"
-    separator = "; " if compact else "\n"
-    return prefix + separator.join(summary_parts), summarized_rounds
-
-
-def _identify_rounds(messages: list[BaseMessage]) -> list[tuple[int, int]]:
-    """Identify round boundaries: (ai_index, last_tool_index) pairs."""
-    rounds: list[tuple[int, int]] = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            start = i
-            j = i + 1
-            while j < len(messages) and isinstance(messages[j], ToolMessage):
-                j += 1
-            rounds.append((start, j - 1))
-            i = j
-        else:
-            i += 1
-    return rounds
-
-
-def _compress_tier1(messages: list[BaseMessage], keep_full: int = KEEP_FULL_ROUNDS) -> list[BaseMessage]:
-    """Tier-1: Compress old ToolMessage content to status summaries."""
-    rounds = _identify_rounds(messages)
-    if len(rounds) <= keep_full:
-        return messages
-
-    compress_set: set[int] = set()
-    for start, end in rounds[:-keep_full]:
-        for idx in range(start, end + 1):
-            if isinstance(messages[idx], ToolMessage):
-                compress_set.add(idx)
-
-    result: list[BaseMessage] = []
-    for idx, msg in enumerate(messages):
-        if idx in compress_set and isinstance(msg, ToolMessage):
-            result.append(ToolMessage(
-                content=_compress_tool_content(msg.content),
-                tool_call_id=msg.tool_call_id,
-            ))
-        else:
-            result.append(msg)
-    return result
-
-
-def _compress_tier2(
-    messages: list[BaseMessage],
-    checkpoints: list[dict[str, Any]] | None = None,
-    keep_full: int = 2,
-) -> CompressionOutcome:
-    """Tier-2: Collapse entire old rounds into a single summary AIMessage.
-
-    Old rounds (AI+ToolMessages) are replaced with a compact summary,
-    keeping only the last *keep_full* rounds intact.
-    """
-    rounds = _identify_rounds(messages)
-    if len(rounds) <= keep_full:
-        return CompressionOutcome(_compress_tier1(messages, keep_full), source="tier1_fallback")
-
-    # Indices of messages that belong to old rounds
-    collapse_ranges: list[tuple[int, int]] = []
-    for start, end in rounds[:-keep_full]:
-        collapse_ranges.append((start, end))
-
-    if not collapse_ranges:
-        return CompressionOutcome(_compress_tier1(messages, keep_full), source="tier1_fallback")
-
-    checkpoint_rounds = _latest_round_checkpoints(checkpoints)
-    summarized_rounds: list[int] = []
-    summary_text = ""
-    summary_source = "messages"
-    if checkpoint_rounds:
-        keep_round_numbers = {int(item.get("round")) for item in checkpoint_rounds[-keep_full:]}
-        collapsed_checkpoints = [
-            checkpoint
-            for checkpoint in checkpoint_rounds
-            if int(checkpoint.get("round", 0) or 0) not in keep_round_numbers
-        ]
-        if collapsed_checkpoints:
-            summary_text, summarized_rounds = _build_checkpoint_round_summary(collapsed_checkpoints, compact=False)
-            summary_source = "checkpoints"
-
-    if not summary_text:
-        summary_text, summarized_rounds = _build_message_round_summary(messages, collapse_ranges, compact=False)
-        summary_source = "messages"
-
-    # Collect indices to remove
-    remove_set: set[int] = set()
-    for start, end in collapse_ranges:
-        for idx in range(start, end + 1):
-            remove_set.add(idx)
-
-    result: list[BaseMessage] = []
-    summary_inserted = False
-    for idx, msg in enumerate(messages):
-        if idx in remove_set:
-            if not summary_inserted:
-                # Insert summary as a single AIMessage right before the kept rounds
-                result.append(AIMessage(content=summary_text))
-                summary_inserted = True
-            continue
-        result.append(msg)
-    return CompressionOutcome(result, source=summary_source, summarized_rounds=summarized_rounds)
-
-
-def _compress_tier3(
-    messages: list[BaseMessage],
-    checkpoints: list[dict[str, Any]] | None = None,
-    keep_full: int = 1,
-) -> CompressionOutcome:
-    """Tier-3: Aggressive truncation — keep system prompt + summary + last round."""
-    rounds = _identify_rounds(messages)
-    if len(rounds) <= keep_full:
-        return _compress_tier2(messages, checkpoints=checkpoints, keep_full=keep_full)
-
-    # Always keep system message(s) and last user message
-    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-    # Find the last HumanMessage
-    last_human_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
-
-    # Keep messages from the last N rounds onwards
-    if rounds:
-        keep_from = rounds[-keep_full][0] if len(rounds) >= keep_full else rounds[0][0]
-    else:
-        keep_from = len(messages)
-
-    collapsed_ranges = list(rounds[:-keep_full] if len(rounds) > keep_full else [])
-    summary_text = ""
-    summary_source = "messages"
-    summarized_rounds: list[int] = []
-    checkpoint_rounds = _latest_round_checkpoints(checkpoints)
-    if checkpoint_rounds:
-        keep_round_numbers = {int(item.get("round")) for item in checkpoint_rounds[-keep_full:]}
-        collapsed_checkpoints = [
-            checkpoint
-            for checkpoint in checkpoint_rounds
-            if int(checkpoint.get("round", 0) or 0) not in keep_round_numbers
-        ]
-        if collapsed_checkpoints:
-            summary_text, summarized_rounds = _build_checkpoint_round_summary(collapsed_checkpoints, compact=True)
-            summary_source = "checkpoints"
-
-    if not summary_text and collapsed_ranges:
-        summary_text, summarized_rounds = _build_message_round_summary(messages, collapsed_ranges, compact=True)
-        summary_source = "messages"
-
-    result: list[BaseMessage] = list(system_msgs)
-    # Insert the last human message if it precedes the kept rounds
-    if last_human_idx >= 0 and last_human_idx < keep_from:
-        result.append(messages[last_human_idx])
-    if summary_text:
-        result.append(AIMessage(content=summary_text))
-    # Append the kept tail
-    for idx in range(keep_from, len(messages)):
-        msg = messages[idx]
-        if isinstance(msg, SystemMessage):
-            continue  # already included
-        if idx == last_human_idx and last_human_idx < keep_from:
-            continue  # already included
-        result.append(msg)
-    return CompressionOutcome(result, source=summary_source, summarized_rounds=summarized_rounds)
-
-
-def compress_messages(
-    messages: list[BaseMessage],
-    tier: int = 0,
-    checkpoints: list[dict[str, Any]] | None = None,
-) -> CompressionOutcome:
-    """Apply progressive compression to conversation messages.
-
-    tier 0 = no compression, tier 1 = tool content, tier 2 = round summary, tier 3 = aggressive.
-    """
-    if tier <= 0:
-        return CompressionOutcome(messages, source="none")
-    if tier == 1:
-        return CompressionOutcome(_compress_tier1(messages), source="tool_content")
-    if tier == 2:
-        return _compress_tier2(messages, checkpoints=checkpoints)
-    return _compress_tier3(messages, checkpoints=checkpoints)
-
-
-def _determine_compression_tier(messages: list[BaseMessage], current_tier: int) -> int:
-    """Decide the appropriate compression tier based on token estimates."""
-    tokens = _estimate_messages_tokens(messages)
-    if tokens >= TOKEN_BUDGET_CRITICAL:
-        return max(current_tier, 3)
-    if tokens >= TOKEN_BUDGET_HARD:
-        return max(current_tier, 2)
-    if tokens >= TOKEN_BUDGET_SOFT:
-        return max(current_tier, 1)
-    return current_tier
-
-
 def _record_tooling_delta_message(
     messages: list[BaseMessage],
     *,
@@ -5394,7 +5480,7 @@ def build_messages(
     _record_tooling_delta_message(messages, body=body, loaded_deferred_tools=loaded, content_events=content_events)
 
     # Inject initial context as delta attachment (full state announcement)
-    context = body.context or {}
+    context = _with_backend_workspace_docs(body.context)
     initial_context = build_initial_context_content(context)
     initial_attachment = str(initial_context.content or "")
     if content_events is not None:
@@ -5496,6 +5582,53 @@ def build_llm(
         **({"model_kwargs": model_kwargs} if model_kwargs else {}),
     )
     return llm.bind_tools(selected_tools) if selected_tools else llm
+
+
+class ContextOverflowError(Exception):
+    """Raised when the model rejects the current message set for context length."""
+
+
+def _is_context_overflow_detail(detail: Any) -> bool:
+    text = str(detail or "").lower()
+    return any(
+        keyword in text
+        for keyword in (
+            "context_length",
+            "context length",
+            "context too long",
+            "maximum context",
+            "max context",
+            "too long",
+            "max_tokens",
+            "maximum tokens",
+        )
+    )
+
+
+def _build_summary_llm(body: ChatRequest, policy: CompactPolicy) -> ReasoningContentChatOpenAI:
+    provider, model = _resolve_provider_and_model(body)
+    api_key = str(provider.get("apiKey", "") or "")
+    endpoint = str(provider.get("endpoint", "https://api.siliconflow.cn/v1")).rstrip("/")
+    model = model or str(provider.get("defaultModel") or "Qwen/Qwen2.5-72B-Instruct")
+    return ReasoningContentChatOpenAI(
+        model=model,
+        api_key=api_key or "not-needed",
+        base_url=endpoint,
+        temperature=0.1,
+        streaming=False,
+        max_tokens=policy.compact_summary_max_output_tokens,
+        pass_empty_reasoning_content=_should_pass_empty_reasoning_content(provider, model, endpoint),
+    )
+
+
+def _resolve_subagent_model(parent_body: ChatRequest, agent: AgentDefinition) -> str:
+    if agent.model:
+        return str(agent.model).strip()
+    inherited = str(parent_body.model or "").strip()
+    if inherited:
+        return inherited
+    _, resolved_model = _resolve_provider_and_model(parent_body)
+    return str(resolved_model or "").strip()
 
 
 COMPLETION_ACTIVITY_CONFIG = {
@@ -5809,7 +5942,7 @@ async def run_completion(body: CompletionRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as exc:
-        detail = str(exc).strip() or "未知错误"
+        detail = _sanitize_upstream_error_detail(str(exc))
         raise HTTPException(status_code=502, detail=f"AI 伴写请求失败: {detail}") from exc
 
 
@@ -6028,6 +6161,153 @@ class QueryCoordinator:
             **data,
         }
 
+    def _compact_policy(self) -> CompactPolicy:
+        provider, model = _resolve_provider_and_model(self.session.body)
+        return build_compact_policy(provider, model)
+
+    async def _generate_compact_summary(
+        self,
+        messages: list[BaseMessage],
+        *,
+        policy: CompactPolicy,
+        source: str,
+    ) -> str:
+        candidate = list(messages)
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_COMPACT_RETRIES + 1):
+            prompt_messages = build_compact_prompt(candidate, policy=policy, source=source)
+            llm = _build_summary_llm(self.session.body, policy)
+            try:
+                response = await llm.ainvoke(prompt_messages)
+            except Exception as exc:
+                last_error = exc
+                if _is_context_overflow_detail(exc):
+                    candidate, changed = drop_oldest_api_round(candidate)
+                    if changed:
+                        _record_trace_event(
+                            self.session,
+                            "compact_retry",
+                            round=self.state.round,
+                            source=source,
+                            attempt=attempt,
+                            reason="compact_prompt_too_long",
+                            remainingMessages=len(candidate),
+                        )
+                        continue
+                raise
+            summary = _stringify_content(getattr(response, "content", response)).strip()
+            if summary:
+                return summary
+            last_error = RuntimeError("compact summary is empty")
+            candidate, changed = drop_oldest_api_round(candidate)
+            if not changed:
+                break
+        if last_error is not None:
+            raise RuntimeError(f"上下文压缩失败: {last_error}") from last_error
+        raise RuntimeError("上下文压缩失败: compact summary is empty")
+
+    async def _compact_session_messages(self, *, source: str, reactive: bool = False) -> dict[str, Any]:
+        policy = self._compact_policy()
+        pre_tokens = estimate_messages_tokens(self.session.messages)
+        _record_trace_event(
+            self.session,
+            "compact_start",
+            round=self.state.round,
+            source=source,
+            preTokens=pre_tokens,
+            contextWindowTokens=policy.context_window_tokens,
+            autoCompactThresholdTokens=policy.auto_compact_threshold_tokens,
+            reactive=reactive,
+        )
+        summary = await self._generate_compact_summary(self.session.messages, policy=policy, source=source)
+        restored = _build_post_compact_restore_attachments(self.session)
+        result = build_compacted_messages(
+            self.session.messages,
+            summary=summary,
+            policy=policy,
+            source=source,
+            restored_attachments=restored,
+        )
+        self.session.messages = result.messages
+        self.state.estimated_tokens = result.post_token_count
+        self.state.last_compact_source = source
+        self.state.last_compact_pre_tokens = result.pre_token_count
+        self.state.last_compact_post_tokens = result.post_token_count
+        self.state.compact_failure_count = 0
+        payload = {
+            "type": "compact_end",
+            "source": source,
+            "preTokens": result.pre_token_count,
+            "postTokens": result.post_token_count,
+            "summaryChars": result.summary_chars,
+            "restoredAttachmentTypes": result.restored_attachment_types,
+            "preservedTailCount": result.preserved_tail_count,
+            "reactive": reactive,
+        }
+        _record_trace_event(self.session, "compact_end", round=self.state.round, **payload)
+        return payload
+
+    async def _maybe_microcompact(self) -> dict[str, Any] | None:
+        result = microcompact_messages(self.session.messages)
+        if not result.changed:
+            self.state.estimated_tokens = result.post_token_count
+            return None
+        self.session.messages = result.messages
+        self.state.estimated_tokens = result.post_token_count
+        self.state.microcompact_count += result.compacted_tool_results
+        payload = {
+            "type": "microcompact",
+            "preTokens": result.pre_token_count,
+            "postTokens": result.post_token_count,
+            "compactedToolResults": result.compacted_tool_results,
+        }
+        _record_trace_event(self.session, "microcompact", round=self.state.round, **payload)
+        return payload
+
+    async def _prepare_context_before_model(self) -> AsyncGenerator[dict[str, Any], None]:
+        microcompact_event = await self._maybe_microcompact()
+        if microcompact_event:
+            yield microcompact_event
+
+        policy = self._compact_policy()
+        self.state.estimated_tokens = estimate_messages_tokens(self.session.messages)
+        if not should_auto_compact(self.session.messages, policy):
+            return
+
+        if self.state.compact_failure_count >= MAX_COMPACT_RETRIES:
+            message = "上下文压缩连续失败，已停止自动链路。请缩短对话或重新开始当前任务。"
+            _record_trace_event(self.session, "compact_failed", round=self.state.round, source="auto", message=message)
+            yield {"type": "compact_failed", "source": "auto", "message": message}
+            self.session.finished = True
+            self.state.transition = Transition.FATAL_ERROR
+            return
+
+        yield {
+            "type": "compact_start",
+            "source": "auto",
+            "preTokens": self.state.estimated_tokens,
+            "contextWindowTokens": policy.context_window_tokens,
+            "autoCompactThresholdTokens": policy.auto_compact_threshold_tokens,
+        }
+        try:
+            compact_event = await self._compact_session_messages(source="auto", reactive=False)
+        except Exception as exc:
+            self.state.compact_failure_count += 1
+            message = f"自动上下文压缩失败: {_normalize_ai_api_error_detail(self.session.body, str(exc))}"
+            _record_trace_event(self.session, "compact_failed", round=self.state.round, source="auto", message=message)
+            yield {"type": "compact_failed", "source": "auto", "message": message}
+            self.session.finished = True
+            self.state.transition = Transition.FATAL_ERROR
+            return
+        yield compact_event
+        yield {
+            "type": "compression",
+            "source": "auto",
+            "estimated_tokens": compact_event["postTokens"],
+            "preTokens": compact_event["preTokens"],
+            "postTokens": compact_event["postTokens"],
+        }
+
     async def _run_model_round(self, messages: list[BaseMessage]) -> AsyncGenerator[dict[str, Any], None]:
         round_content = ""
         round_reasoning = ""
@@ -6066,20 +6346,8 @@ class QueryCoordinator:
                 return
             except HTTPException as exc:
                 self.state.consecutive_errors += 1
-                is_context_overflow = any(
-                    keyword in str(exc.detail).lower()
-                    for keyword in ("too long", "context_length", "maximum context", "max_tokens")
-                )
-                if is_context_overflow:
-                    new_tier = min(self.state.compression_tier + 1, 3)
-                    if new_tier > self.state.compression_tier:
-                        self.state.compression_tier = new_tier
-                        yield self._make_recovery_event(
-                            "context_compress",
-                            tier=new_tier,
-                            attempt=attempt + 1,
-                        )
-                        continue
+                if _is_context_overflow_detail(exc.detail):
+                    raise ContextOverflowError(str(exc.detail)) from exc
                 if exc.status_code == 502 and attempt < MAX_RETRIES_PER_ROUND:
                     delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                     yield self._make_recovery_event(
@@ -6092,18 +6360,8 @@ class QueryCoordinator:
                 raise
             except Exception as exc:
                 self.state.consecutive_errors += 1
-                error_text = str(exc).lower()
-                if (
-                    any(keyword in error_text for keyword in ("too long", "context_length", "maximum context", "max_tokens"))
-                    and self.state.compression_tier < 3
-                ):
-                    self.state.compression_tier += 1
-                    yield self._make_recovery_event(
-                        "context_compress",
-                        tier=self.state.compression_tier,
-                        attempt=attempt + 1,
-                    )
-                    continue
+                if _is_context_overflow_detail(exc):
+                    raise ContextOverflowError(str(exc)) from exc
                 raise
 
         yield {
@@ -6114,11 +6372,213 @@ class QueryCoordinator:
             "finish_reason": round_finish_reason,
         }
 
+    async def _resolve_layout_preflight_page_count(self) -> int:
+        context_page_count = _coerce_context_page_count(self.session.latest_context)
+        probe = await execute_ai_document_tool(
+            "get_page_content",
+            {"page": 1},
+            self.session.latest_context or self.session.body.context or {},
+        )
+        data = probe.get("data") if isinstance(probe.get("data"), dict) else {}
+        try:
+            measured = int(data.get("pageCount"))
+        except Exception:
+            measured = 0
+        return max(context_page_count, measured, 1)
+
+    async def _run_layout_preflight_page(
+        self,
+        page: int,
+        page_count: int,
+        *,
+        screenshot_available: bool,
+    ) -> dict[str, Any]:
+        agent = get_agent_definition("layout-plan")
+        agent_id = new_agent_run_id()
+        result_text = ""
+        trace_events: list[dict[str, Any]] = []
+        prompt = _build_layout_preflight_prompt(page, page_count, screenshot_available=screenshot_available)
+        async for event in self._run_subagent(
+            agent_id=agent_id,
+            agent=agent,
+            description=f"分析第 {page} 页样式",
+            prompt=prompt,
+            background=False,
+        ):
+            if event["type"] == "_subagent_result":
+                result_text = str(event.get("content") or "")
+            else:
+                trace_events.append(event)
+        used_tools = {
+            str(event.get("name") or "")
+            for event in trace_events
+            if event.get("type") == "agent_tool_call"
+        }
+        fallback_parts: list[str] = []
+        for required_tool in ("get_page_content", "get_page_style_summary"):
+            if required_tool in used_tools:
+                continue
+            direct_result = await execute_ai_document_tool(
+                required_tool,
+                {"page": page},
+                self.session.latest_context or self.session.body.context or {},
+            )
+            data = direct_result.get("data") if isinstance(direct_result.get("data"), dict) else {}
+            fallback_parts.append(
+                f"[后端补充证据:{required_tool}] success={direct_result.get('success') is True} "
+                f"message={direct_result.get('message')}\n"
+                f"{_truncate_preview(json.dumps(data, ensure_ascii=False), 1600)}"
+            )
+        if fallback_parts:
+            result_text = "\n\n".join([part for part in [result_text.strip(), *fallback_parts] if part])
+        return {
+            "page": page,
+            "agentId": agent_id,
+            "success": bool(result_text.strip()),
+            "result": result_text.strip(),
+            "usedTools": sorted(tool for tool in used_tools if tool),
+            "traceEventCount": len(trace_events),
+        }
+
+    async def _run_layout_preflight(self) -> AsyncGenerator[dict[str, Any], None]:
+        if self.state.layout_preflight_completed or self.state.layout_preflight_failed:
+            return
+        if not _should_require_layout_preflight(self.session.body, self.session.latest_context):
+            return
+
+        self.state.layout_preflight_required = True
+        self.state.content_locked_for_layout = not _layout_content_mutation_explicitly_requested(self.session.body)
+        self.session.latest_context["contentLockedForLayout"] = self.state.content_locked_for_layout
+        self.state.layout_preflight_signature = await _read_layout_content_signature(self.session.latest_context)
+
+        capabilities = _resolve_runtime_capabilities(self.session.body)
+        screenshot_available = _tool_available_for_runtime("capture_page_screenshot", capabilities)
+        page_count = await self._resolve_layout_preflight_page_count()
+        yield {
+            "type": "layout_preflight_start",
+            "pageCount": page_count,
+            "batchSize": LAYOUT_PREFLIGHT_BATCH_SIZE,
+            "visualEnabled": screenshot_available,
+            "contentLockedForLayout": self.state.content_locked_for_layout,
+        }
+        _record_trace_event(
+            self.session,
+            "layout_preflight_start",
+            pageCount=page_count,
+            visualEnabled=screenshot_available,
+            contentLockedForLayout=self.state.content_locked_for_layout,
+        )
+
+        pages: list[dict[str, Any]] = []
+        try:
+            for start in range(1, page_count + 1, LAYOUT_PREFLIGHT_BATCH_SIZE):
+                batch_pages = list(range(start, min(start + LAYOUT_PREFLIGHT_BATCH_SIZE, page_count + 1)))
+                for page in batch_pages:
+                    yield {
+                        "type": "layout_preflight_page_start",
+                        "page": page,
+                        "pageCount": page_count,
+                    }
+                results = await asyncio.gather(*[
+                    self._run_layout_preflight_page(page, page_count, screenshot_available=screenshot_available)
+                    for page in batch_pages
+                ], return_exceptions=True)
+                for page, result in zip(batch_pages, results):
+                    if isinstance(result, Exception):
+                        page_result = {
+                            "page": page,
+                            "success": False,
+                            "error": str(result),
+                            "result": "",
+                        }
+                    else:
+                        page_result = result
+                    pages.append(page_result)
+                    yield {
+                        "type": "layout_preflight_page_done",
+                        "page": page,
+                        "pageCount": page_count,
+                        "success": page_result.get("success") is True,
+                        "summary": _compact_dossier_result(str(page_result.get("result") or page_result.get("error") or ""), 240),
+                    }
+        except Exception as exc:
+            self.state.layout_preflight_failed = True
+            safe_error = _sanitize_upstream_error_detail(str(exc))
+            _record_trace_event(self.session, "layout_preflight_failed", error=safe_error)
+            yield {
+                "type": "layout_preflight_done",
+                "pageCount": page_count,
+                "success": False,
+                "error": safe_error,
+            }
+            return
+
+        dossier = {
+            "pageCount": page_count,
+            "visualEnabled": screenshot_available,
+            "contentLockedForLayout": self.state.content_locked_for_layout,
+            "pages": pages,
+        }
+        all_success = len(pages) == page_count and all(page.get("success") is True for page in pages)
+        self.state.layout_style_dossier = dossier
+        self.state.layout_preflight_completed = all_success
+        self.state.layout_preflight_failed = not all_success
+        self.session.latest_context["layoutStyleDossier"] = dossier
+        self.session.messages.append(HumanMessage(content=_format_layout_dossier_for_model(dossier)))
+        _record_trace_event(
+            self.session,
+            "layout_preflight_done",
+            pageCount=page_count,
+            successCount=sum(1 for page in pages if page.get("success") is True),
+            success=all_success,
+            contentLockedForLayout=self.state.content_locked_for_layout,
+        )
+        yield {
+            "type": "layout_preflight_done",
+            "pageCount": page_count,
+            "success": all_success,
+            "successCount": sum(1 for page in pages if page.get("success") is True),
+            "contentLockedForLayout": self.state.content_locked_for_layout,
+        }
+
+    def _blocked_execution_content(self, execution: PlannedToolExecution) -> str | None:
+        if (
+            self.state.layout_preflight_required
+            and not self.state.layout_preflight_completed
+            and _is_preflight_guarded_style_execution(execution)
+        ):
+            return _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=False,
+                message="排版样式工具已被后端阻断：逐页 Layout Preflight 尚未完成。",
+                data={"layoutPreflightRequired": True, "layoutPreflightCompleted": False},
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
+        if (
+            self.state.content_locked_for_layout
+            and _is_layout_content_tool_blocked(execution.tool_name)
+            and not _layout_content_mutation_explicitly_requested(self.session.body)
+        ):
+            return _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=False,
+                message="排版结构保护已阻断：当前任务只允许修改样式和页面设置，不能删除、重写或插入正文结构。",
+                data={"contentLockedForLayout": True, "blockedTool": execution.tool_name},
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
+        return None
+
     async def _execute_server_execution(
         self,
         execution: PlannedToolExecution,
     ) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
-        if execution.tool_name == TOOL_SEARCH_NAME:
+        blocked_content = self._blocked_execution_content(execution)
+        if blocked_content is not None:
+            content = blocked_content
+            newly_loaded = []
+        elif execution.tool_name == TOOL_SEARCH_NAME:
             before_loaded = set(self.session.loaded_deferred_tools)
             content = _run_tool_search_tool(
                 execution.params,
@@ -6146,10 +6606,13 @@ class QueryCoordinator:
             )
             newly_loaded = []
         elif is_document_tool(execution.tool_name):
+            tool_context = dict(self.session.latest_context or self.session.body.context or {})
+            if self.state.content_locked_for_layout and execution.tool_name in LAYOUT_PREFLIGHT_STYLE_TOOLS:
+                tool_context["contentLockedForLayout"] = True
             tool_result = await execute_ai_document_tool(
                 execution.tool_name,
                 execution.params,
-                self.session.latest_context or self.session.body.context or {},
+                tool_context,
             )
             content = _serialize_tool_result_payload(
                 tool_name=execution.tool_name,
@@ -6246,12 +6709,11 @@ class QueryCoordinator:
         agent: AgentDefinition,
         description: str,
         prompt: str,
-        model_override: str | None = None,
         background: bool = False,
     ) -> AsyncGenerator[dict[str, Any], None]:
         child_loaded_deferred_tools: set[str] = set()
         body_data = self.session.body.model_dump()
-        selected_model = str(model_override or agent.model or self.session.body.model or "").strip()
+        selected_model = _resolve_subagent_model(self.session.body, agent)
         if selected_model:
             body_data["model"] = selected_model
         child_body = ChatRequest(**body_data)
@@ -6284,6 +6746,7 @@ class QueryCoordinator:
             "runMode": "background" if background else "sync",
             "tools": tool_names,
             "maxTurns": agent.max_turns,
+            "model": selected_model,
         }
 
         final_text = ""
@@ -6477,7 +6940,6 @@ class QueryCoordinator:
         self,
         record: AgentRunRecord,
         agent: AgentDefinition,
-        model_override: str | None,
     ) -> None:
         try:
             async for event in self._run_subagent(
@@ -6485,7 +6947,6 @@ class QueryCoordinator:
                 agent=agent,
                 description=record.description,
                 prompt=record.prompt,
-                model_override=model_override,
                 background=True,
             ):
                 if event["type"] == "_subagent_result":
@@ -6514,7 +6975,7 @@ class QueryCoordinator:
         description = _stringify_content(params.get("description")).strip() or "子代理任务"
         prompt = _stringify_content(params.get("prompt")).strip()
         subagent_type = _stringify_content(params.get("subagent_type")).strip() or "general-purpose"
-        model_override = _stringify_content(params.get("model")).strip() or None
+        params.pop("model", None)
         run_in_background = bool(params.get("run_in_background"))
 
         if not prompt:
@@ -6545,7 +7006,7 @@ class QueryCoordinator:
                     run_mode="background",
                 )
                 save_agent_run(record)
-                task = asyncio.create_task(self._run_background_agent_lifecycle(record, agent, model_override))
+                task = asyncio.create_task(self._run_background_agent_lifecycle(record, agent))
                 register_background_task(agent_id, task)
                 result, summary, events = _build_and_append_agent_execution_result(
                     self.session,
@@ -6575,7 +7036,6 @@ class QueryCoordinator:
                     agent=agent,
                     description=description,
                     prompt=prompt,
-                    model_override=model_override,
                     background=False,
                 ):
                     if event["type"] == "_subagent_result":
@@ -6737,55 +7197,94 @@ class QueryCoordinator:
         yield {"type": "session_created", "sessionId": self.session.session_id}
 
         try:
+            async for preflight_event in self._run_layout_preflight():
+                yield preflight_event
+
             while self.state.round < MAX_REACT_ROUNDS and not self.session.finished:
                 self.state.round += 1
                 self.state.retries_this_round = 0
                 _record_trace_event(self.session, "round_start", round=self.state.round)
                 yield {"type": "round_start", "round": self.state.round}
 
-                previous_tier = self.state.compression_tier
-                self.state.compression_tier = _determine_compression_tier(
-                    self.session.messages,
-                    self.state.compression_tier,
-                )
-                compression_outcome = compress_messages(
-                    self.session.messages,
-                    tier=self.state.compression_tier,
-                    checkpoints=self.session.trace.checkpoints,
-                )
-                compressed_messages = compression_outcome.messages
-                self.state.estimated_tokens = _estimate_messages_tokens(compressed_messages)
-                if self.state.compression_tier > previous_tier:
-                    _record_trace_event(
-                        self.session,
-                        "compression",
-                        round=self.state.round,
-                        tier=self.state.compression_tier,
-                        estimatedTokens=self.state.estimated_tokens,
-                        source=compression_outcome.source,
-                        summarizedRounds=compression_outcome.summarized_rounds,
-                    )
-                    yield {
-                        "type": "compression",
-                        "tier": self.state.compression_tier,
-                        "estimated_tokens": self.state.estimated_tokens,
-                        "source": compression_outcome.source,
-                        "summarizedRounds": compression_outcome.summarized_rounds,
-                    }
+                async for compact_event in self._prepare_context_before_model():
+                    yield compact_event
+                if self.session.finished:
+                    break
                 self.state.consecutive_empty_content = 0
 
                 round_content = ""
                 round_reasoning = ""
                 round_tool_calls: list[dict[str, Any]] = []
                 round_finish_reason = ""
-                async for event in self._run_model_round(compressed_messages):
-                    if event["type"] == "_round_result":
-                        round_content = event["content"]
-                        round_reasoning = str(event.get("reasoning_content", "") or "")
-                        round_tool_calls = event["tool_calls"]
-                        round_finish_reason = str(event.get("finish_reason", "") or "")
-                    else:
-                        yield event
+                reactive_attempt = 0
+                while True:
+                    try:
+                        async for event in self._run_model_round(self.session.messages):
+                            if event["type"] == "_round_result":
+                                round_content = event["content"]
+                                round_reasoning = str(event.get("reasoning_content", "") or "")
+                                round_tool_calls = event["tool_calls"]
+                                round_finish_reason = str(event.get("finish_reason", "") or "")
+                            else:
+                                yield event
+                        break
+                    except ContextOverflowError as exc:
+                        reactive_attempt += 1
+                        if reactive_attempt > MAX_CONTEXT_OVERFLOW_RETRIES:
+                            message = "模型仍然报告上下文过长，reactive compact 已达到 3 次上限，已停止自动链路。"
+                            _record_trace_event(
+                                self.session,
+                                "compact_failed",
+                                round=self.state.round,
+                                source="reactive",
+                                message=message,
+                            )
+                            yield {"type": "compact_failed", "source": "reactive", "message": message}
+                            yield {"type": "error", "message": message}
+                            self.session.finished = True
+                            self.state.transition = Transition.FATAL_ERROR
+                            break
+                        yield self._make_recovery_event(
+                            "context_compact",
+                            source="reactive",
+                            attempt=reactive_attempt,
+                            message="模型报告上下文过长，正在立即压缩并重试当前轮。",
+                        )
+                        yield {
+                            "type": "compact_start",
+                            "source": "reactive",
+                            "preTokens": estimate_messages_tokens(self.session.messages),
+                            "reactive": True,
+                        }
+                        try:
+                            compact_event = await self._compact_session_messages(source="reactive", reactive=True)
+                        except Exception as compact_exc:
+                            message = f"上下文过长后的压缩失败: {_normalize_ai_api_error_detail(self.session.body, str(compact_exc))}"
+                            _record_trace_event(
+                                self.session,
+                                "compact_failed",
+                                round=self.state.round,
+                                source="reactive",
+                                message=message,
+                                cause=str(exc),
+                            )
+                            yield {"type": "compact_failed", "source": "reactive", "message": message}
+                            yield {"type": "error", "message": message}
+                            self.session.finished = True
+                            self.state.transition = Transition.FATAL_ERROR
+                            break
+                        yield compact_event
+                        yield {
+                            "type": "compression",
+                            "source": "reactive",
+                            "estimated_tokens": compact_event["postTokens"],
+                            "preTokens": compact_event["preTokens"],
+                            "postTokens": compact_event["postTokens"],
+                            "reactive": True,
+                        }
+                        continue
+                if self.session.finished:
+                    break
 
                 self.state.last_model_finish_reason = round_finish_reason
                 if round_tool_calls or not _is_output_truncated_finish_reason(round_finish_reason):
@@ -6944,6 +7443,7 @@ class QueryCoordinator:
                     reasoning_content=round_reasoning,
                 ))
 
+                before_gate_signature = _build_gate_progress_signature(self.state, self.session.messages)
                 execution_plan = _build_execution_plan(self.state.round, round_tool_calls)
                 server_executions, client_executions = _split_execution_plan(execution_plan)
                 server_execution_results: list[dict[str, str]] = []
@@ -7002,7 +7502,12 @@ class QueryCoordinator:
                 _update_completion_gate_state(self.state, execution_results)
                 self.state.pending_write_follow_up = _tool_results_started_streaming_write(execution_results)
                 self.state.pending_agent_follow_up = _tool_results_completed_subagent(execution_results)
-                self.state.forced_follow_up_attempts = 0
+                _record_tool_round_progress(
+                    self.state,
+                    self.session.messages,
+                    round_tool_calls,
+                    before_gate_signature,
+                )
                 self.state.consecutive_empty_content = 0
 
                 round_decision = _decide_tool_round(self.state, self.session.messages, round_tool_calls, execution_results)
@@ -7024,6 +7529,34 @@ class QueryCoordinator:
                     )
                     _record_trace_event(self.session, "done", round=self.state.round, reason=round_decision.finish_reason)
                     yield {"type": "done", "reason": round_decision.finish_reason}
+                    break
+
+                if round_decision.action == RoundDecisionAction.ERROR:
+                    self.session.finished = True
+                    self.state.transition = round_decision.transition
+                    _record_round_checkpoint(
+                        self.session,
+                        round_number=self.state.round,
+                        kind="tool_round",
+                        assistant_preview=_truncate_preview(round_content),
+                        transition=self.state.transition,
+                        tool_calls=[tool_call["name"] for tool_call in round_tool_calls],
+                        plan_id=execution_plan.plan_id,
+                        execution_count=len(execution_plan.executions),
+                        tool_results=execution_summary,
+                        reason=round_decision.reason,
+                        model_finish_reason=round_finish_reason,
+                    )
+                    _record_trace_event(
+                        self.session,
+                        "error",
+                        round=self.state.round,
+                        message=round_decision.error_message,
+                    )
+                    yield {
+                        "type": "error",
+                        "message": round_decision.error_message,
+                    }
                     break
 
                 if round_decision.transition == Transition.STOP_HOOK_RETRY:
@@ -7091,15 +7624,25 @@ class QueryCoordinator:
                 )
                 _record_trace_event(self.session, "round_transition", round=self.state.round, transition=self.state.transition.value)
 
-                # Delta injection: inject context changes after tool results
-                # Use latest_context (updated by frontend each round) instead of body.context (frozen at session start)
-                context = self.session.latest_context
-                force_delta = compression_outcome.source != "none"
-                delta_content = build_delta_content(context, self.session.messages, force_full=force_delta)
+                # Delta injection: inject context changes after tool results.
+                # Workspace docs are backend-owned runtime state, so refresh the
+                # manifest here instead of trusting client-sent context.
+                context = _with_backend_workspace_docs(self.session.latest_context)
+                self.session.latest_context = context
+                previous_workspace_docs = list(self.state.previous_workspace_docs)
+                delta_content = build_delta_content(
+                    context,
+                    self.session.messages,
+                    force_full=False,
+                    previous_workspace_docs=previous_workspace_docs,
+                )
                 delta_messages = list(delta_content.content or [])
                 _record_content_event(self.session, delta_content.trace)
                 for delta_msg in delta_messages:
                     self.session.messages.append(HumanMessage(content=delta_msg))
+                current_workspace_docs = context.get("workspaceDocs")
+                if isinstance(current_workspace_docs, list):
+                    self.state.previous_workspace_docs = list(current_workspace_docs)
 
                 # Task reminder: inject reminder if task tools haven't been used recently
                 self.state.rounds_since_last_task_update += 1
@@ -7131,12 +7674,20 @@ class QueryCoordinator:
                 "finished": self.session.finished,
                 "remainingRounds": max(MAX_REACT_ROUNDS - self.state.round, 0),
                 "roundBudgetWarningLevel": self.state.round_budget_warning_level,
-                "lastTokenBudgetWarningTier": self.state.last_token_budget_warning_tier,
+                "lastCompactSource": self.state.last_compact_source,
+                "lastCompactPreTokens": self.state.last_compact_pre_tokens,
+                "lastCompactPostTokens": self.state.last_compact_post_tokens,
+                "compactFailureCount": self.state.compact_failure_count,
+                "microcompactCount": self.state.microcompact_count,
                 "stagnantBudgetRounds": self.state.stagnant_budget_rounds,
                 "budgetStagnationWarningLevel": self.state.budget_stagnation_warning_level,
+                "readOnlyStagnantRounds": self.state.read_only_stagnant_rounds,
                 "outputContinuationAttempts": self.state.output_continuation_attempts,
                 "visionCapabilityBlocked": self.state.vision_capability_blocked,
                 "lastModelFinishReason": self.state.last_model_finish_reason,
+                "layoutPreflightRequired": self.state.layout_preflight_required,
+                "layoutPreflightCompleted": self.state.layout_preflight_completed,
+                "contentLockedForLayout": self.state.content_locked_for_layout,
                 "completionGate": _snapshot_completion_gate(self.state, self.session.messages),
             }
             _store_completed_trace(self.session)
@@ -7163,7 +7714,7 @@ async def list_models(endpoint: str, api_key: str = "", provider_id: str | None 
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text.strip() or str(exc)
+        detail = _sanitize_upstream_error_detail(exc.response.text.strip() or str(exc), status_code=exc.response.status_code)
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {detail}") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"获取模型列表失败: {exc}") from exc

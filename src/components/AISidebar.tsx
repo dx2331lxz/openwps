@@ -46,6 +46,40 @@ interface ConversationGroup {
   conversations: ConversationSummary[]
 }
 
+type AgentTraceStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+type AgentTraceRunMode = 'sync' | 'background'
+type AgentTraceEventType = 'round_start' | 'thinking' | 'content' | 'tool_call' | 'tool_result' | 'done' | 'error'
+
+interface AgentTraceEvent {
+  id: string
+  type: AgentTraceEventType
+  round?: number
+  phase?: string
+  toolCallId?: string
+  toolName?: string
+  summary?: string
+  params?: Record<string, unknown>
+  status?: ToolCallResult['status']
+  message?: string
+  dataPreview?: string
+  content?: string
+  isExpanded?: boolean
+}
+
+interface AgentTrace {
+  id: string
+  agentType: string
+  description: string
+  runMode: AgentTraceRunMode
+  model?: string
+  status: AgentTraceStatus
+  tools: string[]
+  events: AgentTraceEvent[]
+  result?: string
+  error?: string
+  isExpanded?: boolean
+}
+
 interface StoredMessage {
   role: 'user' | 'assistant' | 'tool'
   content?: string | null
@@ -54,6 +88,7 @@ interface StoredMessage {
   toolCalls?: ToolCallResult[]
   tool_calls?: Array<{ id?: string; type?: 'function'; function?: { name?: string; arguments?: string } }>
   tool_call_id?: string
+  agentTraces?: AgentTrace[]
 }
 
 interface ConversationDetail extends ConversationSummary {
@@ -83,6 +118,7 @@ type MessageSegment =
   | { id: string; type: 'content'; text: string }
   | { id: string; type: 'thinking'; text: string }
   | { id: string; type: 'tool'; toolCall: ToolCallResult }
+  | { id: string; type: 'agent'; trace: AgentTrace }
 
 type AttachmentKind = 'image' | 'text'
 
@@ -522,12 +558,13 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'insert_page_break') return target ? `在${target}插入分页符` : '插入分页符'
   if (toolCall.name === 'insert_horizontal_rule') return target ? `在${target}插入分割线` : '插入分割线'
   if (toolCall.name === 'insert_table') return target ? `在${target}插入表格` : '插入表格'
-  if (toolCall.name === 'insert_table_row_before') return '在当前表格行上方插入一行'
-  if (toolCall.name === 'insert_table_row_after') return '在当前表格行下方插入一行'
-  if (toolCall.name === 'delete_table_row') return '删除当前表格行'
-  if (toolCall.name === 'insert_table_column_before') return '在当前表格列左侧插入一列'
-  if (toolCall.name === 'insert_table_column_after') return '在当前表格列右侧插入一列'
-  if (toolCall.name === 'delete_table_column') return '删除当前表格列'
+  if (toolCall.name === 'delete_table') return '删除整个表格'
+  if (toolCall.name === 'insert_table_row_before') return '在指定表格行上方插入一行'
+  if (toolCall.name === 'insert_table_row_after') return '在指定表格行下方插入一行'
+  if (toolCall.name === 'delete_table_row') return '删除指定表格行'
+  if (toolCall.name === 'insert_table_column_before') return '在指定表格列左侧插入一列'
+  if (toolCall.name === 'insert_table_column_after') return '在指定表格列右侧插入一列'
+  if (toolCall.name === 'delete_table_column') return '删除指定表格列'
   if (toolCall.name === 'apply_style_batch') {
     const ruleCount = Array.isArray(toolCall.params.rules) ? toolCall.params.rules.length : 0
     return ruleCount > 0 ? `批量应用 ${ruleCount} 条样式规则` : '批量应用样式规则'
@@ -607,6 +644,377 @@ function formatToolData(data: unknown) {
   } catch {
     return String(data)
   }
+}
+
+const AGENT_TRACE_TEXT_LIMIT = 900
+const AGENT_TRACE_DATA_LIMIT = 700
+
+function compactAgentTraceText(value: unknown, maxLength = AGENT_TRACE_TEXT_LIMIT) {
+  const text = typeof value === 'string' ? value : formatToolData(value)
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  return truncateText(normalized, maxLength)
+}
+
+function normalizeAgentTraceStatus(value: unknown): AgentTraceStatus {
+  const status = String(value ?? 'running')
+  return status === 'completed' || status === 'failed' || status === 'cancelled' ? status : 'running'
+}
+
+function normalizeAgentTraceRunMode(value: unknown): AgentTraceRunMode {
+  return String(value ?? '') === 'background' ? 'background' : 'sync'
+}
+
+function normalizeAgentTraceEventType(value: unknown): AgentTraceEventType | null {
+  const type = String(value ?? '')
+  if (
+    type === 'round_start' ||
+    type === 'thinking' ||
+    type === 'content' ||
+    type === 'tool_call' ||
+    type === 'tool_result' ||
+    type === 'done' ||
+    type === 'error'
+  ) {
+    return type
+  }
+  return null
+}
+
+function normalizeAgentTraceEvent(raw: unknown): AgentTraceEvent | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const type = normalizeAgentTraceEventType(value.type)
+  if (!type) return null
+  const status = value.status === 'ok' || value.status === 'err' || value.status === 'pending'
+    ? value.status
+    : undefined
+  return {
+    id: String(value.id ?? newId()),
+    type,
+    round: Number.isFinite(Number(value.round)) ? Number(value.round) : undefined,
+    phase: typeof value.phase === 'string' ? value.phase : undefined,
+    toolCallId: typeof value.toolCallId === 'string' ? value.toolCallId : undefined,
+    toolName: typeof value.toolName === 'string' ? value.toolName : undefined,
+    summary: typeof value.summary === 'string' ? value.summary : undefined,
+    params: normalizeToolParams(value.params),
+    status,
+    message: typeof value.message === 'string' ? value.message : undefined,
+    dataPreview: typeof value.dataPreview === 'string' ? value.dataPreview : undefined,
+    content: typeof value.content === 'string' ? value.content : undefined,
+    isExpanded: Boolean(value.isExpanded),
+  }
+}
+
+function normalizeAgentTrace(raw: unknown): AgentTrace | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const id = String(value.id ?? '')
+  if (!id) return null
+  const events = Array.isArray(value.events)
+    ? value.events.map(normalizeAgentTraceEvent).filter((event): event is AgentTraceEvent => event !== null)
+    : []
+  const tools = Array.isArray(value.tools)
+    ? value.tools.map(item => String(item)).filter(Boolean)
+    : []
+  return {
+    id,
+    agentType: String(value.agentType ?? 'agent'),
+    description: String(value.description ?? '子代理任务'),
+    runMode: normalizeAgentTraceRunMode(value.runMode),
+    model: typeof value.model === 'string' ? value.model : undefined,
+    status: normalizeAgentTraceStatus(value.status),
+    tools,
+    events,
+    result: typeof value.result === 'string' ? value.result : undefined,
+    error: typeof value.error === 'string' ? value.error : undefined,
+    isExpanded: value.isExpanded !== false,
+  }
+}
+
+function compactAgentTraceForStorage(trace: AgentTrace): AgentTrace {
+  return {
+    id: trace.id,
+    agentType: trace.agentType,
+    description: compactAgentTraceText(trace.description, 180),
+    runMode: trace.runMode,
+    model: trace.model ? compactAgentTraceText(trace.model, 80) : undefined,
+    status: trace.status,
+    tools: trace.tools.slice(0, 30),
+    events: trace.events.map(event => ({
+      id: event.id,
+      type: event.type,
+      round: event.round,
+      phase: event.phase,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      summary: event.summary ? compactAgentTraceText(event.summary, 180) : undefined,
+      params: event.params && Object.keys(event.params).length > 0 ? event.params : undefined,
+      status: event.status,
+      message: event.message ? compactAgentTraceText(event.message, 260) : undefined,
+      dataPreview: event.dataPreview ? compactAgentTraceText(event.dataPreview, AGENT_TRACE_DATA_LIMIT) : undefined,
+      content: event.content ? compactAgentTraceText(event.content, 360) : undefined,
+      isExpanded: false,
+    })),
+    result: trace.result ? compactAgentTraceText(trace.result, 1200) : undefined,
+    error: trace.error ? compactAgentTraceText(trace.error, 360) : undefined,
+    isExpanded: trace.isExpanded !== false,
+  }
+}
+
+function createAgentTraceFromEvent(event: Record<string, unknown>): AgentTrace {
+  const agentId = String(event.agentId ?? newId())
+  const tools = Array.isArray(event.tools)
+    ? event.tools.map(item => String(item)).filter(Boolean)
+    : []
+  return {
+    id: agentId,
+    agentType: String(event.agentType ?? 'agent'),
+    description: String(event.description ?? '子代理任务'),
+    runMode: normalizeAgentTraceRunMode(event.runMode),
+    model: typeof event.model === 'string' ? event.model : undefined,
+    status: 'running',
+    tools,
+    events: [],
+    isExpanded: true,
+  }
+}
+
+function createFallbackAgentTrace(agentId: string, agentType = 'agent'): AgentTrace {
+  return {
+    id: agentId || newId(),
+    agentType,
+    description: '子代理任务',
+    runMode: 'sync',
+    status: 'running',
+    tools: [],
+    events: [],
+    isExpanded: true,
+  }
+}
+
+function upsertAgentTraceInList(
+  traces: AgentTrace[],
+  trace: AgentTrace,
+  updater: (current: AgentTrace) => AgentTrace = current => current,
+) {
+  const nextTrace = updater(trace)
+  const found = traces.some(current => current.id === nextTrace.id)
+  if (!found) return [...traces, nextTrace]
+  return traces.map(current => (current.id === nextTrace.id ? updater(current) : current))
+}
+
+function upsertAgentTraceInMessage(
+  message: Message,
+  trace: AgentTrace,
+  updater: (current: AgentTrace) => AgentTrace = current => current,
+): Message {
+  let found = false
+  const nextSegments = message.segments.map(segment => {
+    if (segment.type !== 'agent' || segment.trace.id !== trace.id) return segment
+    found = true
+    return { ...segment, trace: updater(segment.trace) }
+  })
+  if (!found) nextSegments.push({ id: newId(), type: 'agent', trace: updater(trace) })
+  return { ...message, segments: nextSegments }
+}
+
+function appendAgentTraceEvent(trace: AgentTrace, event: AgentTraceEvent): AgentTrace {
+  const lastEvent = trace.events.at(-1)
+  if (
+    lastEvent &&
+    lastEvent.type === event.type &&
+    lastEvent.phase === event.phase &&
+    (event.type === 'thinking' || event.type === 'content') &&
+    event.content
+  ) {
+    return {
+      ...trace,
+      events: [
+        ...trace.events.slice(0, -1),
+        {
+          ...lastEvent,
+          content: compactAgentTraceText(`${lastEvent.content ?? ''}${event.content}`, AGENT_TRACE_TEXT_LIMIT),
+        },
+      ],
+    }
+  }
+  return { ...trace, events: [...trace.events, event] }
+}
+
+function updateAgentTraceToolResult(trace: AgentTrace, toolCallId: string | undefined, toolName: string, result: Record<string, unknown>): AgentTrace {
+  let matched = false
+  const nextEvents = trace.events.map(event => {
+    if (event.type !== 'tool_call' || matched) return event
+    const sameId = Boolean(toolCallId && event.toolCallId === toolCallId)
+    const samePendingName = !toolCallId && event.toolName === toolName && event.status === 'pending'
+    if (!sameId && !samePendingName) return event
+    matched = true
+    return {
+      ...event,
+      type: 'tool_result' as const,
+      status: result.success === true ? 'ok' as const : 'err' as const,
+      message: typeof result.message === 'string' ? compactAgentTraceText(result.message, 260) : '',
+      dataPreview: result.data != null ? compactAgentTraceText(result.data, AGENT_TRACE_DATA_LIMIT) : undefined,
+      isExpanded: false,
+    }
+  })
+  if (matched) return { ...trace, events: nextEvents }
+  return appendAgentTraceEvent(trace, {
+    id: newId(),
+    type: 'tool_result',
+    toolCallId,
+    toolName,
+    summary: toolName,
+    status: result.success === true ? 'ok' : 'err',
+    message: typeof result.message === 'string' ? compactAgentTraceText(result.message, 260) : '',
+    dataPreview: result.data != null ? compactAgentTraceText(result.data, AGENT_TRACE_DATA_LIMIT) : undefined,
+    isExpanded: false,
+  })
+}
+
+function getAgentTraceStatusLabel(status: AgentTraceStatus) {
+  if (status === 'completed') return '已完成'
+  if (status === 'failed') return '失败'
+  if (status === 'cancelled') return '已取消'
+  return '运行中'
+}
+
+function getAgentTraceEventIcon(event: AgentTraceEvent) {
+  if (event.type === 'tool_result') {
+    return event.status === 'ok' ? '✓' : event.status === 'err' ? '×' : '…'
+  }
+  if (event.type === 'tool_call') return '⌕'
+  if (event.type === 'round_start') return '•'
+  if (event.type === 'done') return '✓'
+  if (event.type === 'error') return '×'
+  return '◦'
+}
+
+function getAgentTraceEventTitle(event: AgentTraceEvent) {
+  if (event.type === 'round_start') return event.round ? `Round ${event.round}` : '开始新一轮'
+  if (event.type === 'thinking') return 'Thinking'
+  if (event.type === 'content') return 'Drafting'
+  if (event.type === 'tool_call' || event.type === 'tool_result') {
+    const toolName = event.toolName || 'tool'
+    const lowerName = toolName.toLowerCase()
+    if (lowerName.includes('search')) return `Search ${toolName}`
+    if (lowerName.includes('read') || lowerName.includes('content') || lowerName.includes('paragraph')) return `Read ${toolName}`
+    if (lowerName.includes('screenshot') || lowerName.includes('image')) return `Inspect ${toolName}`
+    return toolName
+  }
+  if (event.type === 'done') return 'Done'
+  return 'Error'
+}
+
+const AgentTraceBlock: React.FC<{
+  trace: AgentTrace
+  onToggleTrace: () => void
+  onToggleEvent: (eventId: string) => void
+}> = ({ trace, onToggleTrace, onToggleEvent }) => {
+  const expanded = trace.isExpanded !== false
+  const statusClass = trace.status === 'completed'
+    ? 'text-emerald-600'
+    : trace.status === 'failed'
+      ? 'text-red-600'
+      : trace.status === 'cancelled'
+        ? 'text-slate-400'
+        : 'text-blue-600'
+
+  return (
+    <div className="relative rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs text-slate-600 before:absolute before:-left-4 before:top-3 before:h-2 before:w-2 before:rounded-full before:bg-slate-400">
+      <button
+        type="button"
+        onClick={onToggleTrace}
+        className="flex w-full items-start justify-between gap-3 text-left"
+      >
+        <span className="min-w-0">
+          <span className="block font-semibold text-slate-700">
+            {trace.agentType}: {trace.description}
+          </span>
+          <span className="mt-0.5 block truncate text-[11px] text-slate-400">
+            {trace.runMode === 'background' ? '后台子代理' : '同步子代理'}
+            {trace.model ? ` · ${trace.model}` : ''}
+            {trace.tools.length > 0 ? ` · ${trace.tools.length} tools` : ''}
+          </span>
+        </span>
+        <span className={`flex-shrink-0 text-[11px] ${statusClass}`}>
+          {getAgentTraceStatusLabel(trace.status)} {expanded ? '▾' : '▸'}
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="mt-2 space-y-2 border-l border-slate-200 pl-4">
+          {trace.events.length === 0 && trace.status === 'running' && (
+            <div className="relative text-[11px] text-slate-400 before:absolute before:-left-[21px] before:top-1.5 before:h-2 before:w-2 before:rounded-full before:bg-blue-300">
+              等待子代理开始输出...
+            </div>
+          )}
+          {trace.events.map(event => {
+            const eventExpanded = event.isExpanded === true
+            const canExpand = Boolean(event.params && Object.keys(event.params).length > 0) || Boolean(event.dataPreview) || Boolean(event.message)
+            return (
+              <div key={event.id} className="relative before:absolute before:-left-[21px] before:top-1.5 before:h-2 before:w-2 before:rounded-full before:bg-slate-300">
+                <div className="flex items-start gap-2">
+                  <span className={`mt-0.5 w-3 flex-shrink-0 text-center ${event.status === 'err' ? 'text-red-500' : event.status === 'ok' ? 'text-emerald-600' : 'text-slate-400'}`}>
+                    {getAgentTraceEventIcon(event)}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <button
+                      type="button"
+                      disabled={!canExpand}
+                      onClick={() => canExpand && onToggleEvent(event.id)}
+                      className="w-full text-left disabled:cursor-default"
+                    >
+                      <span className="font-medium text-slate-600">{getAgentTraceEventTitle(event)}</span>
+                      {event.summary && (
+                        <>
+                          <span className="mx-1 text-slate-300">·</span>
+                          <span className="text-slate-500">{event.summary}</span>
+                        </>
+                      )}
+                      {canExpand && (
+                        <span className="ml-1 text-[10px] text-slate-400">{eventExpanded ? '▾' : '▸'}</span>
+                      )}
+                    </button>
+                    {event.content && (
+                      <div className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-5 text-slate-500">
+                        {event.content}
+                      </div>
+                    )}
+                    {eventExpanded && (
+                      <div className="mt-1 space-y-1">
+                        {event.params && Object.keys(event.params).length > 0 && (
+                          <pre className="max-h-40 overflow-auto rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] leading-4 text-slate-500">
+                            {formatToolParams(event.params)}
+                          </pre>
+                        )}
+                        {event.message && (
+                          <div className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] leading-4 text-slate-500">
+                            {event.message}
+                          </div>
+                        )}
+                        {event.dataPreview && (
+                          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] leading-4 text-slate-500">
+                            {event.dataPreview}
+                          </pre>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+          {(trace.result || trace.error) && (
+            <div className={`relative rounded-md border px-2 py-1 text-[11px] leading-5 before:absolute before:-left-[21px] before:top-2 before:h-2 before:w-2 before:rounded-full ${trace.error ? 'border-red-100 bg-red-50 text-red-600 before:bg-red-300' : 'border-emerald-100 bg-emerald-50 text-emerald-700 before:bg-emerald-300'}`}>
+              <span className="font-medium">{trace.error ? 'Error' : 'Result'}: </span>
+              <span className="whitespace-pre-wrap break-words">{trace.error || trace.result}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function formatFileSize(size: number) {
@@ -1327,11 +1735,15 @@ function fromStoredMessages(messages: StoredMessage[], sidebarWidth: number): Me
 
     if (stored.role === 'assistant') {
       const aiMessage = makeAiMessage(stored.content ?? '', false)
+      const agentTraces = Array.isArray(stored.agentTraces)
+        ? stored.agentTraces.map(normalizeAgentTrace).filter((trace): trace is AgentTrace => trace !== null)
+        : []
       aiMessage.thinking = stored.thinking ?? ''
       aiMessage.toolCalls = normalizeStoredToolCalls(stored)
       aiMessage.segments = [
         ...(stored.thinking ? [{ id: newId(), type: 'thinking' as const, text: stored.thinking }] : []),
         ...(stored.content ? [{ id: newId(), type: 'content' as const, text: stored.content }] : []),
+        ...agentTraces.map(trace => ({ id: newId(), type: 'agent' as const, trace })),
         ...aiMessage.toolCalls.map(toolCall => ({ id: newId(), type: 'tool' as const, toolCall })),
       ]
       restored.push(aiMessage)
@@ -2108,6 +2520,14 @@ export default function AISidebar({
     let finalText = ''
     let thinkingText = ''
     let finished = false
+    let replayAgentTraces: AgentTrace[] = []
+    const updateReplayAgentTrace = (
+      trace: AgentTrace,
+      updater: (current: AgentTrace) => AgentTrace = current => current,
+    ) => {
+      replayAgentTraces = upsertAgentTraceInList(replayAgentTraces, trace, updater)
+      updateMessage(message => upsertAgentTraceInMessage(message, trace, updater))
+    }
     try {
       const response = await fetch(`/api/ai/react/runs/${sessionId}/events?after=${after}`, {
         signal: controller.signal,
@@ -2191,6 +2611,152 @@ export default function AISidebar({
               }))
               break
             }
+            case 'agent_start': {
+              const trace = createAgentTraceFromEvent(event)
+              updateReplayAgentTrace(trace)
+              if (trace.id) {
+                setAgentRuns(prev => [{
+                  id: trace.id,
+                  agentType: trace.agentType,
+                  description: trace.description,
+                  status: 'running',
+                }, ...prev.filter(agentRun => agentRun.id !== trace.id)])
+                setIsAgentPanelExpanded(true)
+              }
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `子代理 ${trace.agentType} 正在处理：${trace.description}`,
+              }))
+              break
+            }
+            case 'agent_progress': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              const agentType = String(event.agentType ?? 'agent')
+              const phase = String(event.phase ?? '')
+              const fallbackTrace = createFallbackAgentTrace(agentId, agentType)
+              if (phase === 'round_start') {
+                updateReplayAgentTrace(fallbackTrace, trace => appendAgentTraceEvent(trace, {
+                  id: newId(),
+                  type: 'round_start',
+                  round: Number.isFinite(Number(event.round)) ? Number(event.round) : undefined,
+                }))
+              } else if (phase === 'thinking' || phase === 'content') {
+                const content = String(event.content ?? '')
+                if (content) {
+                  updateReplayAgentTrace(fallbackTrace, trace => appendAgentTraceEvent(trace, {
+                    id: newId(),
+                    type: phase,
+                    phase,
+                    content: compactAgentTraceText(content, 360),
+                  }))
+                }
+              }
+              updateMessage(message => ({
+                ...message,
+                activityLabel: phase === 'thinking'
+                  ? `子代理 ${agentType} 正在推理...`
+                  : phase === 'content'
+                    ? `子代理 ${agentType} 正在汇总结论...`
+                    : `子代理 ${agentType} 正在执行...`,
+              }))
+              break
+            }
+            case 'agent_tool_call': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              if (!agentId) break
+              const agentType = String(event.agentType ?? 'agent')
+              const toolCall: ToolCallResult = {
+                id: typeof event.id === 'string' ? event.id : undefined,
+                name: String(event.name ?? ''),
+                params: normalizeToolParams(event.params),
+                originalParams: normalizeToolParams(event.params),
+                status: 'pending',
+                isExpanded: true,
+              }
+              updateReplayAgentTrace(createFallbackAgentTrace(agentId, agentType), trace => appendAgentTraceEvent(trace, {
+                id: newId(),
+                type: 'tool_call',
+                toolCallId: toolCall.id,
+                toolName: toolCall.name,
+                summary: summarizeToolPurpose(toolCall),
+                params: getReplayToolParams(toolCall),
+                status: 'pending',
+                isExpanded: false,
+              }))
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `子代理正在读取：${toolCall.name}`,
+              }))
+              break
+            }
+            case 'agent_tool_result': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              const agentType = String(event.agentType ?? 'agent')
+              const toolResult = event.toolResult && typeof event.toolResult === 'object' && !Array.isArray(event.toolResult)
+                ? event.toolResult as Record<string, unknown>
+                : {}
+              const toolId = typeof toolResult.id === 'string' ? toolResult.id : undefined
+              const toolName = String(toolResult.name ?? '')
+              const result = toolResult.result && typeof toolResult.result === 'object' && !Array.isArray(toolResult.result)
+                ? toolResult.result as Record<string, unknown>
+                : {}
+              updateReplayAgentTrace(createFallbackAgentTrace(agentId, agentType), trace => updateAgentTraceToolResult(trace, toolId, toolName, result))
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '子代理已收到工具结果，继续分析...',
+              }))
+              break
+            }
+            case 'agent_done': {
+              const agentType = String(event.agentType ?? 'agent')
+              const agentId = String(event.agentId ?? '')
+              const result = String(event.result ?? '').trim()
+              if (agentId) {
+                setAgentRuns(prev => prev.map(agentRun => agentRun.id === agentId
+                  ? { ...agentRun, status: 'completed', result }
+                  : agentRun))
+              }
+              updateReplayAgentTrace(createFallbackAgentTrace(agentId, agentType), trace => ({
+                ...appendAgentTraceEvent(trace, {
+                  id: newId(),
+                  type: 'done',
+                  content: result ? compactAgentTraceText(result, 360) : undefined,
+                }),
+                agentType,
+                status: 'completed',
+                result: result ? compactAgentTraceText(result, 1200) : undefined,
+              }))
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `子代理 ${agentType} 已完成，主 Agent 正在继续...`,
+              }))
+              break
+            }
+            case 'agent_background_launched': {
+              const agentType = String(event.agentType ?? 'agent')
+              const agentId = String(event.agentId ?? '')
+              const description = String(event.description ?? '后台任务')
+              updateReplayAgentTrace({
+                id: agentId || newId(),
+                agentType,
+                description,
+                runMode: 'background',
+                status: 'running',
+                tools: [],
+                events: [{
+                  id: newId(),
+                  type: 'content',
+                  phase: 'content',
+                  content: '后台子代理已启动，主 Agent 会继续当前流程。',
+                }],
+                isExpanded: true,
+              })
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '后台子代理已启动，主 Agent 正在继续...',
+              }))
+              break
+            }
             case 'done':
               finished = true
               updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
@@ -2201,11 +2767,14 @@ export default function AISidebar({
         }
       }
 
-      if (finalText.trim() || thinkingText.trim()) {
+      if (finalText.trim() || thinkingText.trim() || replayAgentTraces.length > 0) {
         const message: StoredMessage = {
           role: 'assistant',
           content: finalText || null,
           thinking: thinkingText || undefined,
+          agentTraces: replayAgentTraces.length > 0
+            ? replayAgentTraces.map(compactAgentTraceForStorage)
+            : undefined,
         }
         await fetch(`/api/conversations/${conversationId}/messages`, {
           method: 'POST',
@@ -2607,17 +3176,6 @@ export default function AISidebar({
     let conversationId = shouldStartNewConversation ? null : currentConversationIdRef.current
     let context = getContext()
     try {
-      const wsRes = await fetch('/api/workspace')
-      if (wsRes.ok) {
-        const wsDocs = await wsRes.json()
-        if (Array.isArray(wsDocs) && wsDocs.length > 0) {
-          context.workspaceDocs = wsDocs.map((d: { id: string; name: string; type: string; size: number; textLength: number }) => ({
-            id: d.id, name: d.name, type: d.type, size: d.size, textLength: d.textLength,
-          }))
-        }
-      }
-    } catch { /* ignore */ }
-    try {
       const documentSessionId = await syncDocumentSession(context)
       if (documentSessionId) {
         context = { ...getContext(), ...context, documentSessionId }
@@ -2641,12 +3199,16 @@ export default function AISidebar({
       assistantText: string,
       thinkingText: string,
       toolResults: ToolCallRecord[],
+      agentTraces: AgentTrace[] = [],
     ) => {
-      if (!assistantText && !thinkingText && toolResults.length === 0) return
+      if (!assistantText && !thinkingText && toolResults.length === 0 && agentTraces.length === 0) return
       persistedRecords.push({
         role: 'assistant',
         content: assistantText || null,
         thinking: thinkingText || undefined,
+        agentTraces: agentTraces.length > 0
+          ? agentTraces.map(compactAgentTraceForStorage)
+          : undefined,
         tool_calls: toolResults.length > 0
           ? toolResults.map(tool => ({
             id: tool.id,
@@ -2782,13 +3344,21 @@ export default function AISidebar({
       let roundThinkingText = ''
       let roundNumber = 0
       const pendingToolCalls: ToolCallResult[] = []
-      const agentThinkingKeys = new Set<string>()
+      let roundAgentTraces: AgentTrace[] = []
       let roundToolResultsPersisted = false
 
-      persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
-        if (roundToolResultsPersisted || toolResults.length === 0) return
+      const updateRoundAgentTrace = (
+        trace: AgentTrace,
+        updater: (current: AgentTrace) => AgentTrace = current => current,
+      ) => {
+        roundAgentTraces = upsertAgentTraceInList(roundAgentTraces, trace, updater)
+        updateMessage(message => upsertAgentTraceInMessage(message, trace, updater))
+      }
 
-        appendAssistantRound(roundAssistantText, roundThinkingText, toolResults)
+      persistRoundToolResults = (toolResults: ToolCallRecord[]) => {
+        if (roundToolResultsPersisted || (toolResults.length === 0 && roundAgentTraces.length === 0)) return
+
+        appendAssistantRound(roundAssistantText, roundThinkingText, toolResults, roundAgentTraces)
         persistedRecords.push(
           ...toolResults.map(tool => ({
             role: 'tool' as const,
@@ -2828,7 +3398,7 @@ export default function AISidebar({
               roundNumber = Number(event.round ?? 0)
               roundAssistantText = ''
               roundThinkingText = ''
-              agentThinkingKeys.clear()
+              roundAgentTraces = []
               serverExecutedToolResults.length = 0
               roundToolResultsPersisted = false
               break
@@ -2874,6 +3444,17 @@ export default function AISidebar({
             case 'agent_start': {
               const agentType = String(event.agentType ?? 'general-purpose')
               const description = String(event.description ?? '子代理任务')
+              const trace = createAgentTraceFromEvent(event)
+              updateRoundAgentTrace(trace)
+              if (trace.id) {
+                setAgentRuns(prev => [{
+                  id: trace.id,
+                  agentType: trace.agentType,
+                  description: trace.description,
+                  status: 'running',
+                }, ...prev.filter(agentRun => agentRun.id !== trace.id)])
+                setIsAgentPanelExpanded(true)
+              }
               updateMessage(message => ({
                 ...message,
                 activityLabel: `子代理 ${agentType} 正在处理：${description}`,
@@ -2885,21 +3466,22 @@ export default function AISidebar({
               const agentId = typeof event.agentId === 'string' ? event.agentId : ''
               const agentType = String(event.agentType ?? 'agent')
               const phase = String(event.phase ?? '')
-              if (phase === 'thinking') {
+              const fallbackTrace = createFallbackAgentTrace(agentId, agentType)
+              if (phase === 'round_start') {
+                updateRoundAgentTrace(fallbackTrace, trace => appendAgentTraceEvent(trace, {
+                  id: newId(),
+                  type: 'round_start',
+                  round: Number.isFinite(Number(event.round)) ? Number(event.round) : undefined,
+                }))
+              } else if (phase === 'thinking' || phase === 'content') {
                 const content = String(event.content ?? '')
                 if (content) {
-                  const thinkingKey = agentId || agentType
-                  const prefix = agentThinkingKeys.has(thinkingKey)
-                    ? ''
-                    : `${roundThinkingText ? '\n\n' : ''}[子代理 ${agentType} 思考过程]\n`
-                  agentThinkingKeys.add(thinkingKey)
-                  const thinkingChunk = `${prefix}${content}`
-                  roundThinkingText += thinkingChunk
-                  updateMessage(message => ({
-                    ...appendThinkingChunk(message, thinkingChunk),
-                    activityLabel: `子代理 ${agentType} 正在推理...`,
+                  updateRoundAgentTrace(fallbackTrace, trace => appendAgentTraceEvent(trace, {
+                    id: newId(),
+                    type: phase,
+                    phase,
+                    content: compactAgentTraceText(content, 360),
                   }))
-                  break
                 }
               }
               updateMessage(message => ({
@@ -2916,6 +3498,7 @@ export default function AISidebar({
             case 'agent_tool_call': {
               const agentId = typeof event.agentId === 'string' ? event.agentId : ''
               if (!agentId) break
+              const agentType = String(event.agentType ?? 'agent')
               const toolCall: ToolCallResult = {
                 id: typeof event.id === 'string' ? event.id : undefined,
                 name: String(event.name ?? ''),
@@ -2924,14 +3507,27 @@ export default function AISidebar({
                 status: 'pending',
                 isExpanded: true,
               }
+              const fallbackTrace = createFallbackAgentTrace(agentId, agentType)
+              updateRoundAgentTrace(fallbackTrace, trace => appendAgentTraceEvent(trace, {
+                id: newId(),
+                type: 'tool_call',
+                toolCallId: toolCall.id,
+                toolName: toolCall.name,
+                summary: summarizeToolPurpose(toolCall),
+                params: getReplayToolParams(toolCall),
+                status: 'pending',
+                isExpanded: false,
+              }))
               updateMessage(message => ({
-                ...appendToolSegment(message, toolCall),
+                ...message,
                 activityLabel: `子代理正在读取：${toolCall.name}`,
               }))
               break
             }
 
             case 'agent_tool_result': {
+              const agentId = typeof event.agentId === 'string' ? event.agentId : ''
+              const agentType = String(event.agentType ?? 'agent')
               const toolResult = event.toolResult && typeof event.toolResult === 'object' && !Array.isArray(event.toolResult)
                 ? event.toolResult as Record<string, unknown>
                 : {}
@@ -2940,18 +3536,10 @@ export default function AISidebar({
               const result = toolResult.result && typeof toolResult.result === 'object' && !Array.isArray(toolResult.result)
                 ? toolResult.result as Record<string, unknown>
                 : {}
+              const fallbackTrace = createFallbackAgentTrace(agentId, agentType)
+              updateRoundAgentTrace(fallbackTrace, trace => updateAgentTraceToolResult(trace, toolId, toolName, result))
               updateMessage(message => ({
-                ...updateToolCallInMessage(
-                  message,
-                  currentToolCall => Boolean(toolId && currentToolCall.id === toolId) || (!toolId && currentToolCall.name === toolName && currentToolCall.status === 'pending'),
-                  currentToolCall => ({
-                    ...currentToolCall,
-                    status: result.success === true ? 'ok' : 'err',
-                    message: typeof result.message === 'string' ? result.message : '',
-                    data: result.data,
-                    isExpanded: false,
-                  }),
-                ),
+                ...message,
                 activityLabel: '子代理已收到工具结果，继续分析...',
               }))
               break
@@ -2966,11 +3554,21 @@ export default function AISidebar({
                   ? { ...agentRun, status: 'completed', result }
                   : agentRun))
               }
+              updateRoundAgentTrace(createFallbackAgentTrace(agentId, agentType), trace => {
+                const withDone = appendAgentTraceEvent(trace, {
+                  id: newId(),
+                  type: 'done',
+                  content: result ? compactAgentTraceText(result, 360) : undefined,
+                })
+                return {
+                  ...withDone,
+                  agentType,
+                  status: 'completed',
+                  result: result ? compactAgentTraceText(result, 1200) : undefined,
+                }
+              })
               updateMessage(message => ({
-                ...appendContentChunk(
-                  message,
-                  `${message.text ? '\n\n' : ''}[${agentType} 子代理结果]\n${result}`,
-                ),
+                ...message,
                 activityLabel: `子代理 ${agentType} 已完成，主 Agent 正在继续...`,
               }))
               break
@@ -2989,11 +3587,23 @@ export default function AISidebar({
                 }, ...prev.filter(agentRun => agentRun.id !== agentId)])
                 setIsAgentPanelExpanded(true)
               }
+              updateRoundAgentTrace({
+                id: agentId || newId(),
+                agentType,
+                description,
+                runMode: 'background',
+                status: 'running',
+                tools: [],
+                events: [{
+                  id: newId(),
+                  type: 'content',
+                  phase: 'content',
+                  content: '后台子代理已启动，主 Agent 会继续当前流程。',
+                }],
+                isExpanded: true,
+              })
               updateMessage(message => ({
-                ...appendContentChunk(
-                  message,
-                  `${message.text ? '\n\n' : ''}[${agentType} 后台子代理已启动] ${description}`,
-                ),
+                ...message,
                 activityLabel: '后台子代理已启动，主 Agent 正在继续...',
               }))
               break
@@ -3007,6 +3617,51 @@ export default function AISidebar({
                 activityLabel: loadedCount > 0
                   ? `已加载 ${loadedCount} 个延迟工具，剩余 ${deferredCount} 个`
                   : `已同步工具摘要，延迟工具 ${deferredCount} 个`,
+              }))
+              break
+            }
+
+            case 'layout_preflight_start': {
+              const pageCount = Number(event.pageCount ?? 0)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: pageCount > 0
+                  ? `排版前正在逐页分析样式（共 ${pageCount} 页）...`
+                  : '排版前正在分析页面样式...',
+              }))
+              break
+            }
+
+            case 'layout_preflight_page_start': {
+              const page = Number(event.page ?? 0)
+              const pageCount = Number(event.pageCount ?? 0)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: page > 0 && pageCount > 0
+                  ? `正在分析第 ${page}/${pageCount} 页样式...`
+                  : '正在分析页面样式...',
+              }))
+              break
+            }
+
+            case 'layout_preflight_page_done': {
+              const page = Number(event.page ?? 0)
+              const pageCount = Number(event.pageCount ?? 0)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: page > 0 && pageCount > 0
+                  ? `已完成第 ${page}/${pageCount} 页样式分析...`
+                  : '已完成一页样式分析...',
+              }))
+              break
+            }
+
+            case 'layout_preflight_done': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: event.success === false
+                  ? '排版前样式分析未完成，正在调整策略...'
+                  : '逐页样式分析完成，开始执行排版...',
               }))
               break
             }
@@ -3059,9 +3714,6 @@ export default function AISidebar({
 
             case 'round_complete': {
               persistRoundToolResults(serverExecutedToolResults)
-              if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
-                appendAssistantRound(roundAssistantText, roundThinkingText, [])
-              }
               updateMessage(message => ({
                 ...message,
                 activityLabel: String(event.message ?? '正在继续执行后续步骤...'),
@@ -3073,9 +3725,10 @@ export default function AISidebar({
               finished = true
               {
                 persistRoundToolResults(serverExecutedToolResults)
-                // Persist the final round (content-only, no tools)
-                if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText)) {
-                  appendAssistantRound(roundAssistantText, roundThinkingText, [])
+                // Persist the final round when it has text, thinking, or child-agent trace without tool results.
+                if (!roundToolResultsPersisted && (roundAssistantText || roundThinkingText || roundAgentTraces.length > 0)) {
+                  appendAssistantRound(roundAssistantText, roundThinkingText, [], roundAgentTraces)
+                  roundToolResultsPersisted = true
                 }
                 updateMessage(message => {
                   let nextMessage = message
@@ -3115,10 +3768,42 @@ export default function AISidebar({
             }
 
             case 'compression': {
-              const tier = Number(event.tier ?? 1)
+              const source = String(event.source ?? 'auto')
               updateMessage(message => ({
                 ...message,
-                activityLabel: `上下文压缩（级别 ${tier}）`,
+                activityLabel: source === 'reactive' ? '上下文过长，已压缩后重试' : '上下文已自动压缩',
+              }))
+              break
+            }
+
+            case 'compact_start': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: String(event.source ?? '') === 'reactive' ? '上下文过长，正在压缩...' : '正在压缩上下文...',
+              }))
+              break
+            }
+
+            case 'compact_end': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '上下文压缩完成',
+              }))
+              break
+            }
+
+            case 'compact_failed': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: String(event.message ?? '上下文压缩失败'),
+              }))
+              break
+            }
+
+            case 'microcompact': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '已整理旧工具结果',
               }))
               break
             }
@@ -3627,6 +4312,52 @@ export default function AISidebar({
                                     </div>
                                   )}
                                 </div>
+                              )
+                            }
+
+                            if (segment.type === 'agent') {
+                              const trace = segment.trace
+                              return (
+                                <AgentTraceBlock
+                                  key={segment.id}
+                                  trace={trace}
+                                  onToggleTrace={() => {
+                                    shouldAutoScrollRef.current = false
+                                    setMessages(prev => prev.map(item => {
+                                      if (item.id !== message.id) return item
+                                      return {
+                                        ...item,
+                                        segments: item.segments.map(currentSegment => (
+                                          currentSegment.type === 'agent' && currentSegment.trace.id === trace.id
+                                            ? { ...currentSegment, trace: { ...currentSegment.trace, isExpanded: currentSegment.trace.isExpanded === false } }
+                                            : currentSegment
+                                        )),
+                                      }
+                                    }))
+                                  }}
+                                  onToggleEvent={(eventId: string) => {
+                                    shouldAutoScrollRef.current = false
+                                    setMessages(prev => prev.map(item => {
+                                      if (item.id !== message.id) return item
+                                      return {
+                                        ...item,
+                                        segments: item.segments.map(currentSegment => (
+                                          currentSegment.type === 'agent' && currentSegment.trace.id === trace.id
+                                            ? {
+                                                ...currentSegment,
+                                                trace: {
+                                                  ...currentSegment.trace,
+                                                  events: currentSegment.trace.events.map(event => (
+                                                    event.id === eventId ? { ...event, isExpanded: !event.isExpanded } : event
+                                                  )),
+                                                },
+                                              }
+                                            : currentSegment
+                                        )),
+                                      }
+                                    }))
+                                  }}
+                                />
                               )
                             }
 

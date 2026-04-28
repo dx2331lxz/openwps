@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import patch
 
+from fastapi import HTTPException
 from langchain_core.messages import AIMessageChunk
 
-from server.app.ai import ReasoningContentChatOpenAI, _build_ai_message, _extract_reasoning, _to_langchain_message
+from server.app.ai import (
+    ReasoningContentChatOpenAI,
+    _build_ai_message,
+    _extract_reasoning,
+    _http_error_message,
+    _normalize_ai_api_error_detail,
+    _serialize_tool_result_payload,
+    _to_langchain_message,
+    _with_backend_workspace_docs,
+)
+from server.app.models import ChatRequest
 
 
 class ReasoningExtractionTest(unittest.TestCase):
@@ -97,6 +110,48 @@ class ReasoningExtractionTest(unittest.TestCase):
         })
 
         self.assertEqual(message.additional_kwargs.get("reasoning_content"), "先调用工具再总结。")
+
+    def test_html_error_detail_is_compacted_for_model_context(self) -> None:
+        html = "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>" + ("cloudflare " * 500) + "</body></html>"
+        body = ChatRequest(message="检查页面", model="text-model")
+
+        normalized = _normalize_ai_api_error_detail(body, html)
+        self.assertNotIn("<!DOCTYPE html>", normalized)
+        self.assertLess(len(normalized), 500)
+
+        http_message = _http_error_message(HTTPException(status_code=502, detail=f"多模态模型请求失败: {html}"))
+        self.assertNotIn("<!DOCTYPE html>", http_message)
+        self.assertLess(len(http_message), 1000)
+
+        payload = json.loads(_serialize_tool_result_payload(
+            tool_name="capture_page_screenshot",
+            success=False,
+            message=f"后端视觉模型未能完成页面截图验收：{html}",
+            executed_params={"page": 1},
+        ))
+        self.assertNotIn("<!DOCTYPE html>", payload["message"])
+        self.assertLess(len(payload["message"]), 1000)
+
+    def test_workspace_manifest_is_backend_owned(self) -> None:
+        client_context = {
+            "paragraphCount": 1,
+            "workspaceDocs": [{"id": "client_doc", "name": "客户端伪造.pdf"}],
+        }
+        backend_docs = [{
+            "id": "backend_doc",
+            "name": "后端资料.pdf",
+            "type": "pdf",
+            "size": 128,
+            "textLength": 32,
+            "uploadedAt": "2026-04-28T10:00:00",
+        }]
+
+        with patch("server.app.ai.list_workspace_docs", return_value=backend_docs):
+            context = _with_backend_workspace_docs(client_context)
+
+        self.assertEqual(context["paragraphCount"], 1)
+        self.assertEqual(context["workspaceDocs"], backend_docs)
+        self.assertNotIn("client_doc", json.dumps(context, ensure_ascii=False))
 
 
 if __name__ == "__main__":

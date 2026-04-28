@@ -40,13 +40,17 @@ class AttachmentMessage:
         attachment_type: str,
         added: list[dict] | None = None,
         removed: list[dict] | None = None,
+        current: list[dict] | None = None,
         updated: dict | None = None,
+        mode: str | None = None,
         is_initial: bool = False,
     ):
         self.attachment_type = attachment_type
         self.added = added or []
         self.removed = removed or []
+        self.current = current or []
         self.updated = updated
+        self.mode = mode or ""
         self.is_initial = is_initial
 
 
@@ -134,7 +138,9 @@ def _parse_attachment(content: str, attachment_type: str) -> AttachmentMessage |
             attachment_type=payload.get("type", attachment_type),
             added=payload.get("added", []),
             removed=payload.get("removed", []),
+            current=payload.get("current", []),
             updated=payload.get("updated"),
+            mode=payload.get("mode"),
             is_initial=payload.get("is_initial", False),
         )
     except (json.JSONDecodeError, ValueError):
@@ -154,6 +160,12 @@ def reconstruct_workspace_docs_state(
     attachments = _find_attachment_messages(messages, WORKSPACE_DOCS_DELTA)
     
     for att in attachments:
+        if att.current:
+            announced = {
+                doc_id
+                for item in att.current
+                if (doc_id := item.get("id"))
+            }
         for item in att.added:
             doc_id = item.get("id")
             if doc_id:
@@ -166,11 +178,82 @@ def reconstruct_workspace_docs_state(
     return announced
 
 
+def _workspace_doc_id(doc: dict) -> str | None:
+    doc_id = doc.get("id")
+    return str(doc_id) if doc_id else None
+
+
+def _summarize_workspace_doc(doc: dict) -> dict:
+    summary = {
+        "id": doc.get("id"),
+        "name": doc.get("name", "?"),
+    }
+    for key in ("type", "size", "textLength", "uploadedAt"):
+        if key in doc:
+            summary[key] = doc.get(key)
+    return summary
+
+
+def _workspace_doc_ids(docs: list[dict] | None) -> set[str]:
+    return {
+        doc_id
+        for doc in docs or []
+        if (doc_id := _workspace_doc_id(doc))
+    }
+
+
+def _append_workspace_doc_list(parts: list[str], docs: list[dict], *, marker: str) -> None:
+    for doc in docs:
+        name = doc.get("name", "?")
+        doc_id = doc.get("id", "?")
+        doc_type = doc.get("type", "?")
+        size = doc.get("size", 0)
+        text_length = doc.get("textLength", 0)
+        uploaded_at = doc.get("uploadedAt")
+        suffix = f", uploadedAt={uploaded_at}" if uploaded_at else ""
+        parts.append(f"  {marker} [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars{suffix})")
+
+
+def _format_workspace_docs_snapshot(
+    current_docs: list[dict],
+    *,
+    reason: str,
+    initial: bool = False,
+) -> str | None:
+    if not current_docs:
+        return None
+
+    parts = [f"{ATTACHMENT_MARKER} type={WORKSPACE_DOCS_DELTA}"]
+    payload = {
+        "type": WORKSPACE_DOCS_DELTA,
+        "mode": "snapshot",
+        "current": [_summarize_workspace_doc(doc) for doc in current_docs],
+        "added": [],
+        "removed": [],
+        "is_initial": initial,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    parts.append("")
+    parts.append("[当前工作区参考文档快照]")
+    if reason == "compact":
+        parts.append("这是上下文压缩后的工作区参考文档快照，用于恢复可用参考资料列表；它不表示本轮创建、发现或修改了文件。")
+    elif initial:
+        parts.append("这些是会话开始时已经可用的参考资料，不表示当前任务执行过程中创建、发现或修改了文件。")
+    else:
+        parts.append("这是当前可用参考资料列表，用于建立基线；它不表示本轮创建、发现或修改了文件。")
+    parts.append("除非用户要求引用/处理这些资料，或当前任务确实缺少外部参考，否则不要主动搜索工作区，也不要在最终回复中主动提及未使用的参考文件。")
+    parts.append("当前可用参考文档：")
+    _append_workspace_doc_list(parts, current_docs, marker="-")
+    return "\n".join(parts)
+
+
 def compute_workspace_docs_delta(
     current_docs: list[dict],
     messages: list[Any],
     *,
     initial: bool = False,
+    force_snapshot: bool = False,
+    previous_docs: list[dict] | None = None,
 ) -> str | None:
     """Compute delta for workspace docs changes.
     
@@ -179,12 +262,27 @@ def compute_workspace_docs_delta(
     
     Returns formatted delta text, or None if no changes.
     """
+    if initial or force_snapshot:
+        return _format_workspace_docs_snapshot(
+            current_docs,
+            reason="compact" if force_snapshot and not initial else "initial",
+            initial=initial,
+        )
+
     prior_attachments = _find_attachment_messages(messages, WORKSPACE_DOCS_DELTA)
-    announced_ids = reconstruct_workspace_docs_state(messages)
-    is_initial_announcement = initial or not prior_attachments
-    
-    current_ids = {doc.get("id") for doc in current_docs}
-    current_map = {doc.get("id"): doc for doc in current_docs}
+    if previous_docs is not None:
+        announced_ids = _workspace_doc_ids(previous_docs)
+    elif prior_attachments:
+        announced_ids = reconstruct_workspace_docs_state(messages)
+    else:
+        return _format_workspace_docs_snapshot(current_docs, reason="baseline")
+
+    current_ids = _workspace_doc_ids(current_docs)
+    current_map = {
+        doc_id: doc
+        for doc in current_docs
+        if (doc_id := _workspace_doc_id(doc))
+    }
     
     added_ids = current_ids - announced_ids
     removed_ids = announced_ids - current_ids
@@ -199,29 +297,21 @@ def compute_workspace_docs_delta(
     
     payload = {
         "type": WORKSPACE_DOCS_DELTA,
+        "mode": "delta",
         "added": [{"id": d.get("id"), "name": d.get("name", "?")} for d in added_docs],
         "removed": removed_docs,
-        "is_initial": is_initial_announcement,
+        "is_initial": False,
     }
     parts.append(json.dumps(payload, ensure_ascii=False))
     
     # Human-readable text for the model
     parts.append("")
-    if is_initial_announcement:
-        parts.append("[当前工作区已有文档]")
-        parts.append("这些文档在会话开始时已经存在，是可选参考资料，不代表当前任务执行过程中新增或发现了新文件。除非用户要求引用资料，或任务确实需要参考外部文档，否则不要主动搜索无关文件。")
-    else:
-        parts.append("[工作区文档变更]")
+    parts.append("[工作区文档变更]")
+    parts.append("以下仅为工作区参考资料 manifest 的真实变化；不要把未列在新增文档中的已有文件说成新增。只有用户要求引用/处理资料，或当前任务确实需要外部参考时，才搜索工作区。")
     
     if added_docs:
-        parts.append("已有文档：" if is_initial_announcement else "新增文档：")
-        for doc in added_docs:
-            name = doc.get("name", "?")
-            doc_id = doc.get("id", "?")
-            doc_type = doc.get("type", "?")
-            size = doc.get("size", 0)
-            text_length = doc.get("textLength", 0)
-            parts.append(f"  + [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars)")
+        parts.append("新增文档：")
+        _append_workspace_doc_list(parts, added_docs, marker="+")
     
     if removed_ids:
         parts.append("移除文档：")
@@ -379,6 +469,7 @@ def compute_all_deltas(
     context: dict,
     messages: list[Any],
     force_full: bool = False,
+    previous_workspace_docs: list[dict] | None = None,
 ) -> list[str]:
     """Compute all delta attachments for the current turn.
     
@@ -388,11 +479,11 @@ def compute_all_deltas(
     deltas = []
     
     if force_full:
-        # Full re-announcement: pass empty messages list
+        # Full re-announcement after compaction is a snapshot, not a change event.
         docs_delta = compute_workspace_docs_delta(
             context.get("workspaceDocs", []),
-            [],  # empty → no prior state → full announcement
-            initial=True,
+            [],
+            force_snapshot=True,
         )
         template_delta = compute_template_delta(
             context.get("activeTemplate"),
@@ -406,6 +497,7 @@ def compute_all_deltas(
         docs_delta = compute_workspace_docs_delta(
             context.get("workspaceDocs", []),
             messages,
+            previous_docs=previous_workspace_docs,
         )
         template_delta = compute_template_delta(
             context.get("activeTemplate"),

@@ -12,6 +12,7 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[list[dict[str, Any]]] = None
     toolCalls: Optional[list[dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
+    agentTraces: Optional[list[dict[str, Any]]] = None
     name: Optional[str] = None
     thinking: Optional[str] = None
 

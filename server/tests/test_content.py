@@ -6,7 +6,7 @@ import unittest
 import json
 import zlib
 
-from server.app.models import ChatRequest
+from server.app.models import ChatMessage, ChatRequest
 from server.app.content import (
     build_delta_content,
     build_initial_context_content,
@@ -26,6 +26,24 @@ class DummyMessage:
 
 
 class ContentModuleTest(unittest.TestCase):
+    def test_chat_message_preserves_agent_traces(self) -> None:
+        trace = {
+            "id": "agent_1",
+            "agentType": "verification",
+            "description": "检查第 1 页",
+            "runMode": "sync",
+            "status": "completed",
+            "tools": ["get_page_content"],
+            "events": [{"id": "evt_1", "type": "tool_result", "toolName": "get_page_content", "status": "ok"}],
+            "result": "PASS",
+        }
+
+        message = ChatMessage(role="assistant", content=None, agentTraces=[trace])
+        dumped = message.model_dump(exclude_none=True)
+
+        self.assertEqual(dumped["agentTraces"][0]["id"], "agent_1")
+        self.assertEqual(dumped["agentTraces"][0]["events"][0]["toolName"], "get_page_content")
+
     def test_builtin_vision_test_image_is_valid_png(self) -> None:
         header, encoded = VISION_TEST_IMAGE_DATA_URL.split(",", 1)
         self.assertEqual(header, "data:image/png;base64")
@@ -93,12 +111,14 @@ class ContentModuleTest(unittest.TestCase):
 
         initial = build_initial_context_content(context)
 
-        self.assertIn("当前工作区已有文档", initial.content)
-        self.assertIn("已有文档", initial.content)
+        self.assertIn("当前工作区参考文档快照", initial.content)
+        self.assertIn("当前可用参考文档", initial.content)
+        self.assertIn('"mode": "snapshot"', initial.content)
+        self.assertIn('"current"', initial.content)
         self.assertNotIn("新增文档", initial.content)
-        self.assertIn("不代表当前任务执行过程中新增", initial.content)
+        self.assertNotIn("新增", initial.content)
 
-    def test_workspace_docs_without_prior_delta_are_treated_as_initial(self) -> None:
+    def test_workspace_docs_without_prior_delta_are_snapshot_not_new(self) -> None:
         context = {
             "workspaceDocs": [{
                 "id": "doc_1",
@@ -112,9 +132,41 @@ class ContentModuleTest(unittest.TestCase):
         delta = build_delta_content(context, [])
 
         self.assertEqual(delta.trace["deltaCount"], 1)
-        self.assertIn("当前工作区已有文档", delta.content[0])
-        self.assertIn("已有文档", delta.content[0])
+        self.assertIn("当前工作区参考文档快照", delta.content[0])
+        self.assertIn('"mode": "snapshot"', delta.content[0])
         self.assertNotIn("新增文档", delta.content[0])
+        self.assertNotIn("新增", delta.content[0])
+
+    def test_force_full_workspace_docs_are_snapshot_not_new(self) -> None:
+        context = {
+            "workspaceDocs": [{
+                "id": "doc_1",
+                "name": "初试成绩.pdf",
+                "type": "pdf",
+                "size": 1024,
+                "textLength": 88,
+            }],
+        }
+        full = build_delta_content(context, [], force_full=True)
+
+        self.assertEqual(full.trace["deltaCount"], 1)
+        self.assertIn("当前工作区参考文档快照", full.content[0])
+        self.assertIn('"mode": "snapshot"', full.content[0])
+        self.assertNotIn("新增文档", full.content[0])
+        self.assertNotIn("新增", full.content[0])
+
+    def test_workspace_docs_with_session_baseline_are_not_reannounced(self) -> None:
+        docs = [{
+            "id": "doc_1",
+            "name": "初试成绩.pdf",
+            "type": "pdf",
+            "size": 1024,
+            "textLength": 88,
+        }]
+
+        delta = build_delta_content({"workspaceDocs": docs}, [], previous_workspace_docs=docs)
+
+        self.assertEqual(delta.content, [])
 
     def test_workspace_delta_after_initial_context_describes_new_docs(self) -> None:
         initial_context = {
@@ -146,6 +198,91 @@ class ContentModuleTest(unittest.TestCase):
         self.assertEqual(changed.trace["deltaCount"], 1)
         self.assertIn("新增文档", changed.content[0])
         self.assertIn("新增资料.pdf", changed.content[0])
+        self.assertIn('"mode": "delta"', changed.content[0])
+
+    def test_workspace_state_reconstruction_supports_legacy_added_payload(self) -> None:
+        legacy_attachment = (
+            '[系统附件] type=workspace_docs_delta\n'
+            '{"type":"workspace_docs_delta","added":[{"id":"doc_1","name":"参考资料.pdf"}],"removed":[],"is_initial":true}'
+        )
+        unchanged = build_delta_content(
+            {
+                "workspaceDocs": [{
+                    "id": "doc_1",
+                    "name": "参考资料.pdf",
+                    "type": "pdf",
+                    "size": 1024,
+                    "textLength": 88,
+                }],
+            },
+            [DummyMessage(legacy_attachment)],
+        )
+
+        self.assertEqual(unchanged.content, [])
+
+    def test_workspace_delta_from_session_baseline_describes_new_docs_once(self) -> None:
+        previous_docs = [{
+            "id": "doc_1",
+            "name": "参考资料.pdf",
+            "type": "pdf",
+            "size": 1024,
+            "textLength": 88,
+        }]
+        current_docs = [
+            *previous_docs,
+            {
+                "id": "doc_2",
+                "name": "新增资料.pdf",
+                "type": "pdf",
+                "size": 2048,
+                "textLength": 120,
+            },
+        ]
+
+        changed = build_delta_content(
+            {"workspaceDocs": current_docs},
+            [],
+            previous_workspace_docs=previous_docs,
+        )
+        repeated = build_delta_content(
+            {"workspaceDocs": current_docs},
+            [DummyMessage(changed.content[0])],
+            previous_workspace_docs=current_docs,
+        )
+
+        self.assertEqual(changed.trace["deltaCount"], 1)
+        self.assertIn("新增文档", changed.content[0])
+        self.assertIn("新增资料.pdf", changed.content[0])
+        self.assertEqual(repeated.content, [])
+
+    def test_workspace_delta_describes_removed_docs(self) -> None:
+        initial_context = {
+            "workspaceDocs": [
+                {
+                    "id": "doc_1",
+                    "name": "参考资料.pdf",
+                    "type": "pdf",
+                    "size": 1024,
+                    "textLength": 88,
+                },
+                {
+                    "id": "doc_2",
+                    "name": "删除资料.pdf",
+                    "type": "pdf",
+                    "size": 2048,
+                    "textLength": 120,
+                },
+            ],
+        }
+        initial = build_initial_context_content(initial_context)
+        changed = build_delta_content(
+            {"workspaceDocs": [initial_context["workspaceDocs"][0]]},
+            [DummyMessage(initial.content)],
+        )
+
+        self.assertEqual(changed.trace["deltaCount"], 1)
+        self.assertIn("移除文档", changed.content[0])
+        self.assertIn("doc_2", changed.content[0])
 
     def test_user_attachment_trace_counts_clipped_chars_without_content(self) -> None:
         result = build_user_content(

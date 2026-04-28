@@ -1330,6 +1330,18 @@ async function execute(input) {
       return ok(`已插入 ${rows} 行 ${cols} 列表格`, { table: tableSnapshot(table) }, { docJson: inserted.doc.toJSON() })
     }
 
+    case 'delete_table': {
+      const target = resolveTableTarget(state.doc, params, selectionContext)
+      if (target.error) return fail(target.error)
+      const { table } = target
+      if (state.doc.childCount === 1) {
+        tr.replaceWith(table.pos, table.pos + table.node.nodeSize, schema.nodes.paragraph.create())
+      } else {
+        tr.delete(table.pos, table.pos + table.node.nodeSize)
+      }
+      return ok(`已删除第 ${table.index + 1} 个表格`, { tableIndex: table.index }, { docJson: tr.doc.toJSON() })
+    }
+
     case 'insert_table_row_before':
     case 'insert_table_row_after':
     case 'delete_table_row':

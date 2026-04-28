@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 import uuid
@@ -58,6 +59,7 @@ SERVER_EXECUTABLE_DOCUMENT_TOOLS = {
     "replace_selection_text",
     "delete_selection_text",
     "delete_paragraph",
+    "delete_table",
     "insert_image",
     "insert_mermaid",
     "capture_page_screenshot",
@@ -92,6 +94,74 @@ def _normalize_page_config(value: Any) -> dict[str, Any]:
         "marginLeft": value.get("marginLeft") if isinstance(value.get("marginLeft"), (int, float)) else DEFAULT_PAGE_CONFIG["marginLeft"],
         "marginRight": value.get("marginRight") if isinstance(value.get("marginRight"), (int, float)) else DEFAULT_PAGE_CONFIG["marginRight"],
     }
+
+
+def _node_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    content = value.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(_node_text(item) for item in content)
+
+
+def _hash_jsonable(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _content_structure_signature(doc_json: dict[str, Any]) -> dict[str, Any]:
+    content = doc_json.get("content") if isinstance(doc_json.get("content"), list) else []
+    top_level_types: list[str] = []
+    paragraph_texts: list[str] = []
+    table_texts: list[list[list[str]]] = []
+    full_text_parts: list[str] = []
+
+    for node in content:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "")
+        top_level_types.append(node_type)
+        node_text = _node_text(node)
+        full_text_parts.append(node_text)
+        if node_type == "paragraph":
+            paragraph_texts.append(node_text)
+            continue
+        if node_type == "table":
+            rows: list[list[str]] = []
+            for row in node.get("content") or []:
+                if not isinstance(row, dict):
+                    continue
+                cells: list[str] = []
+                for cell in row.get("content") or []:
+                    if isinstance(cell, dict):
+                        cells.append(_node_text(cell))
+                rows.append(cells)
+            table_texts.append(rows)
+
+    return {
+        "topLevelTypes": top_level_types,
+        "paragraphCount": len(paragraph_texts),
+        "tableCount": len(table_texts),
+        "paragraphTextsHash": _hash_jsonable(paragraph_texts),
+        "tableTextsHash": _hash_jsonable(table_texts),
+        "fullTextHash": _hash_jsonable("\n".join(full_text_parts)),
+    }
+
+
+def _content_structure_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    keys = {
+        "topLevelTypes",
+        "paragraphCount",
+        "tableCount",
+        "paragraphTextsHash",
+        "tableTextsHash",
+        "fullTextHash",
+    }
+    return any(before.get(key) != after.get(key) for key in keys)
 
 
 @dataclass
@@ -243,6 +313,7 @@ async def execute_document_tool(
     *,
     base_version: int | None = None,
     selection_context: dict[str, Any] | None = None,
+    preserve_content_structure: bool = False,
 ) -> dict[str, Any]:
     if not is_document_tool(tool_name):
         return {"success": False, "message": f"Not a document tool: {tool_name}"}
@@ -256,6 +327,8 @@ async def execute_document_tool(
         }
 
     effective_selection = selection_context if selection_context is not None else session.selection_context
+    before_signature = _content_structure_signature(session.doc_json) if preserve_content_structure else None
+
     worker_payload = {
         "toolName": tool_name,
         "params": params or {},
@@ -271,6 +344,22 @@ async def execute_document_tool(
         next_doc = result.get("docJson")
         next_page_config = result.get("pageConfig")
         if isinstance(next_doc, dict):
+            if before_signature is not None:
+                next_doc_normalized = _normalize_doc_json(next_doc)
+                after_signature = _content_structure_signature(next_doc_normalized)
+                if _content_structure_changed(before_signature, after_signature):
+                    return {
+                        "success": False,
+                        "message": "排版结构保护已阻断：样式工具返回结果改变了正文文本或顶层结构",
+                        "data": {
+                            "contentLockViolation": True,
+                            "beforeSignature": before_signature,
+                            "afterSignature": after_signature,
+                            "documentSessionId": session.session_id,
+                            "version": session.version,
+                            "documentEvents": [],
+                        },
+                    }
             session.doc_json = _normalize_doc_json(next_doc)
             document_events.append({"type": "document_replace", "docJson": session.doc_json, "source": "server_tool"})
         if isinstance(next_page_config, dict):
@@ -305,7 +394,14 @@ async def execute_ai_document_tool(tool_name: str, params: dict[str, Any], conte
     if not session_id:
         return {"success": False, "message": "缺少 documentSessionId，无法在后端执行文档工具", "data": None}
     selection_context = context.get("selection") if isinstance(context.get("selection"), dict) else None
-    return await execute_document_tool(session_id, tool_name, params, selection_context=selection_context)
+    preserve_content_structure = bool(context.get("contentLockedForLayout"))
+    return await execute_document_tool(
+        session_id,
+        tool_name,
+        params,
+        selection_context=selection_context,
+        preserve_content_structure=preserve_content_structure,
+    )
 
 
 async def publish_document_event(session: DocumentSession, event: dict[str, Any]) -> None:

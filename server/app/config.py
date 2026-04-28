@@ -172,6 +172,16 @@ def _normalize_positive_int(value: Any, default: int, *, minimum: int = 1, maxim
     return max(min(parsed, maximum), minimum)
 
 
+def _normalize_optional_positive_int(value: Any, *, minimum: int = 1, maximum: int = 1_000_000) -> int | None:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed < minimum:
+        return None
+    return min(parsed, maximum)
+
+
 def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -> dict[str, Any]:
     provider_id = str(raw.get("id") or fallback_id).strip() or fallback_id
     label = str(raw.get("label") or raw.get("name") or ("自定义服务商" if not is_preset else provider_id)).strip()
@@ -187,6 +197,12 @@ def _sanitize_provider(raw: dict[str, Any], fallback_id: str, is_preset: bool) -
         "supportsVision": bool(raw.get("supportsVision", False)),
         "promptCacheMode": prompt_cache_mode,
         "promptCacheRetention": _normalize_prompt_cache_retention(raw.get("promptCacheRetention")),
+        "contextWindowTokens": _normalize_optional_positive_int(raw.get("contextWindowTokens"), minimum=4_000),
+        "compactSummaryMaxOutputTokens": _normalize_optional_positive_int(
+            raw.get("compactSummaryMaxOutputTokens"),
+            minimum=1_000,
+            maximum=20_000,
+        ),
     }
 
 

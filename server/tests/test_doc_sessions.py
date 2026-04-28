@@ -133,6 +133,90 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual(table["rowCount"], 2)
         self.assertEqual(result["data"]["version"], 2)
 
+    def test_delete_table_tool_removes_entire_table(self) -> None:
+        async def run():
+            session = await create_document_session({
+                "docJson": {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "before"}]},
+                        {
+                            "type": "table",
+                            "content": [{
+                                "type": "table_row",
+                                "content": [
+                                    {"type": "table_cell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "A"}]}]},
+                                    {"type": "table_cell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "B"}]}]},
+                                ],
+                            }],
+                        },
+                        {"type": "paragraph", "content": [{"type": "text", "text": "after"}]},
+                    ],
+                },
+            })
+            result = await execute_document_tool(
+                session["documentSessionId"],
+                "delete_table",
+                {"tableIndex": 0},
+            )
+            return result
+
+        result = asyncio.run(run())
+        self.assertTrue(result["success"], result["message"])
+        content = result["data"]["documentEvents"][0]["docJson"]["content"]
+        self.assertEqual([node["type"] for node in content], ["paragraph", "paragraph"])
+        self.assertNotIn('"type": "table"', json.dumps(content))
+
+    def test_layout_content_lock_blocks_text_changes(self) -> None:
+        async def run():
+            session = await create_document_session({
+                "docJson": {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "故事一"}]},
+                    ],
+                },
+            })
+            blocked = await execute_document_tool(
+                session["documentSessionId"],
+                "replace_paragraph_text",
+                {"paragraphIndex": 0, "text": "被误改的正文"},
+                preserve_content_structure=True,
+            )
+            return blocked, await execute_document_tool(
+                session["documentSessionId"],
+                "get_document_content",
+                {},
+            )
+
+        blocked, current = asyncio.run(run())
+        self.assertFalse(blocked["success"])
+        self.assertTrue(blocked["data"]["contentLockViolation"])
+        self.assertIn("故事一", json.dumps(current["data"], ensure_ascii=False))
+        self.assertNotIn("被误改的正文", json.dumps(current["data"], ensure_ascii=False))
+
+    def test_layout_content_lock_allows_style_tools_without_text_change(self) -> None:
+        async def run():
+            session = await create_document_session({
+                "docJson": {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "故事一"}]},
+                    ],
+                },
+            })
+            return await execute_document_tool(
+                session["documentSessionId"],
+                "set_paragraph_style",
+                {"range": {"type": "paragraph", "paragraphIndex": 0}, "align": "center"},
+                preserve_content_structure=True,
+            )
+
+        result = asyncio.run(run())
+        self.assertTrue(result["success"], result["message"])
+        doc = result["data"]["documentEvents"][0]["docJson"]
+        self.assertEqual(doc["content"][0]["attrs"]["align"], "center")
+
     def test_begin_streaming_write_commits_markdown_on_server(self) -> None:
         async def run():
             session = await create_document_session({
@@ -330,6 +414,9 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual(data["detail"], "content")
         self.assertIn("标题", data["text"])
         self.assertIn("A | B", data["text"])
+        table_blocks = [block for block in data["blocks"] if block["type"] == "table"]
+        self.assertEqual(table_blocks[0]["tableIndex"], 0)
+        self.assertEqual(table_blocks[0]["rows"][0]["cells"][0]["columnIndex"], 0)
         self.assertIn('"srcKind": "data"', payload)
         self.assertNotIn("textRuns", payload)
         self.assertNotIn("data:image/png", payload)

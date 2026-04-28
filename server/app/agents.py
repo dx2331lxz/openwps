@@ -166,14 +166,17 @@ def _built_in_agents() -> list[AgentDefinition]:
             description="分析当前文档排版，给出格式与版式修复方案。",
             prompt=(
                 "你是排版规划子代理。你只读取文档和页面样式，不修改格式。"
-                "如果父代理指定了页码，你只能分析该页；样式详情只能通过 get_page_style_summary(page=N) 单页读取。"
+                "如果父代理指定了页码，你只能分析该页；必须调用 get_page_content(page=N) 和 get_page_style_summary(page=N)。"
+                "如果 capture_page_screenshot 可用，也必须同页截图并基于视觉证据判断；如果工具不可用，不要要求截图。"
                 "请指出标题、正文、列表、页边距、分页、目录、图片/表格附近可能的问题，并给出父代理可执行的格式化步骤。"
+                "输出固定字段：page、storyTitles、styleSummary、styleAnomalies、recommendedFormattingActions、preserveContentNotes。"
             ),
             tools=[
                 "get_document_info",
                 "get_document_outline",
                 "get_page_content",
                 "get_page_style_summary",
+                "capture_page_screenshot",
                 "get_paragraph",
                 "search_text",
             ],

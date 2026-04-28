@@ -43,7 +43,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
 - **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
 
-当你需要引用数据、法规条款、格式范文等外部参考时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文件是参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索。"""
+只有当用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时，才调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文件是可选参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索，也不要在最终回复中主动提及未使用的参考文件。"""
 
     if mode == "edit":
         return """## 工作区（参考资料）
@@ -53,7 +53,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
 - **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
 
-当你需要引用数据、法规条款、参考资料等内容时，先调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档在每轮对话上下文中会列出可用文件列表，但它们是参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索。"""
+只有当用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时，才调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档列表只是可用参考资料 manifest，不代表当前任务进展或文件变化；任务已完成时不要因为看到文件列表而继续探索，也不要在最终回复中主动提及未使用的参考文件。"""
 
     # agent mode
     return """## 工作区（参考资料）
@@ -64,7 +64,7 @@ def _get_workspace_section(mode: str | None) -> str:
 - **workspace_read(doc_id, from_line, to_line)** — 读取某个工作区文档的完整内容或指定行范围
 - **web_search(query, topic, searchDepth, maxResults)** — 联网搜索最新网页、新闻和工作区外的公开资料
 
-工作区文档在每轮对话上下文中会列出可用文件列表；它们是参考资料，不代表当前任务进展。当你需要：
+工作区文档列表只是可用参考资料 manifest；它们是参考资料，不代表当前任务进展或文件变化。不要在最终回复中主动提及未使用的参考文件。当你需要：
 - 查找具体数据、条款、引用 → 先 workspace_search 定位
 - 了解某篇参考文档的完整内容 → workspace_read 查看全文或分段阅读
 - 按照参考文档的格式/结构撰写内容 → 先读取参考文档，再据此编排
@@ -416,8 +416,8 @@ def get_dynamic_context_section(context: dict) -> str:
     if workspace_docs and isinstance(workspace_docs, list):
         parts.append("")
         parts.append("[工作区文档列表]")
-        parts.append("以下为当前工作区已有参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
-        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中新增；任务已完成时不要因为列表中存在参考文档而继续探索。")
+        parts.append("以下为当前工作区已有参考文档，可在任务确实需要时用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
+        parts.append("这些文档只是可用参考资料 manifest，不代表当前任务执行过程中创建、发现或修改了文件；任务已完成时不要因为列表中存在参考文档而继续探索，也不要在最终回复中主动提及未使用的参考文件。")
         for doc in workspace_docs:
             name = doc.get("name", "?")
             doc_id = doc.get("id", "?")

@@ -10,6 +10,13 @@
 - **布局引擎**：`@chenglou/pretext`（纯算术分页，不依赖 DOM 重排），详见 `docs/PRETEXT.md`
 - **样式**：Tailwind CSS v4（通过 `@tailwindcss/vite` 插件，非 PostCSS）
 
+## AI / 控制器职责边界
+- **所有 AI 与控制器逻辑以后端为准**：ReAct 主循环、是否继续/停止、工具调度、任务状态门、子代理、上下文 delta、workspace manifest、OCR、联网搜索、文档写入和写后验证都应放在 `server/`。
+- **前端只负责展示与用户手动编辑**：`src/` 侧负责编辑器交互、分页可视层、AI SSE 事件展示、工具/子代理轨迹展示，以及用户通过 UI 直接修改文档。
+- **不要把 AI 状态机放回前端**：前端不得判断工作区文件是否“新增”、不得驱动 ReAct 是否继续、不得根据任务列表强制续跑、不得决定是否搜索/读取工作区资料。
+- **workspace 是后端事实来源**：工作区文件上传、存储、manifest 和 delta 判断都由后端负责；前端可以展示 `/api/workspace` 返回的列表，但不要在 AI 请求中注入 `context.workspaceDocs`。
+- **文档状态同步原则**：用户手动编辑可以发生在前端 ProseMirror/Pretext；AI 运行时需要的文档状态必须通过后端文档会话和工具接口读取/写入，避免前端与后端各自维护一套 AI 事实。
+
 ## 双层渲染注意事项
 - 当前编辑器是**双层结构**：隐藏的 ProseMirror DOM 负责真实文档状态、selection、transaction；可见层 `PretextPageRenderer` 负责分页绘制、命中区域和可视反馈。
 - 任何交互或样式改动都必须同时检查这两层，否则很容易出现两类问题：
