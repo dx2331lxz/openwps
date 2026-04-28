@@ -190,6 +190,26 @@ interface OcrIntentMatch {
   source: 'slash' | 'intent'
 }
 
+type SlashCommandId =
+  | 'template-layout'
+  | 'template-manager'
+  | 'ocr-general'
+  | 'ocr-table'
+  | 'ocr-chart'
+  | 'ocr-handwriting'
+  | 'ocr-formula'
+  | 'ocr-document'
+  | `template:${string}`
+
+interface SlashCommandItem {
+  id: SlashCommandId
+  title: string
+  detail: string
+  keywords: string[]
+  kind: 'action' | 'template'
+  disabled?: boolean
+}
+
 interface OcrAnalysisResult {
   imageIndex: number
   name: string
@@ -2078,6 +2098,8 @@ export default function AISidebar({
   const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([])
   const [ocrConfig, setOcrConfig] = useState<OcrConfigData>(createDefaultOcrConfig())
   const [visionConfig, setVisionConfig] = useState<VisionConfigData>(createDefaultVisionConfig())
+  const [slashCommandIndex, setSlashCommandIndex] = useState(0)
+  const [selectedTemplateId, setSelectedTemplateId] = useState(activeTemplate?.id ?? '')
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollAreaRef = useRef<HTMLDivElement>(null)
@@ -2123,6 +2145,10 @@ export default function AISidebar({
     && effectiveOcrHasApiKey,
   )
   const canSendMessage = Boolean(input.trim() || pendingAttachments.length > 0)
+  const selectedTemplate = useMemo(
+    () => templates.find(template => template.id === selectedTemplateId) ?? activeTemplate ?? null,
+    [activeTemplate, selectedTemplateId, templates],
+  )
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId
@@ -2134,6 +2160,10 @@ export default function AISidebar({
   useEffect(() => {
     tasksRef.current = tasks
   }, [tasks])
+
+  useEffect(() => {
+    setSelectedTemplateId(activeTemplate?.id ?? '')
+  }, [activeTemplate?.id])
 
   useEffect(() => () => {
     if (taskHideTimerRef.current != null) {
@@ -4008,6 +4038,154 @@ export default function AISidebar({
     }
   }, [activeProviderId, activeTemplate, applyServerDocumentEvents, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, syncDocumentSession, templates, viewMode])
 
+  const setInputAndFocus = useCallback((nextInput: string) => {
+    setInput(nextInput)
+    window.setTimeout(() => {
+      const textarea = textareaRef.current
+      if (!textarea) return
+      textarea.focus()
+      textarea.setSelectionRange(nextInput.length, nextInput.length)
+      autoResize(textarea)
+    }, 0)
+  }, [autoResize])
+
+  const insertTemplateLayoutPrompt = useCallback(() => {
+    if (!selectedTemplate || loading) return
+    setInputAndFocus(`请严格按照当前激活模板「${selectedTemplate.name}」对全文进行排版。优先遵循模板中的 templateText 执行页面、结构、标题和正文样式，并结合批量样式与页面设置完成排版。`)
+  }, [loading, selectedTemplate, setInputAndFocus])
+
+  const slashCommandQuery = useMemo(() => {
+    if (loading) return null
+    const match = input.match(/^\/([^\n]*)$/)
+    if (!match) return null
+    return String(match[1] || '').trim().toLowerCase()
+  }, [input, loading])
+
+  const slashCommands = useMemo<SlashCommandItem[]>(() => {
+    const templateCommands: SlashCommandItem[] = templates.map(template => ({
+      id: `template:${template.id}`,
+      title: template.name,
+      detail: template.id === selectedTemplate?.id ? '当前模板' : '设为当前模板',
+      keywords: ['模板', 'template', template.name],
+      kind: 'template',
+    }))
+
+    return [
+      {
+        id: 'template-layout',
+        title: '按当前模板排版',
+        detail: selectedTemplate ? selectedTemplate.name : '先选择一个模板',
+        keywords: ['模板', '排版', 'layout', 'format'],
+        kind: 'action',
+        disabled: !selectedTemplate,
+      },
+      {
+        id: 'template-manager',
+        title: '打开模板库',
+        detail: '上传、管理和编辑模板',
+        keywords: ['模板', '管理', 'template', 'library'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-general',
+        title: 'OCR 识别',
+        detail: '识别已附带图片',
+        keywords: ['ocr', '识别', '图片'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-table',
+        title: 'OCR 表格',
+        detail: '提取图片中的表格',
+        keywords: ['ocr', '表格', 'table'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-document',
+        title: 'OCR 文档文字',
+        detail: '提取扫描件正文',
+        keywords: ['ocr', '文档', '文字', 'document', 'text'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-chart',
+        title: 'OCR 图表',
+        detail: '解析图表内容',
+        keywords: ['ocr', '图表', 'chart'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-handwriting',
+        title: 'OCR 手写',
+        detail: '识别手写内容',
+        keywords: ['ocr', '手写', 'handwriting'],
+        kind: 'action',
+      },
+      {
+        id: 'ocr-formula',
+        title: 'OCR 公式',
+        detail: '识别公式和 LaTeX',
+        keywords: ['ocr', '公式', 'latex', 'formula'],
+        kind: 'action',
+      },
+      ...templateCommands,
+    ]
+  }, [activeTemplate, selectedTemplate, templates])
+
+  const visibleSlashCommands = useMemo(() => {
+    if (slashCommandQuery === null) return []
+    if (!slashCommandQuery) return slashCommands
+    return slashCommands.filter(command => {
+      const haystack = [command.title, command.detail, ...command.keywords].join(' ').toLowerCase()
+      return haystack.includes(slashCommandQuery)
+    })
+  }, [slashCommandQuery, slashCommands])
+
+  const slashMenuOpen = slashCommandQuery !== null && visibleSlashCommands.length > 0
+
+  useEffect(() => {
+    setSlashCommandIndex(0)
+  }, [slashCommandQuery, visibleSlashCommands.length])
+
+  const runSlashCommand = useCallback((command: SlashCommandItem | undefined) => {
+    if (!command || command.disabled || loading) return
+    if (command.id.startsWith('template:')) {
+      const templateId = command.id.slice('template:'.length)
+      setSelectedTemplateId(templateId)
+      setInputAndFocus('')
+      void onActivateTemplate(templateId)
+      return
+    }
+
+    switch (command.id) {
+      case 'template-layout':
+        insertTemplateLayoutPrompt()
+        break
+      case 'template-manager':
+        setInputAndFocus('')
+        onOpenTemplateManager()
+        break
+      case 'ocr-general':
+        setInputAndFocus('/ocr ')
+        break
+      case 'ocr-table':
+        setInputAndFocus('/ocr table ')
+        break
+      case 'ocr-document':
+        setInputAndFocus('/ocr document_text ')
+        break
+      case 'ocr-chart':
+        setInputAndFocus('/ocr chart ')
+        break
+      case 'ocr-handwriting':
+        setInputAndFocus('/ocr handwriting ')
+        break
+      case 'ocr-formula':
+        setInputAndFocus('/ocr formula ')
+        break
+    }
+  }, [insertTemplateLayoutPrompt, loading, onActivateTemplate, onOpenTemplateManager, setInputAndFocus])
+
   const historyEmpty = !historyLoading && conversations.length === 0
   const groupedConversations = useMemo(() => groupConversationsByTime(conversations), [conversations])
 
@@ -4702,47 +4880,74 @@ export default function AISidebar({
                 )}
               </div>
 
-              <div className="border-b border-slate-100 bg-white px-3 py-2">
-                <div className="flex items-center gap-2">
-                  <label className="flex min-w-0 flex-1 items-center gap-2 rounded-full border border-slate-200 bg-slate-50 pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
-                    <span className="shrink-0">模板</span>
-                    <select
-                      value={activeTemplate?.id ?? ''}
-                      onChange={(event) => {
-                        const nextId = event.target.value
-                        if (!nextId) return
-                        void onActivateTemplate(nextId)
-                      }}
-                      disabled={loading || templates.length === 0}
-                      className="min-w-0 flex-1 bg-transparent text-slate-700 outline-none"
-                      title={activeTemplate?.name || '未激活模板'}
-                    >
-                      <option value="">{templates.length > 0 ? '未激活模板' : '暂无模板'}</option>
-                      {templates.map((template) => (
-                        <option key={template.id} value={template.id}>{template.name}</option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <button
-                    type="button"
-                    onClick={onOpenTemplateManager}
-                    disabled={loading}
-                    className="shrink-0 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] text-slate-600 hover:bg-slate-100 disabled:cursor-not-allowed disabled:text-slate-400"
-                  >
-                    管理
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => void handleSend(`请严格按照当前激活模板「${activeTemplate?.name ?? ''}」对全文进行排版。优先遵循模板中的 templateText 执行页面、结构、标题和正文样式，并结合批量样式与页面设置完成排版。`)}
-                    disabled={loading || !activeTemplate}
-                    className="shrink-0 rounded-full bg-emerald-500 px-3 py-1.5 text-[11px] text-white hover:bg-emerald-600 disabled:cursor-not-allowed disabled:bg-slate-300"
-                  >
-                    按模板排版
-                  </button>
+              {slashMenuOpen && (
+                <div className="border-b border-slate-100 bg-white px-2 py-2">
+                  <div className="max-h-80 overflow-y-auto">
+                    {visibleSlashCommands.some(command => command.kind === 'action') && (
+                      <div className="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-slate-400">指令</div>
+                    )}
+                    {visibleSlashCommands.map((command, index) => {
+                      if (command.kind !== 'action') return null
+                      const isSelected = index === Math.min(slashCommandIndex, visibleSlashCommands.length - 1)
+                      return (
+                        <button
+                          key={command.id}
+                          type="button"
+                          onMouseDown={event => event.preventDefault()}
+                          onClick={() => runSlashCommand(command)}
+                          disabled={command.disabled || loading}
+                          className={`flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:text-slate-300 ${isSelected
+                            ? 'bg-slate-100 text-slate-900'
+                            : 'text-slate-700 hover:bg-slate-50'
+                            }`}
+                        >
+                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-[12px] font-semibold text-slate-500">
+                            /
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate font-medium">{command.title}</span>
+                            <span className="block truncate text-xs text-slate-400">{command.detail}</span>
+                          </span>
+                        </button>
+                      )
+                    })}
+                    {visibleSlashCommands.some(command => command.kind === 'template') && (
+                      <div className="mt-1 border-t border-slate-100 px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+                        选择模板
+                      </div>
+                    )}
+                    {visibleSlashCommands.map((command, index) => {
+                      if (command.kind !== 'template') return null
+                      const isSelected = index === Math.min(slashCommandIndex, visibleSlashCommands.length - 1)
+                      const isActiveTemplate = command.id === `template:${selectedTemplate?.id ?? ''}`
+                      return (
+                        <button
+                          key={command.id}
+                          type="button"
+                          onMouseDown={event => event.preventDefault()}
+                          onClick={() => runSlashCommand(command)}
+                          disabled={command.disabled || loading}
+                          className={`flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:text-slate-300 ${isSelected
+                            ? 'bg-blue-50 text-blue-800'
+                            : isActiveTemplate
+                              ? 'text-blue-700 hover:bg-blue-50'
+                              : 'text-slate-700 hover:bg-slate-50'
+                            }`}
+                          title={command.title}
+                        >
+                          <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md border text-[12px] font-semibold ${isActiveTemplate ? 'border-blue-200 bg-blue-50 text-blue-600' : 'border-slate-200 bg-white text-slate-400'}`}>
+                            {isActiveTemplate ? '✓' : ''}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate font-medium">{command.title}</span>
+                            <span className="block truncate text-xs text-slate-400">{command.detail}</span>
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="px-3 py-2.5">
                 <textarea
@@ -4775,6 +4980,28 @@ export default function AISidebar({
                     isComposingRef.current = false
                   }}
                   onKeyDown={event => {
+                    if (slashMenuOpen) {
+                      if (event.key === 'ArrowDown') {
+                        event.preventDefault()
+                        setSlashCommandIndex(prev => (prev + 1) % visibleSlashCommands.length)
+                        return
+                      }
+                      if (event.key === 'ArrowUp') {
+                        event.preventDefault()
+                        setSlashCommandIndex(prev => (prev - 1 + visibleSlashCommands.length) % visibleSlashCommands.length)
+                        return
+                      }
+                      if (event.key === 'Enter' || event.key === 'Tab') {
+                        event.preventDefault()
+                        runSlashCommand(visibleSlashCommands[slashCommandIndex])
+                        return
+                      }
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        setInput('')
+                        return
+                      }
+                    }
                     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && !isComposingRef.current) {
                       event.preventDefault()
                       void handleSend()

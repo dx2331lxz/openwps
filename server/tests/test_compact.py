@@ -32,6 +32,10 @@ class CompactPolicyTest(unittest.TestCase):
         self.assertEqual(openai.compact_summary_max_output_tokens, 20_000)
         self.assertEqual(openai.auto_compact_threshold_tokens, 95_000)
 
+        gpt54 = build_compact_policy({"id": "openai"}, "gpt-5.4")
+        self.assertEqual(gpt54.context_window_tokens, 258_000)
+        self.assertEqual(gpt54.auto_compact_threshold_tokens, 225_000)
+
         claude = build_compact_policy({"id": "anthropic"}, "claude-4-sonnet")
         self.assertEqual(claude.context_window_tokens, 200_000)
 

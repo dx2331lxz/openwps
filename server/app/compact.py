@@ -19,6 +19,7 @@ DEFAULT_COMPACT_SUMMARY_MAX_OUTPUT_TOKENS = 20_000
 MAX_COMPACT_SUMMARY_MAX_OUTPUT_TOKENS = 20_000
 
 GPT_CONTEXT_WINDOW_TOKENS = 128_000
+GPT_54_CONTEXT_WINDOW_TOKENS = 258_000
 CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000
 LOCAL_CONTEXT_WINDOW_TOKENS = 32_000
 UNKNOWN_REMOTE_CONTEXT_WINDOW_TOKENS = 128_000
@@ -192,6 +193,8 @@ def infer_context_window_tokens(provider_id: str, model: str, endpoint: Any = ""
     haystack = " ".join([provider_id, model, str(endpoint or "")]).lower()
     if any(marker in haystack for marker in ("claude-3.5", "claude-3-5", "claude-3.7", "claude-3-7", "claude-4", "sonnet-4", "opus-4")):
         return CLAUDE_CONTEXT_WINDOW_TOKENS
+    if "gpt-5.4" in haystack:
+        return GPT_54_CONTEXT_WINDOW_TOKENS
     if any(marker in haystack for marker in ("gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4")):
         return GPT_CONTEXT_WINDOW_TOKENS
     if any(marker in haystack for marker in ("openrouter", "qwen", "deepseek", "siliconflow")):
