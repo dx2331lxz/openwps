@@ -11,6 +11,7 @@ from server.app.ai import (
     ReasoningContentChatOpenAI,
     _build_ai_message,
     _extract_reasoning,
+    _extract_token_usage,
     _http_error_message,
     _normalize_ai_api_error_detail,
     _serialize_tool_result_payload,
@@ -101,6 +102,18 @@ class ReasoningExtractionTest(unittest.TestCase):
         )
         thinking_payload = thinking_llm._get_request_payload([message])
         self.assertEqual(thinking_payload["messages"][0].get("reasoning_content"), "")
+
+    def test_extracts_openai_compatible_token_usage(self) -> None:
+        chunk = AIMessageChunk(
+            content="",
+            response_metadata={"token_usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}},
+        )
+
+        self.assertEqual(_extract_token_usage(chunk), {
+            "inputTokens": 12,
+            "outputTokens": 3,
+            "totalTokens": 15,
+        })
 
     def test_replays_persisted_thinking_as_reasoning_content(self) -> None:
         message = _to_langchain_message({

@@ -637,9 +637,23 @@ const documentImageAnalysisTool = {
   },
 } as const
 
+const workspaceTreeTool = {
+  name: 'workspace_tree',
+  description: '读取当前工作区目录树，返回可编辑文件和 _references/ 参考资料路径。',
+  parameters: {
+    type: 'object',
+    properties: {
+      workspace_id: {
+        type: 'string',
+        description: '可选工作区ID；不传使用当前激活工作区。',
+      },
+    },
+  },
+} as const
+
 const workspaceSearchTool = {
   name: 'workspace_search',
-  description: '在用户上传的工作区参考文档中搜索关键词。返回所有文档中包含该关键词的片段及上下文。多个关键词用空格分隔，采用AND逻辑。仅在用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时使用；不要因工作区列表存在而主动搜索。',
+  description: '在工作区普通文件或 _references/ 参考资料中搜索关键词。多个关键词用空格分隔，采用AND逻辑。',
   parameters: {
     type: 'object',
     properties: {
@@ -649,7 +663,16 @@ const workspaceSearchTool = {
       },
       doc_id: {
         type: 'string',
-        description: '可选，限定在指定文档中搜索。不提供则搜索所有工作区文档',
+        description: '兼容字段；等同于 path。',
+      },
+      path: {
+        type: 'string',
+        description: '可选，限定在某个工作区相对路径或子目录内搜索。',
+      },
+      scope: {
+        type: 'string',
+        enum: ['all', 'workspace', 'references', 'path'],
+        description: '搜索范围，默认 all。',
       },
       context_lines: {
         type: 'integer',
@@ -661,13 +684,17 @@ const workspaceSearchTool = {
 
 const workspaceReadTool = {
   name: 'workspace_read',
-  description: '读取工作区中某个参考文档的完整内容或指定行范围的内容。仅在用户要求引用/处理该资料，或当前任务确实需要全文证据时使用；不要读取未使用的参考文件来凑进度。',
+  description: '按工作区相对路径读取某个文件的提取文本或指定行范围。',
   parameters: {
     type: 'object',
     properties: {
+      path: {
+        type: 'string',
+        description: '工作区相对路径，如 report.docx 或 _references/spec.pdf。',
+      },
       doc_id: {
         type: 'string',
-        description: '文档ID（从workspace_search结果或工作区文档列表中获取）',
+        description: '兼容字段；等同于 path。',
       },
       from_line: {
         type: 'integer',
@@ -681,6 +708,25 @@ const workspaceReadTool = {
   },
 } as const
 
-export const agentTools = [...taskTools, ...layoutTools, ...editTools, documentImageAnalysisTool, ocrTool, workspaceSearchTool, workspaceReadTool].filter(
+const workspaceOpenTool = {
+  name: 'workspace_open',
+  description: '打开 DOCX/MD/TXT 工作区文件并切换为当前活动文档；修改非当前文件前必须先调用。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: '工作区相对路径。',
+      },
+      workspace_id: {
+        type: 'string',
+        description: '可选工作区ID；不传使用当前激活工作区。',
+      },
+    },
+    required: ['path'],
+  },
+} as const
+
+export const agentTools = [...taskTools, ...layoutTools, ...editTools, documentImageAnalysisTool, ocrTool, workspaceTreeTool, workspaceSearchTool, workspaceReadTool, workspaceOpenTool].filter(
   (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
 )

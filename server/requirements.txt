@@ -3,6 +3,7 @@ uvicorn
 httpx
 langgraph
 langchain-openai
+tiktoken
 python-docx
 PyPDF2
 python-pptx

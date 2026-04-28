@@ -175,6 +175,12 @@ class DocumentSession:
     updated_at: str = field(default_factory=utc_now)
     dirty: bool = False
     current_document_name: str | None = None
+    workspace_id: str | None = None
+    file_path: str | None = None
+    file_type: str | None = None
+    file_mtime: float | None = None
+    content_hash: str | None = None
+    last_saved_at: str | None = None
     subscribers: list[asyncio.Queue[dict[str, Any] | None]] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
@@ -188,6 +194,12 @@ class DocumentSession:
             "updatedAt": self.updated_at,
             "dirty": self.dirty,
             "currentDocumentName": self.current_document_name,
+            "workspaceId": self.workspace_id,
+            "filePath": self.file_path,
+            "fileType": self.file_type,
+            "fileMtime": self.file_mtime,
+            "contentHash": self.content_hash,
+            "lastSavedAt": self.last_saved_at,
         }
 
 
@@ -209,6 +221,12 @@ async def create_document_session(payload: dict[str, Any] | None = None) -> dict
         page_config=_normalize_page_config(data.get("pageConfig")),
         selection_context=data.get("selectionContext") if isinstance(data.get("selectionContext"), dict) else None,
         current_document_name=str(data.get("currentDocumentName") or "") or None,
+        workspace_id=str(data.get("workspaceId") or "") or None,
+        file_path=str(data.get("filePath") or "") or None,
+        file_type=str(data.get("fileType") or "") or None,
+        file_mtime=float(data.get("fileMtime")) if isinstance(data.get("fileMtime"), (int, float)) else None,
+        content_hash=str(data.get("contentHash") or "") or None,
+        last_saved_at=str(data.get("lastSavedAt") or "") or None,
     )
     async with _lock:
         _sessions[session.session_id] = session
@@ -235,6 +253,15 @@ async def set_active_document_session(session_id: str, payload: dict[str, Any] |
     current_document_name = data.get("currentDocumentName")
     if isinstance(current_document_name, str):
         session.current_document_name = current_document_name.strip() or None
+    workspace_id = data.get("workspaceId")
+    file_path = data.get("filePath")
+    file_type = data.get("fileType")
+    if isinstance(workspace_id, str):
+        session.workspace_id = workspace_id.strip() or None
+    if isinstance(file_path, str):
+        session.file_path = file_path.strip() or None
+    if isinstance(file_type, str):
+        session.file_type = file_type.strip() or None
     async with _lock:
         _active_session_id = session.session_id
     return {"documentSessionId": session.session_id, "version": session.version, "active": True}
@@ -258,6 +285,15 @@ async def update_document_session_from_client(session_id: str, payload: dict[str
     page_config = payload.get("pageConfig")
     selection_context = payload.get("selectionContext")
     origin_client_id = str(payload.get("clientId") or "").strip() or None
+    workspace_id = payload.get("workspaceId")
+    file_path = payload.get("filePath")
+    file_type = payload.get("fileType")
+    if isinstance(workspace_id, str):
+        session.workspace_id = workspace_id.strip() or None
+    if isinstance(file_path, str):
+        session.file_path = file_path.strip() or None
+    if isinstance(file_type, str):
+        session.file_type = file_type.strip() or None
 
     events: list[dict[str, Any]] = []
     if doc_json is not None:
@@ -343,6 +379,7 @@ async def execute_document_tool(
     result = await asyncio.to_thread(_run_worker, worker_payload)
 
     document_events: list[dict[str, Any]] = []
+    save_result: dict[str, Any] | None = None
     if result.get("success") is True:
         next_doc = result.get("docJson")
         next_page_config = result.get("pageConfig")
@@ -375,6 +412,31 @@ async def execute_document_tool(
             for event in document_events:
                 event["version"] = session.version
                 await publish_document_event(session, event)
+            if session.workspace_id and session.file_path:
+                try:
+                    from .workspace import save_document_session_file
+
+                    save_result = save_document_session_file(
+                        session.workspace_id,
+                        session.file_path,
+                        session.doc_json,
+                        session.page_config,
+                    )
+                    session.content_hash = str(save_result.get("contentHash") or "") or session.content_hash
+                    session.file_mtime = None
+                    session.last_saved_at = utc_now()
+                    session.dirty = False
+                except HTTPException as exc:
+                    return {
+                        "success": False,
+                        "message": f"文档工具已执行，但保存到工作区文件失败：{exc.detail}",
+                        "data": {
+                            "documentSessionId": session.session_id,
+                            "version": session.version,
+                            "documentEvents": document_events,
+                            "workspaceSaveFailed": True,
+                        },
+                    }
 
     data = result.get("data") if isinstance(result.get("data"), dict) else result.get("data")
     if not isinstance(data, dict):
@@ -383,6 +445,10 @@ async def execute_document_tool(
         "documentSessionId": session.session_id,
         "version": session.version,
         "documentEvents": document_events,
+        "workspaceId": session.workspace_id,
+        "filePath": session.file_path,
+        "fileType": session.file_type,
+        "workspaceSave": save_result,
     })
     return {
         "success": result.get("success") is True,

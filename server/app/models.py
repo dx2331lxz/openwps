@@ -140,11 +140,27 @@ class DocumentSettingsUpdateRequest(BaseModel):
     wpsDirectory: Optional[str] = None
 
 
+class WorkspaceCreateRequest(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+
+
+class WorkspaceMoveRequest(BaseModel):
+    toPath: str
+
+
+class WorkspaceOpenRequest(BaseModel):
+    path: str
+
+
 class DocumentSessionCreateRequest(BaseModel):
     docJson: Optional[dict[str, Any]] = None
     pageConfig: Optional[dict[str, Any]] = None
     selectionContext: Optional[dict[str, Any]] = None
     currentDocumentName: Optional[str] = None
+    workspaceId: Optional[str] = None
+    filePath: Optional[str] = None
+    fileType: Optional[str] = None
 
 
 class DocumentSessionPatchRequest(BaseModel):
@@ -153,11 +169,17 @@ class DocumentSessionPatchRequest(BaseModel):
     pageConfig: Optional[dict[str, Any]] = None
     selectionContext: Optional[dict[str, Any]] = None
     clientId: Optional[str] = None
+    workspaceId: Optional[str] = None
+    filePath: Optional[str] = None
+    fileType: Optional[str] = None
 
 
 class DocumentSessionActiveRequest(BaseModel):
     clientId: Optional[str] = None
     currentDocumentName: Optional[str] = None
+    workspaceId: Optional[str] = None
+    filePath: Optional[str] = None
+    fileType: Optional[str] = None
 
 
 class DocumentToolExecuteRequest(BaseModel):

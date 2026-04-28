@@ -137,8 +137,10 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "apply_style_batch": ToolMetadata("style", "style", "全文排版、多范围样式、按角色设置标题/正文时优先使用。", "不要用多次单段样式工具替代可批量完成的操作。", "返回受影响快照。", batch_hint="推荐批量", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_LAYOUT_AGENT),
     "insert_image": ToolMetadata("write", "write", "插入已有 URL 或 data URL 图片。", "流程图/思维导图等应使用 insert_mermaid。", search_hint="图片 插入图片 URL data URL", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_EDIT_AGENT),
     "insert_mermaid": ToolMetadata("write", "write", "插入流程图、时序图、类图、甘特图、思维导图等 Mermaid 图表。", "不要用文字/表格模拟图表。", search_hint="Mermaid 流程图 时序图 思维导图", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_EDIT_AGENT),
-    "workspace_search": ToolMetadata("search", "search", "用户要求引用/处理工作区资料，或任务确实缺少外部参考时，在工作区参考文档中定位关键词、条款、数据或范文。", "工作区文档能回答时不要先联网；不要因文件列表存在而主动搜索。", search_hint="工作区 参考文档 搜索", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
-    "workspace_read": ToolMetadata("read", "read", "用户要求引用/处理某篇工作区资料，或任务确实需要全文证据时，按 doc_id 读取全文或行范围。", "先用 workspace_search 定位后再读取更稳；不要读取未使用的参考文件来凑进度。", search_hint="读取工作区文档 doc_id", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_tree": ToolMetadata("read", "read", "查看当前工作区目录树、可编辑文件和 _references/ 参考资料路径。", search_hint="工作区 目录树 文件列表", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_search": ToolMetadata("search", "search", "在工作区普通文件或 _references/ 参考资料中定位关键词、条款、数据或范文。", "工作区能回答时不要先联网；先用 scope 控制搜索范围。", search_hint="工作区 搜索 references", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_read": ToolMetadata("read", "read", "按工作区相对路径读取文件提取文本或行范围。", "先用 workspace_tree 或 workspace_search 确认路径；PDF/PPT 只能读取提取文本。", search_hint="读取工作区文件 path", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_open": ToolMetadata("read", "read", "打开 DOCX/MD/TXT 工作区文件并切换为当前活动文档，之后文档编辑工具会写回该文件。", "修改非当前文件前必须先 workspace_open(path)。不要对 _references/ 资料调用。", search_hint="打开 工作区 文件 编辑", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
     "web_search": ToolMetadata("search", "web", "任务依赖最新信息、公开网页或工作区外事实时使用。", "当前文档或工作区资料足够时不要联网。", search_hint="联网 搜索 网页 最新 新闻", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
 }
 
@@ -264,8 +266,8 @@ def build_tool_guidance_section(
             lines.append("- 写入阶梯：长文/多段/整体重写用 begin_streaming_write，并把完整 Markdown 放入 markdown 参数；短插入用 insert_text/insert_paragraph_after；局部替换用 replace_paragraph_text 或 replace_selection_text；删除前确认范围。")
         if enabled & {"apply_style_batch", "set_text_style", "set_paragraph_style", "clear_formatting", "set_page_config", "insert_table_of_contents"}:
             lines.append("- 排版阶梯：全文或多范围样式优先 apply_style_batch；只改文字片段用 set_text_style；改对齐/缩进/标题级别用 set_paragraph_style；目录必须 insert_table_of_contents。")
-        if enabled & {"workspace_search", "workspace_read", "web_search"}:
-            lines.append("- 资料检索：只有用户要求引用/处理工作区资料，或当前任务确实依赖外部参考时才搜索工作区；工作区 manifest 不是新增事件，不要把已有文件当成任务进展或最终回复的主动建议。")
+        if enabled & {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "web_search"}:
+            lines.append("- 工作区：当前活动文档优先；需要修改其他 DOCX/MD/TXT 文件时先 workspace_tree 确认路径，再 workspace_open(path) 切换，随后使用文档编辑工具；_references/ 默认只作资料检索。")
         if "Agent" in enabled:
             lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，文档内图片语义用 image-analysis，复杂验收用 verification。")
             lines.append("- 多页视觉验收时，先读取页数；然后在同一轮并行发起多个 Agent(subagent_type='verification')，每个委托只指定一个页码和对应验收标准。")

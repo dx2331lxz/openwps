@@ -38,20 +38,24 @@ def _get_workspace_section(mode: str | None) -> str:
     if mode == "layout":
         return """## 工作区（参考资料）
 
-用户可能在工作区中上传了参考文档。你可以通过以下工具查看工作区内容：
+工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料。
 
-- **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
-- **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
+- **workspace_tree()** — 查看目录树和工作区相对路径
+- **workspace_search(query, scope)** — 在普通文件或 `_references/` 中搜索关键词
+- **workspace_read(path)** — 读取某个文件的提取文本或指定行范围
+- **workspace_open(path)** — 打开 DOCX/MD/TXT 并切换为当前编辑文件
 
-只有当用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时，才调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文件是可选参考资料，不代表当前任务进展；任务已完成时不要因为看到文件列表而继续探索，也不要在最终回复中主动提及未使用的参考文件。"""
+修改非当前文件前必须先 workspace_open(path)。只需要引用资料时，优先 workspace_search / workspace_read，不要打开 `_references/` 当作编辑目标。"""
 
     if mode == "edit":
         return """## 工作区（参考资料）
 
-用户可能在工作区中上传了参考文档。你可以通过以下工具查看工作区内容：
+工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料。
 
-- **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
-- **workspace_read(doc_id)** — 读取某个工作区文档的完整内容或指定行范围
+- **workspace_tree()** — 查看目录树和工作区相对路径
+- **workspace_search(query, scope)** — 在普通文件或 `_references/` 中搜索关键词
+- **workspace_read(path)** — 读取某个文件的提取文本或指定行范围
+- **workspace_open(path)** — 打开 DOCX/MD/TXT 并切换为当前编辑文件
 
 只有当用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时，才调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档列表只是可用参考资料 manifest，不代表当前任务进展或文件变化；任务已完成时不要因为看到文件列表而继续探索，也不要在最终回复中主动提及未使用的参考文件。"""
 

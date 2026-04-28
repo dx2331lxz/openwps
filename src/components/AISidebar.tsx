@@ -372,11 +372,13 @@ interface Props {
   pageConfig: PageConfig
   templates: TemplateSummary[]
   activeTemplate: TemplateRecord | null
+  activeWorkspaceFile?: { workspaceId: string; filePath: string; fileType: string } | null
   onModelContextChange?: (next: { providerId: string | null, model: string | null }) => void
   onActivateTemplate: (templateId: string) => Promise<void> | void
   onOpenTemplateManager: () => void
   onPageConfigChange: (cfg: PageConfig) => void
   onApplyServerDocumentState?: (docJson: Record<string, unknown>, pageConfig: PageConfig) => void
+  onWorkspaceFileActivated?: (file: { workspaceId: string; filePath: string; fileType: string }) => void
   onDocumentStyleMutation?: () => void
   onClose: () => void
 }
@@ -2038,11 +2040,13 @@ export default function AISidebar({
   pageConfig,
   templates,
   activeTemplate,
+  activeWorkspaceFile,
   onModelContextChange,
   onActivateTemplate,
   onOpenTemplateManager,
   onPageConfigChange,
   onApplyServerDocumentState,
+  onWorkspaceFileActivated,
   onDocumentStyleMutation,
   onClose,
 }: Props) {
@@ -2136,14 +2140,14 @@ export default function AISidebar({
       window.clearTimeout(taskHideTimerRef.current)
       taskHideTimerRef.current = null
     }
-  }, [])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId])
 
   const clearTaskHideTimer = useCallback(() => {
     if (taskHideTimerRef.current != null) {
       window.clearTimeout(taskHideTimerRef.current)
       taskHideTimerRef.current = null
     }
-  }, [])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId])
 
   const applyTaskState = useCallback((nextTasks: TaskItem[], options?: { preserveExpanded?: boolean }) => {
     const normalizedTasks = sortTaskItems(nextTasks)
@@ -2315,6 +2319,11 @@ export default function AISidebar({
         summary: template.summary,
       })),
     }
+    if (activeWorkspaceFile) {
+      ctx.workspaceId = activeWorkspaceFile.workspaceId
+      ctx.filePath = activeWorkspaceFile.filePath
+      ctx.fileType = activeWorkspaceFile.fileType
+    }
     if (activeTemplate) {
       ctx.activeTemplate = {
         id: activeTemplate.id,
@@ -2329,7 +2338,7 @@ export default function AISidebar({
       if (sel) ctx.selection = sel
     }
     return ctx
-  }, [activeTemplate, editorView, editorState, includeSelection, pageConfig, templates])
+  }, [activeTemplate, activeWorkspaceFile, editorView, editorState, includeSelection, pageConfig, templates])
 
   const rememberDocumentSession = useCallback((next: { id: string; version: number } | null) => {
     documentSessionRef.current = next
@@ -2345,12 +2354,17 @@ export default function AISidebar({
       await fetch(`/api/doc-sessions/${sessionId}/active`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clientId: documentClientIdRef.current }),
+        body: JSON.stringify({
+          clientId: documentClientIdRef.current,
+          workspaceId: activeWorkspaceFile?.workspaceId,
+          filePath: activeWorkspaceFile?.filePath,
+          fileType: activeWorkspaceFile?.fileType,
+        }),
       })
     } catch (error) {
       console.warn('登记当前后端文档会话失败', error)
     }
-  }, [])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId])
 
   const syncDocumentSession = useCallback(async (contextSnapshot?: Record<string, unknown>) => {
     if (!editorView) return null
@@ -2359,6 +2373,9 @@ export default function AISidebar({
       docJson: editorView.state.doc.toJSON() as Record<string, unknown>,
       pageConfig,
       selectionContext,
+      workspaceId: activeWorkspaceFile?.workspaceId,
+      filePath: activeWorkspaceFile?.filePath,
+      fileType: activeWorkspaceFile?.fileType,
     }
     const createDocumentSession = async () => {
       const response = await fetch('/api/doc-sessions', {
@@ -2397,7 +2414,7 @@ export default function AISidebar({
     rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
     await registerActiveDocumentSession(current.id)
     return current.id
-  }, [editorView, getContext, pageConfig, registerActiveDocumentSession, rememberDocumentSession])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId, editorView, getContext, pageConfig, registerActiveDocumentSession, rememberDocumentSession])
 
   const applyDocumentEventRecords = useCallback((
     data: unknown,
@@ -2414,6 +2431,16 @@ export default function AISidebar({
       ? record.documentSessionId
       : documentSessionRef.current?.id
     if (!sessionId) return
+    const nextWorkspaceId = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
+    const nextFilePath = typeof record.filePath === 'string' ? record.filePath : undefined
+    const nextFileType = typeof record.fileType === 'string' ? record.fileType : undefined
+    if (nextWorkspaceId && nextFilePath && nextFileType) {
+      onWorkspaceFileActivated?.({
+        workspaceId: nextWorkspaceId,
+        filePath: nextFilePath,
+        fileType: nextFileType,
+      })
+    }
     if (record.type === 'snapshot') {
       const version = Number(record.version ?? documentSessionRef.current?.version ?? 1) || 1
       rememberDocumentSession({ id: sessionId, version })
@@ -2470,7 +2497,7 @@ export default function AISidebar({
       onPageConfigChange(nextPageConfig)
     }
     if (nextVersion > 0) rememberDocumentSession({ id: sessionId, version: nextVersion })
-  }, [onApplyServerDocumentState, onDocumentStyleMutation, onPageConfigChange, pageConfig, rememberDocumentSession])
+  }, [onApplyServerDocumentState, onDocumentStyleMutation, onPageConfigChange, onWorkspaceFileActivated, pageConfig, rememberDocumentSession])
 
   const applyServerDocumentEvents = useCallback((data: unknown) => {
     applyDocumentEventRecords(data)

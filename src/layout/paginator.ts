@@ -1,8 +1,8 @@
 import { prepareWithSegments } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
-import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
-import { DEFAULT_PAGE_CONFIG } from '../shared/document/schema'
-import type { PageConfig } from '../shared/document/schema'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts.js'
+import { DEFAULT_PAGE_CONFIG } from '../shared/document/schema.js'
+import type { PageConfig } from '../shared/document/schema.js'
 
 export { DEFAULT_PAGE_CONFIG }
 export type { PageConfig }

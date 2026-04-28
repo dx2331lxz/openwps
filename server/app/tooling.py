@@ -869,11 +869,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "workspace_tree",
+            "description": "读取当前工作区的目录树。用于确认有哪些可编辑文件、参考资料目录和路径；返回路径均为工作区相对路径。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "可选工作区ID；不传则使用当前激活工作区。",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "workspace_search",
             "description": (
-                "在用户上传的工作区参考文档中搜索关键词。返回所有文档中包含该关键词的片段及上下文。"
+                "在工作区目录中搜索关键词。返回包含关键词的文件片段及上下文。"
                 "多个关键词用空格分隔，采用AND逻辑（所有关键词都需匹配）。"
-                "仅在用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时使用；不要因工作区列表存在而主动搜索。"
+                "scope=workspace 搜普通工作文件，scope=references 搜 _references/，scope=all 搜全部。"
             ),
             "parameters": {
                 "type": "object",
@@ -884,7 +900,20 @@ TOOLS = [
                     },
                     "doc_id": {
                         "type": "string",
-                        "description": "可选，限定在指定文档中搜索。不提供则搜索所有工作区文档",
+                        "description": "兼容字段；等同于 path，可限定某个工作区相对路径。",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "可选，限定在某个工作区相对路径或子目录内搜索。",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "workspace", "references", "path"],
+                        "description": "搜索范围，默认 all。",
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "可选工作区ID；不传则使用当前激活工作区。",
                     },
                     "context_lines": {
                         "type": "integer",
@@ -935,15 +964,23 @@ TOOLS = [
         "function": {
             "name": "workspace_read",
             "description": (
-                "读取工作区中某个参考文档的完整内容或指定行范围的内容。"
-                "仅在用户要求引用/处理该资料，或当前任务确实需要全文证据时使用；不要读取未使用的参考文件来凑进度。"
+                "按工作区相对路径读取某个文件的提取文本或指定行范围。"
+                "适合读取 _references/ 参考资料，或在编辑前查看非当前文件。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "工作区相对路径，如 report.docx 或 _references/spec.pdf。",
+                    },
                     "doc_id": {
                         "type": "string",
-                        "description": "文档ID（从workspace_search结果或工作区文档列表中获取）",
+                        "description": "兼容字段；等同于 path。",
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "可选工作区ID；不传则使用当前激活工作区。",
                     },
                     "from_line": {
                         "type": "integer",
@@ -954,7 +991,32 @@ TOOLS = [
                         "description": "结束行号（包含），不提供则读到末尾",
                     },
                 },
-                "required": ["doc_id"],
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_open",
+            "description": (
+                "打开一个可编辑工作区文件并切换为当前活动文档。"
+                "支持 DOCX、MD、TXT；PDF/PPT/PPTX 只能 workspace_read/search。"
+                "需要修改非当前文件时，先 workspace_open(path)，再使用文档编辑工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "工作区相对路径，不能是 _references/ 中的只读资料，且扩展名必须可编辑。",
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "可选工作区ID；不传则使用当前激活工作区。",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -1017,8 +1079,10 @@ AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {
     "Agent",
     "analyze_document_image",
     "analyze_image_with_ocr",
+    "workspace_tree",
     "workspace_search",
     "workspace_read",
+    "workspace_open",
     "web_search",
 }
 

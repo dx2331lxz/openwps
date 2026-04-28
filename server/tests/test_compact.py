@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from server.app.compact import (
     build_compact_policy,
     build_compacted_messages,
+    count_messages_tokens,
     drop_oldest_api_round,
     microcompact_messages,
     strip_large_payloads_for_summary,
@@ -43,6 +44,23 @@ class CompactPolicyTest(unittest.TestCase):
         )
         self.assertEqual(overridden.context_window_tokens, 64_000)
         self.assertEqual(overridden.compact_summary_max_output_tokens, 20_000)
+
+    def test_message_tokens_are_counted_with_tokenizer(self) -> None:
+        messages = [
+            SystemMessage(content="system"),
+            HumanMessage(content="你好 world"),
+            AIMessage(content="", tool_calls=[{
+                "id": "call_1",
+                "name": "search_text",
+                "args": {"text": "你好"},
+                "type": "tool_call",
+            }]),
+        ]
+
+        count = count_messages_tokens(messages, model="gpt-4o")
+
+        self.assertGreater(count, 10)
+        self.assertLess(count, 100)
 
 
 class MicrocompactTest(unittest.TestCase):

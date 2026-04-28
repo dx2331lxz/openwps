@@ -8,6 +8,11 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+try:
+    import tiktoken
+except ImportError:  # pragma: no cover - dependency should be present via langchain-openai
+    tiktoken = None
+
 
 AUTO_COMPACT_BUFFER_TOKENS = 13_000
 DEFAULT_COMPACT_SUMMARY_MAX_OUTPUT_TOKENS = 20_000
@@ -103,23 +108,65 @@ class CompactionResult:
     preserved_tail_count: int = 0
 
 
-def estimate_tokens(text: Any) -> int:
+def _encoding_for_model(model: str | None = None):
+    if tiktoken is None:
+        return None
+    model_name = str(model or "").strip()
+    if model_name:
+        try:
+            return tiktoken.encoding_for_model(model_name)
+        except Exception:
+            pass
+    for encoding_name in ("o200k_base", "cl100k_base"):
+        try:
+            return tiktoken.get_encoding(encoding_name)
+        except Exception:
+            continue
+    return None
+
+
+def count_text_tokens(text: Any, *, model: str | None = None) -> int:
     value = _stringify_content(text)
     if not value:
         return 0
-    ascii_chars = sum(1 for ch in value if ord(ch) < 128)
-    non_ascii_chars = len(value) - ascii_chars
-    return max(1, ascii_chars // 4 + non_ascii_chars // 2)
+    encoding = _encoding_for_model(model)
+    if encoding is not None:
+        return len(encoding.encode(value, disallowed_special=()))
+    return max(1, len(value.encode("utf-8")) // 4)
+
+
+def count_messages_tokens(messages: list[BaseMessage], *, model: str | None = None) -> int:
+    """Count request tokens with the configured tokenizer before an API call.
+
+    API usage is only available after a request completes. Auto-compaction needs
+    a preflight count, so this uses tiktoken's chat-message accounting rather
+    than the previous character heuristic.
+    """
+    encoding = _encoding_for_model(model)
+    total = 0
+    for message in messages:
+        total += 3
+        total += count_text_tokens(message.content, model=model)
+        name = getattr(message, "name", None)
+        if name:
+            total += 1 + count_text_tokens(name, model=model)
+        if isinstance(message, AIMessage):
+            for tool_call in message.tool_calls:
+                tool_name = str(tool_call.get("name") or "")
+                args = json.dumps(tool_call.get("args", {}), ensure_ascii=False, sort_keys=True)
+                total += count_text_tokens(tool_name, model=model)
+                total += count_text_tokens(args, model=model)
+    if encoding is None:
+        return total + 3
+    return total + 3
+
+
+def estimate_tokens(text: Any) -> int:
+    return count_text_tokens(text)
 
 
 def estimate_messages_tokens(messages: list[BaseMessage]) -> int:
-    total = 0
-    for message in messages:
-        total += estimate_tokens(message.content) + 4
-        if isinstance(message, AIMessage):
-            for tool_call in message.tool_calls:
-                total += estimate_tokens(json.dumps(tool_call.get("args", {}), ensure_ascii=False))
-    return total
+    return count_messages_tokens(messages)
 
 
 def build_compact_policy(provider: dict[str, Any] | None, model: str | None) -> CompactPolicy:
@@ -155,11 +202,11 @@ def infer_context_window_tokens(provider_id: str, model: str, endpoint: Any = ""
 
 
 def should_auto_compact(messages: list[BaseMessage], policy: CompactPolicy) -> bool:
-    return estimate_messages_tokens(messages) >= policy.auto_compact_threshold_tokens
+    return count_messages_tokens(messages, model=policy.model) >= policy.auto_compact_threshold_tokens
 
 
-def microcompact_messages(messages: list[BaseMessage], *, keep_recent_results: int = 3) -> MicrocompactResult:
-    pre_tokens = estimate_messages_tokens(messages)
+def microcompact_messages(messages: list[BaseMessage], *, keep_recent_results: int = 3, model: str | None = None) -> MicrocompactResult:
+    pre_tokens = count_messages_tokens(messages, model=model)
     compactable_indices: list[int] = []
     for index, message in enumerate(messages):
         if not isinstance(message, ToolMessage):
@@ -182,7 +229,7 @@ def microcompact_messages(messages: list[BaseMessage], *, keep_recent_results: i
         else:
             result.append(message)
 
-    post_tokens = estimate_messages_tokens(result)
+    post_tokens = count_messages_tokens(result, model=model)
     return MicrocompactResult(result, True, pre_tokens, post_tokens, len(compact_indices))
 
 
@@ -259,7 +306,7 @@ def build_compacted_messages(
     tail_rounds: int = 2,
     max_tail_messages: int = 12,
 ) -> CompactionResult:
-    pre_tokens = estimate_messages_tokens(original_messages)
+    pre_tokens = count_messages_tokens(original_messages, model=policy.model)
     systems = [message for message in original_messages if isinstance(message, SystemMessage)]
     boundary = CompactBoundary(source=source, pre_token_count=pre_tokens, policy=policy)
     tail = preserve_tail_messages(original_messages, tail_rounds=tail_rounds, max_messages=max_tail_messages)
@@ -271,7 +318,7 @@ def build_compacted_messages(
         boundary=boundary,
         summary_chars=len(summary),
         pre_token_count=pre_tokens,
-        post_token_count=estimate_messages_tokens(messages),
+        post_token_count=count_messages_tokens(messages, model=policy.model),
         source=source,
         restored_attachment_types=[_attachment_type(message) for message in restored],
         preserved_tail_count=len(tail),

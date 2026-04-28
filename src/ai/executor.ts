@@ -2437,11 +2437,28 @@ export async function executeTool(
         }
       }
 
+      case 'workspace_tree': {
+        try {
+          const res = await fetch('/api/workspaces')
+          const data = await res.json()
+          if (!res.ok) return { success: false, message: data.detail || '读取工作区失败' }
+          const workspaceId = String(params.workspace_id || params.workspaceId || data.activeWorkspaceId || '')
+          const treeRes = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/tree`)
+          const tree = await treeRes.json()
+          if (!treeRes.ok) return { success: false, message: tree.detail || '读取目录树失败' }
+          return { success: true, message: '已读取工作区目录树', data: tree }
+        } catch (e) {
+          return { success: false, message: `读取目录树失败: ${e instanceof Error ? e.message : String(e)}` }
+        }
+      }
+
       case 'workspace_search': {
         const query = String(params.query || '')
         if (!query) return { success: false, message: '请提供搜索关键词' }
         const searchParams = new URLSearchParams({ q: query })
         if (params.doc_id) searchParams.set('doc_id', String(params.doc_id))
+        if (params.path) searchParams.set('path', String(params.path))
+        if (params.scope) searchParams.set('scope', String(params.scope))
         if (params.context_lines) searchParams.set('context_lines', String(params.context_lines))
         try {
           const res = await fetch(`/api/workspace/search?${searchParams.toString()}`)
@@ -2456,14 +2473,14 @@ export async function executeTool(
       }
 
       case 'workspace_read': {
-        const docId = String(params.doc_id || '')
-        if (!docId) return { success: false, message: '请提供文档ID' }
+        const docId = String(params.path || params.doc_id || '')
+        if (!docId) return { success: false, message: '请提供工作区相对路径' }
         const readParams = new URLSearchParams()
         if (params.from_line !== undefined) readParams.set('from_line', String(params.from_line))
         if (params.to_line !== undefined) readParams.set('to_line', String(params.to_line))
         const qs = readParams.toString()
         try {
-          const res = await fetch(`/api/workspace/${docId}/content${qs ? '?' + qs : ''}`)
+          const res = await fetch(`/api/workspace/${encodeURIComponent(docId)}/content${qs ? '?' + qs : ''}`)
           const data = await res.json()
           if (!res.ok) return { success: false, message: data.detail || '读取文档失败' }
           const totalLines = data.totalLines ?? 0
@@ -2472,6 +2489,13 @@ export async function executeTool(
           return { success: true, message: `文档"${data.name}" 第${fromLine}-${toLine}行（共${totalLines}行）`, data }
         } catch (e) {
           return { success: false, message: `读取文档失败: ${e instanceof Error ? e.message : String(e)}` }
+        }
+      }
+
+      case 'workspace_open': {
+        return {
+          success: false,
+          message: 'workspace_open 需要后端 Agent 执行以切换文档会话；请使用后端 ReAct 模式。',
         }
       }
 

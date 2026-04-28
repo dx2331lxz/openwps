@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@chenglou/pretext": "^0.0.4",
+    "@xmldom/xmldom": "^0.8.12",
     "docx": "^9.6.1",
     "file-saver": "^2.0.5",
     "jszip": "^3.10.1",

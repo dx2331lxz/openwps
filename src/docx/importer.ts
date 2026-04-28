@@ -1,6 +1,6 @@
 import JSZip from 'jszip'
-import type { PageConfig } from '../layout/paginator'
-import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
+import type { PageConfig } from '../layout/paginator.js'
+import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts.js'
 
 const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 const TWIP_TO_PX = 96 / 1440
@@ -293,12 +293,9 @@ function getLocalName(element: Element) {
 
 function getAttr(element: Element | undefined, name: string) {
   if (!element) return ''
-  const direct = element.getAttribute(name)
-    ?? element.getAttribute(`w:${name}`)
-    ?? element.getAttribute(`r:${name}`)
-    ?? element.getAttribute(`a:${name}`)
-    ?? element.getAttribute(`wp:${name}`)
-  if (direct != null) return direct
+  for (const candidate of [name, `w:${name}`, `r:${name}`, `a:${name}`, `wp:${name}`]) {
+    if (element.hasAttribute(candidate)) return element.getAttribute(candidate) ?? ''
+  }
 
   for (const attr of Array.from(element.attributes)) {
     const attrLocalName = attr.localName ?? attr.name.split(':').pop() ?? attr.name
@@ -1541,7 +1538,7 @@ async function parseDocument(
 }
 
 export async function importDocx(file: File): Promise<DocxImportResult> {
-  const zip = await JSZip.loadAsync(file)
+  const zip = await JSZip.loadAsync(await file.arrayBuffer())
   const documentXml = await zip.file('word/document.xml')?.async('string')
   if (!documentXml) throw new Error('DOCX 缺少 word/document.xml')
 

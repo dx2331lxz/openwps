@@ -1,7 +1,7 @@
 import { type Mark, type Node as PMNode } from 'prosemirror-model'
 import { marked, type Token, type Tokens } from 'marked'
-import { schema } from '../editor/schema'
-import { FONT_STACKS } from '../fonts'
+import { schema } from '../editor/schema.js'
+import { FONT_STACKS } from '../fonts.js'
 
 const DEFAULT_PARAGRAPH_ATTRS = {
   align: 'left',

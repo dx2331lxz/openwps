@@ -63,17 +63,31 @@ from .models import (
     TemplateUpdateRequest,
     VisionAnalyzeRequest,
     VisionTestRequest,
+    WorkspaceCreateRequest,
+    WorkspaceMoveRequest,
+    WorkspaceOpenRequest,
 )
 from .models import OCRCommandRequest
 from .template_analysis import analyze_template_request
 from .templates import create_template, delete_template, list_templates, read_template, update_template
 from .tasks import create_task, delete_task, get_task, list_tasks, reset_completed_tasks, update_task
 from .workspace import (
+    create_folder,
+    create_workspace,
     delete_document as ws_delete,
+    delete_file as ws_delete_file,
     get_document_content as ws_get_content,
+    get_workspace_tree,
+    list_workspaces,
     list_workspace_docs,
+    move_file as ws_move_file,
+    open_file_as_document,
+    read_file_path as ws_read_file_path,
+    save_file as ws_save_file,
     search_workspace,
+    set_active_workspace,
     upload_document,
+    upload_workspace_file,
 )
 
 
@@ -377,7 +391,71 @@ def create_api_router() -> APIRouter:
         delete_template(template_id)
         return {"success": True}
 
-    # ── Workspace (知识库) ──
+    # ── Workspaces (目录化工作区) ──
+
+    @router.get("/workspaces")
+    def get_workspaces():
+        return list_workspaces()
+
+    @router.post("/workspaces")
+    def post_workspace(body: WorkspaceCreateRequest):
+        return create_workspace(body.name, body.id)
+
+    @router.post("/workspaces/{workspace_id}/active")
+    def post_active_workspace(workspace_id: str):
+        return set_active_workspace(workspace_id)
+
+    @router.get("/workspaces/{workspace_id}/tree")
+    def get_workspace_file_tree(workspace_id: str):
+        return get_workspace_tree(workspace_id)
+
+    @router.post("/workspaces/{workspace_id}/folders/{path:path}")
+    def post_workspace_folder(workspace_id: str, path: str):
+        return create_folder(workspace_id, path)
+
+    @router.post("/workspaces/{workspace_id}/files/upload")
+    async def upload_workspace_file_route(workspace_id: str, file: UploadFile, path: str | None = None):
+        content = await file.read()
+        return upload_workspace_file(workspace_id, path, file.filename or "untitled", file.content_type or "", content)
+
+    @router.post("/workspaces/{workspace_id}/open")
+    async def post_workspace_open(workspace_id: str, body: WorkspaceOpenRequest):
+        payload = open_file_as_document(workspace_id, body.path)
+        session = await create_document_session(payload)
+        await set_active_document_session(
+            session["documentSessionId"],
+            {
+                "currentDocumentName": payload.get("currentDocumentName"),
+                "workspaceId": payload.get("workspaceId"),
+                "filePath": payload.get("filePath"),
+                "fileType": payload.get("fileType"),
+            },
+        )
+        return {**payload, **session}
+
+    @router.post("/workspaces/{workspace_id}/files/{path:path}/move")
+    def move_workspace_file_route(workspace_id: str, path: str, body: WorkspaceMoveRequest):
+        return ws_move_file(workspace_id, path, body.toPath)
+
+    @router.get("/workspaces/{workspace_id}/files/{path:path}/content")
+    def get_workspace_file_content(workspace_id: str, path: str, from_line: int | None = None, to_line: int | None = None):
+        return ws_get_content(path, from_line, to_line, workspace_id=workspace_id)
+
+    @router.get("/workspaces/{workspace_id}/files/{path:path}")
+    def get_workspace_file(workspace_id: str, path: str):
+        file_path = ws_read_file_path(workspace_id, path)
+        return FileResponse(file_path, filename=file_path.name)
+
+    @router.put("/workspaces/{workspace_id}/files/{path:path}")
+    async def put_workspace_file(workspace_id: str, path: str, request: Request):
+        content = await request.body()
+        return ws_save_file(workspace_id, path, content, content_type=request.headers.get("content-type", ""))
+
+    @router.delete("/workspaces/{workspace_id}/files/{path:path}")
+    def delete_workspace_file(workspace_id: str, path: str):
+        return ws_delete_file(workspace_id, path)
+
+    # ── Legacy Workspace (参考资料兼容层，映射到 default/_references) ──
 
     @router.get("/workspace")
     def get_workspace():
@@ -394,10 +472,17 @@ def create_api_router() -> APIRouter:
         return ws_delete(doc_id)
 
     @router.get("/workspace/search")
-    def search_workspace_docs(q: str, doc_id: str | None = None, context_lines: int = 3):
-        return search_workspace(q, doc_id, context_lines)
+    def search_workspace_docs(
+        q: str,
+        doc_id: str | None = None,
+        context_lines: int = 3,
+        workspace_id: str | None = None,
+        scope: str = "all",
+        path: str | None = None,
+    ):
+        return search_workspace(q, doc_id, context_lines, workspace_id=workspace_id, scope=scope, path=path)
 
-    @router.get("/workspace/{doc_id}/content")
+    @router.get("/workspace/{doc_id:path}/content")
     def get_workspace_content(doc_id: str, from_line: int | None = None, to_line: int | None = None):
         return ws_get_content(doc_id, from_line, to_line)
 

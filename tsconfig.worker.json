@@ -16,6 +16,10 @@
   },
   "include": [
     "server/node/document_worker.ts",
+    "server/node/document_io_worker.ts",
+    "src/docx/**/*.ts",
+    "src/layout/**/*.ts",
+    "src/markdown/**/*.ts",
     "src/shared/document/**/*.ts",
     "src/fonts.ts"
   ]

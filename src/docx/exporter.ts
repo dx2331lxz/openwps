@@ -21,12 +21,12 @@ import {
   WidthType,
   type ParagraphChild,
 } from 'docx'
-import { saveAs } from 'file-saver'
+import saveAs from 'file-saver'
 import JSZip from 'jszip'
 import type { Node as PMNode } from 'prosemirror-model'
-import { DEFAULT_PAGE_CONFIG, paginate, type PageConfig, type PaginateResult } from '../layout/paginator'
-import type { DocxTypographyConfig } from './importer'
-import { toDocxFontName } from '../fonts'
+import { DEFAULT_PAGE_CONFIG, paginate, type PageConfig, type PaginateResult } from '../layout/paginator.js'
+import type { DocxTypographyConfig } from './importer.js'
+import { toDocxFontName } from '../fonts.js'
 
 const PX_TO_TWIP = 1440 / 96
 

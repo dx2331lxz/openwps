@@ -69,15 +69,15 @@ from .compact import (
     build_compact_policy,
     build_compact_prompt,
     build_compacted_messages,
+    count_messages_tokens,
     drop_oldest_api_round,
-    estimate_messages_tokens,
     microcompact_messages,
     should_auto_compact,
 )
-from .doc_sessions import execute_ai_document_tool, is_document_tool, read_document_session
+from .doc_sessions import create_document_session, execute_ai_document_tool, is_document_tool, read_document_session, set_active_document_session
 from .tasks import create_task, get_task, list_tasks, update_task
 from .workspace import get_document_content as get_workspace_document_content
-from .workspace import list_workspace_docs
+from .workspace import get_workspace_manifest, get_workspace_tree, list_workspace_docs, open_file_as_document
 from .workspace import search_workspace
 
 logger = logging.getLogger("uvicorn.error")
@@ -370,6 +370,82 @@ def _extract_finish_reason(payload: Any) -> str:
     return ""
 
 
+def _extract_token_usage(payload: Any) -> dict[str, int]:
+    if payload is None or isinstance(payload, str):
+        return {}
+
+    if isinstance(payload, dict):
+        candidates: list[Any] = [
+            payload.get("usage_metadata"),
+            payload.get("usage"),
+            payload.get("token_usage"),
+        ]
+        response_metadata = payload.get("response_metadata")
+        if isinstance(response_metadata, dict):
+            candidates.extend([
+                response_metadata.get("usage_metadata"),
+                response_metadata.get("usage"),
+                response_metadata.get("token_usage"),
+            ])
+        for candidate in candidates:
+            normalized = _normalize_token_usage(candidate)
+            if normalized:
+                return normalized
+        for key in ("response_metadata", "additional_kwargs", "llm_output", "output", "message", "generations"):
+            usage = _extract_token_usage(payload.get(key))
+            if usage:
+                return usage
+        return {}
+
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            usage = _extract_token_usage(item)
+            if usage:
+                return usage
+        return {}
+
+    for attr in ("usage_metadata", "response_metadata", "additional_kwargs", "llm_output", "output", "message", "generations"):
+        if hasattr(payload, attr):
+            usage = _extract_token_usage(getattr(payload, attr))
+            if usage:
+                return usage
+    return {}
+
+
+def _normalize_token_usage(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+
+    def read_int(*keys: str) -> int | None:
+        for key in keys:
+            raw = value.get(key)
+            try:
+                parsed = int(raw)
+            except Exception:
+                continue
+            if parsed >= 0:
+                return parsed
+        return None
+
+    input_tokens = read_int("input_tokens", "prompt_tokens")
+    output_tokens = read_int("output_tokens", "completion_tokens")
+    total_tokens = read_int("total_tokens")
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = int(input_tokens or 0) + int(output_tokens or 0)
+    if input_tokens is None and total_tokens is not None and output_tokens is not None:
+        input_tokens = max(0, total_tokens - output_tokens)
+    if output_tokens is None and total_tokens is not None and input_tokens is not None:
+        output_tokens = max(0, total_tokens - input_tokens)
+    usage: dict[str, int] = {}
+    if input_tokens is not None:
+        usage["inputTokens"] = input_tokens
+    if output_tokens is not None:
+        usage["outputTokens"] = output_tokens
+    if total_tokens is not None:
+        usage["totalTokens"] = total_tokens
+    return usage
+
+
 def _is_output_truncated_finish_reason(finish_reason: str) -> bool:
     normalized = finish_reason.strip().lower()
     if not normalized:
@@ -527,15 +603,34 @@ def _build_context_block(context: dict) -> str:
     if workspaceDocs and isinstance(workspaceDocs, list):
         parts.append("")
         parts.append("[工作区文档列表]")
-        parts.append("以下为当前工作区已有参考文档，可使用 workspace_search 搜索内容或 workspace_read(doc_id) 查看全文：")
-        parts.append("这些文档是会话开始时可用的参考资料，不代表当前任务执行过程中的文件变化；任务已完成时不要因为列表中存在参考文档而继续探索，也不要在最终回复中主动提及未使用的参考文件。")
+        parts.append("以下为当前工作区 _references/ 下的参考文档，可使用 workspace_search 搜索内容或 workspace_read(path) 查看全文。")
+        parts.append("参考目录中的文件默认只作为资料来源；普通工作区文件可用 workspace_open(path) 切换为当前编辑文件。")
         for doc in workspaceDocs:
             name = doc.get("name", "?")
-            doc_id = doc.get("id", "?")
+            doc_id = doc.get("path") or doc.get("id", "?")
             doc_type = doc.get("type", "?")
             size = doc.get("size", 0)
             text_length = doc.get("textLength", 0)
             parts.append(f"  - [{doc_id}] {name} ({doc_type}, {size} bytes, {text_length} chars)")
+
+    workspace_manifest = context.get("workspaceManifest")
+    if workspace_manifest and isinstance(workspace_manifest, dict):
+        parts.append("")
+        parts.append("[当前工作区目录]")
+        memory = workspace_manifest.get("memory")
+        if isinstance(memory, dict) and memory.get("content"):
+            parts.append("OPENWPS.md 记忆/指令：")
+            parts.append(str(memory.get("content") or "")[:40000])
+        files = workspace_manifest.get("files")
+        refs = workspace_manifest.get("references")
+        if isinstance(files, list):
+            parts.append("普通可编辑/可读文件：")
+            for item in files[:80]:
+                parts.append(f"  - {item.get('path')} ({item.get('type')}, editable={item.get('editable')})")
+        if isinstance(refs, list):
+            parts.append("_references/ 参考资料：")
+            for item in refs[:80]:
+                parts.append(f"  - {item.get('path')} ({item.get('type')}, {item.get('textLength', 0)} chars)")
 
     return "\n".join(parts)
 
@@ -549,6 +644,7 @@ def _with_backend_workspace_docs(context: dict[str, Any] | None) -> dict[str, An
     """
     merged = dict(context or {})
     merged["workspaceDocs"] = list_workspace_docs()
+    merged["workspaceManifest"] = get_workspace_manifest()
     return merged
 
 
@@ -2839,6 +2935,7 @@ class LoopState:
     last_compact_post_tokens: int = 0
     compact_failure_count: int = 0
     microcompact_count: int = 0
+    last_api_usage: dict[str, int] = field(default_factory=dict)
     pending_write_follow_up: bool = False
     pending_agent_follow_up: bool = False
     forced_follow_up_attempts: int = 0
@@ -4025,6 +4122,7 @@ def _record_round_checkpoint(
         "lastCompactPreTokens": session.state.last_compact_pre_tokens,
         "lastCompactPostTokens": session.state.last_compact_post_tokens,
         "microcompactCount": session.state.microcompact_count,
+        "lastApiUsage": dict(session.state.last_api_usage),
         "remainingRounds": max(MAX_REACT_ROUNDS - session.state.round, 0),
         "roundBudgetWarningLevel": session.state.round_budget_warning_level,
         "stagnantBudgetRounds": session.state.stagnant_budget_rounds,
@@ -4575,23 +4673,37 @@ async def _run_task_tool(tool_name: str, params: dict[str, Any], conversation_id
 
 
 def _workspace_tool_cache_key(tool_name: str, params: dict[str, Any]) -> str:
+    if tool_name == "workspace_tree":
+        workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
+        return f"{tool_name}:{workspace_id}"
     if tool_name == "workspace_search":
         query = _stringify_content(params.get("query")).strip()
         doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+        scope = _stringify_content(params.get("scope") or "all").strip()
+        path = _stringify_content(params.get("path")).strip()
         context_lines = str(params.get("context_lines") or params.get("contextLines") or 3)
-        return f"{tool_name}:{query}:{doc_id}:{context_lines}"
+        return f"{tool_name}:{query}:{doc_id}:{scope}:{path}:{context_lines}"
     if tool_name == "workspace_read":
-        doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+        doc_id = _stringify_content(params.get("path") or params.get("doc_id") or params.get("docId")).strip()
         from_line = params.get("from_line", params.get("fromLine"))
         to_line = params.get("to_line", params.get("toLine"))
         return f"{tool_name}:{doc_id}:{from_line}:{to_line}"
+    if tool_name == "workspace_open":
+        path = _stringify_content(params.get("path")).strip()
+        workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
+        return f"{tool_name}:{workspace_id}:{path}"
     return f"{tool_name}:{json.dumps(params, ensure_ascii=False, sort_keys=True)}"
 
 
-async def _run_workspace_tool(tool_name: str, params: dict[str, Any], cache: set[str] | None = None) -> str:
+async def _run_workspace_tool(
+    tool_name: str,
+    params: dict[str, Any],
+    cache: set[str] | None = None,
+    context: dict[str, Any] | None = None,
+) -> str:
     try:
         cache_key = _workspace_tool_cache_key(tool_name, params)
-        if cache is not None and cache_key in cache:
+        if cache is not None and cache_key in cache and tool_name != "workspace_open":
             return _serialize_tool_result_payload(
                 tool_name=tool_name,
                 success=True,
@@ -4604,26 +4716,75 @@ async def _run_workspace_tool(tool_name: str, params: dict[str, Any], cache: set
                 executed_params=params,
                 original_params=params,
             )
-        if tool_name == "workspace_search":
+        if tool_name == "workspace_tree":
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
+            data = get_workspace_tree(workspace_id)
+            message = "已读取工作区目录树"
+        elif tool_name == "workspace_search":
             query = _stringify_content(params.get("query")).strip()
             if not query:
                 raise HTTPException(status_code=400, detail="workspace_search 缺少 query")
             doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip() or None
             context_lines = int(params.get("context_lines") or params.get("contextLines") or 3)
-            data = search_workspace(query, doc_id, context_lines)
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
+            scope = _stringify_content(params.get("scope") or "all").strip() or "all"
+            path = _stringify_content(params.get("path")).strip() or None
+            data = search_workspace(query, doc_id, context_lines, workspace_id=workspace_id, scope=scope, path=path)
             message = f"工作区搜索完成，匹配 {data.get('matchedDocs', 0)} 个文档"
         elif tool_name == "workspace_read":
-            doc_id = _stringify_content(params.get("doc_id") or params.get("docId")).strip()
+            doc_id = _stringify_content(params.get("path") or params.get("doc_id") or params.get("docId")).strip()
             if not doc_id:
-                raise HTTPException(status_code=400, detail="workspace_read 缺少 doc_id")
+                raise HTTPException(status_code=400, detail="workspace_read 缺少 path")
             from_line = params.get("from_line", params.get("fromLine"))
             to_line = params.get("to_line", params.get("toLine"))
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
             data = get_workspace_document_content(
                 doc_id,
                 int(from_line) if from_line is not None else None,
                 int(to_line) if to_line is not None else None,
+                workspace_id=workspace_id,
             )
             message = f"已读取工作区文档 {doc_id}"
+        elif tool_name == "workspace_open":
+            path = _stringify_content(params.get("path")).strip()
+            if not path:
+                raise HTTPException(status_code=400, detail="workspace_open 缺少 path")
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
+            payload = open_file_as_document(workspace_id or "", path)
+            session = await create_document_session(payload)
+            await set_active_document_session(
+                session["documentSessionId"],
+                {
+                    "currentDocumentName": payload.get("currentDocumentName"),
+                    "workspaceId": payload.get("workspaceId"),
+                    "filePath": payload.get("filePath"),
+                    "fileType": payload.get("fileType"),
+                },
+            )
+            data = {
+                **payload,
+                **session,
+                "documentEvents": [
+                    {
+                        "type": "document_replace",
+                        "docJson": payload.get("docJson"),
+                        "source": "workspace_open",
+                        "version": session.get("version"),
+                    },
+                    {
+                        "type": "page_config_changed",
+                        "pageConfig": payload.get("pageConfig"),
+                        "source": "workspace_open",
+                        "version": session.get("version"),
+                    },
+                ],
+            }
+            if context is not None:
+                context["documentSessionId"] = session["documentSessionId"]
+                context["workspaceId"] = payload.get("workspaceId")
+                context["filePath"] = payload.get("filePath")
+                context["fileType"] = payload.get("fileType")
+            message = f"已打开工作区文件 {payload.get('filePath')}"
         else:
             return _serialize_tool_result_payload(
                 tool_name=tool_name,
@@ -5107,6 +5268,7 @@ def _build_recent_read_snapshot_attachment(messages: list[BaseMessage], *, limit
         "get_page_style_summary",
         "get_paragraph",
         "search_text",
+        "workspace_tree",
         "workspace_read",
         "workspace_search",
     }
@@ -5578,6 +5740,7 @@ def build_llm(
         base_url=endpoint,
         temperature=0.3,
         streaming=streaming,
+        stream_usage=streaming,
         pass_empty_reasoning_content=_should_pass_empty_reasoning_content(provider, model, endpoint),
         **({"model_kwargs": model_kwargs} if model_kwargs else {}),
     )
@@ -6065,14 +6228,19 @@ async def _run_llm_round(
     assistant_content = ""
     assistant_reasoning = ""
     finish_reason = ""
+    token_usage: dict[str, int] = {}
 
     try:
         async for event in graph.astream_events({"messages": messages}, version="v2"):
             event_name = event.get("event")
             if event_name == "on_chat_model_end":
-                extracted_finish_reason = _extract_finish_reason(event.get("data", {}).get("output"))
+                output = event.get("data", {}).get("output")
+                extracted_finish_reason = _extract_finish_reason(output)
                 if extracted_finish_reason:
                     finish_reason = extracted_finish_reason
+                extracted_usage = _extract_token_usage(output)
+                if extracted_usage:
+                    token_usage = extracted_usage
                 continue
 
             if event_name != "on_chat_model_stream":
@@ -6080,6 +6248,10 @@ async def _run_llm_round(
             chunk = event.get("data", {}).get("chunk")
             if not isinstance(chunk, AIMessageChunk):
                 continue
+
+            extracted_usage = _extract_token_usage(chunk)
+            if extracted_usage:
+                token_usage = extracted_usage
 
             extracted_finish_reason = _extract_finish_reason(chunk)
             if extracted_finish_reason:
@@ -6143,6 +6315,7 @@ async def _run_llm_round(
         "reasoning_content": assistant_reasoning,
         "tool_calls": parsed_tool_calls,
         "finish_reason": finish_reason,
+        "token_usage": token_usage,
     }
 
 
@@ -6195,6 +6368,16 @@ class QueryCoordinator:
                         )
                         continue
                 raise
+            usage = _extract_token_usage(response)
+            if usage:
+                self.state.last_api_usage = usage
+                _record_trace_event(
+                    self.session,
+                    "token_usage",
+                    round=self.state.round,
+                    source=f"compact:{source}",
+                    **usage,
+                )
             summary = _stringify_content(getattr(response, "content", response)).strip()
             if summary:
                 return summary
@@ -6208,7 +6391,7 @@ class QueryCoordinator:
 
     async def _compact_session_messages(self, *, source: str, reactive: bool = False) -> dict[str, Any]:
         policy = self._compact_policy()
-        pre_tokens = estimate_messages_tokens(self.session.messages)
+        pre_tokens = count_messages_tokens(self.session.messages, model=policy.model)
         _record_trace_event(
             self.session,
             "compact_start",
@@ -6248,7 +6431,8 @@ class QueryCoordinator:
         return payload
 
     async def _maybe_microcompact(self) -> dict[str, Any] | None:
-        result = microcompact_messages(self.session.messages)
+        policy = self._compact_policy()
+        result = microcompact_messages(self.session.messages, model=policy.model)
         if not result.changed:
             self.state.estimated_tokens = result.post_token_count
             return None
@@ -6270,7 +6454,7 @@ class QueryCoordinator:
             yield microcompact_event
 
         policy = self._compact_policy()
-        self.state.estimated_tokens = estimate_messages_tokens(self.session.messages)
+        self.state.estimated_tokens = count_messages_tokens(self.session.messages, model=policy.model)
         if not should_auto_compact(self.session.messages, policy):
             return
 
@@ -6319,6 +6503,7 @@ class QueryCoordinator:
             round_reasoning = ""
             round_tool_calls = []
             round_finish_reason = ""
+            round_token_usage: dict[str, int] = {}
             llm = build_llm(
                 streaming=True,
                 body=self.session.body,
@@ -6333,6 +6518,7 @@ class QueryCoordinator:
                         round_reasoning = str(event.get("reasoning_content", "") or "")
                         round_tool_calls = event["tool_calls"]
                         round_finish_reason = str(event.get("finish_reason", "") or "")
+                        round_token_usage = event.get("token_usage") if isinstance(event.get("token_usage"), dict) else {}
                     else:
                         yield event
                 self.state.consecutive_errors = 0
@@ -6342,6 +6528,7 @@ class QueryCoordinator:
                     "reasoning_content": round_reasoning,
                     "tool_calls": round_tool_calls,
                     "finish_reason": round_finish_reason,
+                    "token_usage": round_token_usage,
                 }
                 return
             except HTTPException as exc:
@@ -6370,6 +6557,7 @@ class QueryCoordinator:
             "reasoning_content": round_reasoning,
             "tool_calls": round_tool_calls,
             "finish_reason": round_finish_reason,
+            "token_usage": round_token_usage,
         }
 
     async def _resolve_layout_preflight_page_count(self) -> int:
@@ -6589,8 +6777,13 @@ class QueryCoordinator:
         elif execution.tool_name in {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
             content = await _run_task_tool(execution.tool_name, execution.params, self.session.body.conversationId)
             newly_loaded = []
-        elif execution.tool_name in {"workspace_search", "workspace_read"}:
-            content = await _run_workspace_tool(execution.tool_name, execution.params, self.session.workspace_tool_cache)
+        elif execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open"}:
+            content = await _run_workspace_tool(
+                execution.tool_name,
+                execution.params,
+                self.session.workspace_tool_cache,
+                self.session.latest_context,
+            )
             newly_loaded = []
         elif execution.tool_name == "analyze_image_with_ocr":
             content = await _run_ocr_attachment_tool(execution.params, self.session.body)
@@ -6857,8 +7050,13 @@ class QueryCoordinator:
                         server_execution.params,
                         self.session.body.conversationId,
                     )
-                elif server_execution.tool_name in {"workspace_search", "workspace_read"}:
-                    server_content = await _run_workspace_tool(server_execution.tool_name, server_execution.params, self.session.workspace_tool_cache)
+                elif server_execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open"}:
+                    server_content = await _run_workspace_tool(
+                        server_execution.tool_name,
+                        server_execution.params,
+                        self.session.workspace_tool_cache,
+                        self.session.latest_context,
+                    )
                 elif server_execution.tool_name == "analyze_image_with_ocr":
                     server_content = await _run_ocr_attachment_tool(server_execution.params, self.session.body)
                 elif server_execution.tool_name == "web_search":
@@ -7216,6 +7414,7 @@ class QueryCoordinator:
                 round_reasoning = ""
                 round_tool_calls: list[dict[str, Any]] = []
                 round_finish_reason = ""
+                round_token_usage: dict[str, int] = {}
                 reactive_attempt = 0
                 while True:
                     try:
@@ -7225,6 +7424,7 @@ class QueryCoordinator:
                                 round_reasoning = str(event.get("reasoning_content", "") or "")
                                 round_tool_calls = event["tool_calls"]
                                 round_finish_reason = str(event.get("finish_reason", "") or "")
+                                round_token_usage = event.get("token_usage") if isinstance(event.get("token_usage"), dict) else {}
                             else:
                                 yield event
                         break
@@ -7253,7 +7453,7 @@ class QueryCoordinator:
                         yield {
                             "type": "compact_start",
                             "source": "reactive",
-                            "preTokens": estimate_messages_tokens(self.session.messages),
+                            "preTokens": count_messages_tokens(self.session.messages, model=self._compact_policy().model),
                             "reactive": True,
                         }
                         try:
@@ -7285,6 +7485,17 @@ class QueryCoordinator:
                         continue
                 if self.session.finished:
                     break
+
+                if round_token_usage:
+                    self.state.last_api_usage = round_token_usage
+                    self.state.estimated_tokens = round_token_usage.get("inputTokens", self.state.estimated_tokens)
+                    _record_trace_event(
+                        self.session,
+                        "token_usage",
+                        round=self.state.round,
+                        source="chat_model",
+                        **round_token_usage,
+                    )
 
                 self.state.last_model_finish_reason = round_finish_reason
                 if round_tool_calls or not _is_output_truncated_finish_reason(round_finish_reason):
@@ -7679,6 +7890,7 @@ class QueryCoordinator:
                 "lastCompactPostTokens": self.state.last_compact_post_tokens,
                 "compactFailureCount": self.state.compact_failure_count,
                 "microcompactCount": self.state.microcompact_count,
+                "lastApiUsage": dict(self.state.last_api_usage),
                 "stagnantBudgetRounds": self.state.stagnant_budget_rounds,
                 "budgetStagnationWarningLevel": self.state.budget_stagnation_warning_level,
                 "readOnlyStagnantRounds": self.state.read_only_stagnant_rounds,

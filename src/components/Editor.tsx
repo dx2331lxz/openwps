@@ -28,7 +28,7 @@ import {
 } from '../layout/paginator'
 import { Toolbar, type AICopilotActivity } from './Toolbar'
 import AISidebar from './AISidebar'
-import WorkspacePanel from './WorkspacePanel'
+import WorkspacePanel, { type WorkspaceFileRef } from './WorkspacePanel'
 import FileManagerModal from './FileManagerModal'
 import type { DocumentFileSummary, DocumentSettings, DocumentSource } from './FileManagerModal'
 import SettingsModal from './SettingsModal'
@@ -442,6 +442,59 @@ function createDefaultEditorDoc() {
 
 function createBlankEditorDoc() {
   return schema.nodes.doc.create(null, schema.nodes.paragraph.create())
+}
+
+function serializeTableAsMarkdown(node: PMNode) {
+  const rows: string[][] = []
+  node.forEach(row => {
+    const cells: string[] = []
+    row.forEach(cell => cells.push(cell.textContent.trim()))
+    rows.push(cells)
+  })
+  if (rows.length === 0) return ''
+  const header = rows[0]
+  const lines = [
+    `| ${header.join(' | ')} |`,
+    `| ${header.map(() => '---').join(' | ')} |`,
+    ...rows.slice(1).map(row => `| ${row.join(' | ')} |`),
+  ]
+  return lines.join('\n')
+}
+
+function serializeEditorDoc(doc: PMNode, fileType: string) {
+  const format = fileType.toLowerCase()
+  const blocks: string[] = []
+  doc.forEach(node => {
+    if (node.type.name === 'paragraph') {
+      const text = node.textContent
+      if (format === 'md' || format === 'markdown') {
+        const heading = Number(node.attrs.headingLevel || 0)
+        const listType = String(node.attrs.listType || '')
+        if (heading >= 1 && heading <= 6) {
+          blocks.push(`${'#'.repeat(heading)} ${text}`.trimEnd())
+          return
+        }
+        if (listType === 'bullet') {
+          blocks.push(`- ${text}`.trimEnd())
+          return
+        }
+        if (listType === 'ordered') {
+          blocks.push(`1. ${text}`.trimEnd())
+          return
+        }
+      }
+      blocks.push(text)
+      return
+    }
+    if (node.type.name === 'table') {
+      blocks.push(format === 'md' || format === 'markdown'
+        ? serializeTableAsMarkdown(node)
+        : node.textContent)
+      return
+    }
+    if (node.type.name === 'horizontal_rule') blocks.push('---')
+  })
+  return blocks.join('\n').replace(/\s+$/, '') + '\n'
 }
 
 function buildUntitledDocumentName(existingNames: string[]) {
@@ -1692,6 +1745,7 @@ export const Editor: React.FC = () => {
   })
   const [documentSettingsSaving, setDocumentSettingsSaving] = useState(false)
   const [currentDocumentName, setCurrentDocumentName] = useState(initialDraft?.currentDocumentName ?? DEFAULT_SERVER_DOCUMENT_NAME)
+  const [activeWorkspaceFile, setActiveWorkspaceFile] = useState<WorkspaceFileRef | null>(null)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [templateManagerOpen, setTemplateManagerOpen] = useState(false)
   const [activeTemplate, setActiveTemplate] = useState<TemplateRecord | null>(null)
@@ -1854,12 +1908,15 @@ export const Editor: React.FC = () => {
         body: JSON.stringify({
           clientId: documentClientIdRef.current,
           currentDocumentName: currentDocumentName || undefined,
+          workspaceId: activeWorkspaceFile?.workspaceId,
+          filePath: activeWorkspaceFile?.filePath,
+          fileType: activeWorkspaceFile?.fileType,
         }),
       })
     } catch (error) {
       console.warn('登记当前文档会话失败', error)
     }
-  }, [currentDocumentName])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId, currentDocumentName])
 
   const syncDocumentSession = useCallback(async () => {
     const currentState = editorStateRef.current
@@ -1869,6 +1926,9 @@ export const Editor: React.FC = () => {
       pageConfig: pageConfigRef.current,
       clientId: documentClientIdRef.current,
       currentDocumentName: currentDocumentName || undefined,
+      workspaceId: activeWorkspaceFile?.workspaceId,
+      filePath: activeWorkspaceFile?.filePath,
+      fileType: activeWorkspaceFile?.fileType,
     }
     const createDocumentSession = async () => {
       const response = await fetch('/api/doc-sessions', {
@@ -1911,7 +1971,7 @@ export const Editor: React.FC = () => {
     const data = await readJsonResponse<{ version?: number }>(response)
     rememberDocumentSession({ id: current.id, version: Number(data.version ?? current.version + 1) || current.version + 1 })
     await registerActiveDocumentSession(current.id)
-  }, [currentDocumentName, registerActiveDocumentSession, rememberDocumentSession])
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.fileType, activeWorkspaceFile?.workspaceId, currentDocumentName, registerActiveDocumentSession, rememberDocumentSession])
 
   useEffect(() => {
     if (!editorState) return undefined
@@ -2526,6 +2586,7 @@ export const Editor: React.FC = () => {
         typography: parsed.typography,
       }, parsed.typography.punctuationCompression ? DOCX_PUNCTUATION_COMPRESSION_PX : 0)
       setCurrentDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME)
+      setActiveWorkspaceFile(null)
       console.log(
         `[docx] typography: compressPunctuation=${parsed.typography.punctuationCompression} ` +
         `doNotWrapTextWithPunct=${parsed.typography.doNotWrapTextWithPunct} ` +
@@ -2548,6 +2609,7 @@ export const Editor: React.FC = () => {
       const doc = markdownToDocument(markdown)
       applyDocumentState(doc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
       setCurrentDocumentName(buildImportedDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME))
+      setActiveWorkspaceFile(null)
       repaginate()
       window.alert('Markdown 导入成功')
     } catch (error) {
@@ -2574,6 +2636,7 @@ export const Editor: React.FC = () => {
     const blankDoc = createBlankEditorDoc()
     applyDocumentState(blankDoc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
     setCurrentDocumentName(buildUntitledDocumentName(documentFiles.map(file => file.name)))
+    setActiveWorkspaceFile(null)
     setSelectedBlockPos(null)
     setBlockAIPopover(null)
     setActiveComment(null)
@@ -2602,6 +2665,7 @@ export const Editor: React.FC = () => {
       })
       await handleImportDocx(file)
       setCurrentDocumentName(name)
+      setActiveWorkspaceFile(null)
       setFileModalMode(null)
       await loadDocumentFiles(documentSettings.activeSource)
       window.alert(`${documentSettings.activeSource === 'wps_directory' ? 'WPS 目录' : '服务器文档'}打开成功`)
@@ -2611,6 +2675,85 @@ export const Editor: React.FC = () => {
       window.alert(`打开文档失败：${message}`)
     }
   }, [documentSettings.activeSource, handleImportDocx, loadDocumentFiles])
+
+  const handleOpenWorkspaceFile = useCallback(async (workspaceId: string, filePath: string) => {
+    try {
+      const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath }),
+      })
+      const data = await readJsonResponse<{
+        documentSessionId?: string
+        version?: number
+        docJson?: PMNodeJSON
+        pageConfig?: PageConfig
+        filePath?: string
+        fileType?: string
+        workspaceId?: string
+        currentDocumentName?: string
+        docxExportOptions?: DocxExportOptions
+        docxLetterSpacingPx?: number
+      }>(response)
+      if (!data.docJson) throw new Error('后端未返回文档内容')
+      const nextPageConfig = normalizePageConfig(data.pageConfig)
+      const nextDocxExportOptions = isRecord(data.docxExportOptions)
+        ? data.docxExportOptions as DocxExportOptions
+        : undefined
+      const nextDocxLetterSpacingPx = typeof data.docxLetterSpacingPx === 'number'
+        ? data.docxLetterSpacingPx
+        : 0
+      applyDocumentState(data.docJson, nextPageConfig, nextDocxExportOptions, nextDocxLetterSpacingPx)
+      pageConfigRef.current = nextPageConfig
+      repaginate()
+      const nextFile: WorkspaceFileRef = {
+        workspaceId: data.workspaceId || workspaceId,
+        filePath: data.filePath || filePath,
+        fileType: data.fileType || filePath.split('.').pop() || 'docx',
+      }
+      setActiveWorkspaceFile(nextFile)
+      setCurrentDocumentName(data.currentDocumentName || nextFile.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME)
+      if (data.documentSessionId) {
+        rememberDocumentSession({ id: data.documentSessionId, version: Number(data.version ?? 1) || 1 })
+        await registerActiveDocumentSession(data.documentSessionId)
+      }
+    } catch (error) {
+      console.error('[Editor] open workspace file failed', error)
+      window.alert(`打开工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [applyDocumentState, registerActiveDocumentSession, rememberDocumentSession, repaginate])
+
+  const handleSaveWorkspaceFile = useCallback(async () => {
+    const editorView = viewRef.current
+    if (!editorView || !activeWorkspaceFile) return
+    try {
+      const fileType = activeWorkspaceFile.fileType.toLowerCase()
+      let body: Blob | string
+      let contentType = 'text/plain;charset=utf-8'
+      if (fileType === 'docx') {
+        body = await buildCurrentDocxBlob()
+        contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      } else {
+        body = serializeEditorDoc(editorView.state.doc, fileType)
+        contentType = fileType === 'md' || fileType === 'markdown'
+          ? 'text/markdown;charset=utf-8'
+          : 'text/plain;charset=utf-8'
+      }
+      const response = await fetch(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceFile.workspaceId)}/files/${encodeURIComponent(activeWorkspaceFile.filePath)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': contentType },
+          body,
+        },
+      )
+      await readJsonResponse<Record<string, unknown>>(response)
+      window.alert('工作区文件保存成功')
+    } catch (error) {
+      console.error('[Editor] save workspace file failed', error)
+      window.alert(`保存工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [activeWorkspaceFile, buildCurrentDocxBlob])
 
   const handleSaveDocument = useCallback(async (name?: string) => {
     const editorView = viewRef.current
@@ -2724,6 +2867,10 @@ export const Editor: React.FC = () => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
       event.preventDefault()
       if (event.repeat || fileModalMode) return
+      if (activeWorkspaceFile) {
+        void handleSaveWorkspaceFile()
+        return
+      }
       const targetName = currentDocumentName.trim()
       if (targetName) {
         void handleSaveDocument(targetName)
@@ -2734,7 +2881,7 @@ export const Editor: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [currentDocumentName, fileModalMode, handleSaveDocument, openSaveFileModal])
+  }, [activeWorkspaceFile, currentDocumentName, fileModalMode, handleSaveDocument, handleSaveWorkspaceFile, openSaveFileModal])
 
   const handleExportDocx = useCallback(async () => {
     const editorView = viewRef.current
@@ -3634,7 +3781,15 @@ export const Editor: React.FC = () => {
       <div className="flex min-h-0 flex-1">
         {/* Workspace Panel — content-level library */}
         {workspaceOpen && (
-          <WorkspacePanel onClose={() => setWorkspaceOpen(false)} />
+          <WorkspacePanel
+            onClose={() => setWorkspaceOpen(false)}
+            activeFile={activeWorkspaceFile}
+            onOpenFile={handleOpenWorkspaceFile}
+            onSaveActiveFile={handleSaveWorkspaceFile}
+            onWorkspaceChange={() => {
+              // 工作区切换只改变目录事实源；已打开文件保持到用户显式切换。
+            }}
+          />
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -3954,6 +4109,7 @@ export const Editor: React.FC = () => {
             pageConfig={pageConfig}
             templates={templates}
             activeTemplate={activeTemplate}
+            activeWorkspaceFile={activeWorkspaceFile}
             onModelContextChange={(next) => {
               setCurrentAIProviderId(next.providerId)
               setCurrentAIModel(next.model)
@@ -3969,6 +4125,10 @@ export const Editor: React.FC = () => {
               applyDocumentState(docJson as PMNodeJSON, nextPageConfig)
               pageConfigRef.current = nextPageConfig
               repaginate()
+            }}
+            onWorkspaceFileActivated={(file) => {
+              setActiveWorkspaceFile(file)
+              setCurrentDocumentName(file.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME)
             }}
             onDocumentStyleMutation={clearImportedDocxCompatibility}
             onClose={() => setSidebarOpen(false)}
