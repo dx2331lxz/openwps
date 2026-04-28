@@ -16,18 +16,31 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from .config import BASE_DIR, DOCUMENTS_DIR
+from .config import BASE_DIR
 
 logger = logging.getLogger("uvicorn.error")
 
 WORKSPACES_DIR = BASE_DIR / "data" / "workspaces"
-LEGACY_WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
 WORKSPACES_META_PATH = WORKSPACES_DIR / "meta.json"
 DEFAULT_WORKSPACE_ID = "default"
 FILES_DIRNAME = "files"
 INTERNAL_DIRNAME = ".openwps"
 REFERENCES_DIRNAME = "_references"
-MEMORY_FILENAME = "OPENWPS.md"
+MEMORY_DIRNAME = "memory"
+MEMORY_ENTRYPOINT_FILENAME = "MEMORY.md"
+MEMORY_ROOT_RELATIVE = f"{INTERNAL_DIRNAME}/{MEMORY_DIRNAME}"
+MEMORY_ENTRYPOINT_RELATIVE = f"{MEMORY_ROOT_RELATIVE}/{MEMORY_ENTRYPOINT_FILENAME}"
+MEMORY_TYPES = {"user", "feedback", "project", "reference"}
+MEMORY_ENTRYPOINT_MAX_LINES = 200
+MEMORY_ENTRYPOINT_MAX_BYTES = 25_000
+MEMORY_FILE_MAX_LINES = 200
+MEMORY_FILE_MAX_BYTES = 4_096
+MEMORY_SELECTED_LIMIT = 5
+MEMORY_SCAN_LIMIT = 200
+SYSTEM_ROOT_DIR_ORDER = {
+    INTERNAL_DIRNAME: 0,
+    REFERENCES_DIRNAME: 1,
+}
 
 ALLOWED_EXTENSIONS = {".docx", ".txt", ".md", ".pdf", ".ppt", ".pptx", ".markdown"}
 EDITABLE_EXTENSIONS = {".docx", ".txt", ".md", ".markdown"}
@@ -107,6 +120,14 @@ def _workspace_internal_root(workspace_id: str) -> Path:
     return _workspace_files_root(workspace_id) / INTERNAL_DIRNAME
 
 
+def _workspace_memory_root(workspace_id: str) -> Path:
+    return _workspace_internal_root(workspace_id) / MEMORY_DIRNAME
+
+
+def _workspace_memory_entrypoint(workspace_id: str) -> Path:
+    return _workspace_memory_root(workspace_id) / MEMORY_ENTRYPOINT_FILENAME
+
+
 def _load_workspaces_meta() -> dict[str, Any]:
     raw = _read_json(WORKSPACES_META_PATH, {})
     if not isinstance(raw, dict):
@@ -117,7 +138,6 @@ def _load_workspaces_meta() -> dict[str, Any]:
     return {
         "version": int(raw.get("version") or 1),
         "activeWorkspaceId": str(raw.get("activeWorkspaceId") or DEFAULT_WORKSPACE_ID),
-        "migratedAt": raw.get("migratedAt") if isinstance(raw.get("migratedAt"), str) else "",
         "workspaces": [item for item in items if isinstance(item, dict)],
     }
 
@@ -142,6 +162,12 @@ def _ensure_workspace_dirs(workspace_id: str) -> None:
     internal_root = files_root / INTERNAL_DIRNAME
     (internal_root / "index").mkdir(parents=True, exist_ok=True)
     (internal_root / "versions").mkdir(parents=True, exist_ok=True)
+    (internal_root / "cache").mkdir(parents=True, exist_ok=True)
+    memory_root = _workspace_memory_root(workspace_id)
+    memory_root.mkdir(parents=True, exist_ok=True)
+    entrypoint = _workspace_memory_entrypoint(workspace_id)
+    if not entrypoint.exists():
+        entrypoint.write_text("", encoding="utf-8")
 
 
 def ensure_default_workspace() -> None:
@@ -151,9 +177,6 @@ def ensure_default_workspace() -> None:
         meta["workspaces"].insert(0, _workspace_entry(DEFAULT_WORKSPACE_ID))
         meta["activeWorkspaceId"] = DEFAULT_WORKSPACE_ID
     _ensure_workspace_dirs(DEFAULT_WORKSPACE_ID)
-    if not meta.get("migratedAt"):
-        _migrate_legacy_data(DEFAULT_WORKSPACE_ID)
-        meta["migratedAt"] = utc_now()
     _save_workspaces_meta(meta)
 
 
@@ -245,6 +268,56 @@ def _resolve_workspace_path(
     return relative, target
 
 
+def _is_memory_workspace_path(raw_path: str | None) -> bool:
+    text = str(raw_path or "").replace("\\", "/").strip().strip("/")
+    return text == MEMORY_ROOT_RELATIVE or text.startswith(f"{MEMORY_ROOT_RELATIVE}/")
+
+
+def _memory_workspace_path(memory_relative_path: str) -> str:
+    clean = memory_relative_path.strip("/")
+    return f"{MEMORY_ROOT_RELATIVE}/{clean}" if clean else MEMORY_ROOT_RELATIVE
+
+
+def _sanitize_memory_relative_path(raw_path: str | None, *, allow_empty: bool = False) -> str:
+    text = str(raw_path or "").replace("\\", "/").strip()
+    if text.startswith(f"{MEMORY_ROOT_RELATIVE}/"):
+        text = text[len(MEMORY_ROOT_RELATIVE) + 1:]
+    elif text == MEMORY_ROOT_RELATIVE:
+        text = ""
+    if text in {"", "."}:
+        if allow_empty:
+            return ""
+        raise HTTPException(status_code=400, detail="记忆文件路径不能为空")
+    pure = PurePosixPath(text)
+    if pure.is_absolute():
+        raise HTTPException(status_code=400, detail="记忆文件路径必须是相对路径")
+    parts = [part for part in pure.parts if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        raise HTTPException(status_code=400, detail="记忆文件路径不能包含 ..")
+    if parts and parts[0] == INTERNAL_DIRNAME:
+        raise HTTPException(status_code=400, detail="记忆文件路径必须位于 .openwps/memory 内")
+    if not parts:
+        if allow_empty:
+            return ""
+        raise HTTPException(status_code=400, detail="记忆文件路径不能为空")
+    relative = "/".join(parts)
+    suffix = Path(relative).suffix.lower()
+    if suffix not in {".md", ".markdown"}:
+        raise HTTPException(status_code=400, detail="记忆文件只支持 .md / .markdown")
+    return relative
+
+
+def _resolve_memory_path(workspace_id: str, raw_path: str | None) -> tuple[str, str, Path]:
+    memory_relative = _sanitize_memory_relative_path(raw_path)
+    root = _workspace_memory_root(workspace_id).resolve()
+    target = (root / memory_relative).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="记忆文件路径越界") from exc
+    return memory_relative, _memory_workspace_path(memory_relative), target
+
+
 def _detect_extension(filename: str, content_type: str = "") -> str:
     ct = (content_type or "").strip().lower()
     if ct in MIME_MAP:
@@ -268,7 +341,9 @@ def _is_reference_path(relative_path: str) -> bool:
 
 
 def _entry_role(relative_path: str, is_dir: bool) -> str:
-    if relative_path == MEMORY_FILENAME:
+    if relative_path == MEMORY_ENTRYPOINT_RELATIVE:
+        return "memoryIndex"
+    if _is_memory_workspace_path(relative_path):
         return "memory"
     if _is_reference_path(relative_path):
         return "reference"
@@ -287,6 +362,96 @@ def _safe_unique_path(directory: Path, filename: str) -> Path:
         candidate = directory / f"{stem} {index}{suffix}"
         index += 1
     return candidate
+
+
+def _truncate_text(raw: str, *, max_lines: int, max_bytes: int) -> dict[str, Any]:
+    text = raw.strip()
+    lines = text.split("\n") if text else []
+    line_count = len(lines)
+    byte_count = len(text.encode("utf-8"))
+    was_line_truncated = line_count > max_lines
+    was_byte_truncated = byte_count > max_bytes
+    if was_line_truncated:
+        text = "\n".join(lines[:max_lines])
+    encoded = text.encode("utf-8")
+    if len(encoded) > max_bytes:
+        text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        cut_at = text.rfind("\n")
+        if cut_at > 0:
+            text = text[:cut_at]
+    return {
+        "content": text,
+        "lineCount": line_count,
+        "byteCount": byte_count,
+        "wasLineTruncated": was_line_truncated,
+        "wasByteTruncated": was_byte_truncated,
+        "truncated": was_line_truncated or was_byte_truncated,
+    }
+
+
+def _parse_memory_frontmatter(content: str) -> dict[str, str]:
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}
+    data: dict[str, str] = {}
+    for line in lines[1:30]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in {"name", "description", "type"}:
+            data[key] = value.strip().strip("\"'")
+    if data.get("type") and data["type"] not in MEMORY_TYPES:
+        data.pop("type", None)
+    return data
+
+
+def _memory_body_excerpt(content: str) -> str:
+    text = re.sub(r"^---\s*\n.*?\n---\s*\n?", "", content, flags=re.DOTALL).strip()
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return first_line[:140]
+
+
+def _memory_index_line(memory_relative_path: str, content: str, *, title: str | None = None, hook: str | None = None) -> str:
+    frontmatter = _parse_memory_frontmatter(content)
+    line_title = (title or frontmatter.get("name") or Path(memory_relative_path).stem).strip()
+    line_hook = (hook or frontmatter.get("description") or _memory_body_excerpt(content)).strip()
+    if line_hook:
+        return f"- [{line_title}]({memory_relative_path}) - {line_hook}"
+    return f"- [{line_title}]({memory_relative_path})"
+
+
+def _remove_memory_index_entry(entrypoint: Path, memory_relative_path: str) -> None:
+    if not entrypoint.exists():
+        return
+    escaped = re.escape(memory_relative_path)
+    pattern = re.compile(rf"^\s*-\s+\[[^\]]+\]\((?:\./)?{escaped}\)(?:\s+-.*)?\s*$")
+    lines = entrypoint.read_text(encoding="utf-8", errors="replace").splitlines()
+    next_lines = [line for line in lines if not pattern.match(line)]
+    if next_lines != lines:
+        entrypoint.write_text("\n".join(next_lines).rstrip() + ("\n" if next_lines else ""), encoding="utf-8")
+
+
+def _upsert_memory_index_entry(
+    workspace_id: str,
+    memory_relative_path: str,
+    content: str,
+    *,
+    title: str | None = None,
+    hook: str | None = None,
+) -> None:
+    if memory_relative_path == MEMORY_ENTRYPOINT_FILENAME:
+        return
+    entrypoint = _workspace_memory_entrypoint(workspace_id)
+    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    if not entrypoint.exists():
+        entrypoint.write_text("", encoding="utf-8")
+    _remove_memory_index_entry(entrypoint, memory_relative_path)
+    current = entrypoint.read_text(encoding="utf-8", errors="replace").rstrip()
+    line = _memory_index_line(memory_relative_path, content, title=title, hook=hook)
+    entrypoint.write_text((current + "\n" if current else "") + line + "\n", encoding="utf-8")
 
 
 def _document_timestamp(path: Path) -> str:
@@ -328,6 +493,25 @@ def _iter_workspace_files(workspace_id: str) -> list[tuple[str, Path]]:
     return files
 
 
+def _iter_memory_files(workspace_id: str, *, include_entrypoint: bool = True) -> list[tuple[str, str, Path]]:
+    root = _workspace_memory_root(workspace_id)
+    files: list[tuple[str, str, Path]] = []
+    if not root.exists():
+        return files
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".md", ".markdown"}:
+            continue
+        try:
+            memory_relative = path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            continue
+        if not include_entrypoint and memory_relative == MEMORY_ENTRYPOINT_FILENAME:
+            continue
+        files.append((memory_relative, _memory_workspace_path(memory_relative), path))
+    files.sort(key=lambda item: item[0].lower())
+    return files
+
+
 def _build_tree_node(workspace_id: str, path: Path) -> dict[str, Any] | None:
     relative = _relative_path_for_file(workspace_id, path)
     if relative.split("/")[0] == INTERNAL_DIRNAME:
@@ -361,6 +545,77 @@ def _build_tree_node(workspace_id: str, path: Path) -> dict[str, Any] | None:
     return node
 
 
+def _build_memory_tree_node(workspace_id: str, path: Path) -> dict[str, Any] | None:
+    memory_root = _workspace_memory_root(workspace_id).resolve()
+    resolved = path.resolve()
+    try:
+        memory_relative = resolved.relative_to(memory_root).as_posix()
+    except ValueError:
+        return None
+    if memory_relative == ".":
+        memory_relative = ""
+    is_dir = path.is_dir()
+    if not is_dir and path.suffix.lower() not in {".md", ".markdown"}:
+        return None
+    workspace_relative = _memory_workspace_path(memory_relative)
+    stat = path.stat()
+    role = "memoryFolder" if is_dir else ("memoryIndex" if memory_relative == MEMORY_ENTRYPOINT_FILENAME else "memory")
+    node: dict[str, Any] = {
+        "name": path.name,
+        "path": workspace_relative,
+        "kind": "directory" if is_dir else "file",
+        "role": role,
+        "size": 0 if is_dir else stat.st_size,
+        "updatedAt": _document_timestamp(path),
+        "editable": not is_dir,
+        "readOnly": False,
+        "type": "" if is_dir else ("markdown" if path.suffix.lower() == ".markdown" else "md"),
+        "extension": "" if is_dir else path.suffix.lower().lstrip("."),
+        "isReference": False,
+        "isMemory": True,
+    }
+    if is_dir:
+        children: list[dict[str, Any]] = []
+        for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+            child_node = _build_memory_tree_node(workspace_id, child)
+            if child_node is not None:
+                children.append(child_node)
+        node["children"] = children
+    else:
+        node["contentHash"] = _hash_file(path)
+    return node
+
+
+def _build_openwps_tree_node(workspace_id: str) -> dict[str, Any] | None:
+    memory_root = _workspace_memory_root(workspace_id)
+    memory_node = _build_memory_tree_node(workspace_id, memory_root)
+    if memory_node is None:
+        return None
+    return {
+        "name": INTERNAL_DIRNAME,
+        "path": INTERNAL_DIRNAME,
+        "kind": "directory",
+        "role": "openwps",
+        "size": 0,
+        "updatedAt": _document_timestamp(_workspace_internal_root(workspace_id)),
+        "editable": False,
+        "readOnly": True,
+        "type": "",
+        "extension": "",
+        "isReference": False,
+        "isMemory": True,
+        "children": [memory_node],
+    }
+
+
+def _root_tree_sort_key(node: dict[str, Any]) -> tuple[int, int, str]:
+    name = str(node.get("name") or "")
+    path = str(node.get("path") or "")
+    priority = SYSTEM_ROOT_DIR_ORDER.get(path, 100)
+    is_dir = node.get("kind") == "directory"
+    return (priority, 0 if is_dir else 1, name.lower())
+
+
 def get_workspace_tree(workspace_id: str | None = None) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
     root = _workspace_files_root(target)
@@ -369,6 +624,10 @@ def get_workspace_tree(workspace_id: str | None = None) -> dict[str, Any]:
         node = _build_tree_node(target, child)
         if node is not None:
             children.append(node)
+    openwps_node = _build_openwps_tree_node(target)
+    if openwps_node is not None:
+        children.append(openwps_node)
+    children.sort(key=_root_tree_sort_key)
     return {
         "workspaceId": target,
         "root": {
@@ -381,16 +640,128 @@ def get_workspace_tree(workspace_id: str | None = None) -> dict[str, Any]:
     }
 
 
-def get_workspace_memory(workspace_id: str | None = None) -> dict[str, Any] | None:
+def _memory_header(memory_relative: str, workspace_relative: str, path: Path) -> dict[str, Any]:
+    content = path.read_text(encoding="utf-8", errors="replace")
+    frontmatter = _parse_memory_frontmatter(content)
+    stat = path.stat()
+    return {
+        "path": workspace_relative,
+        "memoryPath": memory_relative,
+        "name": frontmatter.get("name") or Path(memory_relative).stem,
+        "description": frontmatter.get("description") or "",
+        "type": frontmatter.get("type") or "",
+        "size": stat.st_size,
+        "updatedAt": _document_timestamp(path),
+        "contentHash": _hash_file(path),
+    }
+
+
+def _extract_entrypoint_links(content: str) -> dict[str, str]:
+    links: dict[str, str] = {}
+    for line in content.splitlines():
+        for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", line):
+            target = match.group(1).strip()
+            if not target or "://" in target or target.startswith("#"):
+                continue
+            try:
+                memory_relative = _sanitize_memory_relative_path(target)
+            except HTTPException:
+                continue
+            links[memory_relative] = line.strip()
+    return links
+
+
+def _query_terms(query: str | None) -> list[str]:
+    text = str(query or "").lower()
+    return [term for term in re.split(r"[\s,，。；;：:、/\\|()\[\]{}<>\"']+", text) if len(term) >= 2]
+
+
+def _select_memory_files(
+    query: str | None,
+    entrypoint_content: str,
+    manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    entrypoint_links = _extract_entrypoint_links(entrypoint_content)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for item in manifest:
+        memory_path = str(item.get("memoryPath") or "")
+        haystack = " ".join([
+            memory_path,
+            str(item.get("name") or ""),
+            str(item.get("description") or ""),
+            str(item.get("type") or ""),
+            entrypoint_links.get(memory_path, ""),
+        ]).lower()
+        score = sum(1 for term in terms if term in haystack)
+        if score > 0:
+            scored.append((score, str(item.get("updatedAt") or ""), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _score, _updated, item in scored[:MEMORY_SELECTED_LIMIT]]
+
+
+def _read_selected_memory_files(workspace_id: str, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in selected:
+        memory_path = str(item.get("memoryPath") or "")
+        if not memory_path:
+            continue
+        try:
+            _memory_relative, workspace_relative, path = _resolve_memory_path(workspace_id, memory_path)
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            limited = _truncate_text(raw, max_lines=MEMORY_FILE_MAX_LINES, max_bytes=MEMORY_FILE_MAX_BYTES)
+            result.append({
+                **item,
+                "path": workspace_relative,
+                "content": limited["content"],
+                "truncated": limited["truncated"],
+                "lineCount": limited["lineCount"],
+                "byteCount": limited["byteCount"],
+            })
+        except Exception:
+            continue
+    return result
+
+
+def get_workspace_memory(workspace_id: str | None = None, *, query: str | None = None) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
-    _, path = _resolve_workspace_path(target, MEMORY_FILENAME)
-    if not path.exists() or not path.is_file():
-        return None
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return {"path": MEMORY_FILENAME, "content": text[:40000], "updatedAt": _document_timestamp(path)}
+    entrypoint = _workspace_memory_entrypoint(target)
+    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    if not entrypoint.exists():
+        entrypoint.write_text("", encoding="utf-8")
+    entrypoint_text = entrypoint.read_text(encoding="utf-8", errors="replace")
+    entrypoint_limited = _truncate_text(
+        entrypoint_text,
+        max_lines=MEMORY_ENTRYPOINT_MAX_LINES,
+        max_bytes=MEMORY_ENTRYPOINT_MAX_BYTES,
+    )
+    manifest = [
+        _memory_header(memory_relative, workspace_relative, path)
+        for memory_relative, workspace_relative, path in _iter_memory_files(target, include_entrypoint=False)
+    ]
+    manifest.sort(key=lambda item: str(item.get("updatedAt") or ""), reverse=True)
+    manifest = manifest[:MEMORY_SCAN_LIMIT]
+    selected_headers = _select_memory_files(query, entrypoint_text, manifest)
+    return {
+        "workspaceId": target,
+        "entrypoint": {
+            "path": MEMORY_ENTRYPOINT_RELATIVE,
+            "memoryPath": MEMORY_ENTRYPOINT_FILENAME,
+            "content": entrypoint_limited["content"],
+            "updatedAt": _document_timestamp(entrypoint),
+            "truncated": entrypoint_limited["truncated"],
+            "lineCount": entrypoint_limited["lineCount"],
+            "byteCount": entrypoint_limited["byteCount"],
+        },
+        "manifest": manifest,
+        "selected": _read_selected_memory_files(target, selected_headers),
+        "truncated": len(manifest) >= MEMORY_SCAN_LIMIT,
+    }
 
 
-def get_workspace_manifest(workspace_id: str | None = None, *, limit: int = 200) -> dict[str, Any]:
+def get_workspace_manifest(workspace_id: str | None = None, *, limit: int = 200, query: str | None = None) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
     files = []
     references = []
@@ -415,42 +786,8 @@ def get_workspace_manifest(workspace_id: str | None = None, *, limit: int = 200)
         "files": files[:limit],
         "references": references[:limit],
         "truncated": len(files) + len(references) > limit * 2,
-        "memory": get_workspace_memory(target),
+        "memory": get_workspace_memory(target, query=query),
     }
-
-
-def _migrate_legacy_data(workspace_id: str) -> None:
-    root = _workspace_files_root(workspace_id)
-    refs = root / REFERENCES_DIRNAME
-    root.mkdir(parents=True, exist_ok=True)
-    refs.mkdir(parents=True, exist_ok=True)
-
-    if DOCUMENTS_DIR.exists():
-        for source in sorted(DOCUMENTS_DIR.glob("*.docx")):
-            if not source.is_file():
-                continue
-            target = root / source.name
-            if not target.exists():
-                shutil.copy2(source, target)
-
-    legacy_meta_path = LEGACY_WORKSPACE_DIR / "meta.json"
-    legacy_docs = _read_json(legacy_meta_path, [])
-    if not isinstance(legacy_docs, list):
-        return
-    for item in legacy_docs:
-        if not isinstance(item, dict):
-            continue
-        doc_id = str(item.get("id") or "")
-        name = Path(str(item.get("name") or "reference")).name
-        doc_dir = LEGACY_WORKSPACE_DIR / doc_id
-        if not doc_id or not doc_dir.exists():
-            continue
-        source_file = next((p for p in doc_dir.iterdir() if p.is_file() and p.name != "text.txt"), None)
-        if not source_file:
-            continue
-        target = _safe_unique_path(refs, name)
-        if not target.exists():
-            shutil.copy2(source_file, target)
 
 
 def create_folder(workspace_id: str, path: str) -> dict[str, Any]:
@@ -502,6 +839,109 @@ def upload_workspace_file(workspace_id: str, directory: str | None, filename: st
     target_path = _safe_unique_path(directory_path, filename)
     relative = f"{directory_relative}/{target_path.name}" if directory_relative else target_path.name
     return save_file(target, relative, content, content_type=content_type)
+
+
+def read_memory_file(workspace_id: str, path: str) -> dict[str, Any]:
+    target = _require_workspace(workspace_id)
+    memory_relative, workspace_relative, resolved = _resolve_memory_path(target, path)
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="记忆文件不存在")
+    content = resolved.read_text(encoding="utf-8", errors="replace")
+    return {
+        "workspaceId": target,
+        "path": workspace_relative,
+        "memoryPath": memory_relative,
+        "content": content,
+        "updatedAt": _document_timestamp(resolved),
+        "contentHash": _hash_file(resolved),
+    }
+
+
+def save_memory_file(
+    workspace_id: str,
+    path: str,
+    content: str | bytes,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    memory_type: str | None = None,
+    index_title: str | None = None,
+    index_hook: str | None = None,
+) -> dict[str, Any]:
+    target = _require_workspace(workspace_id)
+    memory_relative, workspace_relative, resolved = _resolve_memory_path(target, path)
+    text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
+    memory_type_normalized = memory_type if memory_type in MEMORY_TYPES else None
+    if memory_relative != MEMORY_ENTRYPOINT_FILENAME and not _parse_memory_frontmatter(text) and (name or description or memory_type_normalized):
+        frontmatter = [
+            "---",
+            f"name: {name or Path(memory_relative).stem}",
+            f"description: {description or _memory_body_excerpt(text)}",
+            f"type: {memory_type_normalized or 'project'}",
+            "---",
+            "",
+        ]
+        text = "\n".join(frontmatter) + text.lstrip()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    _snapshot_file(target, workspace_relative, resolved)
+    resolved.write_text(text, encoding="utf-8")
+    _write_index(target, workspace_relative, resolved)
+    if memory_relative != MEMORY_ENTRYPOINT_FILENAME:
+        _upsert_memory_index_entry(
+            target,
+            memory_relative,
+            text,
+            title=index_title or name,
+            hook=index_hook or description,
+        )
+    stat = resolved.stat()
+    return {
+        "workspaceId": target,
+        "path": workspace_relative,
+        "memoryPath": memory_relative,
+        "name": resolved.name,
+        "type": "markdown" if resolved.suffix.lower() == ".markdown" else "md",
+        "size": stat.st_size,
+        "updatedAt": _document_timestamp(resolved),
+        "contentHash": _hash_file(resolved),
+        "editable": True,
+        "role": "memoryIndex" if memory_relative == MEMORY_ENTRYPOINT_FILENAME else "memory",
+    }
+
+
+def delete_memory_file(workspace_id: str, path: str) -> dict[str, Any]:
+    target = _require_workspace(workspace_id)
+    memory_relative, workspace_relative, resolved = _resolve_memory_path(target, path)
+    if memory_relative == MEMORY_ENTRYPOINT_FILENAME:
+        raise HTTPException(status_code=400, detail="MEMORY.md 是记忆入口索引，不能删除")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="记忆文件不存在")
+    _snapshot_file(target, workspace_relative, resolved)
+    resolved.unlink()
+    _remove_memory_index_entry(_workspace_memory_entrypoint(target), memory_relative)
+    return {"success": True, "workspaceId": target, "path": workspace_relative, "memoryPath": memory_relative}
+
+
+def move_memory_file(workspace_id: str, path: str, to_path: str) -> dict[str, Any]:
+    target = _require_workspace(workspace_id)
+    memory_relative, workspace_relative, resolved = _resolve_memory_path(target, path)
+    next_memory_relative, next_workspace_relative, next_resolved = _resolve_memory_path(target, to_path)
+    if memory_relative == MEMORY_ENTRYPOINT_FILENAME:
+        raise HTTPException(status_code=400, detail="MEMORY.md 是固定入口索引，不能移动或重命名")
+    if next_memory_relative == MEMORY_ENTRYPOINT_FILENAME:
+        raise HTTPException(status_code=400, detail="不能覆盖 MEMORY.md")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="记忆文件不存在")
+    if next_resolved.exists():
+        raise HTTPException(status_code=409, detail="目标记忆文件已存在")
+    next_resolved.parent.mkdir(parents=True, exist_ok=True)
+    _snapshot_file(target, workspace_relative, resolved)
+    resolved.rename(next_resolved)
+    _remove_memory_index_entry(_workspace_memory_entrypoint(target), memory_relative)
+    content = next_resolved.read_text(encoding="utf-8", errors="replace")
+    _upsert_memory_index_entry(target, next_memory_relative, content)
+    _write_index(target, next_workspace_relative, next_resolved)
+    return {"success": True, "workspaceId": target, "path": next_workspace_relative, "memoryPath": next_memory_relative}
 
 
 def read_file_path(workspace_id: str, path: str) -> Path:
@@ -579,7 +1019,7 @@ def _snapshot_file(workspace_id: str, relative_path: str, file_path: Path) -> No
 
 def open_file_as_document(workspace_id: str, path: str) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
-    relative, resolved = _resolve_workspace_path(target, path)
+    relative, resolved = _resolve_workspace_path(target, path, allow_internal=_is_memory_workspace_path(path))
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     extension = resolved.suffix.lower()
@@ -609,6 +1049,13 @@ def save_document_session_file(
     page_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
+    if _is_memory_workspace_path(path):
+        memory_relative, _workspace_relative, resolved = _resolve_memory_path(target, path)
+        extension = resolved.suffix.lower()
+        if extension not in {".md", ".markdown"}:
+            raise HTTPException(status_code=400, detail="记忆文件只支持 Markdown")
+        content = _doc_json_to_file_bytes(doc_json, extension, page_config or DEFAULT_PAGE_CONFIG)
+        return save_memory_file(target, memory_relative, content)
     relative, resolved = _resolve_workspace_path(target, path)
     extension = resolved.suffix.lower()
     if extension not in EDITABLE_EXTENSIONS:
@@ -1096,13 +1543,15 @@ def search_text_lines(text: str, query: str, context_lines: int = 3) -> list[dic
 
 def _scope_accepts_path(relative: str, *, scope: str, path: str | None) -> bool:
     if path:
-        normalized = _sanitize_relative_path(path, allow_empty=True)
+        normalized = _sanitize_relative_path(path, allow_empty=True, allow_internal=_is_memory_workspace_path(path))
         if normalized and not (relative == normalized or relative.startswith(f"{normalized}/")):
             return False
     if scope == "references":
         return _is_reference_path(relative)
     if scope == "workspace":
         return not _is_reference_path(relative)
+    if scope == "memory":
+        return _is_memory_workspace_path(relative)
     return True
 
 
@@ -1117,12 +1566,17 @@ def search_workspace(
 ) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
     scope_normalized = str(scope or "all").strip().lower()
-    if scope_normalized not in {"all", "workspace", "references", "path"}:
+    if scope_normalized not in {"all", "workspace", "references", "path", "memory"}:
         scope_normalized = "all"
     path_filter = path or doc_id
     all_results: list[dict[str, Any]] = []
     total = 0
-    for relative, file_path in _iter_workspace_files(target):
+    source_files: list[tuple[str, Path]]
+    if scope_normalized == "memory" or (path_filter and _is_memory_workspace_path(path_filter)):
+        source_files = [(workspace_relative, file_path) for _memory_relative, workspace_relative, file_path in _iter_memory_files(target)]
+    else:
+        source_files = _iter_workspace_files(target)
+    for relative, file_path in source_files:
         if not _scope_accepts_path(relative, scope=scope_normalized, path=path_filter):
             continue
         total += 1
@@ -1155,7 +1609,7 @@ def get_document_content(
     workspace_id: str | None = None,
 ) -> dict[str, Any]:
     target = _require_workspace(workspace_id)
-    relative, file_path = _resolve_workspace_path(target, doc_id)
+    relative, file_path = _resolve_workspace_path(target, doc_id, allow_internal=_is_memory_workspace_path(doc_id))
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="文档不存在")
     text = _read_index_or_extract(target, relative, file_path)
@@ -1196,11 +1650,3 @@ def list_workspace_docs() -> list[dict[str, Any]]:
             "workspaceId": target,
         })
     return docs
-
-
-def upload_document(filename: str, content_type: str, content: bytes) -> dict[str, Any]:
-    return upload_workspace_file(get_active_workspace_id(), REFERENCES_DIRNAME, filename, content_type, content)
-
-
-def delete_document(doc_id: str) -> dict[str, Any]:
-    return delete_file(get_active_workspace_id(), doc_id)

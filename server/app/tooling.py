@@ -889,7 +889,7 @@ TOOLS = [
             "description": (
                 "在工作区目录中搜索关键词。返回包含关键词的文件片段及上下文。"
                 "多个关键词用空格分隔，采用AND逻辑（所有关键词都需匹配）。"
-                "scope=workspace 搜普通工作文件，scope=references 搜 _references/，scope=all 搜全部。"
+                "scope=workspace 搜普通工作文件，scope=references 搜 _references/，scope=memory 搜 .openwps/memory，scope=all 搜普通文件和参考资料。"
             ),
             "parameters": {
                 "type": "object",
@@ -908,7 +908,7 @@ TOOLS = [
                     },
                     "scope": {
                         "type": "string",
-                        "enum": ["all", "workspace", "references", "path"],
+                        "enum": ["all", "workspace", "references", "memory", "path"],
                         "description": "搜索范围，默认 all。",
                     },
                     "workspace_id": {
@@ -965,14 +965,14 @@ TOOLS = [
             "name": "workspace_read",
             "description": (
                 "按工作区相对路径读取某个文件的提取文本或指定行范围。"
-                "适合读取 _references/ 参考资料，或在编辑前查看非当前文件。"
+                "适合读取 _references/ 参考资料、.openwps/memory 记忆文件，或在编辑前查看非当前文件。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "工作区相对路径，如 report.docx 或 _references/spec.pdf。",
+                        "description": "工作区相对路径，如 report.docx、_references/spec.pdf 或 .openwps/memory/topic.md。",
                     },
                     "doc_id": {
                         "type": "string",
@@ -1001,7 +1001,7 @@ TOOLS = [
             "name": "workspace_open",
             "description": (
                 "打开一个可编辑工作区文件并切换为当前活动文档。"
-                "支持 DOCX、MD、TXT；PDF/PPT/PPTX 只能 workspace_read/search。"
+                "支持 DOCX、MD、TXT 以及 .openwps/memory 下的 Markdown 记忆文件；PDF/PPT/PPTX 只能 workspace_read/search。"
                 "需要修改非当前文件时，先 workspace_open(path)，再使用文档编辑工具。"
             ),
             "parameters": {
@@ -1015,6 +1015,51 @@ TOOLS = [
                         "type": "string",
                         "description": "可选工作区ID；不传则使用当前激活工作区。",
                     },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_memory_write",
+            "description": (
+                "创建或更新 .openwps/memory 下的 Markdown 记忆文件，并同步维护 MEMORY.md 索引。"
+                "适合用户明确要求记住/忘记长期偏好、项目背景或参考位置时使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "记忆文件路径，可传 topic.md 或 .openwps/memory/topic.md；不能是 MEMORY.md 之外的非 Markdown 文件。",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "记忆文件完整 Markdown 内容；建议包含 name/description/type frontmatter。",
+                    },
+                    "name": {"type": "string", "description": "可选，缺少 frontmatter 时写入 name。"},
+                    "description": {"type": "string", "description": "可选，缺少 frontmatter 时写入 description，并作为 MEMORY.md 索引摘要。"},
+                    "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "可选记忆类型。"},
+                    "index_title": {"type": "string", "description": "可选，MEMORY.md 索引标题。"},
+                    "index_hook": {"type": "string", "description": "可选，MEMORY.md 一行索引摘要。"},
+                    "workspace_id": {"type": "string", "description": "可选工作区ID；不传则使用当前激活工作区。"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_memory_delete",
+            "description": "删除 .openwps/memory 下的记忆文件，并从 MEMORY.md 索引移除对应条目。不能删除 MEMORY.md。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "记忆文件路径，可传 topic.md 或 .openwps/memory/topic.md。"},
+                    "workspace_id": {"type": "string", "description": "可选工作区ID；不传则使用当前激活工作区。"},
                 },
                 "required": ["path"],
             },
@@ -1083,6 +1128,8 @@ AGENT_TOOL_NAMES = LAYOUT_TOOL_NAMES | EDIT_TOOL_NAMES | {
     "workspace_search",
     "workspace_read",
     "workspace_open",
+    "workspace_memory_write",
+    "workspace_memory_delete",
     "web_search",
 }
 

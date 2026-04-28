@@ -38,39 +38,44 @@ def _get_workspace_section(mode: str | None) -> str:
     if mode == "layout":
         return """## 工作区（参考资料）
 
-工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料。
+工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料；长期记忆位于 `.openwps/memory/`，其中 `MEMORY.md` 是索引。
 
 - **workspace_tree()** — 查看目录树和工作区相对路径
-- **workspace_search(query, scope)** — 在普通文件或 `_references/` 中搜索关键词
+- **workspace_search(query, scope)** — 在普通文件、`_references/` 或 `.openwps/memory/` 中搜索关键词
 - **workspace_read(path)** — 读取某个文件的提取文本或指定行范围
-- **workspace_open(path)** — 打开 DOCX/MD/TXT 并切换为当前编辑文件
+- **workspace_open(path)** — 打开 DOCX/MD/TXT 或 `.openwps/memory/` Markdown 并切换为当前编辑文件
 
 修改非当前文件前必须先 workspace_open(path)。只需要引用资料时，优先 workspace_search / workspace_read，不要打开 `_references/` 当作编辑目标。"""
 
     if mode == "edit":
         return """## 工作区（参考资料）
 
-工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料。
+工作区是真实目录。当前活动文档优先，`_references/` 下文件默认只作参考资料；长期记忆位于 `.openwps/memory/`，其中 `MEMORY.md` 是索引。
 
 - **workspace_tree()** — 查看目录树和工作区相对路径
-- **workspace_search(query, scope)** — 在普通文件或 `_references/` 中搜索关键词
+- **workspace_search(query, scope)** — 在普通文件、`_references/` 或 `.openwps/memory/` 中搜索关键词
 - **workspace_read(path)** — 读取某个文件的提取文本或指定行范围
-- **workspace_open(path)** — 打开 DOCX/MD/TXT 并切换为当前编辑文件
+- **workspace_open(path)** — 打开 DOCX/MD/TXT 或 `.openwps/memory/` Markdown 并切换为当前编辑文件
 
 只有当用户要求引用/处理工作区资料，或当前任务确实缺少外部参考时，才调用 workspace_search 定位，再按需用 workspace_read 查看全文。工作区文档列表只是可用参考资料 manifest，不代表当前任务进展或文件变化；任务已完成时不要因为看到文件列表而继续探索，也不要在最终回复中主动提及未使用的参考文件。"""
 
     # agent mode
     return """## 工作区（参考资料）
 
-用户可能在工作区中上传了参考文档（如需求文档、法规文件、数据表、范文等）。你可以通过以下工具查看工作区内容：
+工作区是真实目录；当前活动文档优先。`_references/` 是参考资料，`.openwps/memory/MEMORY.md` 是长期记忆索引，具体记忆文件按需读取。
 
-- **workspace_search(query)** — 在所有工作区文档中搜索关键词，返回匹配片段及上下文
-- **workspace_read(doc_id, from_line, to_line)** — 读取某个工作区文档的完整内容或指定行范围
+- **workspace_tree()** — 查看目录树和工作区相对路径
+- **workspace_search(query, scope)** — 在普通文件、`_references/` 或 `.openwps/memory/` 中搜索关键词
+- **workspace_read(path, from_line, to_line)** — 读取某个工作区文件、参考资料或记忆文件
+- **workspace_open(path)** — 打开 DOCX/MD/TXT 或 `.openwps/memory/` Markdown 并切换为当前编辑文件
+- **workspace_memory_write/delete** — 维护长期记忆文件和 `MEMORY.md` 索引
 - **web_search(query, topic, searchDepth, maxResults)** — 联网搜索最新网页、新闻和工作区外的公开资料
 
 工作区文档列表只是可用参考资料 manifest；它们是参考资料，不代表当前任务进展或文件变化。不要在最终回复中主动提及未使用的参考文件。当你需要：
 - 查找具体数据、条款、引用 → 先 workspace_search 定位
 - 了解某篇参考文档的完整内容 → workspace_read 查看全文或分段阅读
+- 修改非当前文件 → 先 workspace_open(path)，再使用文档编辑工具
+- 保存长期偏好/项目背景/反馈 → 写入 `.openwps/memory/` 记忆文件，不要把大段正文写进 `MEMORY.md`
 - 按照参考文档的格式/结构撰写内容 → 先读取参考文档，再据此编排
 - 查找最新信息、工作区外部事实、公开网页资源 → 使用 web_search"""
 

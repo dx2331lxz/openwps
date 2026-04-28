@@ -77,7 +77,8 @@ from .compact import (
 from .doc_sessions import create_document_session, execute_ai_document_tool, is_document_tool, read_document_session, set_active_document_session
 from .tasks import create_task, get_task, list_tasks, update_task
 from .workspace import get_document_content as get_workspace_document_content
-from .workspace import get_workspace_manifest, get_workspace_tree, list_workspace_docs, open_file_as_document
+from .workspace import delete_memory_file, get_workspace_manifest, get_workspace_tree, list_workspace_docs, open_file_as_document
+from .workspace import save_memory_file
 from .workspace import search_workspace
 
 logger = logging.getLogger("uvicorn.error")
@@ -618,9 +619,27 @@ def _build_context_block(context: dict) -> str:
         parts.append("")
         parts.append("[当前工作区目录]")
         memory = workspace_manifest.get("memory")
-        if isinstance(memory, dict) and memory.get("content"):
-            parts.append("OPENWPS.md 记忆/指令：")
-            parts.append(str(memory.get("content") or "")[:40000])
+        if isinstance(memory, dict):
+            entrypoint = memory.get("entrypoint")
+            if isinstance(entrypoint, dict) and entrypoint.get("content"):
+                parts.append(".openwps/memory/MEMORY.md 记忆索引：")
+                parts.append(str(entrypoint.get("content") or ""))
+                parts.append("MEMORY.md 只是索引；需要完整记忆时使用 workspace_read(path) 读取 .openwps/memory 下的具体文件。")
+            selected = memory.get("selected")
+            if isinstance(selected, list) and selected:
+                parts.append("本轮按需命中的记忆文件：")
+                for item in selected[:5]:
+                    parts.append(f"--- Memory: {item.get('path')} ---")
+                    parts.append(str(item.get("content") or ""))
+            manifest = memory.get("manifest")
+            if isinstance(manifest, list) and manifest:
+                parts.append("可用记忆文件 manifest（按需读取，不要默认全量读取）：")
+                for item in manifest[:40]:
+                    desc = str(item.get("description") or "")
+                    memory_type = str(item.get("type") or "")
+                    suffix = f" [{memory_type}]" if memory_type else ""
+                    parts.append(f"  - {item.get('path')}{suffix}: {desc}")
+            parts.append("记忆可能过期；当记忆提到文件、函数、资料路径或当前事实时，先读取当前工作区真实文件验证。")
         files = workspace_manifest.get("files")
         refs = workspace_manifest.get("references")
         if isinstance(files, list):
@@ -635,7 +654,7 @@ def _build_context_block(context: dict) -> str:
     return "\n".join(parts)
 
 
-def _with_backend_workspace_docs(context: dict[str, Any] | None) -> dict[str, Any]:
+def _with_backend_workspace_docs(context: dict[str, Any] | None, *, query: str | None = None) -> dict[str, Any]:
     """Attach the backend-owned workspace manifest to model context.
 
     Workspace files are uploaded to and persisted by the backend, so the frontend
@@ -644,7 +663,7 @@ def _with_backend_workspace_docs(context: dict[str, Any] | None) -> dict[str, An
     """
     merged = dict(context or {})
     merged["workspaceDocs"] = list_workspace_docs()
-    merged["workspaceManifest"] = get_workspace_manifest()
+    merged["workspaceManifest"] = get_workspace_manifest(query=query)
     return merged
 
 
@@ -4692,6 +4711,15 @@ def _workspace_tool_cache_key(tool_name: str, params: dict[str, Any]) -> str:
         path = _stringify_content(params.get("path")).strip()
         workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
         return f"{tool_name}:{workspace_id}:{path}"
+    if tool_name == "workspace_memory_write":
+        path = _stringify_content(params.get("path")).strip()
+        workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
+        content_hash = hashlib.sha256(_stringify_content(params.get("content")).encode("utf-8")).hexdigest()
+        return f"{tool_name}:{workspace_id}:{path}:{content_hash}"
+    if tool_name == "workspace_memory_delete":
+        path = _stringify_content(params.get("path")).strip()
+        workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
+        return f"{tool_name}:{workspace_id}:{path}"
     return f"{tool_name}:{json.dumps(params, ensure_ascii=False, sort_keys=True)}"
 
 
@@ -4703,7 +4731,7 @@ async def _run_workspace_tool(
 ) -> str:
     try:
         cache_key = _workspace_tool_cache_key(tool_name, params)
-        if cache is not None and cache_key in cache and tool_name != "workspace_open":
+        if cache is not None and cache_key in cache and tool_name not in {"workspace_open", "workspace_memory_write", "workspace_memory_delete"}:
             return _serialize_tool_result_payload(
                 tool_name=tool_name,
                 success=True,
@@ -4785,6 +4813,30 @@ async def _run_workspace_tool(
                 context["filePath"] = payload.get("filePath")
                 context["fileType"] = payload.get("fileType")
             message = f"已打开工作区文件 {payload.get('filePath')}"
+        elif tool_name == "workspace_memory_write":
+            path = _stringify_content(params.get("path")).strip()
+            content = _stringify_content(params.get("content"))
+            if not path:
+                raise HTTPException(status_code=400, detail="workspace_memory_write 缺少 path")
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
+            data = save_memory_file(
+                workspace_id or "",
+                path,
+                content,
+                name=_stringify_content(params.get("name")).strip() or None,
+                description=_stringify_content(params.get("description")).strip() or None,
+                memory_type=_stringify_content(params.get("type") or params.get("memory_type") or params.get("memoryType")).strip() or None,
+                index_title=_stringify_content(params.get("index_title") or params.get("indexTitle")).strip() or None,
+                index_hook=_stringify_content(params.get("index_hook") or params.get("indexHook")).strip() or None,
+            )
+            message = f"已写入记忆文件 {data.get('path')}"
+        elif tool_name == "workspace_memory_delete":
+            path = _stringify_content(params.get("path")).strip()
+            if not path:
+                raise HTTPException(status_code=400, detail="workspace_memory_delete 缺少 path")
+            workspace_id = _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip() or None
+            data = delete_memory_file(workspace_id or "", path)
+            message = f"已删除记忆文件 {data.get('path')}"
         else:
             return _serialize_tool_result_payload(
                 tool_name=tool_name,
@@ -5208,7 +5260,7 @@ class ReactSession:
         self.messages = messages
         self.state = LoopState()
         self.finished = False
-        self.latest_context: dict[str, Any] = _with_backend_workspace_docs(body.context)  # Updated each round
+        self.latest_context: dict[str, Any] = _with_backend_workspace_docs(body.context, query=body.message)  # Updated each round
         if body.documentSessionId:
             self.latest_context["documentSessionId"] = body.documentSessionId
         workspace_docs = self.latest_context.get("workspaceDocs")
@@ -5304,7 +5356,7 @@ def _build_recent_read_snapshot_attachment(messages: list[BaseMessage], *, limit
 
 def _build_post_compact_restore_attachments(session: ReactSession) -> list[BaseMessage]:
     attachments: list[BaseMessage] = []
-    context = _with_backend_workspace_docs(session.latest_context)
+    context = _with_backend_workspace_docs(session.latest_context, query=session.body.message)
     session.latest_context = context
 
     previous_workspace_docs = list(context.get("workspaceDocs") or [])
@@ -5642,7 +5694,7 @@ def build_messages(
     _record_tooling_delta_message(messages, body=body, loaded_deferred_tools=loaded, content_events=content_events)
 
     # Inject initial context as delta attachment (full state announcement)
-    context = _with_backend_workspace_docs(body.context)
+    context = _with_backend_workspace_docs(body.context, query=body.message)
     initial_context = build_initial_context_content(context)
     initial_attachment = str(initial_context.content or "")
     if content_events is not None:
@@ -6777,7 +6829,7 @@ class QueryCoordinator:
         elif execution.tool_name in {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
             content = await _run_task_tool(execution.tool_name, execution.params, self.session.body.conversationId)
             newly_loaded = []
-        elif execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open"}:
+        elif execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "workspace_memory_write", "workspace_memory_delete"}:
             content = await _run_workspace_tool(
                 execution.tool_name,
                 execution.params,
@@ -7050,7 +7102,7 @@ class QueryCoordinator:
                         server_execution.params,
                         self.session.body.conversationId,
                     )
-                elif server_execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open"}:
+                elif server_execution.tool_name in {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "workspace_memory_write", "workspace_memory_delete"}:
                     server_content = await _run_workspace_tool(
                         server_execution.tool_name,
                         server_execution.params,
@@ -7838,7 +7890,7 @@ class QueryCoordinator:
                 # Delta injection: inject context changes after tool results.
                 # Workspace docs are backend-owned runtime state, so refresh the
                 # manifest here instead of trusting client-sent context.
-                context = _with_backend_workspace_docs(self.session.latest_context)
+                context = _with_backend_workspace_docs(self.session.latest_context, query=self.session.body.message)
                 self.session.latest_context = context
                 previous_workspace_docs = list(self.state.previous_workspace_docs)
                 delta_content = build_delta_content(

@@ -653,7 +653,7 @@ const workspaceTreeTool = {
 
 const workspaceSearchTool = {
   name: 'workspace_search',
-  description: '在工作区普通文件或 _references/ 参考资料中搜索关键词。多个关键词用空格分隔，采用AND逻辑。',
+  description: '在工作区普通文件、_references/ 参考资料或 .openwps/memory 记忆文件中搜索关键词。多个关键词用空格分隔，采用AND逻辑。',
   parameters: {
     type: 'object',
     properties: {
@@ -671,7 +671,7 @@ const workspaceSearchTool = {
       },
       scope: {
         type: 'string',
-        enum: ['all', 'workspace', 'references', 'path'],
+        enum: ['all', 'workspace', 'references', 'memory', 'path'],
         description: '搜索范围，默认 all。',
       },
       context_lines: {
@@ -684,7 +684,7 @@ const workspaceSearchTool = {
 
 const workspaceReadTool = {
   name: 'workspace_read',
-  description: '按工作区相对路径读取某个文件的提取文本或指定行范围。',
+  description: '按工作区相对路径读取某个文件的提取文本或指定行范围，支持 .openwps/memory 记忆文件。',
   parameters: {
     type: 'object',
     properties: {
@@ -710,7 +710,7 @@ const workspaceReadTool = {
 
 const workspaceOpenTool = {
   name: 'workspace_open',
-  description: '打开 DOCX/MD/TXT 工作区文件并切换为当前活动文档；修改非当前文件前必须先调用。',
+  description: '打开 DOCX/MD/TXT 工作区文件或 .openwps/memory Markdown 记忆文件并切换为当前活动文档；修改非当前文件前必须先调用。',
   parameters: {
     type: 'object',
     properties: {
@@ -727,6 +727,69 @@ const workspaceOpenTool = {
   },
 } as const
 
-export const agentTools = [...taskTools, ...layoutTools, ...editTools, documentImageAnalysisTool, ocrTool, workspaceTreeTool, workspaceSearchTool, workspaceReadTool, workspaceOpenTool].filter(
+const workspaceMemoryWriteTool = {
+  name: 'workspace_memory_write',
+  description: '创建或更新 .openwps/memory 下的 Markdown 记忆文件，并同步维护 MEMORY.md 索引。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: '记忆文件路径，可传 topic.md 或 .openwps/memory/topic.md。',
+      },
+      content: {
+        type: 'string',
+        description: '记忆文件完整 Markdown 内容；建议包含 name/description/type frontmatter。',
+      },
+      name: {
+        type: 'string',
+        description: '可选，缺少 frontmatter 时写入 name。',
+      },
+      description: {
+        type: 'string',
+        description: '可选，缺少 frontmatter 时写入 description，并作为 MEMORY.md 索引摘要。',
+      },
+      type: {
+        type: 'string',
+        enum: ['user', 'feedback', 'project', 'reference'],
+        description: '可选记忆类型。',
+      },
+      index_title: {
+        type: 'string',
+        description: '可选，MEMORY.md 索引标题。',
+      },
+      index_hook: {
+        type: 'string',
+        description: '可选，MEMORY.md 一行索引摘要。',
+      },
+      workspace_id: {
+        type: 'string',
+        description: '可选工作区ID；不传使用当前激活工作区。',
+      },
+    },
+    required: ['path', 'content'],
+  },
+} as const
+
+const workspaceMemoryDeleteTool = {
+  name: 'workspace_memory_delete',
+  description: '删除 .openwps/memory 下的记忆文件，并从 MEMORY.md 索引移除对应条目。不能删除 MEMORY.md。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: '记忆文件路径，可传 topic.md 或 .openwps/memory/topic.md。',
+      },
+      workspace_id: {
+        type: 'string',
+        description: '可选工作区ID；不传使用当前激活工作区。',
+      },
+    },
+    required: ['path'],
+  },
+} as const
+
+export const agentTools = [...taskTools, ...layoutTools, ...editTools, documentImageAnalysisTool, ocrTool, workspaceTreeTool, workspaceSearchTool, workspaceReadTool, workspaceOpenTool, workspaceMemoryWriteTool, workspaceMemoryDeleteTool].filter(
   (tool, index, list) => list.findIndex(item => item.name === tool.name) === index,
 )

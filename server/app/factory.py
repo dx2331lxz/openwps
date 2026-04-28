@@ -74,19 +74,21 @@ from .tasks import create_task, delete_task, get_task, list_tasks, reset_complet
 from .workspace import (
     create_folder,
     create_workspace,
-    delete_document as ws_delete,
     delete_file as ws_delete_file,
+    delete_memory_file as ws_delete_memory_file,
     get_document_content as ws_get_content,
+    get_workspace_memory,
     get_workspace_tree,
     list_workspaces,
-    list_workspace_docs,
+    move_memory_file as ws_move_memory_file,
     move_file as ws_move_file,
     open_file_as_document,
+    read_memory_file as ws_read_memory_file,
     read_file_path as ws_read_file_path,
+    save_memory_file as ws_save_memory_file,
     save_file as ws_save_file,
     search_workspace,
     set_active_workspace,
-    upload_document,
     upload_workspace_file,
 )
 
@@ -409,6 +411,38 @@ def create_api_router() -> APIRouter:
     def get_workspace_file_tree(workspace_id: str):
         return get_workspace_tree(workspace_id)
 
+    @router.get("/workspaces/{workspace_id}/search")
+    def search_workspace_route(
+        workspace_id: str,
+        q: str,
+        doc_id: str | None = None,
+        context_lines: int = 3,
+        scope: str = "all",
+        path: str | None = None,
+    ):
+        return search_workspace(q, doc_id, context_lines, workspace_id=workspace_id, scope=scope, path=path)
+
+    @router.get("/workspaces/{workspace_id}/memory")
+    def get_workspace_memory_route(workspace_id: str, q: str | None = None):
+        return get_workspace_memory(workspace_id, query=q)
+
+    @router.get("/workspaces/{workspace_id}/memory/files/{path:path}")
+    def get_workspace_memory_file(workspace_id: str, path: str):
+        return ws_read_memory_file(workspace_id, path)
+
+    @router.put("/workspaces/{workspace_id}/memory/files/{path:path}")
+    async def put_workspace_memory_file(workspace_id: str, path: str, request: Request):
+        content = await request.body()
+        return ws_save_memory_file(workspace_id, path, content)
+
+    @router.delete("/workspaces/{workspace_id}/memory/files/{path:path}")
+    def delete_workspace_memory_file(workspace_id: str, path: str):
+        return ws_delete_memory_file(workspace_id, path)
+
+    @router.post("/workspaces/{workspace_id}/memory/files/{path:path}/move")
+    def move_workspace_memory_file(workspace_id: str, path: str, body: WorkspaceMoveRequest):
+        return ws_move_memory_file(workspace_id, path, body.toPath)
+
     @router.post("/workspaces/{workspace_id}/folders/{path:path}")
     def post_workspace_folder(workspace_id: str, path: str):
         return create_folder(workspace_id, path)
@@ -454,37 +488,6 @@ def create_api_router() -> APIRouter:
     @router.delete("/workspaces/{workspace_id}/files/{path:path}")
     def delete_workspace_file(workspace_id: str, path: str):
         return ws_delete_file(workspace_id, path)
-
-    # ── Legacy Workspace (参考资料兼容层，映射到 default/_references) ──
-
-    @router.get("/workspace")
-    def get_workspace():
-        return list_workspace_docs()
-
-    @router.post("/workspace/upload")
-    async def upload_workspace_doc(file: UploadFile):
-        content = await file.read()
-        result = upload_document(file.filename or "untitled", file.content_type or "", content)
-        return result
-
-    @router.delete("/workspace/{doc_id}")
-    def delete_workspace_doc(doc_id: str):
-        return ws_delete(doc_id)
-
-    @router.get("/workspace/search")
-    def search_workspace_docs(
-        q: str,
-        doc_id: str | None = None,
-        context_lines: int = 3,
-        workspace_id: str | None = None,
-        scope: str = "all",
-        path: str | None = None,
-    ):
-        return search_workspace(q, doc_id, context_lines, workspace_id=workspace_id, scope=scope, path=path)
-
-    @router.get("/workspace/{doc_id:path}/content")
-    def get_workspace_content(doc_id: str, from_line: int | None = None, to_line: int | None = None):
-        return ws_get_content(doc_id, from_line, to_line)
 
     @router.post("/ai/chat")
     async def chat(body: ChatRequest):
@@ -599,6 +602,8 @@ def create_app() -> FastAPI:
 
         @app.get("/{full_path:path}")
         async def spa_fallback(full_path: str):
+            if full_path == "api" or full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="API endpoint not found")
             index = DIST_DIR / "index.html"
             if index.exists():
                 return Response(index.read_bytes(), media_type="text/html; charset=utf-8")

@@ -2461,7 +2461,14 @@ export async function executeTool(
         if (params.scope) searchParams.set('scope', String(params.scope))
         if (params.context_lines) searchParams.set('context_lines', String(params.context_lines))
         try {
-          const res = await fetch(`/api/workspace/search?${searchParams.toString()}`)
+          let workspaceId = String(params.workspace_id || params.workspaceId || '')
+          if (!workspaceId) {
+            const workspacesRes = await fetch('/api/workspaces')
+            const workspaces = await workspacesRes.json()
+            if (!workspacesRes.ok) return { success: false, message: workspaces.detail || '读取工作区失败' }
+            workspaceId = String(workspaces.activeWorkspaceId || '')
+          }
+          const res = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/search?${searchParams.toString()}`)
           const data = await res.json()
           if (!res.ok) return { success: false, message: data.detail || '搜索失败' }
           if (!data.results || data.results.length === 0) return { success: true, message: `未在工作区找到包含"${query}"的内容`, data }
@@ -2480,7 +2487,14 @@ export async function executeTool(
         if (params.to_line !== undefined) readParams.set('to_line', String(params.to_line))
         const qs = readParams.toString()
         try {
-          const res = await fetch(`/api/workspace/${encodeURIComponent(docId)}/content${qs ? '?' + qs : ''}`)
+          let workspaceId = String(params.workspace_id || params.workspaceId || '')
+          if (!workspaceId) {
+            const workspacesRes = await fetch('/api/workspaces')
+            const workspaces = await workspacesRes.json()
+            if (!workspacesRes.ok) return { success: false, message: workspaces.detail || '读取工作区失败' }
+            workspaceId = String(workspaces.activeWorkspaceId || '')
+          }
+          const res = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(docId)}/content${qs ? '?' + qs : ''}`)
           const data = await res.json()
           if (!res.ok) return { success: false, message: data.detail || '读取文档失败' }
           const totalLines = data.totalLines ?? 0
@@ -2496,6 +2510,14 @@ export async function executeTool(
         return {
           success: false,
           message: 'workspace_open 需要后端 Agent 执行以切换文档会话；请使用后端 ReAct 模式。',
+        }
+      }
+
+      case 'workspace_memory_write':
+      case 'workspace_memory_delete': {
+        return {
+          success: false,
+          message: `${toolName} 需要后端 Agent 执行以维护 .openwps/memory；请使用后端 ReAct 模式。`,
         }
       }
 

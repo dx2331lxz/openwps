@@ -139,8 +139,10 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "insert_mermaid": ToolMetadata("write", "write", "插入流程图、时序图、类图、甘特图、思维导图等 Mermaid 图表。", "不要用文字/表格模拟图表。", search_hint="Mermaid 流程图 时序图 思维导图", executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_EDIT_AGENT),
     "workspace_tree": ToolMetadata("read", "read", "查看当前工作区目录树、可编辑文件和 _references/ 参考资料路径。", search_hint="工作区 目录树 文件列表", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
     "workspace_search": ToolMetadata("search", "search", "在工作区普通文件或 _references/ 参考资料中定位关键词、条款、数据或范文。", "工作区能回答时不要先联网；先用 scope 控制搜索范围。", search_hint="工作区 搜索 references", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
-    "workspace_read": ToolMetadata("read", "read", "按工作区相对路径读取文件提取文本或行范围。", "先用 workspace_tree 或 workspace_search 确认路径；PDF/PPT 只能读取提取文本。", search_hint="读取工作区文件 path", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
-    "workspace_open": ToolMetadata("read", "read", "打开 DOCX/MD/TXT 工作区文件并切换为当前活动文档，之后文档编辑工具会写回该文件。", "修改非当前文件前必须先 workspace_open(path)。不要对 _references/ 资料调用。", search_hint="打开 工作区 文件 编辑", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_read": ToolMetadata("read", "read", "按工作区相对路径读取文件提取文本或行范围。", "先用 workspace_tree 或 workspace_search 确认路径；PDF/PPT 只能读取提取文本；记忆文件位于 .openwps/memory。", search_hint="读取工作区文件 path memory", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_open": ToolMetadata("read", "read", "打开 DOCX/MD/TXT 工作区文件或 .openwps/memory Markdown 记忆文件并切换为当前活动文档，之后文档编辑工具会写回该文件。", "修改非当前文件前必须先 workspace_open(path)。不要对 _references/ 资料调用。", search_hint="打开 工作区 文件 编辑 memory", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_memory_write": ToolMetadata("edit", "write", "创建或更新 .openwps/memory 记忆文件，并维护 MEMORY.md 索引。", "只保存对后续会话有长期价值的用户偏好、项目背景、反馈或参考位置。", search_hint="记忆 memory 写入 remember", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_memory_delete": ToolMetadata("edit", "delete", "删除 .openwps/memory 记忆文件，并清理 MEMORY.md 索引。", "用户要求忘记某条记忆时使用；不能删除 MEMORY.md。", search_hint="记忆 memory 删除 forget", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
     "web_search": ToolMetadata("search", "web", "任务依赖最新信息、公开网页或工作区外事实时使用。", "当前文档或工作区资料足够时不要联网。", search_hint="联网 搜索 网页 最新 新闻", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
 }
 
@@ -266,8 +268,8 @@ def build_tool_guidance_section(
             lines.append("- 写入阶梯：长文/多段/整体重写用 begin_streaming_write，并把完整 Markdown 放入 markdown 参数；短插入用 insert_text/insert_paragraph_after；局部替换用 replace_paragraph_text 或 replace_selection_text；删除前确认范围。")
         if enabled & {"apply_style_batch", "set_text_style", "set_paragraph_style", "clear_formatting", "set_page_config", "insert_table_of_contents"}:
             lines.append("- 排版阶梯：全文或多范围样式优先 apply_style_batch；只改文字片段用 set_text_style；改对齐/缩进/标题级别用 set_paragraph_style；目录必须 insert_table_of_contents。")
-        if enabled & {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "web_search"}:
-            lines.append("- 工作区：当前活动文档优先；需要修改其他 DOCX/MD/TXT 文件时先 workspace_tree 确认路径，再 workspace_open(path) 切换，随后使用文档编辑工具；_references/ 默认只作资料检索。")
+        if enabled & {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "workspace_memory_write", "workspace_memory_delete", "web_search"}:
+            lines.append("- 工作区：当前活动文档优先；需要修改其他 DOCX/MD/TXT 或 .openwps/memory 记忆文件时先 workspace_tree 确认路径，再 workspace_open(path) 切换；_references/ 默认只作资料检索；长期记忆用 workspace_memory_write/delete 维护。")
         if "Agent" in enabled:
             lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，文档内图片语义用 image-analysis，复杂验收用 verification。")
             lines.append("- 多页视觉验收时，先读取页数；然后在同一轮并行发起多个 Agent(subagent_type='verification')，每个委托只指定一个页码和对应验收标准。")
