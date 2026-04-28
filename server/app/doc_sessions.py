@@ -281,13 +281,16 @@ async def update_document_session_from_client(session_id: str, payload: dict[str
 
 
 def _worker_path() -> Path:
-    return BASE_DIR / "node" / "document_worker.mjs"
+    return BASE_DIR / "node" / ".generated" / "server" / "node" / "document_worker.js"
 
 
 def _run_worker(payload: dict[str, Any]) -> dict[str, Any]:
     worker = _worker_path()
     if not worker.exists():
-        return {"success": False, "message": f"Document worker not found: {worker}"}
+        return {
+            "success": False,
+            "message": f"Document worker not found: {worker}. 请先运行 npm run build:worker",
+        }
     proc = subprocess.run(
         ["node", str(worker)],
         input=json.dumps(payload, ensure_ascii=False),
@@ -395,13 +398,51 @@ async def execute_ai_document_tool(tool_name: str, params: dict[str, Any], conte
         return {"success": False, "message": "缺少 documentSessionId，无法在后端执行文档工具", "data": None}
     selection_context = context.get("selection") if isinstance(context.get("selection"), dict) else None
     preserve_content_structure = bool(context.get("contentLockedForLayout"))
-    return await execute_document_tool(
+    result = await execute_document_tool(
         session_id,
         tool_name,
         params,
         selection_context=selection_context,
         preserve_content_structure=preserve_content_structure,
     )
+    data = result.get("data")
+    if isinstance(data, dict):
+        result = dict(result)
+        result["data"] = _compact_ai_tool_data(data)
+    return result
+
+
+def _compact_ai_tool_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove full document payloads from model/trace tool results.
+
+    The authoritative docJson is already published through the document session
+    event stream. Keeping it in ReAct tool results duplicates large ProseMirror
+    trees into model context, traces, and the sidebar.
+    """
+    compact = dict(data)
+    events = compact.get("documentEvents")
+    if isinstance(events, list):
+        compact["documentEvents"] = [
+            _compact_ai_document_event(event)
+            for event in events
+            if isinstance(event, dict)
+        ]
+    return compact
+
+
+def _compact_ai_document_event(event: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        key: event[key]
+        for key in ("type", "source", "version", "originClientId")
+        if key in event
+    }
+    if event.get("type") == "document_replace":
+        compact["docJsonChanged"] = isinstance(event.get("docJson"), dict)
+    elif event.get("type") == "page_config_changed":
+        compact["pageConfigChanged"] = isinstance(event.get("pageConfig"), dict)
+        if isinstance(event.get("pageConfig"), dict):
+            compact["pageConfig"] = event.get("pageConfig")
+    return compact
 
 
 async def publish_document_event(session: DocumentSession, event: dict[str, Any]) -> None:

@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from server.app.doc_sessions import (
     create_document_session,
+    execute_ai_document_tool,
     execute_document_tool,
     read_active_document_session,
     set_active_document_session,
@@ -42,6 +43,33 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual(result["data"]["version"], 2)
         self.assertEqual(marks[0]["type"], "textStyle")
         self.assertTrue(marks[0]["attrs"]["bold"])
+
+    def test_ai_document_tool_omits_full_doc_json_from_trace_data(self) -> None:
+        async def run():
+            session = await create_document_session({
+                "docJson": {
+                    "type": "doc",
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "hello world"}],
+                    }],
+                },
+            })
+            result = await execute_ai_document_tool(
+                "insert_paragraph_after",
+                {"afterParagraph": 0, "text": "new paragraph"},
+                {"documentSessionId": session["documentSessionId"]},
+            )
+            snapshot = await read_active_document_session()
+            return result, snapshot
+
+        result, snapshot = asyncio.run(run())
+        self.assertTrue(result["success"], result["message"])
+        event = result["data"]["documentEvents"][0]
+        self.assertEqual(event["type"], "document_replace")
+        self.assertTrue(event["docJsonChanged"])
+        self.assertNotIn("docJson", event)
+        self.assertIn("new paragraph", json.dumps(snapshot["docJson"], ensure_ascii=False))
 
     def test_client_patch_rejects_stale_version(self) -> None:
         async def run():
@@ -422,6 +450,33 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertNotIn("data:image/png", payload)
         self.assertNotIn('"style"', payload)
         self.assertNotIn('"lines"', payload)
+
+    def test_get_document_info_reports_measured_page_count(self) -> None:
+        async def run():
+            session = await create_document_session({
+                "docJson": {
+                    "type": "doc",
+                    "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "第一页"}]},
+                        {
+                            "type": "paragraph",
+                            "attrs": {"pageBreakBefore": True},
+                            "content": [{"type": "text", "text": "第二页"}],
+                        },
+                    ],
+                },
+                "pageConfig": {"pageWidth": 300, "pageHeight": 220, "marginTop": 20, "marginBottom": 20, "marginLeft": 20, "marginRight": 20},
+            })
+            return await execute_document_tool(
+                session["documentSessionId"],
+                "get_document_info",
+                {},
+            )
+
+        result = asyncio.run(run())
+        self.assertTrue(result["success"], result["message"])
+        self.assertGreaterEqual(result["data"]["pageCount"], 2)
+        self.assertNotEqual(result["data"]["pageCount"], 1)
 
     def test_get_document_content_ignores_extra_detail_parameter(self) -> None:
         async def run():

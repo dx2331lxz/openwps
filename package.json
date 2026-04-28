@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run build:worker && tsc -b && vite build",
+    "build:worker": "tsc -p tsconfig.worker.json",
     "lint": "eslint .",
     "test:markdown-import": "node scripts/test-markdown-import.cjs",
     "test:docx-toc": "node scripts/test-docx-toc.cjs",

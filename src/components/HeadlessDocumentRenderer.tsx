@@ -1,7 +1,7 @@
 import { useEffect, useMemo } from 'react'
-import { schema } from '../editor/schema'
-import { DEFAULT_PAGE_CONFIG, paginate } from '../layout/paginator'
-import type { PageConfig } from '../layout/paginator'
+import { paginate } from '../layout/paginator'
+import { DEFAULT_PAGE_CONFIG, schema } from '../shared/document/schema'
+import type { PageConfig } from '../shared/document/schema'
 import { PretextPageRenderer } from './PretextPageRenderer'
 
 const PAGE_GAP = 32

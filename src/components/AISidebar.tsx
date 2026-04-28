@@ -498,6 +498,15 @@ function truncateText(value: string, maxLength = 48) {
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value
 }
 
+function finiteParamNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
 function describeToolTarget(params: Record<string, unknown>) {
   const range = params.range
   if (range && typeof range === 'object' && !Array.isArray(range)) {
@@ -505,21 +514,43 @@ function describeToolTarget(params: Record<string, unknown>) {
     if (type === 'selection') return '当前选区'
     if (type === 'all') return '全文'
     if (type === 'paragraph') {
-      const paragraphIndex = Number((range as Record<string, unknown>).paragraphIndex)
-      if (Number.isFinite(paragraphIndex)) return `第 ${paragraphIndex + 1} 段`
+      const paragraphIndex = finiteParamNumber((range as Record<string, unknown>).paragraphIndex)
+      if (paragraphIndex !== null) return `第 ${paragraphIndex + 1} 段`
     }
     if (type === 'paragraphs') {
-      const from = Number((range as Record<string, unknown>).from)
-      const to = Number((range as Record<string, unknown>).to)
-      if (Number.isFinite(from) && Number.isFinite(to)) return `第 ${from + 1}-${to + 1} 段`
+      const from = finiteParamNumber((range as Record<string, unknown>).from)
+      const to = finiteParamNumber((range as Record<string, unknown>).to)
+      if (from !== null && to !== null) return `第 ${from + 1}-${to + 1} 段`
     }
   }
 
-  if (Number.isFinite(Number(params.paragraphIndex))) return `第 ${Number(params.paragraphIndex) + 1} 段`
-  if (Number.isFinite(Number(params.afterParagraph))) return `第 ${Number(params.afterParagraph) + 1} 段后`
-  if (Number.isFinite(Number(params.index))) return `第 ${Number(params.index) + 1} 段`
-  if (Number.isFinite(Number(params.page))) return `第 ${Number(params.page)} 页`
+  const paragraphIndex = finiteParamNumber(params.paragraphIndex)
+  const fromParagraph = finiteParamNumber(params.fromParagraph)
+  const toParagraph = finiteParamNumber(params.toParagraph)
+  const afterParagraph = finiteParamNumber(params.afterParagraph)
+  const index = finiteParamNumber(params.index)
+  const page = finiteParamNumber(params.page)
+  if (fromParagraph !== null && toParagraph !== null) return `第 ${fromParagraph + 1}-${toParagraph + 1} 段`
+  if (fromParagraph !== null) return `第 ${fromParagraph + 1} 段起`
+  if (toParagraph !== null) return `截至第 ${toParagraph + 1} 段`
+  if (paragraphIndex !== null) return `第 ${paragraphIndex + 1} 段`
+  if (afterParagraph !== null) return `第 ${afterParagraph + 1} 段后`
+  if (index !== null) return `第 ${index + 1} 段`
+  if (page !== null) return `第 ${page} 页`
   return ''
+}
+
+function describeStreamingWriteTarget(params: Record<string, unknown>) {
+  const action = String(params.action ?? '')
+  if (action === 'insert_after_paragraph') {
+    const afterParagraph = finiteParamNumber(params.afterParagraph)
+    return afterParagraph !== null ? `第 ${afterParagraph + 1} 段后` : ''
+  }
+  if (action === 'replace_paragraph') {
+    const paragraphIndex = finiteParamNumber(params.paragraphIndex)
+    return paragraphIndex !== null ? `第 ${paragraphIndex + 1} 段` : ''
+  }
+  return describeToolTarget(params)
 }
 
 function summarizeToolPurpose(toolCall: ToolCallResult) {
@@ -548,7 +579,10 @@ function summarizeToolPurpose(toolCall: ToolCallResult) {
   if (toolCall.name === 'set_text_style') return target ? `修改${target}的文字样式` : '修改文字样式'
   if (toolCall.name === 'set_paragraph_style') return target ? `调整${target}的段落格式` : '调整段落格式'
   if (toolCall.name === 'clear_formatting') return target ? `清除${target}的排版格式` : '清除排版格式'
-  if (toolCall.name === 'begin_streaming_write') return target ? `开始向${target}流式写正文` : '开始流式写正文'
+  if (toolCall.name === 'begin_streaming_write') {
+    const streamingTarget = describeStreamingWriteTarget(toolCall.params)
+    return streamingTarget ? `开始向${streamingTarget}流式写正文` : '开始流式写正文'
+  }
   if (toolCall.name === 'insert_text') return target ? `向${target}补充文字` : '插入新的文字内容'
   if (toolCall.name === 'insert_paragraph_after') return target ? `在${target}后新增段落` : '插入一个新段落'
   if (toolCall.name === 'replace_paragraph_text') return target ? `整体改写${target}` : '整体替换段落内容'
@@ -705,6 +739,41 @@ function normalizeAgentTraceEvent(raw: unknown): AgentTraceEvent | null {
   }
 }
 
+function shouldMergeAgentTraceTextEvent(left: AgentTraceEvent | undefined, right: AgentTraceEvent): left is AgentTraceEvent {
+  return Boolean(
+    left
+    && right.content
+    && (right.type === 'thinking' || right.type === 'content')
+    && left.type === right.type
+    && (left.phase ?? right.phase ?? '') === (right.phase ?? left.phase ?? ''),
+  )
+}
+
+function mergeAgentTraceTextContent(left: string | undefined, right: string) {
+  const previous = left ?? ''
+  const needsSpace = previous.length > 0
+    && right.length > 0
+    && !/\s$/.test(previous)
+    && !/^\s|^[,.;:!?，。；：！？、）\]}]/.test(right)
+  return compactAgentTraceText(`${previous}${needsSpace ? ' ' : ''}${right}`, AGENT_TRACE_TEXT_LIMIT)
+}
+
+function coalesceAgentTraceEvents(events: AgentTraceEvent[]) {
+  const result: AgentTraceEvent[] = []
+  for (const event of events) {
+    const lastEvent = result.at(-1)
+    if (shouldMergeAgentTraceTextEvent(lastEvent, event)) {
+      result[result.length - 1] = {
+        ...lastEvent,
+        content: mergeAgentTraceTextContent(lastEvent?.content, event.content ?? ''),
+      }
+      continue
+    }
+    result.push(event)
+  }
+  return result
+}
+
 function normalizeAgentTrace(raw: unknown): AgentTrace | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const value = raw as Record<string, unknown>
@@ -724,7 +793,7 @@ function normalizeAgentTrace(raw: unknown): AgentTrace | null {
     model: typeof value.model === 'string' ? value.model : undefined,
     status: normalizeAgentTraceStatus(value.status),
     tools,
-    events,
+    events: coalesceAgentTraceEvents(events),
     result: typeof value.result === 'string' ? value.result : undefined,
     error: typeof value.error === 'string' ? value.error : undefined,
     isExpanded: value.isExpanded !== false,
@@ -732,6 +801,7 @@ function normalizeAgentTrace(raw: unknown): AgentTrace | null {
 }
 
 function compactAgentTraceForStorage(trace: AgentTrace): AgentTrace {
+  const events = coalesceAgentTraceEvents(trace.events)
   return {
     id: trace.id,
     agentType: trace.agentType,
@@ -740,7 +810,7 @@ function compactAgentTraceForStorage(trace: AgentTrace): AgentTrace {
     model: trace.model ? compactAgentTraceText(trace.model, 80) : undefined,
     status: trace.status,
     tools: trace.tools.slice(0, 30),
-    events: trace.events.map(event => ({
+    events: events.map(event => ({
       id: event.id,
       type: event.type,
       round: event.round,
@@ -820,20 +890,14 @@ function upsertAgentTraceInMessage(
 
 function appendAgentTraceEvent(trace: AgentTrace, event: AgentTraceEvent): AgentTrace {
   const lastEvent = trace.events.at(-1)
-  if (
-    lastEvent &&
-    lastEvent.type === event.type &&
-    lastEvent.phase === event.phase &&
-    (event.type === 'thinking' || event.type === 'content') &&
-    event.content
-  ) {
+  if (shouldMergeAgentTraceTextEvent(lastEvent, event)) {
     return {
       ...trace,
       events: [
         ...trace.events.slice(0, -1),
         {
           ...lastEvent,
-          content: compactAgentTraceText(`${lastEvent.content ?? ''}${event.content}`, AGENT_TRACE_TEXT_LIMIT),
+          content: mergeAgentTraceTextContent(lastEvent?.content, event.content ?? ''),
         },
       ],
     }
@@ -944,12 +1008,12 @@ const AgentTraceBlock: React.FC<{
 
       {expanded && (
         <div className="mt-2 space-y-2 border-l border-slate-200 pl-4">
-          {trace.events.length === 0 && trace.status === 'running' && (
+          {coalesceAgentTraceEvents(trace.events).length === 0 && trace.status === 'running' && (
             <div className="relative text-[11px] text-slate-400 before:absolute before:-left-[21px] before:top-1.5 before:h-2 before:w-2 before:rounded-full before:bg-blue-300">
               等待子代理开始输出...
             </div>
           )}
-          {trace.events.map(event => {
+          {coalesceAgentTraceEvents(trace.events).map(event => {
             const eventExpanded = event.isExpanded === true
             const canExpand = Boolean(event.params && Object.keys(event.params).length > 0) || Boolean(event.dataPreview) || Boolean(event.message)
             return (
@@ -2136,6 +2200,22 @@ export default function AISidebar({
     return nextTasks
   }, [applyTaskState])
 
+  const applyTaskToolResultData = useCallback((data: unknown, options?: { preserveExpanded?: boolean }) => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return
+    const value = data as Record<string, unknown>
+    if (Array.isArray(value.tasks)) {
+      const nextTasks = value.tasks.map(normalizeTaskItem).filter((task): task is TaskItem => task !== null)
+      applyTaskState(nextTasks, options)
+      return
+    }
+
+    const task = normalizeTaskItem(value.task)
+    if (!task) return
+    const mergedById = new Map(tasksRef.current.map(item => [item.id, item]))
+    mergedById.set(task.id, task)
+    applyTaskState([...mergedById.values()], options)
+  }, [applyTaskState])
+
   const fetchAgentRunsForConversation = useCallback(async (conversationId: string) => {
     const response = await fetch(`/api/conversations/${conversationId}/agents`)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -2595,6 +2675,7 @@ export default function AISidebar({
                 ? event.result as Record<string, unknown>
                 : {}
               applyServerDocumentEvents(result.data)
+              applyTaskToolResultData(result.data)
               updateMessage(message => ({
                 ...updateToolCallInMessage(
                   message,
@@ -2700,6 +2781,7 @@ export default function AISidebar({
               const result = toolResult.result && typeof toolResult.result === 'object' && !Array.isArray(toolResult.result)
                 ? toolResult.result as Record<string, unknown>
                 : {}
+              applyTaskToolResultData(result.data)
               updateReplayAgentTrace(createFallbackAgentTrace(agentId, agentType), trace => updateAgentTraceToolResult(trace, toolId, toolName, result))
               updateMessage(message => ({
                 ...message,
@@ -3536,6 +3618,7 @@ export default function AISidebar({
               const result = toolResult.result && typeof toolResult.result === 'object' && !Array.isArray(toolResult.result)
                 ? toolResult.result as Record<string, unknown>
                 : {}
+              applyTaskToolResultData(result.data)
               const fallbackTrace = createFallbackAgentTrace(agentId, agentType)
               updateRoundAgentTrace(fallbackTrace, trace => updateAgentTraceToolResult(trace, toolId, toolName, result))
               updateMessage(message => ({
@@ -3673,6 +3756,7 @@ export default function AISidebar({
                 ? event.result as Record<string, unknown>
                 : {}
               applyServerDocumentEvents(result.data)
+              applyTaskToolResultData(result.data)
               const toolRecord: ToolCallRecord = {
                 id: toolId ?? String(event.executionId ?? newId()),
                 name: toolName,

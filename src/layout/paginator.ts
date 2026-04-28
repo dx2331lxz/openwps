@@ -1,24 +1,11 @@
 import { prepareWithSegments } from '@chenglou/pretext'
 import type { Node as PMNode } from 'prosemirror-model'
 import { DEFAULT_EDITOR_FONT_STACK, FONT_STACKS } from '../fonts'
+import { DEFAULT_PAGE_CONFIG } from '../shared/document/schema'
+import type { PageConfig } from '../shared/document/schema'
 
-export interface PageConfig {
-  pageWidth: number
-  pageHeight: number
-  marginTop: number
-  marginBottom: number
-  marginLeft: number
-  marginRight: number
-}
-
-export const DEFAULT_PAGE_CONFIG: PageConfig = {
-  pageWidth: 794,
-  pageHeight: 1123,
-  marginTop: 96,
-  marginBottom: 96,
-  marginLeft: 113,
-  marginRight: 113,
-}
+export { DEFAULT_PAGE_CONFIG }
+export type { PageConfig }
 
 export interface LineInfo {
   text: string
