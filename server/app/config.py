@@ -11,6 +11,7 @@ CONVERSATIONS_DIR = BASE_DIR / "data" / "conversations"
 DOCUMENTS_DIR = BASE_DIR / "data" / "documents"
 DOCUMENT_SETTINGS_PATH = BASE_DIR / "data" / "document_settings.json"
 TASKS_DIR = BASE_DIR / "data" / "tasks"
+PLANS_DIR = BASE_DIR / "data" / "plans"
 AGENTS_DIR = BASE_DIR / "data" / "agents"
 AGENT_RUNS_DIR = BASE_DIR / "data" / "agent_runs"
 TEMPLATES_DIR = BASE_DIR / "data" / "templates"
@@ -21,6 +22,7 @@ CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
+PLANS_DIR.mkdir(parents=True, exist_ok=True)
 AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 AGENT_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)

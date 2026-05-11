@@ -64,6 +64,7 @@ class ChatRequest(BaseModel):
     conversationId: Optional[str] = None
     reactMessages: list[dict[str, Any]] = Field(default_factory=list)
     mode: str = "agent"
+    operationMode: str = "build"
     images: list[dict[str, Any]] = Field(default_factory=list)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     model: Optional[str] = None
@@ -153,6 +154,48 @@ class WorkspaceOpenRequest(BaseModel):
     path: str
 
 
+class SkillCreateRequest(BaseModel):
+    scope: str = "workspace"
+    workspaceId: Optional[str] = None
+    directoryName: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    whenToUse: Optional[str] = None
+    arguments: list[str] = Field(default_factory=list)
+    argumentHint: Optional[str] = None
+    disableModelInvocation: bool = False
+    context: str = "inline"
+    agent: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    version: Optional[str] = None
+    allowedTools: list[str] = Field(default_factory=list)
+    hooks: Optional[dict[str, Any]] = None
+    shell: Optional[dict[str, Any]] = None
+    paths: list[str] = Field(default_factory=list)
+    content: str = ""
+
+
+class SkillUpdateRequest(BaseModel):
+    directoryName: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    whenToUse: Optional[str] = None
+    arguments: Optional[list[str]] = None
+    argumentHint: Optional[str] = None
+    disableModelInvocation: Optional[bool] = None
+    context: Optional[str] = None
+    agent: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    version: Optional[str] = None
+    allowedTools: Optional[list[str]] = None
+    hooks: Optional[dict[str, Any]] = None
+    shell: Optional[dict[str, Any]] = None
+    paths: Optional[list[str]] = None
+    content: Optional[str] = None
+
+
 class DocumentSessionCreateRequest(BaseModel):
     docJson: Optional[dict[str, Any]] = None
     pageConfig: Optional[dict[str, Any]] = None
@@ -209,6 +252,14 @@ class TaskUpdateRequest(BaseModel):
     addBlocks: Optional[list[str]] = None
     addBlockedBy: Optional[list[str]] = None
     metadata: Optional[dict[str, Any]] = None
+
+
+class PlanQuestionAnswerRequest(BaseModel):
+    answer: str
+
+
+class PlanRejectRequest(BaseModel):
+    feedback: Optional[str] = None
 
 
 class TemplateCreateRequest(BaseModel):

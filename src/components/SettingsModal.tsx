@@ -8,6 +8,7 @@ import {
   type TavilyConfigData,
   type VisionConfigData,
 } from '../ai/providers'
+import SkillManagerModal from './SkillManagerModal'
 
 interface EditableProvider extends AIProviderSettings {
   apiKey: string
@@ -44,7 +45,7 @@ interface Props {
   onClose: () => void
 }
 
-type SettingsTab = 'providers' | 'vision' | 'ocr' | 'search'
+type SettingsTab = 'providers' | 'vision' | 'ocr' | 'search' | 'skills'
 type CapabilityTone = 'green' | 'amber' | 'red' | 'gray'
 
 const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; description: string }> = [
@@ -52,6 +53,7 @@ const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; description: string
   { id: 'vision', label: '多模态图片', description: '文档图片与视觉理解' },
   { id: 'ocr', label: 'OCR 识别', description: '扫描件、表格、公式' },
   { id: 'search', label: '联网搜索', description: 'Tavily web_search' },
+  { id: 'skills', label: '技能', description: 'SKILL.md 工作流' },
 ]
 
 function slugify(value: string) {
@@ -148,6 +150,7 @@ export default function SettingsModal({ onClose }: Props) {
     vision: false,
     ocr: false,
     search: false,
+    skills: false,
   })
 
   useEffect(() => {
@@ -629,7 +632,7 @@ export default function SettingsModal({ onClose }: Props) {
         </div>
 
         <div className="border-b border-gray-100 px-5 pt-3 flex-shrink-0">
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid grid-cols-5 gap-2">
             {SETTINGS_TABS.map(tab => (
               <button
                 key={tab.id}
@@ -1299,6 +1302,10 @@ export default function SettingsModal({ onClose }: Props) {
                 </div>
               </div>
             )}
+
+            {activeSettingsTab === 'skills' && (
+              <SkillManagerModal />
+            )}
           </div>
         </div>
 
@@ -1310,13 +1317,15 @@ export default function SettingsModal({ onClose }: Props) {
             取消
           </button>
 
-          <button
-            onClick={() => void handleAISave()}
-            disabled={aiSaving}
-            className={`px-4 py-2 text-sm rounded-lg text-white ${aiSaving ? 'bg-blue-300' : aiSavedOk ? 'bg-green-500' : 'bg-blue-500 hover:bg-blue-600'}`}
-          >
-            {aiSaving ? '保存中...' : aiSavedOk ? '已保存' : '保存 AI 配置'}
-          </button>
+          {activeSettingsTab !== 'skills' && (
+            <button
+              onClick={() => void handleAISave()}
+              disabled={aiSaving}
+              className={`px-4 py-2 text-sm rounded-lg text-white ${aiSaving ? 'bg-blue-300' : aiSavedOk ? 'bg-green-500' : 'bg-blue-500 hover:bg-blue-600'}`}
+            >
+              {aiSaving ? '保存中...' : aiSavedOk ? '已保存' : '保存 AI 配置'}
+            </button>
+          )}
         </div>
       </div>
     </div>

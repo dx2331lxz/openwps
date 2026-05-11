@@ -54,6 +54,11 @@ interface WorkspacesResponse {
   workspaces: WorkspaceSummary[]
 }
 
+interface WorkspaceDeleteResponse extends WorkspacesResponse {
+  success: boolean
+  workspaceId: string
+}
+
 interface WorkspaceTreeResponse {
   workspaceId: string
   root: WorkspaceFileNode
@@ -70,7 +75,10 @@ interface Props {
   activeFile?: WorkspaceFileRef | null
   onOpenFile: (workspaceId: string, path: string) => Promise<void> | void
   onSaveActiveFile?: () => Promise<void> | void
+  onActiveFileMoved?: (file: WorkspaceFileRef) => void
   onWorkspaceChange?: (workspaceId: string) => void
+  onWorkspaceDeleted?: (workspaceId: string, activeWorkspaceId: string) => void
+  refreshToken?: number
 }
 
 function joinPath(dir: string, name: string) {
@@ -126,7 +134,10 @@ export default function WorkspacePanel({
   activeFile,
   onOpenFile,
   onSaveActiveFile,
+  onActiveFileMoved,
   onWorkspaceChange,
+  onWorkspaceDeleted,
+  refreshToken = 0,
 }: Props) {
   const [workspaces, setWorkspaces] = React.useState<WorkspaceSummary[]>([])
   const [workspaceId, setWorkspaceId] = React.useState('')
@@ -212,6 +223,11 @@ export default function WorkspacePanel({
     }
   }, [loadTree, loadWorkspaces, workspaceId])
 
+  React.useEffect(() => {
+    if (refreshToken <= 0) return
+    void refresh()
+  }, [refresh, refreshToken])
+
   const switchWorkspace = React.useCallback(async (nextId: string) => {
     if (!nextId || nextId === workspaceId) return
     setWorkspaceId(nextId)
@@ -241,6 +257,51 @@ export default function WorkspacePanel({
       setError(err instanceof Error ? err.message : String(err))
     }
   }, [loadWorkspaces])
+
+  const deleteWorkspace = React.useCallback(async () => {
+    if (!workspaceId) return
+    const currentWorkspace = workspaces.find(item => item.id === workspaceId)
+    const workspaceName = currentWorkspace?.name || workspaceId
+    const isDefaultWorkspace = workspaceId === 'default'
+    const confirmed = window.confirm(
+      isDefaultWorkspace
+        ? `清空默认工作区「${workspaceName}」？\n\n这会永久删除其中的文件，并重建系统目录。`
+        : `永久删除工作区「${workspaceName}」？\n\n其中的文件会一并删除，无法撤销。`,
+    )
+    if (!confirmed) return
+
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'DELETE' })
+      if (!response.ok) {
+        let message = `删除工作区失败：HTTP ${response.status}`
+        try {
+          const data = await response.json() as { detail?: string }
+          if (data.detail) message = data.detail
+        } catch {
+          // keep HTTP fallback
+        }
+        throw new Error(message)
+      }
+      const data = await response.json() as WorkspaceDeleteResponse
+      const nextWorkspaceId = data.activeWorkspaceId || data.workspaces[0]?.id || ''
+      setWorkspaces(data.workspaces)
+      setWorkspaceId(nextWorkspaceId)
+      setSelectedDir('')
+      setPreview(null)
+      setPendingCreate(null)
+      setOpenMenuPath(null)
+      onWorkspaceChange?.(nextWorkspaceId)
+      onWorkspaceDeleted?.(data.workspaceId || workspaceId, nextWorkspaceId)
+      if (nextWorkspaceId) await loadTree(nextWorkspaceId)
+      else setTree(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [loadTree, onWorkspaceChange, onWorkspaceDeleted, workspaceId, workspaces])
 
   const createFolder = React.useCallback(async () => {
     if (!workspaceId) return
@@ -427,11 +488,20 @@ export default function WorkspacePanel({
           body: JSON.stringify({ toPath: nextPath }),
         })
       if (!response.ok) throw new Error(`重命名失败：HTTP ${response.status}`)
+      const data = await response.json() as { workspaceId?: string; path?: string }
+      const renamedPath = data.path || nextPath
+      if (node.kind !== 'directory' && activeFile?.workspaceId === workspaceId && activeFile.filePath === node.path) {
+        onActiveFileMoved?.({
+          workspaceId: data.workspaceId || workspaceId,
+          filePath: renamedPath,
+          fileType: node.type || activeFile.fileType,
+        })
+      }
       await refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [refresh, workspaceId])
+  }, [activeFile?.filePath, activeFile?.workspaceId, onActiveFileMoved, refresh, workspaceId])
 
   const moveNode = React.useCallback(async (node: WorkspaceFileNode) => {
     setOpenMenuPath(null)
@@ -455,11 +525,20 @@ export default function WorkspacePanel({
           body: JSON.stringify({ toPath: nextPath.trim() }),
         })
       if (!response.ok) throw new Error(`移动失败：HTTP ${response.status}`)
+      const data = await response.json() as { workspaceId?: string; path?: string }
+      const movedPath = data.path || nextPath.trim()
+      if (node.kind !== 'directory' && activeFile?.workspaceId === workspaceId && activeFile.filePath === node.path) {
+        onActiveFileMoved?.({
+          workspaceId: data.workspaceId || workspaceId,
+          filePath: movedPath,
+          fileType: node.type || activeFile.fileType,
+        })
+      }
       await refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [refresh, workspaceId])
+  }, [activeFile?.filePath, activeFile?.workspaceId, onActiveFileMoved, refresh, workspaceId])
 
   const handleNodeActivate = React.useCallback(async (node: WorkspaceFileNode) => {
     if (node.kind === 'directory') {
@@ -663,6 +742,14 @@ export default function WorkspacePanel({
           </select>
           <button onClick={createWorkspace} className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50" title="新建工作区">
             <Plus size={14} />
+          </button>
+          <button
+            onClick={() => { void deleteWorkspace() }}
+            className="flex h-7 w-7 items-center justify-center rounded-md border border-red-100 text-red-500 hover:bg-red-50 disabled:border-slate-200 disabled:text-slate-300 disabled:hover:bg-white"
+            title={workspaceId === 'default' ? '清空默认工作区' : '删除当前工作区'}
+            disabled={!workspaceId || loading}
+          >
+            <Trash2 size={14} />
           </button>
           <button onClick={() => { void refresh() }} className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50" title="刷新">
             <RefreshCw size={14} />

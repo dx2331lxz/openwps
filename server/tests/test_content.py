@@ -15,7 +15,7 @@ from server.app.content import (
     build_system_content,
     build_user_content,
 )
-from server.app.ai import VISION_TEST_IMAGE_DATA_URL, _prepare_page_screenshot_tool_result
+from server.app.ai import OpenWPSMemoryContextScrubber, VISION_TEST_IMAGE_DATA_URL, _prepare_page_screenshot_tool_result
 from server.app.agents import AgentDefinition
 from server.app.config import PRESET_PROVIDERS, normalize_config
 
@@ -200,6 +200,63 @@ class ContentModuleTest(unittest.TestCase):
         self.assertIn("新增资料.pdf", changed.content[0])
         self.assertIn('"mode": "delta"', changed.content[0])
 
+    def test_initial_context_includes_workspace_memory_context(self) -> None:
+        context = {
+            "workspaceManifest": {
+                "memory": {
+                    "workspaceId": "default",
+                    "entrypoint": {
+                        "path": ".openwps/memory/MEMORY.md",
+                        "content": "- [人物一致性](novel-character-consistency.md) - 主角性格",
+                        "contentHash": "entry-hash",
+                    },
+                    "manifest": [{
+                        "path": ".openwps/memory/novel-character-consistency.md",
+                        "memoryPath": "novel-character-consistency.md",
+                        "name": "人物一致性",
+                        "description": "主角性格与关系约束",
+                        "type": "project",
+                        "contentHash": "memory-hash",
+                    }],
+                    "selected": [{
+                        "path": ".openwps/memory/novel-character-consistency.md",
+                        "content": "江南：冷静、克制、外热内慎。",
+                        "contentHash": "memory-hash",
+                    }],
+                },
+            },
+        }
+
+        initial = build_initial_context_content(context)
+
+        self.assertTrue(initial.trace["memoryContextLoaded"])
+        self.assertEqual(initial.trace["memorySelectedCount"], 1)
+        self.assertIn("type=workspace_memory_delta", initial.content)
+        self.assertIn("<openwps-memory-context>", initial.content)
+        self.assertIn("江南：冷静、克制", initial.content)
+        self.assertIn("</openwps-memory-context>", initial.content)
+
+    def test_workspace_memory_delta_is_not_reannounced_when_unchanged(self) -> None:
+        context = {
+            "workspaceManifest": {
+                "memory": {
+                    "workspaceId": "default",
+                    "entrypoint": {
+                        "path": ".openwps/memory/MEMORY.md",
+                        "content": "- [偏好](preferences.md) - 简洁",
+                        "contentHash": "entry-hash",
+                    },
+                    "manifest": [],
+                    "selected": [],
+                },
+            },
+        }
+        initial = build_initial_context_content(context)
+
+        repeated = build_delta_content(context, [DummyMessage(initial.content)])
+
+        self.assertEqual(repeated.content, [])
+
     def test_workspace_state_reconstruction_supports_legacy_added_payload(self) -> None:
         legacy_attachment = (
             '[系统附件] type=workspace_docs_delta\n'
@@ -368,6 +425,62 @@ class ContentModuleTest(unittest.TestCase):
         self.assertIn("敏感正文", payload["userPrompt"])
         self.assertNotIn("敏感正文", str(result.trace))
         self.assertEqual(result.trace["agentType"], "verification")
+
+    def test_subagent_content_inherits_workspace_memory_context(self) -> None:
+        agent = AgentDefinition(
+            agent_type="writing-plan",
+            description="规划",
+            prompt="只读规划",
+            tools=["workspace_read"],
+        )
+        result = build_subagent_content(
+            agent=agent,
+            tool_names=["workspace_read"],
+            description="规划第一章",
+            prompt="请规划第一章",
+            context={
+                "workspaceManifest": {
+                    "memory": {
+                        "workspaceId": "default",
+                        "entrypoint": {
+                            "path": ".openwps/memory/MEMORY.md",
+                            "content": "- [第一章规划](outline.md) - 章节结构",
+                            "contentHash": "entry-hash",
+                        },
+                        "manifest": [],
+                        "selected": [{
+                            "path": ".openwps/memory/outline.md",
+                            "content": "第一章以案件切入。",
+                            "contentHash": "outline-hash",
+                        }],
+                    },
+                },
+            },
+        )
+
+        self.assertIn("<openwps-memory-context>", result.content["userPrompt"])
+        self.assertIn("第一章以案件切入", result.content["userPrompt"])
+        self.assertNotIn("第一章以案件切入", str(result.trace))
+
+    def test_memory_context_scrubber_strips_complete_and_split_spans(self) -> None:
+        scrubber = OpenWPSMemoryContextScrubber()
+        visible = (
+            scrubber.feed("开头 <openwps-memory-context>secret")
+            + scrubber.feed("</openwps-memory-context> 结尾")
+            + scrubber.flush()
+        )
+
+        self.assertEqual(visible, "开头  结尾")
+
+    def test_memory_context_scrubber_strips_case_insensitive_split_tags(self) -> None:
+        scrubber = OpenWPSMemoryContextScrubber()
+        visible = (
+            scrubber.feed("A <OPENWPS-MEM")
+            + scrubber.feed("ORY-CONTEXT>hidden</OPENWPS-MEMORY-CONTEXT> B")
+            + scrubber.flush()
+        )
+
+        self.assertEqual(visible, "A  B")
 
     def test_page_screenshot_tool_result_injects_image_without_text_data_url(self) -> None:
         raw = {

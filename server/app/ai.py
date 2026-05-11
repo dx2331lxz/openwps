@@ -55,6 +55,13 @@ from .tooling import (
     get_tool_metadata_payload,
     search_deferred_tool_definitions,
 )
+from .plans import (
+    get_approved_plan_attachment,
+    get_rejected_plan_attachment,
+    request_plan_questions,
+    submit_plan_for_approval,
+)
+from .skills import build_skill_discovery_delta, expand_skill_for_model
 from .content import (
     build_delta_content,
     build_initial_context_content,
@@ -82,6 +89,84 @@ from .workspace import save_memory_file
 from .workspace import search_workspace
 
 logger = logging.getLogger("uvicorn.error")
+
+PLAN_ONLY_TOOL_NAMES = {"AskUserQuestion", "SubmitPlanForApproval"}
+OPENWPS_MEMORY_CONTEXT_OPEN = "<openwps-memory-context>"
+OPENWPS_MEMORY_CONTEXT_CLOSE = "</openwps-memory-context>"
+
+
+def _build_plan_mode_system_section() -> str:
+    return """## Plan Mode（只读规划）
+
+当前 operationMode=plan。你处在严格只读规划阶段：
+- 只能读取、搜索、调研、委托只读子代理或维护计划审批状态；不要修改文档正文、样式、工作区记忆或内部执行任务。
+- 如果需求、范围或实现路径存在会影响结果的歧义，调用 AskUserQuestion 提交结构化多选问题。
+- 当计划已经决策完整时，调用 SubmitPlanForApproval，并把完整计划放入 content。content 必须是 Markdown，建议用 <proposed_plan> 包裹。
+- 不要用普通 assistant 文本代替计划提交；用户批准计划后，Build 模式才会执行写入。"""
+
+
+class OpenWPSMemoryContextScrubber:
+    """Remove leaked OpenWPS memory-context fences from streamed model output."""
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_span = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._buf += text
+        output: list[str] = []
+        open_tag = OPENWPS_MEMORY_CONTEXT_OPEN
+        close_tag = OPENWPS_MEMORY_CONTEXT_CLOSE
+
+        while self._buf:
+            lower = self._buf.lower()
+            if self._in_span:
+                close_index = lower.find(close_tag)
+                if close_index == -1:
+                    keep = self._max_partial_suffix(self._buf, close_tag)
+                    self._buf = self._buf[-keep:] if keep else ""
+                    return "".join(output)
+                self._buf = self._buf[close_index + len(close_tag):]
+                self._in_span = False
+                continue
+
+            open_index = lower.find(open_tag)
+            if open_index == -1:
+                keep = self._max_partial_suffix(self._buf, open_tag)
+                if keep:
+                    output.append(self._buf[:-keep])
+                    self._buf = self._buf[-keep:]
+                else:
+                    output.append(self._buf)
+                    self._buf = ""
+                return "".join(output)
+
+            output.append(self._buf[:open_index])
+            self._buf = self._buf[open_index + len(open_tag):]
+            self._in_span = True
+
+        return "".join(output)
+
+    def flush(self) -> str:
+        if self._in_span:
+            self._buf = ""
+            self._in_span = False
+            return ""
+        tail = self._buf
+        self._buf = ""
+        return tail
+
+    @staticmethod
+    def _max_partial_suffix(buf: str, tag: str) -> int:
+        buf_lower = buf.lower()
+        tag_lower = tag.lower()
+        max_check = min(len(buf_lower), len(tag_lower) - 1)
+        for size in range(max_check, 0, -1):
+            if tag_lower.startswith(buf_lower[-size:]):
+                return size
+        return 0
 
 
 class ReasoningContentChatOpenAI(ChatOpenAI):
@@ -1026,9 +1111,26 @@ def _get_model_tools_for_body(
         get_model_tools(body.mode, loaded_deferred_tools or set(), agent_type=agent_type),
         _resolve_runtime_capabilities(body),
     )
+    filtered = [
+        tool
+        for tool in filtered
+        if _tool_available_for_operation_mode(_tool_name_from_schema(tool), body.operationMode)
+    ]
     if not _get_deferred_tool_definitions_for_body(body, loaded_deferred_tools or set()):
         filtered = [tool for tool in filtered if _tool_name_from_schema(tool) != TOOL_SEARCH_NAME]
     return filtered
+
+
+def _operation_mode_name(operation_mode: str | None) -> str:
+    return "plan" if str(operation_mode or "").strip().lower() == "plan" else "build"
+
+
+def _tool_available_for_operation_mode(tool_name: str, operation_mode: str | None) -> bool:
+    if _operation_mode_name(operation_mode) != "plan":
+        return tool_name not in PLAN_ONLY_TOOL_NAMES
+    if tool_name in PLAN_ONLY_TOOL_NAMES or tool_name in {TOOL_SEARCH_NAME, "Agent"}:
+        return True
+    return bool(get_tool_metadata_payload(tool_name).get("readOnly"))
 
 
 def _get_deferred_tool_definitions_for_body(
@@ -1040,6 +1142,7 @@ def _get_deferred_tool_definitions_for_body(
         definition
         for definition in get_deferred_tool_definitions(body.mode, loaded_deferred_tools or set())
         if _tool_available_for_runtime(definition.name, capabilities)
+        and _tool_available_for_operation_mode(definition.name, body.operationMode)
     ]
 
 
@@ -1049,6 +1152,7 @@ def _get_tool_definitions_for_body(body: ChatRequest) -> list[Any]:
         definition
         for definition in get_tool_definitions(body.mode)
         if _tool_available_for_runtime(definition.name, capabilities)
+        and _tool_available_for_operation_mode(definition.name, body.operationMode)
     ]
 
 
@@ -1062,6 +1166,7 @@ def _search_deferred_tool_definitions_for_body(
         definition
         for definition in search_deferred_tool_definitions(body.mode, query, loaded_deferred_tools or set())
         if _tool_available_for_runtime(definition.name, capabilities)
+        and _tool_available_for_operation_mode(definition.name, body.operationMode)
     ]
 
 
@@ -3940,6 +4045,16 @@ def _record_content_events(session: "ReactSession", events: list[dict[str, Any]]
         _record_content_event(session, event)
 
 
+def _memory_context_loaded_event(trace: dict[str, Any]) -> dict[str, Any] | None:
+    if not trace.get("memoryContextLoaded"):
+        return None
+    return {
+        "type": "memory_context_loaded",
+        "selectedCount": int(trace.get("memorySelectedCount") or 0),
+        "deltaCount": int(trace.get("memoryDeltaCount") or 1),
+    }
+
+
 def _message_text_for_intent(body: ChatRequest) -> str:
     return _stringify_content(body.message).lower()
 
@@ -5109,8 +5224,39 @@ def _run_tool_search_tool(
                     definition.to_deferred_summary()
                     for definition in _get_deferred_tool_definitions_for_body(body, loaded_deferred_tools)
                 ],
-            },
-        )
+        },
+    )
+
+
+def _run_ask_user_question_tool(params: dict[str, Any], body: ChatRequest) -> str:
+    questions = params.get("questions")
+    if not isinstance(questions, list):
+        questions = []
+    plan = request_plan_questions(
+        body.conversationId,
+        [question for question in questions if isinstance(question, dict)],
+        context=str(params.get("context") or ""),
+    )
+    return _serialize_tool_result_payload(
+        tool_name="AskUserQuestion",
+        success=True,
+        message="已生成需要用户选择的计划问题。",
+        executed_params=params,
+        original_params=params,
+        data={"plan": plan, "questions": plan.get("questions", [])},
+    )
+
+
+def _run_submit_plan_for_approval_tool(params: dict[str, Any], body: ChatRequest) -> str:
+    plan = submit_plan_for_approval(body.conversationId, str(params.get("content") or ""))
+    return _serialize_tool_result_payload(
+        tool_name="SubmitPlanForApproval",
+        success=True,
+        message="计划已提交审批，等待用户批准或退回。",
+        executed_params=params,
+        original_params=params,
+        data={"plan": plan},
+    )
 
 
 def _build_execution_plan(round_number: int, tool_calls: list[dict[str, Any]]) -> ToolExecutionPlan:
@@ -5251,7 +5397,7 @@ class ReactSession:
     __slots__ = (
         "session_id", "body", "messages",
         "state", "finished", "trace", "latest_context",
-        "loaded_deferred_tools", "server_streaming_write", "workspace_tool_cache",
+        "loaded_deferred_tools", "loaded_skills", "server_streaming_write", "workspace_tool_cache",
     )
 
     def __init__(self, session_id: str, body: ChatRequest, messages: list[BaseMessage]):
@@ -5267,6 +5413,7 @@ class ReactSession:
         if isinstance(workspace_docs, list):
             self.state.previous_workspace_docs = list(workspace_docs)
         self.loaded_deferred_tools: set[str] = set()
+        self.loaded_skills: dict[str, str] = {}
         self.server_streaming_write: dict[str, Any] | None = None
         self.workspace_tool_cache: set[str] = set()
         self.trace = SessionTrace(
@@ -5386,6 +5533,9 @@ def _build_post_compact_restore_attachments(session: ReactSession) -> list[BaseM
     tooling_delta = _build_tooling_delta_attachment_for_body(session.body, session.loaded_deferred_tools)
     if tooling_delta:
         attachments.append(HumanMessage(content=tooling_delta))
+    for attachment in list(session.loaded_skills.values())[-5:]:
+        if attachment:
+            attachments.append(HumanMessage(content=attachment))
     return attachments
 
 
@@ -5421,10 +5571,10 @@ class ReactGatewayRun:
         item = {"seq": self.last_seq, **event}
         event_type = str(item.get("type") or "")
         if event_type in {"tool_result", "agent_tool_result", "round_start", "content", "thinking"}:
-            if self.status != "completed":
+            if self.status not in {"completed", "failed", "cancelled"}:
                 self.status = "running"
         elif event_type == "done":
-            self.status = "completed"
+            self.status = "cancelled" if str(item.get("reason") or "") == "stopped_by_client" else "completed"
         elif event_type == "error":
             self.status = "failed"
             self.error = str(item.get("message") or "AI 请求失败")
@@ -5477,7 +5627,8 @@ async def create_react_gateway_run(body: ChatRequest) -> ReactGatewayRun:
         except HTTPException as exc:
             await run.append_event({"type": "error", "message": _http_error_message(exc)})
         except asyncio.CancelledError:
-            await run.append_event({"type": "done", "reason": "stopped_by_client"})
+            if run.status != "cancelled":
+                await run.append_event({"type": "done", "reason": "stopped_by_client"})
             raise
         except Exception as exc:
             logger.exception("[openwps.ai] gateway run %s failed", session.session_id)
@@ -5517,23 +5668,27 @@ async def stream_react_gateway_run_events(
             for event in pending:
                 cursor = int(event.get("seq") or cursor)
                 yield event
-            if run.status in {"completed", "failed"}:
+            if run.status in {"completed", "failed", "cancelled"}:
                 return
             continue
 
-        if run.status in {"completed", "failed"}:
+        if run.status in {"completed", "failed", "cancelled"}:
             return
 
         async with run.condition:
             await run.condition.wait()
 
 
-def cancel_react_gateway_run(session_id: str) -> None:
+async def cancel_react_gateway_run(session_id: str) -> dict[str, Any]:
     run = _react_gateway_runs.get(session_id)
     if not run:
         raise HTTPException(status_code=404, detail="React run not found or expired")
+    if run.status in {"completed", "failed", "cancelled"}:
+        return run.snapshot()
     if run.task and not run.task.done():
         run.task.cancel()
+    await run.append_event({"type": "done", "reason": "stopped_by_client"})
+    return run.snapshot()
 
 
 def get_react_session(session_id: str) -> ReactSession | None:
@@ -5626,12 +5781,15 @@ def _record_tooling_delta_message(
 ) -> None:
     attachment = _build_tooling_delta_attachment_for_body(body, loaded_deferred_tools)
     deferred_count = len(_get_deferred_tool_definitions_for_body(body, loaded_deferred_tools))
+    context = body.context if isinstance(body.context, dict) else {}
+    skill_count = len(build_skill_discovery_delta(_stringify_content(context.get("workspaceId")).strip() or None))
     if content_events is not None:
         content_events.append({
             "type": "tooling_delta",
             "mode": body.mode or "layout",
             "deferredToolCount": deferred_count,
             "loadedDeferredToolCount": len(loaded_deferred_tools),
+            "skillDiscoveryCount": skill_count,
             "contentChars": len(attachment),
         })
     if attachment:
@@ -5647,7 +5805,10 @@ def _build_tooling_delta_attachment_for_body(
         definition.to_deferred_summary()
         for definition in _get_deferred_tool_definitions_for_body(body, set(loaded))
     ]
-    if not deferred and not loaded:
+    context = body.context if isinstance(body.context, dict) else {}
+    workspace_id = _stringify_content(context.get("workspaceId")).strip() or None
+    skill_delta = build_skill_discovery_delta(workspace_id)
+    if not deferred and not loaded and not skill_delta:
         return ""
     payload = {
         "type": "tooling_delta",
@@ -5656,7 +5817,7 @@ def _build_tooling_delta_attachment_for_body(
         "deferredTools": deferred,
         "loadedDeferredTools": loaded,
         "mcpInstructionsDelta": [],
-        "skillDiscoveryDelta": [],
+        "skillDiscoveryDelta": skill_delta,
     }
     lines = [
         "[系统附件] type=tooling_delta",
@@ -5670,6 +5831,14 @@ def _build_tooling_delta_attachment_for_body(
             for item in deferred
         )
         lines.append("需要其中任一工具时，先调用 ToolSearch 加载完整 schema。")
+    if skill_delta:
+        lines.append("")
+        lines.append("[Skill 摘要]")
+        lines.extend(
+            f"- {item['name']} ({item.get('context') or 'inline'}): {item.get('whenToUse') or item.get('description')}"
+            for item in skill_delta
+        )
+        lines.append("用户请求匹配某个 Skill 时，先调用 Skill 加载完整 SKILL.md。")
     return "\n".join(lines)
 
 
@@ -5688,10 +5857,22 @@ def build_messages(
         deferred_tool_count=len(_get_deferred_tool_definitions_for_body(body, loaded)),
         loaded_deferred_tool_count=len(loaded),
     )
-    messages: list[BaseMessage] = [SystemMessage(content=system_content.prompt)]
+    system_prompt = system_content.prompt
+    if _operation_mode_name(body.operationMode) == "plan":
+        system_prompt = "\n\n".join([system_prompt, _build_plan_mode_system_section()])
+    messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     if content_events is not None:
         content_events.append(system_content.trace)
     _record_tooling_delta_message(messages, body=body, loaded_deferred_tools=loaded, content_events=content_events)
+
+    if _operation_mode_name(body.operationMode) == "plan":
+        rejected_plan = get_rejected_plan_attachment(body.conversationId)
+        if rejected_plan:
+            messages.append(HumanMessage(content=rejected_plan))
+    else:
+        approved_plan = get_approved_plan_attachment(body.conversationId)
+        if approved_plan:
+            messages.append(HumanMessage(content=approved_plan))
 
     # Inject initial context as delta attachment (full state announcement)
     context = _with_backend_workspace_docs(body.context, query=body.message)
@@ -6167,6 +6348,8 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
     graph = build_graph(llm)
     tool_call_acc: dict[int, dict[str, Any]] = {}
     range_required_tools = {"set_text_style", "set_paragraph_style", "clear_formatting"}
+    content_scrubber = OpenWPSMemoryContextScrubber()
+    reasoning_scrubber = OpenWPSMemoryContextScrubber()
 
     try:
         async for event in graph.astream_events({"messages": build_messages(prepared_body)}, version="v2"):
@@ -6179,9 +6362,11 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
 
             reasoning = _extract_reasoning(chunk)
             if reasoning:
-                yield {"type": "thinking", "content": reasoning}
+                visible_reasoning = reasoning_scrubber.feed(reasoning)
+                if visible_reasoning:
+                    yield {"type": "thinking", "content": visible_reasoning}
 
-            content = _strip_tool_result_json_leaks(_stringify_content(chunk.content))
+            content = content_scrubber.feed(_strip_tool_result_json_leaks(_stringify_content(chunk.content)))
             if content:
                 yield {"type": "content", "content": content}
 
@@ -6199,6 +6384,13 @@ async def stream_react_round(body: ChatRequest) -> AsyncGenerator[dict[str, Any]
         raise
     except Exception as exc:
         _raise_ai_api_request_error(prepared_body, exc)
+
+    reasoning_tail = reasoning_scrubber.flush()
+    if reasoning_tail:
+        yield {"type": "thinking", "content": reasoning_tail}
+    content_tail = content_scrubber.flush()
+    if content_tail:
+        yield {"type": "content", "content": content_tail}
 
     if tool_call_acc:
         for index in sorted(tool_call_acc.keys()):
@@ -6281,6 +6473,8 @@ async def _run_llm_round(
     assistant_reasoning = ""
     finish_reason = ""
     token_usage: dict[str, int] = {}
+    content_scrubber = OpenWPSMemoryContextScrubber()
+    reasoning_scrubber = OpenWPSMemoryContextScrubber()
 
     try:
         async for event in graph.astream_events({"messages": messages}, version="v2"):
@@ -6311,10 +6505,12 @@ async def _run_llm_round(
 
             reasoning = _extract_reasoning(chunk)
             if reasoning:
-                assistant_reasoning += reasoning
-                yield {"type": "thinking", "content": reasoning}
+                visible_reasoning = reasoning_scrubber.feed(reasoning)
+                if visible_reasoning:
+                    assistant_reasoning += visible_reasoning
+                    yield {"type": "thinking", "content": visible_reasoning}
 
-            content = _strip_tool_result_json_leaks(_stringify_content(chunk.content))
+            content = content_scrubber.feed(_strip_tool_result_json_leaks(_stringify_content(chunk.content)))
             if content:
                 assistant_content += content
                 yield {"type": "content", "content": content}
@@ -6332,6 +6528,15 @@ async def _run_llm_round(
         raise
     except Exception as exc:
         _raise_ai_api_request_error(body, exc)
+
+    reasoning_tail = reasoning_scrubber.flush()
+    if reasoning_tail:
+        assistant_reasoning += reasoning_tail
+        yield {"type": "thinking", "content": reasoning_tail}
+    content_tail = content_scrubber.flush()
+    if content_tail:
+        assistant_content += content_tail
+        yield {"type": "content", "content": content_tail}
 
     parsed_tool_calls: list[dict[str, Any]] = []
     if tool_call_acc:
@@ -6783,6 +6988,30 @@ class QueryCoordinator:
 
     def _blocked_execution_content(self, execution: PlannedToolExecution) -> str | None:
         if (
+            _operation_mode_name(self.session.body.operationMode) != "plan"
+            and execution.tool_name in PLAN_ONLY_TOOL_NAMES
+        ):
+            return _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=False,
+                message="该工具只能在 Plan Mode 中使用。",
+                data={"operationMode": _operation_mode_name(self.session.body.operationMode), "blockedTool": execution.tool_name},
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
+        if (
+            _operation_mode_name(self.session.body.operationMode) == "plan"
+            and not _tool_available_for_operation_mode(execution.tool_name, "plan")
+        ):
+            return _serialize_tool_result_payload(
+                tool_name=execution.tool_name,
+                success=False,
+                message="Plan Mode 已阻断该工具：规划阶段只能只读调研、提问或提交计划，不能修改文档、样式、任务或工作区记忆。",
+                data={"operationMode": "plan", "blockedTool": execution.tool_name},
+                executed_params=execution.params,
+                original_params=execution.params,
+            )
+        if (
             self.state.layout_preflight_required
             and not self.state.layout_preflight_completed
             and _is_preflight_guarded_style_execution(execution)
@@ -6810,13 +7039,146 @@ class QueryCoordinator:
             )
         return None
 
+    async def _execute_skill_tool_content(
+        self,
+        execution: PlannedToolExecution,
+    ) -> tuple[str, str | None, list[dict[str, Any]]]:
+        params = dict(execution.params or {})
+        skill_name = _stringify_content(params.get("skill") or params.get("name")).strip()
+        arguments = _stringify_content(params.get("arguments")) if params.get("arguments") is not None else None
+        reason = _stringify_content(params.get("reason")).strip()
+        workspace_id = (
+            _stringify_content(params.get("workspace_id") or params.get("workspaceId")).strip()
+            or _stringify_content((self.session.latest_context or {}).get("workspaceId")).strip()
+            or _stringify_content((self.session.body.context or {}).get("workspaceId")).strip()
+            or None
+        )
+        if not skill_name:
+            return _serialize_tool_result_payload(
+                tool_name="Skill",
+                success=False,
+                message="Skill 缺少 skill 参数",
+                executed_params=params,
+                original_params=params,
+            ), None, []
+
+        try:
+            expanded = expand_skill_for_model(
+                skill_name,
+                arguments,
+                session_id=self.session.session_id,
+                workspace_id=workspace_id,
+            )
+        except HTTPException as exc:
+            return _serialize_tool_result_payload(
+                tool_name="Skill",
+                success=False,
+                message=_http_error_message(exc),
+                executed_params=params,
+                original_params=params,
+            ), None, []
+
+        if expanded.get("context") == "fork":
+            events: list[dict[str, Any]] = []
+            agent_type = str(expanded.get("agent") or "general-purpose")
+            try:
+                base_agent = get_agent_definition(agent_type)
+                agent = base_agent
+                skill_model = str(expanded.get("model") or "").strip()
+                if skill_model and skill_model.lower() != "inherit":
+                    agent = AgentDefinition(
+                        agent_type=base_agent.agent_type,
+                        description=base_agent.description,
+                        prompt=base_agent.prompt,
+                        tools=list(base_agent.tools),
+                        model=skill_model,
+                        max_turns=base_agent.max_turns,
+                        background=False,
+                        source=base_agent.source,
+                    )
+                agent_id = new_agent_run_id()
+                final_content = ""
+                prompt = "\n\n".join([
+                    f"你正在执行 OpenWPS Skill：{expanded.get('name') or expanded.get('slug')}",
+                    f"触发原因：{reason or '用户请求匹配该 skill'}",
+                    f"原始用户请求：{self.session.body.message}",
+                    str(expanded.get("prompt") or ""),
+                ])
+                async for event in self._run_subagent(
+                    agent_id=agent_id,
+                    agent=agent,
+                    description=f"Skill: {expanded.get('name') or expanded.get('slug')}",
+                    prompt=prompt,
+                    background=False,
+                ):
+                    if event["type"] == "_subagent_result":
+                        final_content = str(event.get("content") or "")
+                    else:
+                        events.append(event)
+                return _serialize_tool_result_payload(
+                    tool_name="Skill",
+                    success=bool(final_content.strip()),
+                    message=f"Skill 已通过子代理执行：{expanded.get('name') or expanded.get('slug')}",
+                    data={
+                        "skillId": expanded.get("skillId"),
+                        "skill": expanded.get("slug"),
+                        "displayName": expanded.get("name"),
+                        "context": "fork",
+                        "agent": agent.agent_type,
+                        "result": final_content,
+                    },
+                    executed_params=params,
+                    original_params=params,
+                ), None, events
+            except Exception as exc:
+                logger.exception("[openwps.ai] Skill fork execution failed")
+                return _serialize_tool_result_payload(
+                    tool_name="Skill",
+                    success=False,
+                    message=f"Skill fork 执行失败：{_truncate_preview(_stringify_content(exc), 240)}",
+                    data={
+                        "skillId": expanded.get("skillId"),
+                        "skill": expanded.get("slug"),
+                        "context": "fork",
+                        "agent": agent_type,
+                    },
+                    executed_params=params,
+                    original_params=params,
+                ), None, events
+
+        return _serialize_tool_result_payload(
+            tool_name="Skill",
+            success=True,
+            message=f"已加载 Skill：{expanded.get('name') or expanded.get('slug')}。下一轮必须阅读并遵循已注入的 skill_context。",
+            data={
+                "skillId": expanded.get("skillId"),
+                "skill": expanded.get("slug"),
+                "displayName": expanded.get("name"),
+                "context": "inline",
+                "workspaceId": expanded.get("workspaceId"),
+            },
+            executed_params=params,
+            original_params=params,
+        ), str(expanded.get("attachment") or ""), []
+
     async def _execute_server_execution(
         self,
         execution: PlannedToolExecution,
     ) -> tuple[dict[str, str], dict[str, Any], list[dict[str, Any]]]:
+        skill_attachment: str | None = None
+        extra_events: list[dict[str, Any]] = []
         blocked_content = self._blocked_execution_content(execution)
         if blocked_content is not None:
             content = blocked_content
+            newly_loaded = []
+        elif execution.tool_name == "AskUserQuestion":
+            content = _run_ask_user_question_tool(execution.params, self.session.body)
+            newly_loaded = []
+        elif execution.tool_name == "SubmitPlanForApproval":
+            content = _run_submit_plan_for_approval_tool(execution.params, self.session.body)
+            newly_loaded = []
+        elif execution.tool_name == "Skill":
+            content, skill_attachment, extra_events = await self._execute_skill_tool_content(execution)
             newly_loaded = []
         elif execution.tool_name == TOOL_SEARCH_NAME:
             before_loaded = set(self.session.loaded_deferred_tools)
@@ -6892,13 +7254,46 @@ class QueryCoordinator:
             "sourceToolCallCount": len(execution.source_calls),
         }
 
-        events: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = list(extra_events)
+        if blocked_content is not None and _operation_mode_name(self.session.body.operationMode) == "plan":
+            events.append({
+                "type": "plan_blocked_tool",
+                "toolName": execution.tool_name,
+                "message": str(payload.get("message") or ""),
+                "data": payload.get("data"),
+            })
+        if execution.tool_name == "AskUserQuestion" and payload.get("success") is True:
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            events.append({
+                "type": "plan_question",
+                "plan": data.get("plan"),
+                "questions": data.get("questions") or [],
+            })
+        if execution.tool_name == "SubmitPlanForApproval" and payload.get("success") is True:
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            events.append({
+                "type": "plan_pending_approval",
+                "plan": data.get("plan"),
+            })
         for source_call in execution.source_calls:
             self.session.messages.append(ToolMessage(
                 content=_decorate_tool_result_content(safe_content, execution, source_call),
                 tool_call_id=source_call.id,
             ))
             events.append(_build_tool_result_event(execution, source_call, payload))
+        if skill_attachment and payload.get("success") is True:
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            skill_id = str(data.get("skillId") or execution.execution_id)
+            self.session.loaded_skills.pop(skill_id, None)
+            self.session.loaded_skills[skill_id] = skill_attachment
+            self.session.messages.append(HumanMessage(content=skill_attachment))
+            events.append({
+                "type": "skill_loaded",
+                "skillId": skill_id,
+                "skill": data.get("skill"),
+                "displayName": data.get("displayName"),
+                "context": data.get("context") or "inline",
+            })
         if image_message is not None:
             self.session.messages.append(image_message)
 
@@ -6911,6 +7306,8 @@ class QueryCoordinator:
             "contentChars": len(safe_content),
         })
         if execution.tool_name == TOOL_SEARCH_NAME:
+            context = self.session.body.context if isinstance(self.session.body.context, dict) else {}
+            skill_count = len(build_skill_discovery_delta(_stringify_content(context.get("workspaceId")).strip() or None))
             _record_content_event(self.session, {
                 "type": "tooling_delta",
                 "mode": self.session.body.mode or "layout",
@@ -6918,12 +7315,14 @@ class QueryCoordinator:
                 "loadedToolNamesHash": _stable_short_hash(newly_loaded),
                 "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
                 "deferredToolCount": len(_get_deferred_tool_definitions_for_body(self.session.body, self.session.loaded_deferred_tools)),
+                "skillDiscoveryCount": skill_count,
             })
             events.append({
                 "type": "tooling_delta",
                 "loadedToolNames": newly_loaded,
                 "loadedDeferredToolCount": len(self.session.loaded_deferred_tools),
                 "deferredToolCount": len(_get_deferred_tool_definitions_for_body(self.session.body, self.session.loaded_deferred_tools)),
+                "skillDiscoveryCount": skill_count,
             })
         return result, summary, events
 
@@ -7445,6 +7844,10 @@ class QueryCoordinator:
     async def stream(self) -> AsyncGenerator[dict[str, Any], None]:
         _record_trace_event(self.session, "session_created")
         yield {"type": "session_created", "sessionId": self.session.session_id}
+        for content_event in self.session.trace.content_events:
+            memory_event = _memory_context_loaded_event(content_event)
+            if memory_event:
+                yield memory_event
 
         try:
             async for preflight_event in self._run_layout_preflight():
@@ -7773,6 +8176,28 @@ class QueryCoordinator:
                 )
                 self.state.consecutive_empty_content = 0
 
+                plan_tool_names = {str(item.get("toolName") or "") for item in execution_summary}
+                if "AskUserQuestion" in plan_tool_names or "SubmitPlanForApproval" in plan_tool_names:
+                    reason = "plan_needs_user_input" if "AskUserQuestion" in plan_tool_names else "plan_pending_approval"
+                    self.state.transition = Transition.COMPLETED
+                    self.session.finished = True
+                    _record_round_checkpoint(
+                        self.session,
+                        round_number=self.state.round,
+                        kind="tool_round",
+                        assistant_preview=_truncate_preview(round_content),
+                        transition=self.state.transition,
+                        tool_calls=[tool_call["name"] for tool_call in round_tool_calls],
+                        plan_id=execution_plan.plan_id,
+                        execution_count=len(execution_plan.executions),
+                        tool_results=execution_summary,
+                        reason=reason,
+                        model_finish_reason=round_finish_reason,
+                    )
+                    _record_trace_event(self.session, "done", round=self.state.round, reason=reason)
+                    yield {"type": "done", "reason": reason}
+                    break
+
                 round_decision = _decide_tool_round(self.state, self.session.messages, round_tool_calls, execution_results)
                 if round_decision.action == RoundDecisionAction.FINISH:
                     self.state.transition = round_decision.transition
@@ -7901,6 +8326,9 @@ class QueryCoordinator:
                 )
                 delta_messages = list(delta_content.content or [])
                 _record_content_event(self.session, delta_content.trace)
+                memory_event = _memory_context_loaded_event(delta_content.trace)
+                if memory_event:
+                    yield memory_event
                 for delta_msg in delta_messages:
                     self.session.messages.append(HumanMessage(content=delta_msg))
                 current_workspace_docs = context.get("workspaceDocs")

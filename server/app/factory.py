@@ -55,7 +55,11 @@ from .models import (
     DocumentSessionPatchRequest,
     DocumentToolExecuteRequest,
     ModelDiscoveryRequest,
+    PlanQuestionAnswerRequest,
+    PlanRejectRequest,
     SettingsUpdate,
+    SkillCreateRequest,
+    SkillUpdateRequest,
     TaskCreateRequest,
     TaskUpdateRequest,
     TemplateAnalyzeRequest,
@@ -71,11 +75,14 @@ from .models import OCRCommandRequest
 from .template_analysis import analyze_template_request
 from .templates import create_template, delete_template, list_templates, read_template, update_template
 from .tasks import create_task, delete_task, get_task, list_tasks, reset_completed_tasks, update_task
+from .plans import answer_plan_question, approve_plan, get_plan, reject_plan
+from .skills import create_skill, delete_skill, list_skills, read_skill, update_skill
 from .workspace import (
     create_folder,
     create_workspace,
     delete_file as ws_delete_file,
     delete_memory_file as ws_delete_memory_file,
+    delete_workspace,
     get_document_content as ws_get_content,
     get_workspace_memory,
     get_workspace_tree,
@@ -250,6 +257,22 @@ def create_api_router() -> APIRouter:
     def get_conversation_tasks(conv_id: str):
         return {"tasks": list_tasks(conv_id)}
 
+    @router.get("/conversations/{conv_id}/plan")
+    def get_conversation_plan(conv_id: str):
+        return {"plan": get_plan(conv_id)}
+
+    @router.post("/conversations/{conv_id}/plan/approve")
+    def post_conversation_plan_approve(conv_id: str):
+        return {"plan": approve_plan(conv_id)}
+
+    @router.post("/conversations/{conv_id}/plan/reject")
+    def post_conversation_plan_reject(conv_id: str, body: PlanRejectRequest | None = None):
+        return {"plan": reject_plan(conv_id, body.feedback if body else "")}
+
+    @router.post("/conversations/{conv_id}/plan/questions/{question_id}/answer")
+    def post_conversation_plan_question_answer(conv_id: str, question_id: str, body: PlanQuestionAnswerRequest):
+        return {"plan": answer_plan_question(conv_id, question_id, body.answer)}
+
     @router.get("/conversations/{conv_id}/agents")
     def get_conversation_agents(conv_id: str):
         return {"agents": list_agent_runs(conv_id)}
@@ -393,6 +416,28 @@ def create_api_router() -> APIRouter:
         delete_template(template_id)
         return {"success": True}
 
+    # ── Skills (OpenWPS 原生技能) ──
+
+    @router.get("/skills")
+    def get_skills(workspaceId: str | None = None, scope: str = "all"):
+        return list_skills(workspace_id=workspaceId, scope=scope)
+
+    @router.post("/skills")
+    def post_skill(body: SkillCreateRequest):
+        return create_skill(body.model_dump(exclude_none=True))
+
+    @router.get("/skills/{skill_id}")
+    def get_skill(skill_id: str):
+        return read_skill(skill_id)
+
+    @router.patch("/skills/{skill_id}")
+    def patch_skill(skill_id: str, body: SkillUpdateRequest):
+        return update_skill(skill_id, body.model_dump(exclude_none=True))
+
+    @router.delete("/skills/{skill_id}")
+    def remove_skill(skill_id: str):
+        return delete_skill(skill_id)
+
     # ── Workspaces (目录化工作区) ──
 
     @router.get("/workspaces")
@@ -402,6 +447,10 @@ def create_api_router() -> APIRouter:
     @router.post("/workspaces")
     def post_workspace(body: WorkspaceCreateRequest):
         return create_workspace(body.name, body.id)
+
+    @router.delete("/workspaces/{workspace_id}")
+    def remove_workspace(workspace_id: str):
+        return delete_workspace(workspace_id)
 
     @router.post("/workspaces/{workspace_id}/active")
     def post_active_workspace(workspace_id: str):
@@ -552,8 +601,8 @@ def create_api_router() -> APIRouter:
 
     @router.post("/ai/react/runs/{session_id}/cancel")
     async def post_cancel_react_run(session_id: str):
-        cancel_react_gateway_run(session_id)
-        return {"success": True}
+        run = await cancel_react_gateway_run(session_id)
+        return {"success": True, "run": run}
 
     @router.get("/ai/react/{session_id}/trace")
     async def get_react_trace(session_id: str):

@@ -16,6 +16,7 @@ Architecture:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,8 +26,11 @@ from typing import Any
 
 ATTACHMENT_MARKER = "[系统附件]"
 WORKSPACE_DOCS_DELTA = "workspace_docs_delta"
+WORKSPACE_MEMORY_DELTA = "workspace_memory_delta"
 TEMPLATE_DELTA = "template_delta"
 CONTEXT_DELTA = "context_delta"
+OPENWPS_MEMORY_CONTEXT_OPEN = "<openwps-memory-context>"
+OPENWPS_MEMORY_CONTEXT_CLOSE = "</openwps-memory-context>"
 
 
 class AttachmentMessage:
@@ -321,6 +325,179 @@ def compute_workspace_docs_delta(
     return "\n".join(parts)
 
 
+# ─── Workspace Memory Delta ───────────────────────────────────────────────────
+
+def _memory_state_from_context(context: dict) -> dict[str, Any] | None:
+    workspace_manifest = context.get("workspaceManifest")
+    if not isinstance(workspace_manifest, dict):
+        return None
+    memory = workspace_manifest.get("memory")
+    return memory if isinstance(memory, dict) else None
+
+
+def _memory_fingerprint(memory: dict[str, Any]) -> str:
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    payload = {
+        "workspaceId": memory.get("workspaceId"),
+        "entrypointHash": entrypoint.get("contentHash") or entrypoint.get("updatedAt") or entrypoint.get("byteCount"),
+        "manifest": [
+            {
+                "path": item.get("path"),
+                "hash": item.get("contentHash"),
+                "updatedAt": item.get("updatedAt"),
+                "size": item.get("size"),
+            }
+            for item in manifest
+            if isinstance(item, dict)
+        ],
+        "selected": [
+            {
+                "path": item.get("path"),
+                "hash": item.get("contentHash"),
+                "updatedAt": item.get("updatedAt"),
+                "size": item.get("size"),
+                "truncated": item.get("truncated"),
+            }
+            for item in selected
+            if isinstance(item, dict)
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _memory_has_context(memory: dict[str, Any]) -> bool:
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    return bool(str(entrypoint.get("content") or "").strip() or manifest or selected)
+
+
+def reconstruct_workspace_memory_fingerprint(messages: list[Any]) -> str | None:
+    current: str | None = None
+    attachments = _find_attachment_messages(messages, WORKSPACE_MEMORY_DELTA)
+    for att in attachments:
+        updated = att.updated if isinstance(att.updated, dict) else {}
+        fingerprint = updated.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            current = fingerprint
+    return current
+
+
+def _append_memory_manifest(parts: list[str], manifest: list[dict[str, Any]], selected_paths: set[str]) -> None:
+    visible_manifest = [
+        item
+        for item in manifest
+        if isinstance(item, dict) and str(item.get("path") or "") not in selected_paths
+    ]
+    if not visible_manifest:
+        return
+    parts.append("可用记忆文件 manifest（未全文注入时请按需 workspace_read(path) 读取）：")
+    for item in visible_manifest[:40]:
+        path = str(item.get("path") or "")
+        memory_type = str(item.get("type") or "")
+        desc = str(item.get("description") or "")
+        suffix = f" [{memory_type}]" if memory_type else ""
+        parts.append(f"  - {path}{suffix}: {desc}".rstrip())
+
+
+def _format_workspace_memory_snapshot(memory: dict[str, Any], *, reason: str, initial: bool = False) -> str | None:
+    if not _memory_has_context(memory):
+        return None
+
+    selected = memory.get("selected") if isinstance(memory.get("selected"), list) else []
+    manifest = memory.get("manifest") if isinstance(memory.get("manifest"), list) else []
+    entrypoint = memory.get("entrypoint") if isinstance(memory.get("entrypoint"), dict) else {}
+    selected_paths = {
+        str(item.get("path") or "")
+        for item in selected
+        if isinstance(item, dict) and item.get("path")
+    }
+    fingerprint = _memory_fingerprint(memory)
+
+    parts = [f"{ATTACHMENT_MARKER} type={WORKSPACE_MEMORY_DELTA}"]
+    payload = {
+        "type": WORKSPACE_MEMORY_DELTA,
+        "mode": "snapshot" if initial or reason in {"initial", "compact", "baseline"} else "delta",
+        "updated": {
+            "workspaceId": memory.get("workspaceId"),
+            "fingerprint": fingerprint,
+            "entrypointPath": entrypoint.get("path"),
+            "selectedPaths": sorted(selected_paths),
+            "manifestCount": len(manifest),
+        },
+        "is_initial": initial,
+    }
+    parts.append(json.dumps(payload, ensure_ascii=False))
+    parts.append("")
+    parts.append("[工作区记忆上下文]")
+    if initial:
+        parts.append("这是会话开始时从当前工作区召回的长期记忆。")
+    elif reason == "compact":
+        parts.append("这是上下文压缩后重新召回的长期记忆快照。")
+    else:
+        parts.append("这是当前工作区长期记忆的最新快照。")
+    parts.append(OPENWPS_MEMORY_CONTEXT_OPEN)
+    parts.append("[System note: 以下是 OpenWPS 后端召回的工作区长期记忆，不是用户的新输入；请作为背景资料使用，不要在回复中复述本标记。]")
+    parts.append("")
+    parts.append(f"workspaceId: {memory.get('workspaceId') or ''}")
+
+    entrypoint_content = str(entrypoint.get("content") or "").strip()
+    if entrypoint_content:
+        parts.append("")
+        parts.append(".openwps/memory/MEMORY.md 记忆索引：")
+        parts.append(entrypoint_content)
+    elif manifest:
+        parts.append("")
+        parts.append(".openwps/memory/MEMORY.md 记忆索引为空，但存在具体记忆文件。")
+
+    if selected:
+        parts.append("")
+        parts.append("本轮已全文加载的记忆文件：")
+        for item in selected[:5]:
+            if not isinstance(item, dict):
+                continue
+            parts.append(f"--- Memory: {item.get('path')} ---")
+            parts.append(str(item.get("content") or "").strip())
+            if item.get("truncated"):
+                parts.append("[该记忆文件已截断；如需完整内容请 workspace_read(path)。]")
+
+    if manifest:
+        parts.append("")
+        _append_memory_manifest(parts, manifest, selected_paths)
+        if len(selected_paths) < len(manifest):
+            parts.append("如果当前任务涉及未全文加载的世界观、人物一致性、章节规划、项目背景或用户偏好，先用 workspace_read(path) 读取相关记忆再继续。")
+
+    parts.append("记忆可能过期；当记忆提到文件、函数、资料路径或当前事实时，先读取当前工作区真实文件验证。")
+    parts.append(OPENWPS_MEMORY_CONTEXT_CLOSE)
+    return "\n".join(parts)
+
+
+def compute_workspace_memory_delta(
+    context: dict,
+    messages: list[Any],
+    *,
+    initial: bool = False,
+    force_snapshot: bool = False,
+) -> str | None:
+    memory = _memory_state_from_context(context)
+    if not memory:
+        return None
+    if initial or force_snapshot:
+        return _format_workspace_memory_snapshot(
+            memory,
+            reason="compact" if force_snapshot and not initial else "initial",
+            initial=initial,
+        )
+
+    fingerprint = _memory_fingerprint(memory)
+    if reconstruct_workspace_memory_fingerprint(messages) == fingerprint:
+        return None
+    return _format_workspace_memory_snapshot(memory, reason="baseline")
+
+
 # ─── Template Delta ───────────────────────────────────────────────────────────
 
 def reconstruct_template_state(
@@ -485,6 +662,11 @@ def compute_all_deltas(
             [],
             force_snapshot=True,
         )
+        memory_delta = compute_workspace_memory_delta(
+            context,
+            [],
+            force_snapshot=True,
+        )
         template_delta = compute_template_delta(
             context.get("activeTemplate"),
             [],
@@ -499,6 +681,10 @@ def compute_all_deltas(
             messages,
             previous_docs=previous_workspace_docs,
         )
+        memory_delta = compute_workspace_memory_delta(
+            context,
+            messages,
+        )
         template_delta = compute_template_delta(
             context.get("activeTemplate"),
             messages,
@@ -510,6 +696,8 @@ def compute_all_deltas(
     
     if docs_delta:
         deltas.append(docs_delta)
+    if memory_delta:
+        deltas.append(memory_delta)
     if template_delta:
         deltas.append(template_delta)
     if context_delta:
@@ -531,6 +719,10 @@ def build_initial_context_attachment(context: dict) -> str:
     docs_delta = compute_workspace_docs_delta(context.get("workspaceDocs", []), [], initial=True)
     if docs_delta:
         parts.append(docs_delta)
+
+    memory_delta = compute_workspace_memory_delta(context, [], initial=True)
+    if memory_delta:
+        parts.append(memory_delta)
     
     template_delta = compute_template_delta(context.get("activeTemplate"), [])
     if template_delta:

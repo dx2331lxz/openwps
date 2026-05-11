@@ -55,4 +55,74 @@
 .ai-message-content a,
 .ai-markdown a { color: #2563eb; text-decoration: underline; }
 
+.openwps-markdown-body {
+  color: #111827;
+  line-height: 1.75;
+  font-size: 15px;
+  word-break: break-word;
+}
+.openwps-markdown-body h1,
+.openwps-markdown-body h2,
+.openwps-markdown-body h3,
+.openwps-markdown-body h4,
+.openwps-markdown-body h5,
+.openwps-markdown-body h6 {
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 1.25em 0 0.55em;
+}
+.openwps-markdown-body h1 { font-size: 2em; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.3em; }
+.openwps-markdown-body h2 { font-size: 1.55em; border-bottom: 1px solid #eef2f7; padding-bottom: 0.25em; }
+.openwps-markdown-body h3 { font-size: 1.25em; }
+.openwps-markdown-body p { margin: 0.7em 0; }
+.openwps-markdown-body ul,
+.openwps-markdown-body ol { margin: 0.7em 0; padding-left: 1.6em; }
+.openwps-markdown-body li { margin: 0.25em 0; }
+.openwps-markdown-body blockquote {
+  margin: 1em 0;
+  padding: 0.1em 1em;
+  border-left: 4px solid #cbd5e1;
+  color: #475569;
+  background: #f8fafc;
+}
+.openwps-markdown-body code {
+  border-radius: 4px;
+  background: #f1f5f9;
+  padding: 0.15em 0.35em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+.openwps-markdown-body pre {
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 1em;
+}
+.openwps-markdown-body pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.openwps-markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+}
+.openwps-markdown-body th,
+.openwps-markdown-body td {
+  border: 1px solid #dbe3ee;
+  padding: 0.45em 0.65em;
+}
+.openwps-markdown-body th {
+  background: #f8fafc;
+  font-weight: 650;
+}
+.openwps-markdown-body a { color: #2563eb; text-decoration: underline; }
+.openwps-markdown-body img { max-width: 100%; height: auto; }
+.openwps-markdown-body hr { border: 0; border-top: 1px solid #e5e7eb; margin: 1.5em 0; }
+.openwps-markdown-body > :first-child { margin-top: 0; }
+.openwps-markdown-body > :last-child { margin-bottom: 0; }
+
 .toolbar-row::-webkit-scrollbar { display: none; }

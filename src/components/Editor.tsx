@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { Check, X } from 'lucide-react'
+import { Check, Code2, Eye, Save, X } from 'lucide-react'
+import { marked, type Tokens } from 'marked'
 import { EditorState, NodeSelection, Plugin, Selection, TextSelection } from 'prosemirror-state'
 import { EditorView, Decoration, DecorationSet } from 'prosemirror-view'
 import { DOMParser as PMDOMParser, type Node as PMNode } from 'prosemirror-model'
@@ -82,6 +83,20 @@ interface AISettingsSnapshot {
   model?: string
 }
 
+type DocumentMode = 'document' | 'markdown'
+type MarkdownFileType = 'md' | 'markdown'
+type MarkdownViewMode = 'preview' | 'source'
+
+interface MarkdownDocumentState {
+  workspaceId?: string
+  filePath?: string
+  fileType: MarkdownFileType
+  source: string
+  draft: string
+  viewMode: MarkdownViewMode
+  dirty: boolean
+}
+
 interface EditorDraftSnapshot {
   version: 1
   savedAt: string
@@ -95,6 +110,15 @@ interface EditorDraftSnapshot {
     from: number
     to: number
   }
+  documentMode?: DocumentMode
+  activeWorkspaceFile?: WorkspaceFileRef
+  currentWorkspaceId?: string
+  markdownDocument?: MarkdownDocumentState
+}
+
+interface WorkspacesResponse {
+  activeWorkspaceId?: string
+  workspaces?: Array<{ id?: string }>
 }
 
 interface BlockAIPopoverState {
@@ -399,10 +423,103 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
-function buildImportedDocumentName(filename: string) {
-  const trimmed = filename.trim()
-  if (!trimmed) return DEFAULT_SERVER_DOCUMENT_NAME
-  return trimmed.replace(/\.(md|markdown)$/i, '.docx')
+function isMarkdownFileType(fileType: string | undefined | null) {
+  const normalized = String(fileType || '').trim().toLowerCase()
+  return normalized === 'md' || normalized === 'markdown'
+}
+
+function markdownFileTypeFromPath(path: string, fallback: MarkdownFileType = 'md'): MarkdownFileType {
+  const normalized = path.trim().toLowerCase()
+  if (normalized.endsWith('.markdown')) return 'markdown'
+  if (normalized.endsWith('.md')) return 'md'
+  return fallback
+}
+
+function isMarkdownWorkspaceFile(path: string, fileType?: string | null) {
+  return isMarkdownFileType(fileType) || /\.(md|markdown)$/i.test(path)
+}
+
+function normalizeWorkspaceFileRef(value: unknown): WorkspaceFileRef | undefined {
+  if (!isRecord(value)) return undefined
+  if (typeof value.workspaceId !== 'string' || !value.workspaceId.trim()) return undefined
+  if (typeof value.filePath !== 'string' || !value.filePath.trim()) return undefined
+  const fileType = typeof value.fileType === 'string' && value.fileType.trim()
+    ? value.fileType
+    : value.filePath.split('.').pop() || 'docx'
+  return {
+    workspaceId: value.workspaceId,
+    filePath: value.filePath,
+    fileType,
+  }
+}
+
+function normalizeMarkdownDocumentState(value: unknown): MarkdownDocumentState | undefined {
+  if (!isRecord(value)) return undefined
+  const draft = typeof value.draft === 'string' ? value.draft : undefined
+  if (draft === undefined) return undefined
+  const filePath = typeof value.filePath === 'string' && value.filePath.trim()
+    ? value.filePath
+    : undefined
+  const rawFileType = typeof value.fileType === 'string' ? value.fileType : undefined
+  const fileType = isMarkdownFileType(rawFileType)
+    ? rawFileType as MarkdownFileType
+    : markdownFileTypeFromPath(filePath || '', 'md')
+  const workspaceId = typeof value.workspaceId === 'string' && value.workspaceId.trim()
+    ? value.workspaceId
+    : undefined
+  const source = typeof value.source === 'string' ? value.source : draft
+  return {
+    workspaceId,
+    filePath,
+    fileType,
+    source,
+    draft,
+    viewMode: value.viewMode === 'source' ? 'source' : 'preview',
+    dirty: typeof value.dirty === 'boolean' ? value.dirty : draft !== source,
+  }
+}
+
+function workspaceFileRefFromMarkdownDocument(document: MarkdownDocumentState | null | undefined): WorkspaceFileRef | null {
+  if (!document?.workspaceId || !document.filePath) return null
+  return {
+    workspaceId: document.workspaceId,
+    filePath: document.filePath,
+    fileType: document.fileType,
+  }
+}
+
+function ensureDocxDocumentName(filename: string) {
+  const trimmed = filename.trim() || DEFAULT_SERVER_DOCUMENT_NAME
+  const fileName = trimmed.split(/[\\/]/).pop() || DEFAULT_SERVER_DOCUMENT_NAME
+  return fileName.toLowerCase().endsWith('.docx') ? fileName : `${fileName}.docx`
+}
+
+function joinWorkspacePath(dir: string, name: string) {
+  const cleanName = name.trim().replace(/^\/+/, '')
+  if (!dir) return cleanName
+  return `${dir.replace(/\/+$/, '')}/${cleanName}`
+}
+
+function parentWorkspacePath(path: string) {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+$/, '')
+  const index = normalized.lastIndexOf('/')
+  return index >= 0 ? normalized.slice(0, index) : ''
+}
+
+function isMemoryWorkspacePath(path: string) {
+  const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '')
+  return normalized === '.openwps/memory' || normalized.startsWith('.openwps/memory/')
+}
+
+function toMemoryApiPath(path: string) {
+  return path.replace(/\\/g, '/').replace(/^\.openwps\/memory\/?/, '')
+}
+
+function buildMarkdownDocumentName(filename: string, fallbackType: MarkdownFileType = 'md') {
+  const trimmed = filename.trim() || `document.${fallbackType}`
+  const fileName = trimmed.split(/[\\/]/).pop() || `document.${fallbackType}`
+  if (/\.(md|markdown)$/i.test(fileName)) return fileName
+  return `${fileName}.${fallbackType}`
 }
 
 function buildDocumentNameFromTitle(title: string, currentName: string) {
@@ -531,6 +648,13 @@ function readEditorDraftSnapshot(): EditorDraftSnapshot | null {
       && typeof parsed.selection.to === 'number'
       ? { from: parsed.selection.from, to: parsed.selection.to }
       : undefined
+    const markdownDocument = normalizeMarkdownDocumentState(parsed.markdownDocument)
+    const activeWorkspaceFile = normalizeWorkspaceFileRef(parsed.activeWorkspaceFile)
+      ?? workspaceFileRefFromMarkdownDocument(markdownDocument)
+      ?? undefined
+    const documentMode: DocumentMode = parsed.documentMode === 'markdown' && markdownDocument
+      ? 'markdown'
+      : 'document'
 
     return {
       version: 1,
@@ -544,6 +668,10 @@ function readEditorDraftSnapshot(): EditorDraftSnapshot | null {
       docxLetterSpacingPx: typeof parsed.docxLetterSpacingPx === 'number' ? parsed.docxLetterSpacingPx : 0,
       doc: parsed.doc as PMNodeJSON,
       selection,
+      documentMode,
+      activeWorkspaceFile,
+      currentWorkspaceId: typeof parsed.currentWorkspaceId === 'string' ? parsed.currentWorkspaceId : activeWorkspaceFile?.workspaceId,
+      markdownDocument,
     }
   } catch (error) {
     console.warn('[Editor] failed to restore editor draft, clearing snapshot', error)
@@ -559,6 +687,32 @@ function writeEditorDraftSnapshot(snapshot: EditorDraftSnapshot) {
   } catch (error) {
     console.warn('[Editor] failed to save editor draft', error)
   }
+}
+
+function escapeHtmlText(text: string) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const safeMarkdownRenderer = new marked.Renderer()
+safeMarkdownRenderer.html = ({ text }: Tokens.HTML | Tokens.Tag) => escapeHtmlText(text)
+
+function markdownToSafeHtml(markdown: string) {
+  const parsed = marked.parse(markdown, { renderer: safeMarkdownRenderer })
+  return typeof parsed === 'string' ? parsed : escapeHtmlText(markdown)
+}
+
+function markdownPreviewSource(markdown: string) {
+  const normalized = markdown.replace(/\r\n?/g, '\n')
+  const lines = normalized.split('\n')
+  if ((lines[0] ?? '').trim() !== '---') return markdown
+  const endIndex = lines.findIndex((line, index) => index > 0 && ['---', '...'].includes(line.trim()))
+  if (endIndex < 0) return markdown
+  return lines.slice(endIndex + 1).join('\n').replace(/^\s+/, '')
 }
 
 // Widget height for a break after a page that used `usedH` px of content:
@@ -1708,9 +1862,154 @@ function initState(initial?: { doc?: PMNodeJSON; selection?: { from: number; to:
   }
 }
 
+interface MarkdownDocumentViewProps {
+  document: MarkdownDocumentState
+  documentName: string
+  onChange: (nextDraft: string) => void
+  onViewModeChange: (viewMode: MarkdownViewMode) => void
+  onSave: () => void | Promise<void>
+}
+
+const MarkdownDocumentView: React.FC<MarkdownDocumentViewProps> = ({
+  document,
+  documentName,
+  onChange,
+  onViewModeChange,
+  onSave,
+}) => {
+  const html = React.useMemo(() => markdownToSafeHtml(markdownPreviewSource(document.draft)), [document.draft])
+  const isPreview = document.viewMode === 'preview'
+  const scrollContainerRef = React.useRef<HTMLDivElement | null>(null)
+  const contentRef = React.useRef<HTMLElement | null>(null)
+  const pendingScrollProgressRef = React.useRef<number | null>(null)
+
+  const captureScrollProgress = React.useCallback(() => {
+    const scroller = scrollContainerRef.current
+    const content = contentRef.current
+    if (document.viewMode === 'source' && content instanceof HTMLTextAreaElement) {
+      const maxTextScroll = Math.max(content.scrollHeight - content.clientHeight, 0)
+      if (maxTextScroll > 0) return Math.max(0, Math.min(1, content.scrollTop / maxTextScroll))
+    }
+
+    if (!scroller) return 0
+    const maxScroll = Math.max(scroller.scrollHeight - scroller.clientHeight, 0)
+    if (maxScroll <= 0) return 0
+    return Math.max(0, Math.min(1, scroller.scrollTop / maxScroll))
+  }, [document.viewMode])
+
+  const restoreScrollProgress = React.useCallback((progress: number) => {
+    const scroller = scrollContainerRef.current
+    const content = contentRef.current
+    if (document.viewMode === 'source' && content instanceof HTMLTextAreaElement) {
+      const maxTextScroll = Math.max(content.scrollHeight - content.clientHeight, 0)
+      content.scrollTop = Math.max(0, Math.min(maxTextScroll, progress * maxTextScroll))
+      return
+    }
+
+    if (!scroller) return
+    const maxScroll = Math.max(scroller.scrollHeight - scroller.clientHeight, 0)
+    scroller.scrollTop = Math.max(0, Math.min(maxScroll, progress * maxScroll))
+  }, [document.viewMode])
+
+  const handleViewModeChange = React.useCallback((viewMode: MarkdownViewMode) => {
+    if (viewMode === document.viewMode) return
+    pendingScrollProgressRef.current = captureScrollProgress()
+    onViewModeChange(viewMode)
+  }, [captureScrollProgress, document.viewMode, onViewModeChange])
+
+  React.useLayoutEffect(() => {
+    const progress = pendingScrollProgressRef.current
+    if (progress == null) return
+    pendingScrollProgressRef.current = null
+    restoreScrollProgress(progress)
+  }, [document.viewMode, restoreScrollProgress])
+
+  return (
+    <div
+      data-openwps-markdown-view="true"
+      className="mx-auto flex h-full min-h-0 w-full max-w-[920px] flex-col px-6"
+    >
+      <div
+        data-openwps-markdown-header="true"
+        className="flex flex-shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-[#e8e8e8] py-3"
+      >
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-slate-900" title={document.filePath || documentName}>
+            {document.filePath || documentName}
+          </div>
+          <div className="text-xs text-slate-500">
+            {document.dirty ? 'Markdown 源码有未保存修改' : 'Markdown 源码已保存'}
+          </div>
+        </div>
+        <div className="flex flex-shrink-0 items-center gap-2">
+          <div className="inline-flex h-9 overflow-hidden rounded-md border border-slate-300 bg-white">
+            <button
+              type="button"
+              data-openwps-markdown-preview-toggle="true"
+              onClick={() => handleViewModeChange('preview')}
+              className={`flex h-full items-center gap-1.5 px-3 text-sm ${isPreview ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
+              title="预览 Markdown"
+            >
+              <Eye size={15} />
+              <span>预览</span>
+            </button>
+            <button
+              type="button"
+              data-openwps-markdown-source-toggle="true"
+              onClick={() => handleViewModeChange('source')}
+              className={`flex h-full items-center gap-1.5 border-l border-slate-200 px-3 text-sm ${!isPreview ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
+              title="编辑 Markdown 源码"
+            >
+              <Code2 size={15} />
+              <span>源码</span>
+            </button>
+          </div>
+          <button
+            type="button"
+            data-openwps-markdown-save="true"
+            onClick={() => { void onSave() }}
+            className="flex h-9 items-center gap-1.5 rounded-md bg-blue-600 px-3 text-sm font-medium text-white hover:bg-blue-700 disabled:bg-blue-300"
+            disabled={!document.dirty}
+            title="保存 Markdown"
+          >
+            <Save size={15} />
+            <span>保存</span>
+          </button>
+        </div>
+      </div>
+
+      <div
+        ref={scrollContainerRef}
+        data-openwps-markdown-scroll="true"
+        className={`min-h-0 flex-1 py-8 ${isPreview ? 'overflow-y-auto overflow-x-visible' : 'overflow-hidden'}`}
+      >
+        {isPreview ? (
+          <article
+            ref={element => { contentRef.current = element }}
+            className="openwps-markdown-body rounded-md bg-white px-12 py-10 shadow-[0_2px_12px_rgba(0,0,0,0.12)]"
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        ) : (
+          <textarea
+            ref={element => { contentRef.current = element }}
+            data-openwps-markdown-source="true"
+            value={document.draft}
+            onChange={event => onChange(event.currentTarget.value)}
+            spellCheck={false}
+            className="box-border h-full min-h-[420px] w-full resize-none rounded-md border border-slate-300 bg-white px-4 py-3 font-mono text-sm leading-6 text-slate-900 shadow-[0_2px_12px_rgba(0,0,0,0.12)] outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── Editor component ─────────────────────────────────────────────────────────
 export const Editor: React.FC = () => {
   const [initialDraft] = useState<EditorDraftSnapshot | null>(() => readEditorDraftSnapshot())
+  const restoredMarkdownDocument = initialDraft?.documentMode === 'markdown' ? initialDraft.markdownDocument ?? null : null
+  const restoredDocumentMode: DocumentMode = restoredMarkdownDocument ? 'markdown' : 'document'
+  const restoredWorkspaceFile = initialDraft?.activeWorkspaceFile ?? workspaceFileRefFromMarkdownDocument(restoredMarkdownDocument)
   const mountRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -1745,7 +2044,11 @@ export const Editor: React.FC = () => {
   })
   const [documentSettingsSaving, setDocumentSettingsSaving] = useState(false)
   const [currentDocumentName, setCurrentDocumentName] = useState(initialDraft?.currentDocumentName ?? DEFAULT_SERVER_DOCUMENT_NAME)
-  const [activeWorkspaceFile, setActiveWorkspaceFile] = useState<WorkspaceFileRef | null>(null)
+  const [activeWorkspaceFile, setActiveWorkspaceFile] = useState<WorkspaceFileRef | null>(restoredWorkspaceFile ?? null)
+  const [documentMode, setDocumentMode] = useState<DocumentMode>(restoredDocumentMode)
+  const [activeMarkdownDocument, setActiveMarkdownDocument] = useState<MarkdownDocumentState | null>(restoredMarkdownDocument)
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState(initialDraft?.currentWorkspaceId ?? restoredWorkspaceFile?.workspaceId ?? '')
+  const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0)
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [templateManagerOpen, setTemplateManagerOpen] = useState(false)
   const [activeTemplate, setActiveTemplate] = useState<TemplateRecord | null>(null)
@@ -1765,6 +2068,8 @@ export const Editor: React.FC = () => {
   const aiCopilotPreviewRef = useRef<AICopilotPreview | null>(null)
   const aiCopilotEnabledRef = useRef(aiCopilotEnabled)
   const editorStateRef = useRef<EditorState | null>(null)
+  const documentModeRef = useRef<DocumentMode>(restoredDocumentMode)
+  const activeMarkdownDocumentRef = useRef<MarkdownDocumentState | null>(restoredMarkdownDocument)
   const documentClientIdRef = useRef(createDocumentClientId())
   const documentSessionRef = useRef<{ id: string; version: number } | null>(null)
   const [documentSessionInfo, setDocumentSessionInfo] = useState<{ id: string; version: number } | null>(null)
@@ -1782,6 +2087,8 @@ export const Editor: React.FC = () => {
   useEffect(() => { aiCopilotEnabledRef.current = aiCopilotEnabled }, [aiCopilotEnabled])
   useEffect(() => { editorStateRef.current = editorState }, [editorState])
   useEffect(() => { editorFocusedRef.current = editorFocused }, [editorFocused])
+  useEffect(() => { documentModeRef.current = documentMode }, [documentMode])
+  useEffect(() => { activeMarkdownDocumentRef.current = activeMarkdownDocument }, [activeMarkdownDocument])
   useEffect(() => {
     aiCopilotPreviewRef.current = aiCopilotState.status === 'preview' ? aiCopilotState.preview : null
   }, [aiCopilotState])
@@ -1802,8 +2109,12 @@ export const Editor: React.FC = () => {
         from: state.selection.from,
         to: state.selection.to,
       },
+      documentMode: documentModeRef.current,
+      activeWorkspaceFile: activeWorkspaceFile ?? workspaceFileRefFromMarkdownDocument(activeMarkdownDocumentRef.current) ?? undefined,
+      currentWorkspaceId,
+      markdownDocument: activeMarkdownDocumentRef.current ?? undefined,
     }
-  }, [currentDocumentName, documentSettings.activeSource, docxLetterSpacingPx, pageConfig])
+  }, [activeWorkspaceFile, currentDocumentName, currentWorkspaceId, documentSettings.activeSource, docxLetterSpacingPx, pageConfig])
 
   useEffect(() => {
     if (!editorState) return undefined
@@ -1812,7 +2123,18 @@ export const Editor: React.FC = () => {
       if (snapshot) writeEditorDraftSnapshot(snapshot)
     }, EDITOR_DRAFT_SAVE_DELAY_MS)
     return () => window.clearTimeout(timer)
-  }, [buildEditorDraftSnapshot, currentDocumentName, documentSettings.activeSource, docxLetterSpacingPx, editorState, pageConfig])
+  }, [
+    activeMarkdownDocument,
+    activeWorkspaceFile,
+    buildEditorDraftSnapshot,
+    currentDocumentName,
+    currentWorkspaceId,
+    documentMode,
+    documentSettings.activeSource,
+    docxLetterSpacingPx,
+    editorState,
+    pageConfig,
+  ])
 
   useEffect(() => {
     const flushDraft = () => {
@@ -1900,17 +2222,25 @@ export const Editor: React.FC = () => {
     })
   }, [])
 
-  const registerActiveDocumentSession = useCallback(async (sessionId: string) => {
+  const registerActiveDocumentSession = useCallback(async (
+    sessionId: string,
+    metadata?: {
+      currentDocumentName?: string
+      workspaceId?: string
+      filePath?: string
+      fileType?: string
+    },
+  ) => {
     try {
       await fetch(`/api/doc-sessions/${sessionId}/active`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clientId: documentClientIdRef.current,
-          currentDocumentName: currentDocumentName || undefined,
-          workspaceId: activeWorkspaceFile?.workspaceId,
-          filePath: activeWorkspaceFile?.filePath,
-          fileType: activeWorkspaceFile?.fileType,
+          currentDocumentName: (metadata?.currentDocumentName ?? currentDocumentName) || undefined,
+          workspaceId: metadata?.workspaceId ?? activeWorkspaceFile?.workspaceId,
+          filePath: metadata?.filePath ?? activeWorkspaceFile?.filePath,
+          fileType: metadata?.fileType ?? activeWorkspaceFile?.fileType,
         }),
       })
     } catch (error) {
@@ -1982,6 +2312,47 @@ export const Editor: React.FC = () => {
     }, SERVER_DOCUMENT_SYNC_DELAY_MS)
     return () => window.clearTimeout(timer)
   }, [currentDocumentName, editorState, pageConfig, syncDocumentSession])
+
+  useEffect(() => {
+    if (documentMode !== 'markdown' || !activeMarkdownDocument) return undefined
+    const timer = window.setTimeout(() => {
+      try {
+        const doc = markdownToDocument(activeMarkdownDocument.draft)
+        applyDocumentState(doc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
+      } catch (error) {
+        console.warn('同步 Markdown 到后端文档模型失败', error)
+      }
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [activeMarkdownDocument, applyDocumentState, documentMode])
+
+  useEffect(() => {
+    let cancelled = false
+    const loadCurrentWorkspace = async () => {
+      try {
+        const response = await fetch('/api/workspaces')
+        const data = await readJsonResponse<WorkspacesResponse>(response)
+        const nextWorkspaceId = data.activeWorkspaceId || data.workspaces?.find(item => item.id)?.id || ''
+        if (!cancelled && nextWorkspaceId) setCurrentWorkspaceId(nextWorkspaceId)
+      } catch (error) {
+        console.warn('读取当前工作区失败', error)
+      }
+    }
+    void loadCurrentWorkspace()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const resolveCurrentWorkspaceId = useCallback(async () => {
+    if (currentWorkspaceId) return currentWorkspaceId
+    const response = await fetch('/api/workspaces')
+    const data = await readJsonResponse<WorkspacesResponse>(response)
+    const nextWorkspaceId = data.activeWorkspaceId || data.workspaces?.find(item => item.id)?.id || ''
+    if (!nextWorkspaceId) throw new Error('没有可用工作区')
+    setCurrentWorkspaceId(nextWorkspaceId)
+    return nextWorkspaceId
+  }, [currentWorkspaceId])
 
   const loadDocumentSettings = useCallback(async () => {
     const response = await fetch('/api/documents/settings')
@@ -2269,8 +2640,27 @@ export const Editor: React.FC = () => {
           ? data.pageConfig as PageConfig
           : null
         if (nextDocJson) {
-          applyDocumentState(nextDocJson, nextPageConfig ?? pageConfigRef.current)
-          clearImportedDocxCompatibility()
+          if (documentModeRef.current === 'markdown') {
+            applyDocumentState(nextDocJson, nextPageConfig ?? DEFAULT_PAGE_CONFIG)
+            try {
+              const nextMarkdown = serializeEditorDoc(
+                schema.nodeFromJSON(nextDocJson),
+                activeMarkdownDocumentRef.current?.fileType ?? 'md',
+              )
+              setActiveMarkdownDocument(current => current
+                ? {
+                  ...current,
+                  draft: nextMarkdown,
+                  dirty: nextMarkdown !== current.source,
+                }
+                : current)
+            } catch (error) {
+              console.warn('将后端文档事件转换为 Markdown 失败', error)
+            }
+          } else {
+            applyDocumentState(nextDocJson, nextPageConfig ?? pageConfigRef.current)
+            clearImportedDocxCompatibility()
+          }
         } else if (nextPageConfig) {
           setPageConfig(nextPageConfig)
           pageConfigRef.current = nextPageConfig
@@ -2579,6 +2969,8 @@ export const Editor: React.FC = () => {
     if (!editorView) return
 
     try {
+      setDocumentMode('document')
+      setActiveMarkdownDocument(null)
       const parsed = await importDocx(file)
       applyingImportedDocxRef.current = true
       applyDocumentState(parsed.doc, parsed.pageConfig, {
@@ -2606,10 +2998,20 @@ export const Editor: React.FC = () => {
   const handleImportMarkdown = useCallback(async (file: File) => {
     try {
       const markdown = await file.text()
+      const fileType = markdownFileTypeFromPath(file.name)
+      const documentName = buildMarkdownDocumentName(file.name || `document.${fileType}`, fileType)
       const doc = markdownToDocument(markdown)
       applyDocumentState(doc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
-      setCurrentDocumentName(buildImportedDocumentName(file.name || DEFAULT_SERVER_DOCUMENT_NAME))
+      setDocumentMode('markdown')
+      setCurrentDocumentName(documentName)
       setActiveWorkspaceFile(null)
+      setActiveMarkdownDocument({
+        fileType,
+        source: '',
+        draft: markdown,
+        viewMode: 'preview',
+        dirty: true,
+      })
       repaginate()
       window.alert('Markdown 导入成功')
     } catch (error) {
@@ -2628,12 +3030,134 @@ export const Editor: React.FC = () => {
     await handleImportDocx(file)
   }, [handleImportDocx, handleImportMarkdown])
 
-  const handleDocumentTitleChange = useCallback((title: string) => {
-    setCurrentDocumentName(current => buildDocumentNameFromTitle(title, current))
-  }, [])
+  const handleDocumentTitleChange = useCallback(async (title: string) => {
+    if (!activeWorkspaceFile) {
+      setCurrentDocumentName(current => buildDocumentNameFromTitle(title, current))
+      return
+    }
+
+    const currentName = activeWorkspaceFile.filePath.split('/').pop() || currentDocumentName
+    const nextName = buildDocumentNameFromTitle(title, currentName)
+    const nextPath = joinWorkspacePath(parentWorkspacePath(activeWorkspaceFile.filePath), nextName)
+    if (!nextPath || nextPath === activeWorkspaceFile.filePath) {
+      setCurrentDocumentName(nextName || currentDocumentName)
+      return
+    }
+
+    try {
+      const response = isMemoryWorkspacePath(activeWorkspaceFile.filePath)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspaceFile.workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(activeWorkspaceFile.filePath))}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: toMemoryApiPath(nextPath) }),
+        })
+        : await fetch(`/api/workspaces/${encodeURIComponent(activeWorkspaceFile.workspaceId)}/files/${encodeURIComponent(activeWorkspaceFile.filePath)}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ toPath: nextPath }),
+        })
+      const data = await readJsonResponse<{ workspaceId?: string; path?: string }>(response)
+      const renamedPath = data.path || nextPath
+      const renamedName = renamedPath.split('/').pop() || nextName
+      const nextFile: WorkspaceFileRef = {
+        ...activeWorkspaceFile,
+        workspaceId: data.workspaceId || activeWorkspaceFile.workspaceId,
+        filePath: renamedPath,
+      }
+      setActiveWorkspaceFile(nextFile)
+      setCurrentWorkspaceId(nextFile.workspaceId)
+      setCurrentDocumentName(renamedName)
+      setActiveMarkdownDocument(current => current
+        ? {
+          ...current,
+          workspaceId: nextFile.workspaceId,
+          filePath: nextFile.filePath,
+          fileType: markdownFileTypeFromPath(nextFile.filePath, current.fileType),
+        }
+        : current)
+      setWorkspaceRefreshToken(value => value + 1)
+      const session = documentSessionRef.current
+      if (session) {
+        await registerActiveDocumentSession(session.id, {
+          currentDocumentName: renamedName,
+          workspaceId: nextFile.workspaceId,
+          filePath: nextFile.filePath,
+          fileType: nextFile.fileType,
+        })
+      }
+    } catch (error) {
+      console.error('[Editor] rename workspace file from title failed', error)
+      window.alert(`重命名工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [activeWorkspaceFile, currentDocumentName, registerActiveDocumentSession])
+
+  const handleWorkspaceActiveFileMoved = useCallback((file: WorkspaceFileRef) => {
+    setActiveWorkspaceFile(file)
+    setCurrentWorkspaceId(file.workspaceId)
+    setCurrentDocumentName(file.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME)
+    setActiveMarkdownDocument(current => current
+      ? {
+        ...current,
+        workspaceId: file.workspaceId,
+        filePath: file.filePath,
+        fileType: markdownFileTypeFromPath(file.filePath, current.fileType),
+      }
+      : current)
+    const session = documentSessionRef.current
+    if (session) {
+      void registerActiveDocumentSession(session.id, {
+        currentDocumentName: file.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME,
+        workspaceId: file.workspaceId,
+        filePath: file.filePath,
+        fileType: file.fileType,
+      })
+    }
+  }, [registerActiveDocumentSession])
+
+  const handleWorkspaceDeleted = useCallback((deletedWorkspaceId: string, nextWorkspaceId: string) => {
+    setCurrentWorkspaceId(nextWorkspaceId)
+    const markdownDocument = activeMarkdownDocumentRef.current
+    const deletedFilePath = activeWorkspaceFile?.workspaceId === deletedWorkspaceId
+      ? activeWorkspaceFile.filePath
+      : markdownDocument?.workspaceId === deletedWorkspaceId
+        ? markdownDocument.filePath
+        : undefined
+    if (!deletedFilePath) return
+
+    const releasedName = deletedFilePath.split('/').pop() || currentDocumentName || DEFAULT_SERVER_DOCUMENT_NAME
+    setActiveWorkspaceFile(null)
+    setCurrentDocumentName(releasedName)
+    setActiveMarkdownDocument(current => current?.workspaceId === deletedWorkspaceId
+      ? {
+        ...current,
+        workspaceId: undefined,
+        filePath: undefined,
+        dirty: true,
+      }
+      : current)
+
+    const session = documentSessionRef.current
+    if (session) {
+      void fetch(`/api/doc-sessions/${session.id}/active`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clientId: documentClientIdRef.current,
+          currentDocumentName: releasedName,
+          workspaceId: '',
+          filePath: '',
+          fileType: '',
+        }),
+      }).catch(error => {
+        console.warn('清除工作区文档会话绑定失败', error)
+      })
+    }
+  }, [activeWorkspaceFile?.filePath, activeWorkspaceFile?.workspaceId, currentDocumentName])
 
   const handleNewDocument = useCallback(() => {
     const blankDoc = createBlankEditorDoc()
+    setDocumentMode('document')
+    setActiveMarkdownDocument(null)
     applyDocumentState(blankDoc.toJSON() as PMNodeJSON, DEFAULT_PAGE_CONFIG)
     setCurrentDocumentName(buildUntitledDocumentName(documentFiles.map(file => file.name)))
     setActiveWorkspaceFile(null)
@@ -2656,6 +3180,8 @@ export const Editor: React.FC = () => {
 
   const handleOpenDocument = useCallback(async (name: string) => {
     try {
+      setDocumentMode('document')
+      setActiveMarkdownDocument(null)
       const searchParams = new URLSearchParams({ source: documentSettings.activeSource })
       const response = await fetch(`/api/documents/${encodeURIComponent(name)}?${searchParams.toString()}`)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -2676,8 +3202,104 @@ export const Editor: React.FC = () => {
     }
   }, [documentSettings.activeSource, handleImportDocx, loadDocumentFiles])
 
+  const createMarkdownDocumentSession = useCallback(async (
+    docJson: PMNodeJSON,
+    metadata: {
+      currentDocumentName: string
+      workspaceId?: string
+      filePath?: string
+      fileType?: string
+    },
+  ) => {
+    const response = await fetch('/api/doc-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        docJson,
+        pageConfig: DEFAULT_PAGE_CONFIG,
+        clientId: documentClientIdRef.current,
+        currentDocumentName: metadata.currentDocumentName,
+        workspaceId: metadata.workspaceId,
+        filePath: metadata.filePath,
+        fileType: metadata.fileType,
+      }),
+    })
+    const data = await readJsonResponse<{ documentSessionId?: string; version?: number }>(response)
+    const id = String(data.documentSessionId || '')
+    if (!id) throw new Error('后端未返回 documentSessionId')
+    rememberDocumentSession({ id, version: Number(data.version ?? 1) || 1 })
+    await registerActiveDocumentSession(id, metadata)
+  }, [registerActiveDocumentSession, rememberDocumentSession])
+
+  const readWorkspaceMarkdownSource = useCallback(async (workspaceId: string, filePath: string) => {
+    const response = isMemoryWorkspacePath(filePath)
+      ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(filePath))}`)
+      : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(filePath)}/content`)
+    const data = await readJsonResponse<{
+      workspaceId?: string
+      path?: string
+      type?: string
+      content?: string
+    }>(response)
+    const resolvedPath = data.path || filePath
+    const resolvedType = isMarkdownFileType(data.type)
+      ? data.type as MarkdownFileType
+      : markdownFileTypeFromPath(resolvedPath, markdownFileTypeFromPath(filePath))
+    return {
+      workspaceId: data.workspaceId || workspaceId,
+      filePath: resolvedPath,
+      fileType: resolvedType,
+      content: data.content ?? '',
+    }
+  }, [])
+
+  const openMarkdownWorkspaceFile = useCallback(async (workspaceId: string, filePath: string) => {
+    const markdown = await readWorkspaceMarkdownSource(workspaceId, filePath)
+    const doc = markdownToDocument(markdown.content)
+    const docJson = doc.toJSON() as PMNodeJSON
+    const currentName = markdown.filePath.split('/').pop() || buildMarkdownDocumentName(filePath, markdown.fileType)
+    const nextFile: WorkspaceFileRef = {
+      workspaceId: markdown.workspaceId,
+      filePath: markdown.filePath,
+      fileType: markdown.fileType,
+    }
+    setDocumentMode('markdown')
+    setCurrentWorkspaceId(nextFile.workspaceId)
+    setActiveWorkspaceFile(nextFile)
+    setCurrentDocumentName(currentName)
+    setSelectedBlockPos(null)
+    setBlockAIPopover(null)
+    setActiveComment(null)
+    setAddCommentAnchor(null)
+    setPendingCommentTarget(null)
+    setVisibleComments([])
+    setAICopilotState({ status: 'idle' })
+    setActiveMarkdownDocument({
+      workspaceId: nextFile.workspaceId,
+      filePath: nextFile.filePath,
+      fileType: markdown.fileType,
+      source: markdown.content,
+      draft: markdown.content,
+      viewMode: 'preview',
+      dirty: false,
+    })
+    applyDocumentState(docJson, DEFAULT_PAGE_CONFIG)
+    await createMarkdownDocumentSession(docJson, {
+      currentDocumentName: currentName,
+      workspaceId: nextFile.workspaceId,
+      filePath: nextFile.filePath,
+      fileType: nextFile.fileType,
+    })
+  }, [applyDocumentState, createMarkdownDocumentSession, readWorkspaceMarkdownSource])
+
   const handleOpenWorkspaceFile = useCallback(async (workspaceId: string, filePath: string) => {
     try {
+      if (isMarkdownWorkspaceFile(filePath)) {
+        await openMarkdownWorkspaceFile(workspaceId, filePath)
+        return
+      }
+      setDocumentMode('document')
+      setActiveMarkdownDocument(null)
       const response = await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/open`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2711,6 +3333,7 @@ export const Editor: React.FC = () => {
         filePath: data.filePath || filePath,
         fileType: data.fileType || filePath.split('.').pop() || 'docx',
       }
+      setCurrentWorkspaceId(nextFile.workspaceId)
       setActiveWorkspaceFile(nextFile)
       setCurrentDocumentName(data.currentDocumentName || nextFile.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME)
       if (data.documentSessionId) {
@@ -2721,9 +3344,92 @@ export const Editor: React.FC = () => {
       console.error('[Editor] open workspace file failed', error)
       window.alert(`打开工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
     }
-  }, [applyDocumentState, registerActiveDocumentSession, rememberDocumentSession, repaginate])
+  }, [applyDocumentState, openMarkdownWorkspaceFile, registerActiveDocumentSession, rememberDocumentSession, repaginate])
+
+  const handleMarkdownDraftChange = useCallback((nextDraft: string) => {
+    setActiveMarkdownDocument(current => current
+      ? {
+        ...current,
+        draft: nextDraft,
+        dirty: nextDraft !== current.source,
+      }
+      : current)
+  }, [])
+
+  const handleMarkdownViewModeChange = useCallback((viewMode: MarkdownViewMode) => {
+    setActiveMarkdownDocument(current => current ? { ...current, viewMode } : current)
+  }, [])
+
+  const handleSaveMarkdownDocument = useCallback(async () => {
+    const markdownDoc = activeMarkdownDocumentRef.current
+    if (!markdownDoc) return
+    const workspaceId = markdownDoc.workspaceId || await resolveCurrentWorkspaceId()
+    const targetPath = markdownDoc.filePath || buildMarkdownDocumentName(currentDocumentName, markdownDoc.fileType)
+    try {
+      const response = isMemoryWorkspacePath(targetPath)
+        ? await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/files/${encodeURIComponent(toMemoryApiPath(targetPath))}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+          body: markdownDoc.draft,
+        })
+        : await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(targetPath)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'text/markdown; charset=utf-8' },
+          body: markdownDoc.draft,
+        })
+      const data = await readJsonResponse<{
+        workspaceId?: string
+        path?: string
+        name?: string
+        type?: string
+      }>(response)
+      const savedWorkspaceId = data.workspaceId || workspaceId
+      const savedPath = data.path || targetPath
+      const savedType = isMarkdownFileType(data.type)
+        ? data.type as MarkdownFileType
+        : markdownFileTypeFromPath(savedPath, markdownDoc.fileType)
+      const savedName = data.name || savedPath.split('/').pop() || buildMarkdownDocumentName(currentDocumentName, savedType)
+      const nextFile: WorkspaceFileRef = {
+        workspaceId: savedWorkspaceId,
+        filePath: savedPath,
+        fileType: savedType,
+      }
+      setCurrentWorkspaceId(savedWorkspaceId)
+      setActiveWorkspaceFile(nextFile)
+      setCurrentDocumentName(savedName)
+      setWorkspaceRefreshToken(value => value + 1)
+      setActiveMarkdownDocument(current => current
+        ? {
+          ...current,
+          workspaceId: savedWorkspaceId,
+          filePath: savedPath,
+          fileType: savedType,
+          source: markdownDoc.draft,
+          draft: markdownDoc.draft,
+          dirty: false,
+        }
+        : current)
+      const session = documentSessionRef.current
+      if (session) {
+        await registerActiveDocumentSession(session.id, {
+          currentDocumentName: savedName,
+          workspaceId: nextFile.workspaceId,
+          filePath: nextFile.filePath,
+          fileType: nextFile.fileType,
+        })
+      }
+      window.alert('Markdown 文件保存成功')
+    } catch (error) {
+      console.error('[Editor] save markdown file failed', error)
+      window.alert(`保存 Markdown 文件失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }, [currentDocumentName, registerActiveDocumentSession, resolveCurrentWorkspaceId])
 
   const handleSaveWorkspaceFile = useCallback(async () => {
+    if (documentModeRef.current === 'markdown' || activeMarkdownDocumentRef.current) {
+      await handleSaveMarkdownDocument()
+      return
+    }
     const editorView = viewRef.current
     if (!editorView || !activeWorkspaceFile) return
     try {
@@ -2753,14 +3459,62 @@ export const Editor: React.FC = () => {
       console.error('[Editor] save workspace file failed', error)
       window.alert(`保存工作区文件失败：${error instanceof Error ? error.message : String(error)}`)
     }
-  }, [activeWorkspaceFile, buildCurrentDocxBlob])
+  }, [activeWorkspaceFile, buildCurrentDocxBlob, handleSaveMarkdownDocument])
 
   const handleSaveDocument = useCallback(async (name?: string) => {
+    if (documentModeRef.current === 'markdown' || activeMarkdownDocumentRef.current) {
+      await handleSaveMarkdownDocument()
+      return
+    }
     const editorView = viewRef.current
     if (!editorView) return
-    const targetName = (name ?? currentDocumentName).trim() || DEFAULT_SERVER_DOCUMENT_NAME
+    const targetName = ensureDocxDocumentName(name ?? currentDocumentName)
     try {
       const blob = await buildCurrentDocxBlob()
+      if (!activeWorkspaceFile) {
+        const workspaceId = await resolveCurrentWorkspaceId()
+        const response = await fetch(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/files/${encodeURIComponent(targetName)}`,
+          {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            },
+            body: blob,
+          },
+        )
+        const data = await readJsonResponse<{
+          workspaceId?: string
+          path?: string
+          name?: string
+          type?: string
+        }>(response)
+        const savedWorkspaceId = data.workspaceId || workspaceId
+        const savedPath = data.path || targetName
+        const savedName = data.name || savedPath.split('/').pop() || targetName
+        const nextFile: WorkspaceFileRef = {
+          workspaceId: savedWorkspaceId,
+          filePath: savedPath,
+          fileType: data.type || 'docx',
+        }
+        setCurrentWorkspaceId(savedWorkspaceId)
+        setActiveWorkspaceFile(nextFile)
+        setCurrentDocumentName(savedName)
+        setFileModalMode(null)
+        setWorkspaceRefreshToken(value => value + 1)
+        const session = documentSessionRef.current
+        if (session) {
+          await registerActiveDocumentSession(session.id, {
+            currentDocumentName: savedName,
+            workspaceId: nextFile.workspaceId,
+            filePath: nextFile.filePath,
+            fileType: nextFile.fileType,
+          })
+        }
+        window.alert('已保存到当前工作区')
+        return
+      }
+
       const searchParams = new URLSearchParams({ source: documentSettings.activeSource })
       const response = await fetch(`/api/documents/${encodeURIComponent(targetName)}?${searchParams.toString()}`, {
         method: 'PUT',
@@ -2779,7 +3533,7 @@ export const Editor: React.FC = () => {
       const message = error instanceof Error ? error.message : String(error)
       window.alert(`保存文档失败：${message}`)
     }
-  }, [buildCurrentDocxBlob, currentDocumentName, documentSettings.activeSource, loadDocumentFiles])
+  }, [activeWorkspaceFile, buildCurrentDocxBlob, currentDocumentName, documentSettings.activeSource, handleSaveMarkdownDocument, loadDocumentFiles, registerActiveDocumentSession, resolveCurrentWorkspaceId])
 
   const handleDeleteDocument = useCallback(async (name: string) => {
     try {
@@ -2884,6 +3638,10 @@ export const Editor: React.FC = () => {
   }, [activeWorkspaceFile, currentDocumentName, fileModalMode, handleSaveDocument, handleSaveWorkspaceFile, openSaveFileModal])
 
   const handleExportDocx = useCallback(async () => {
+    if (documentModeRef.current === 'markdown') {
+      window.alert('Markdown 文件请直接保存源码；需要 DOCX 时请先转换为文档模式。')
+      return
+    }
     const editorView = viewRef.current
     if (!editorView) return
 
@@ -3738,6 +4496,7 @@ export const Editor: React.FC = () => {
         <Toolbar
           view={view}
           editorState={editorState}
+          documentMode={documentMode}
           documentTitle={currentDocumentName}
           onDocumentTitleChange={handleDocumentTitleChange}
           pageConfig={pageConfig}
@@ -3758,7 +4517,13 @@ export const Editor: React.FC = () => {
           workspaceOpen={workspaceOpen}
           onNewDocument={handleNewDocument}
           onOpenServerFile={openServerFileModal}
-          onSaveServerFile={openSaveFileModal}
+          onSaveServerFile={() => {
+            if (activeWorkspaceFile) {
+              void handleSaveWorkspaceFile()
+              return
+            }
+            void handleSaveDocument(currentDocumentName)
+          }}
           onImportDocx={handleImportFile}
           onExportDocx={handleExportDocx}
           onInsertImage={handleInsertImage}
@@ -3786,16 +4551,32 @@ export const Editor: React.FC = () => {
             activeFile={activeWorkspaceFile}
             onOpenFile={handleOpenWorkspaceFile}
             onSaveActiveFile={handleSaveWorkspaceFile}
-            onWorkspaceChange={() => {
+            onActiveFileMoved={handleWorkspaceActiveFileMoved}
+            onWorkspaceChange={(workspaceId) => {
+              setCurrentWorkspaceId(workspaceId)
               // 工作区切换只改变目录事实源；已打开文件保持到用户显式切换。
             }}
+            onWorkspaceDeleted={handleWorkspaceDeleted}
+            refreshToken={workspaceRefreshToken}
           />
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
 
         {/* Main content */}
-        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-visible" style={{ paddingTop: 32, paddingBottom: 32 }}>
+        <div
+          className={`flex-1 min-h-0 ${documentMode === 'markdown' ? 'overflow-hidden' : 'overflow-y-auto overflow-x-visible'}`}
+          style={{ paddingTop: documentMode === 'markdown' ? 0 : 32, paddingBottom: documentMode === 'markdown' ? 0 : 32 }}
+        >
+          {documentMode === 'markdown' && activeMarkdownDocument && (
+            <MarkdownDocumentView
+              document={activeMarkdownDocument}
+              documentName={currentDocumentName}
+              onChange={handleMarkdownDraftChange}
+              onViewModeChange={handleMarkdownViewModeChange}
+              onSave={handleSaveMarkdownDocument}
+            />
+          )}
           {/*
         Canvas: explicit height so absolute page cards create scroll space.
         Width = page width, centered.
@@ -3806,9 +4587,15 @@ export const Editor: React.FC = () => {
              Inside the editor, transparent widgets push content between cards.
       */}
           <div
+            data-openwps-document-canvas="true"
             ref={canvasRef}
             className="relative mx-auto"
-            style={{ width: cfg.pageWidth, height: canvasH, overflow: 'visible' }}
+            style={{
+              width: cfg.pageWidth,
+              height: canvasH,
+              overflow: 'visible',
+              display: documentMode === 'markdown' ? 'none' : undefined,
+            }}
           >
             {/* ── Layer 1: page cards ── */}
             {Array.from({ length: pageCount }).map((_, i) => (
@@ -4122,11 +4909,38 @@ export const Editor: React.FC = () => {
               repaginate()
             }}
             onApplyServerDocumentState={(docJson, nextPageConfig) => {
+              if (documentModeRef.current === 'markdown') {
+                const nextDocJson = docJson as PMNodeJSON
+                applyDocumentState(nextDocJson, nextPageConfig)
+                try {
+                  const nextMarkdown = serializeEditorDoc(
+                    schema.nodeFromJSON(nextDocJson),
+                    activeMarkdownDocumentRef.current?.fileType ?? 'md',
+                  )
+                  setActiveMarkdownDocument(current => current
+                    ? {
+                      ...current,
+                      draft: nextMarkdown,
+                      dirty: nextMarkdown !== current.source,
+                    }
+                    : current)
+                } catch (error) {
+                  console.warn('将 AI 文档状态转换为 Markdown 失败', error)
+                }
+                return
+              }
               applyDocumentState(docJson as PMNodeJSON, nextPageConfig)
               pageConfigRef.current = nextPageConfig
               repaginate()
             }}
             onWorkspaceFileActivated={(file) => {
+              if (isMarkdownWorkspaceFile(file.filePath, file.fileType)) {
+                void handleOpenWorkspaceFile(file.workspaceId, file.filePath)
+                return
+              }
+              setDocumentMode('document')
+              setActiveMarkdownDocument(null)
+              setCurrentWorkspaceId(file.workspaceId)
               setActiveWorkspaceFile(file)
               setCurrentDocumentName(file.filePath.split('/').pop() || DEFAULT_SERVER_DOCUMENT_NAME)
             }}

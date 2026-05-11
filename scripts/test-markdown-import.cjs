@@ -12,6 +12,50 @@ const SCREENSHOTS_DIR = path.join(__dirname, '..', 'screenshots')
 
 if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true })
 
+let workspaceMarkdown = [
+    '# Workspace Markdown',
+    '',
+    '这是工作区 Markdown 正文。',
+    '',
+    '- 渲染为列表',
+    '',
+    ...Array.from({ length: 48 }, (_, index) => {
+        const sectionNumber = index + 1
+        return [
+            `## Section ${sectionNumber}`,
+            '',
+            `这是第 ${sectionNumber} 个长文档段落，用来验证 Markdown 预览和源码切换时不会回到开头。`,
+            '',
+            `- Section ${sectionNumber} list item A`,
+            `- Section ${sectionNumber} list item B`,
+        ].join('\n')
+    }),
+].join('\n')
+let memoryMarkdown = [
+    '---',
+    'name: Memory Metadata',
+    'description: should not render',
+    'type: project',
+    '---',
+    '',
+    '# Memory Markdown',
+    '',
+    '这是记忆 Markdown 正文。',
+].join('\n')
+
+function sendJson(res, payload, status = 200) {
+    res.writeHead(status, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(payload))
+}
+
+function readBody(req) {
+    return new Promise((resolve) => {
+        const chunks = []
+        req.on('data', chunk => chunks.push(chunk))
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    })
+}
+
 function startStaticServer() {
     return new Promise((resolve, reject) => {
         const mime = {
@@ -24,15 +68,157 @@ function startStaticServer() {
             json: 'application/json',
         }
 
-        const server = http.createServer((req, res) => {
-            if (req.url?.startsWith('/api/templates')) {
-                res.writeHead(200, { 'Content-Type': 'application/json' })
-                res.end('[]')
+        const server = http.createServer(async (req, res) => {
+            const url = new URL(req.url || '/', BASE_URL)
+            const pathname = decodeURIComponent(url.pathname)
+
+            if (pathname.startsWith('/api/templates')) {
+                sendJson(res, [])
                 return
             }
 
-            let filePath = path.join(DIST_DIR, req.url === '/' ? '/index.html' : req.url)
-            filePath = filePath.split('?')[0]
+            if (pathname === '/api/workspaces') {
+                sendJson(res, {
+                    activeWorkspaceId: 'default',
+                    workspaces: [{ id: 'default', name: '默认工作区' }],
+                })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/active' && req.method === 'POST') {
+                sendJson(res, { activeWorkspaceId: 'default' })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/tree') {
+                sendJson(res, {
+                    workspaceId: 'default',
+                    root: {
+                        name: 'default',
+                        path: '',
+                        kind: 'directory',
+                        role: 'workspace',
+                        children: [
+                            {
+                                name: '.openwps',
+                                path: '.openwps',
+                                kind: 'directory',
+                                role: 'openwps',
+                                isMemory: true,
+                                children: [
+                                    {
+                                        name: 'memory',
+                                        path: '.openwps/memory',
+                                        kind: 'directory',
+                                        role: 'memoryFolder',
+                                        isMemory: true,
+                                        children: [
+                                            {
+                                                name: 'notes.md',
+                                                path: '.openwps/memory/notes.md',
+                                                kind: 'file',
+                                                role: 'memory',
+                                                type: 'md',
+                                                extension: '.md',
+                                                editable: true,
+                                                isMemory: true,
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                name: 'docs',
+                                path: 'docs',
+                                kind: 'directory',
+                                role: 'folder',
+                                children: [
+                                    {
+                                        name: 'report.md',
+                                        path: 'docs/report.md',
+                                        kind: 'file',
+                                        role: 'document',
+                                        type: 'md',
+                                        extension: '.md',
+                                        editable: true,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/files/docs/report.md/content' && req.method === 'GET') {
+                sendJson(res, {
+                    workspaceId: 'default',
+                    path: 'docs/report.md',
+                    name: 'report.md',
+                    type: 'md',
+                    content: workspaceMarkdown,
+                })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/files/docs/report.md' && req.method === 'PUT') {
+                workspaceMarkdown = await readBody(req)
+                sendJson(res, {
+                    workspaceId: 'default',
+                    path: 'docs/report.md',
+                    name: 'report.md',
+                    type: 'md',
+                })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/memory/files/notes.md' && req.method === 'GET') {
+                sendJson(res, {
+                    workspaceId: 'default',
+                    path: '.openwps/memory/notes.md',
+                    memoryPath: 'notes.md',
+                    content: memoryMarkdown,
+                })
+                return
+            }
+
+            if (pathname === '/api/workspaces/default/memory/files/notes.md' && req.method === 'PUT') {
+                memoryMarkdown = await readBody(req)
+                sendJson(res, {
+                    workspaceId: 'default',
+                    path: '.openwps/memory/notes.md',
+                    memoryPath: 'notes.md',
+                    name: 'notes.md',
+                    type: 'md',
+                })
+                return
+            }
+
+            if (pathname === '/api/doc-sessions' && req.method === 'POST') {
+                await readBody(req)
+                sendJson(res, { documentSessionId: 'doc_markdown_test', version: 1 })
+                return
+            }
+
+            if (pathname === '/api/doc-sessions/doc_markdown_test/active' && req.method === 'POST') {
+                await readBody(req)
+                sendJson(res, { documentSessionId: 'doc_markdown_test', version: 1, active: true })
+                return
+            }
+
+            if (pathname === '/api/doc-sessions/doc_markdown_test/client-patches' && req.method === 'POST') {
+                await readBody(req)
+                sendJson(res, { documentSessionId: 'doc_markdown_test', version: 2 })
+                return
+            }
+
+            if (pathname === '/api/doc-sessions/doc_markdown_test/events') {
+                res.writeHead(204)
+                res.end()
+                return
+            }
+
+            let filePath = path.join(DIST_DIR, pathname === '/' ? '/index.html' : pathname)
             const ext = path.extname(filePath).slice(1)
 
             fs.readFile(filePath, (err, data) => {
@@ -171,6 +357,143 @@ async function run() {
         assert(!result.completedTask?.text.includes('[x]'), `已完成任务项仍保留原始 markdown: ${result.completedTask?.text}`)
 
         console.log('✅ Markdown 导入列表粗体回归测试通过')
+
+        await page.getByTitle('工作区').first().click()
+        await page.getByTitle('docs').click()
+        await page.getByTitle('docs/report.md').click()
+        await page.waitForFunction(() => {
+            const h1 = document.querySelector('[data-openwps-markdown-view="true"] h1')
+            return h1?.textContent === 'Workspace Markdown'
+        }, { timeout: 10000 })
+
+        const workspaceRender = await page.evaluate(() => {
+            const markdownRoot = document.querySelector('[data-openwps-markdown-view="true"]')
+            const canvas = document.querySelector('[data-openwps-document-canvas="true"]')
+            return {
+                title: markdownRoot?.querySelector('h1')?.textContent ?? '',
+                listItem: markdownRoot?.querySelector('li')?.textContent ?? '',
+                canvasDisplay: canvas ? window.getComputedStyle(canvas).display : '',
+            }
+        })
+        assert(workspaceRender.title === 'Workspace Markdown', `工作区 Markdown 标题未按 h1 渲染: ${JSON.stringify(workspaceRender)}`)
+        assert(workspaceRender.listItem.includes('渲染为列表'), `工作区 Markdown 列表未渲染: ${JSON.stringify(workspaceRender)}`)
+        assert(workspaceRender.canvasDisplay === 'none', `Markdown 模式下分页画布仍可见: ${workspaceRender.canvasDisplay}`)
+
+        await page.evaluate(() => {
+            const target = Array.from(document.querySelectorAll('[data-openwps-markdown-view="true"] h2'))
+                .find((heading) => heading.textContent === 'Section 34')
+            target?.scrollIntoView({ block: 'start' })
+        })
+        await page.waitForTimeout(100)
+        const previewBeforeToggle = await page.evaluate(() => {
+            const scroller = document.querySelector('[data-openwps-markdown-scroll="true"]')
+            const target = Array.from(document.querySelectorAll('[data-openwps-markdown-view="true"] h2'))
+                .find((heading) => heading.textContent === 'Section 34')
+            return {
+                scrollTop: scroller instanceof HTMLElement ? scroller.scrollTop : 0,
+                targetTop: target instanceof HTMLElement ? target.getBoundingClientRect().top : 0,
+            }
+        })
+        assert(previewBeforeToggle.scrollTop > 1000, `长 Markdown 预览没有滚到中后段: ${JSON.stringify(previewBeforeToggle)}`)
+
+        await page.locator('[data-openwps-markdown-source-toggle="true"]').click()
+        await page.waitForSelector('[data-openwps-markdown-source="true"]', { timeout: 10000 })
+        await page.waitForTimeout(100)
+        const sourceAfterToggle = await page.locator('[data-openwps-markdown-source="true"]').evaluate((textarea) => {
+            const source = textarea instanceof HTMLTextAreaElement ? textarea : null
+            return {
+                scrollTop: source?.scrollTop ?? 0,
+                maxScroll: source ? source.scrollHeight - source.clientHeight : 0,
+            }
+        })
+        assert(sourceAfterToggle.maxScroll > 0, `长 Markdown 源码区域没有内部滚动空间: ${JSON.stringify(sourceAfterToggle)}`)
+        assert(sourceAfterToggle.scrollTop > sourceAfterToggle.maxScroll * 0.45, `预览切到源码后位置回到了开头: ${JSON.stringify(sourceAfterToggle)}`)
+
+        await page.locator('[data-openwps-markdown-preview-toggle="true"]').click()
+        await page.waitForSelector('[data-openwps-markdown-view="true"] h2', { timeout: 10000 })
+        await page.waitForTimeout(100)
+        const previewAfterToggle = await page.evaluate(() => {
+            const root = document.querySelector('[data-openwps-markdown-view="true"]')
+            const scroller = document.querySelector('[data-openwps-markdown-scroll="true"]')
+            const header = root?.querySelector('[data-openwps-markdown-header="true"]')
+            const headerBottom = header instanceof HTMLElement ? header.getBoundingClientRect().bottom : 0
+            const visibleHeading = Array.from(document.querySelectorAll('[data-openwps-markdown-view="true"] h2'))
+                .find((heading) => {
+                    if (!(heading instanceof HTMLElement)) return false
+                    const rect = heading.getBoundingClientRect()
+                    return rect.bottom > headerBottom + 8 && rect.top < window.innerHeight
+                })
+            const headingNumber = Number((visibleHeading?.textContent || '').replace(/^Section\s+/, ''))
+            const scrollerTop = scroller instanceof HTMLElement ? scroller.getBoundingClientRect().top : 0
+            return {
+                scrollTop: scroller instanceof HTMLElement ? scroller.scrollTop : 0,
+                visibleHeading: visibleHeading?.textContent ?? '',
+                headingNumber,
+                headerBottom,
+                scrollerTop,
+            }
+        })
+        assert(previewAfterToggle.scrollTop > 1000, `源码切回预览后位置回到了开头: ${JSON.stringify(previewAfterToggle)}`)
+        assert(previewAfterToggle.headingNumber >= 18, `源码切回预览后没有保持在同一阅读区域: ${JSON.stringify(previewAfterToggle)}`)
+        assert(previewAfterToggle.scrollerTop >= previewAfterToggle.headerBottom - 1, `Markdown 控制条遮挡了正文滚动区: ${JSON.stringify(previewAfterToggle)}`)
+        console.log('✅ Markdown 预览/源码切换滚动位置保持回归测试通过')
+
+        await page.waitForTimeout(700)
+        await page.reload({ waitUntil: 'networkidle', timeout: 15000 })
+        await page.waitForFunction(() => {
+            const h1 = document.querySelector('[data-openwps-markdown-view="true"] h1')
+            return h1?.textContent === 'Workspace Markdown'
+        }, { timeout: 10000 })
+        const restoredMarkdownRender = await page.evaluate(() => {
+            const markdownRoot = document.querySelector('[data-openwps-markdown-view="true"]')
+            const canvas = document.querySelector('[data-openwps-document-canvas="true"]')
+            return {
+                title: markdownRoot?.querySelector('h1')?.textContent ?? '',
+                hasSource: Boolean(document.querySelector('[data-openwps-markdown-source="true"]')),
+                canvasDisplay: canvas ? window.getComputedStyle(canvas).display : '',
+            }
+        })
+        assert(restoredMarkdownRender.title === 'Workspace Markdown', `刷新后未恢复 Markdown 预览: ${JSON.stringify(restoredMarkdownRender)}`)
+        assert(restoredMarkdownRender.canvasDisplay === 'none', `刷新后 Markdown 又回到分页文档视图: ${JSON.stringify(restoredMarkdownRender)}`)
+        console.log('✅ Markdown 刷新缓存恢复回归测试通过')
+
+        await page.locator('[data-openwps-markdown-source-toggle="true"]').click()
+        await page.locator('[data-openwps-markdown-source="true"]').fill('# Workspace Markdown\n\n- saved from source\n')
+        await page.locator('[data-openwps-markdown-save="true"]').click()
+        await page.waitForFunction(() => {
+            const button = document.querySelector('[data-openwps-markdown-save="true"]')
+            return button instanceof HTMLButtonElement && button.disabled
+        }, { timeout: 10000 })
+        assert(workspaceMarkdown.includes('saved from source'), `源码保存没有写回 Markdown 文件: ${workspaceMarkdown}`)
+
+        await page.getByTitle('工作区').first().click()
+        await page.getByTitle('.openwps/memory/notes.md').click()
+        await page.waitForFunction(() => {
+            const h1 = document.querySelector('[data-openwps-markdown-view="true"] h1')
+            return h1?.textContent === 'Memory Markdown'
+        }, { timeout: 10000 })
+        await page.locator('[data-openwps-markdown-source-toggle="true"]').click()
+        await page.locator('[data-openwps-markdown-source="true"]').fill('---\nname: Memory Metadata\ndescription: should not render\ntype: project\n---\n\n# Memory Markdown\n\nmemory saved\n')
+        await page.locator('[data-openwps-markdown-save="true"]').click()
+        await page.waitForFunction(() => {
+            const button = document.querySelector('[data-openwps-markdown-save="true"]')
+            return button instanceof HTMLButtonElement && button.disabled
+        }, { timeout: 10000 })
+        assert(memoryMarkdown.includes('memory saved'), `记忆 Markdown 保存没有走 memory API: ${memoryMarkdown}`)
+
+        await page.locator('[data-openwps-markdown-preview-toggle="true"]').click()
+        await page.waitForFunction(() => {
+            const h1 = document.querySelector('[data-openwps-markdown-view="true"] h1')
+            return h1?.textContent === 'Memory Markdown'
+        }, { timeout: 10000 })
+        const frontmatterVisible = await page.locator('.openwps-markdown-body').evaluate((root) => {
+            const text = root.textContent || ''
+            return text.includes('Memory Metadata') || text.includes('type: project')
+        })
+        assert(!frontmatterVisible, 'Markdown 预览不应显示 YAML frontmatter')
+        await screenshot(page, 'workspace-markdown-render')
+        console.log('✅ 工作区 Markdown 默认渲染与源码保存回归测试通过')
+
         if (consoleErrors.length === 0) {
             console.log('✅ 无 Console 错误')
         } else {

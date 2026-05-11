@@ -24,6 +24,7 @@ import ModelPicker from './ModelPicker'
 
 type View = 'history' | 'chat'
 type AssistantMode = 'agent' | 'layout' | 'edit'
+type OperationMode = 'build' | 'plan'
 const ACTIVE_CONVERSATION_STORAGE_KEY = 'openwps:ai-active-conversation'
 
 function createDocumentClientId() {
@@ -98,9 +99,40 @@ interface ConversationDetail extends ConversationSummary {
 interface ReactRunSummary {
   sessionId: string
   conversationId?: string | null
-  status: 'running' | 'completed' | 'failed'
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
   error?: string | null
   lastSeq?: number
+}
+
+interface PlanQuestionOption {
+  value: string
+  label: string
+  description?: string
+}
+
+interface PlanQuestion {
+  id: string
+  header?: string
+  question: string
+  options: PlanQuestionOption[]
+  answered?: boolean
+  answer?: string
+}
+
+interface PlanRecord {
+  planId: string
+  conversationId: string
+  status: 'drafting' | 'needs_user_input' | 'pending_approval' | 'approved' | 'rejected' | 'superseded'
+  content: string
+  questions: PlanQuestion[]
+  feedback?: string
+  createdAt?: string
+  updatedAt?: string
+  approvedAt?: string
+}
+
+interface PlanResponse {
+  plan?: PlanRecord | null
 }
 
 interface ToolCallResult {
@@ -682,6 +714,61 @@ function normalizeAgentRunItem(raw: unknown): AgentRunItem | null {
     error: typeof value.error === 'string' ? value.error : undefined,
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : undefined,
     updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : undefined,
+  }
+}
+
+function normalizePlanQuestionOption(raw: unknown, index: number): PlanQuestionOption | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    const label = String(raw ?? '').trim()
+    return label ? { value: label || `option_${index + 1}`, label } : null
+  }
+  const value = raw as Record<string, unknown>
+  const label = String(value.label ?? value.value ?? '').trim()
+  if (!label) return null
+  return {
+    value: String(value.value ?? label),
+    label,
+    description: typeof value.description === 'string' && value.description.trim() ? value.description : undefined,
+  }
+}
+
+function normalizePlanQuestion(raw: unknown, index: number): PlanQuestion | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const question = String(value.question ?? '').trim()
+  const options = Array.isArray(value.options)
+    ? value.options.map(normalizePlanQuestionOption).filter((option): option is PlanQuestionOption => option !== null)
+    : []
+  if (!question || options.length === 0) return null
+  return {
+    id: String(value.id ?? `q${index + 1}`),
+    header: typeof value.header === 'string' && value.header.trim() ? value.header : undefined,
+    question,
+    options,
+    answered: Boolean(value.answered),
+    answer: typeof value.answer === 'string' ? value.answer : undefined,
+  }
+}
+
+function normalizePlanRecord(raw: unknown): PlanRecord | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const value = raw as Record<string, unknown>
+  const status = String(value.status ?? '')
+  if (!['drafting', 'needs_user_input', 'pending_approval', 'approved', 'rejected', 'superseded'].includes(status)) return null
+  const planId = String(value.planId ?? '')
+  if (!planId) return null
+  return {
+    planId,
+    conversationId: String(value.conversationId ?? ''),
+    status: status as PlanRecord['status'],
+    content: String(value.content ?? ''),
+    questions: Array.isArray(value.questions)
+      ? value.questions.map(normalizePlanQuestion).filter((question): question is PlanQuestion => question !== null)
+      : [],
+    feedback: typeof value.feedback === 'string' ? value.feedback : undefined,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : undefined,
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : undefined,
+    approvedAt: typeof value.approvedAt === 'string' ? value.approvedAt : undefined,
   }
 }
 
@@ -2080,7 +2167,11 @@ export default function AISidebar({
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [cancelRequested, setCancelRequested] = useState(false)
   const [assistantMode, setAssistantMode] = useState<AssistantMode>('agent')
+  const [operationMode, setOperationMode] = useState<OperationMode>('build')
+  const [currentPlan, setCurrentPlan] = useState<PlanRecord | null>(null)
+  const [planBusy, setPlanBusy] = useState(false)
   const [tasks, setTasks] = useState<TaskItem[]>([])
   const [isTaskPanelExpanded, setIsTaskPanelExpanded] = useState(false)
   const [agentRuns, setAgentRuns] = useState<AgentRunItem[]>([])
@@ -2107,6 +2198,7 @@ export default function AISidebar({
   const imageInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const activeRunSessionIdRef = useRef<string | null>(null)
+  const cancelRequestedRef = useRef(false)
   const autoRestoreAttemptedRef = useRef(false)
   const conversationNavigationSeqRef = useRef(0)
   const isDragging = useRef(false)
@@ -2116,6 +2208,10 @@ export default function AISidebar({
   const conversationMessagesRef = useRef<StoredMessage[]>([])
   const tasksRef = useRef<TaskItem[]>([])
   const taskHideTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    cancelRequestedRef.current = cancelRequested
+  }, [cancelRequested])
 
   const activeOcrProvider = useMemo(
     () => providers.find(provider => provider.id === ocrConfig.providerId) ?? null,
@@ -2252,13 +2348,27 @@ export default function AISidebar({
     return nextAgentRuns
   }, [])
 
+  const fetchPlanForConversation = useCallback(async (conversationId: string) => {
+    const response = await fetch(`/api/conversations/${conversationId}/plan`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json() as PlanResponse
+    const plan = normalizePlanRecord(payload.plan)
+    setCurrentPlan(plan)
+    return plan
+  }, [])
+
   useEffect(() => {
     if (!currentConversationId) {
       applyTaskState([])
       setAgentRuns([])
       setIsAgentPanelExpanded(false)
+      setCurrentPlan(null)
       return
     }
+    void fetchPlanForConversation(currentConversationId).catch(error => {
+      console.error('[AISidebar] load conversation plan failed', error)
+      if (currentConversationIdRef.current === currentConversationId) setCurrentPlan(null)
+    })
     void fetchTasksForConversation(currentConversationId, { preserveExpanded: true }).catch(error => {
       console.error('[AISidebar] load conversation tasks failed', error)
       if (currentConversationIdRef.current === currentConversationId) {
@@ -2272,7 +2382,7 @@ export default function AISidebar({
         setIsAgentPanelExpanded(false)
       }
     })
-  }, [applyTaskState, currentConversationId, fetchAgentRunsForConversation, fetchTasksForConversation])
+  }, [applyTaskState, currentConversationId, fetchAgentRunsForConversation, fetchPlanForConversation, fetchTasksForConversation])
 
   useEffect(() => {
     if (!currentConversationId || !agentRuns.some(agentRun => agentRun.status === 'running')) return
@@ -2635,6 +2745,8 @@ export default function AISidebar({
     const aiMessage = makeAiMessage('', true)
     setMessages(prev => prev.some(message => message.streaming) ? prev : [...prev, aiMessage])
     setLoading(true)
+    setCancelRequested(false)
+    cancelRequestedRef.current = false
     activeRunSessionIdRef.current = sessionId
     const controller = new AbortController()
     abortRef.current = controller
@@ -2886,9 +2998,40 @@ export default function AISidebar({
               }))
               break
             }
+            case 'plan_question': {
+              const plan = normalizePlanRecord(event.plan)
+              if (plan) setCurrentPlan(plan)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '计划需要你先选择一个方向...',
+              }))
+              break
+            }
+            case 'plan_pending_approval': {
+              const plan = normalizePlanRecord(event.plan)
+              if (plan) setCurrentPlan(plan)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '计划已生成，等待你批准或退回。',
+              }))
+              break
+            }
+            case 'plan_blocked_tool': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `Plan Mode 已阻断 ${String(event.toolName ?? '写入工具')}。`,
+              }))
+              break
+            }
             case 'done':
               finished = true
-              updateMessage(message => ({ ...message, streaming: false, activityLabel: '' }))
+              updateMessage(message => {
+                const stoppedByClient = String(event.reason ?? '') === 'stopped_by_client'
+                const nextMessage = stoppedByClient
+                  ? appendContentChunk(message, message.text ? '' : '（已取消）')
+                  : message
+                return { ...nextMessage, streaming: false, activityLabel: '' }
+              })
               break
             case 'error':
               throw new Error(String(event.message ?? 'AI 请求失败'))
@@ -2913,7 +3056,13 @@ export default function AISidebar({
         conversationMessagesRef.current = [...conversationMessagesRef.current, message]
       }
     } catch (error) {
-      if (!(error instanceof Error && error.name === 'AbortError')) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        updateMessage(message => ({
+          ...appendContentChunk(message, message.text ? '' : '（已取消）'),
+          streaming: false,
+          activityLabel: '',
+        }))
+      } else {
         console.error('[AISidebar] restore react run failed', error)
         updateMessage(message => ({
           ...appendContentChunk(message, buildErrorText(error), true),
@@ -2923,6 +3072,8 @@ export default function AISidebar({
       }
     } finally {
       setLoading(false)
+      setCancelRequested(false)
+      cancelRequestedRef.current = false
       abortRef.current = null
       if (activeRunSessionIdRef.current === sessionId) activeRunSessionIdRef.current = null
       void loadConversations()
@@ -3094,6 +3245,7 @@ export default function AISidebar({
         setCurrentConversationTitle('')
         conversationMessagesRef.current = []
         setMessages([])
+        setCurrentPlan(null)
         window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY)
       }
     } catch (error) {
@@ -3162,6 +3314,11 @@ export default function AISidebar({
   }, [activeProviderId, activeVisionProvider?.endpoint, assistantMode, currentConversationTitle, effectiveOcrEndpoint, getContext, includeSelection, messages, modelName, ocrConfig.backend, ocrConfig.model, ocrConfig.providerId, selectedModel, visionConfig.enabled, visionConfig.endpoint, visionConfig.model, visionConfig.providerId])
 
   const handleCancel = useCallback(() => {
+    setCancelRequested(true)
+    cancelRequestedRef.current = true
+    setMessages(prev => prev.map(message => message.streaming
+      ? { ...message, activityLabel: '正在中断当前会话...' }
+      : message))
     const sessionId = activeRunSessionIdRef.current
     if (sessionId) {
       void fetch(`/api/ai/react/runs/${sessionId}/cancel`, { method: 'POST' }).catch(error => {
@@ -3230,8 +3387,9 @@ export default function AISidebar({
     setPendingAttachments(prev => prev.filter(attachment => attachment.id !== id))
   }, [])
 
-  const handleSend = useCallback(async (overrideText?: string) => {
+  const handleSend = useCallback(async (overrideText?: string, overrideOperationMode?: OperationMode) => {
     const rawText = (overrideText ?? input).trim()
+    const requestOperationMode = overrideOperationMode ?? operationMode
     const imageAttachments = pendingAttachments.filter(isImageAttachment)
     const textAttachments = pendingAttachments.filter(isTextAttachment)
     if (rawText.startsWith('/ocr') && imageAttachments.length === 0) {
@@ -3277,6 +3435,7 @@ export default function AISidebar({
       applyTaskState([])
       setAgentRuns([])
       setIsAgentPanelExpanded(false)
+      setCurrentPlan(null)
     }
     setInput('')
     setPendingAttachments([])
@@ -3295,6 +3454,8 @@ export default function AISidebar({
     }
 
     setLoading(true)
+    setCancelRequested(false)
+    cancelRequestedRef.current = false
     const controller = new AbortController()
     abortRef.current = controller
 
@@ -3316,6 +3477,8 @@ export default function AISidebar({
         activityLabel: `后端文档会话同步失败：${error instanceof Error ? error.message : String(error)}`,
       }))
       setLoading(false)
+      setCancelRequested(false)
+      cancelRequestedRef.current = false
       return
     }
     let persistedAssistantText = ''
@@ -3433,6 +3596,7 @@ export default function AISidebar({
           conversationId,
           reactMessages,
           mode: assistantMode,
+          operationMode: requestOperationMode,
           documentSessionId: typeof context.documentSessionId === 'string' ? context.documentSessionId : undefined,
           model: selectedModel || modelName || undefined,
           providerId: activeProviderId || undefined,
@@ -3742,11 +3906,62 @@ export default function AISidebar({
             case 'tooling_delta': {
               const loadedCount = Number(event.loadedDeferredToolCount ?? 0)
               const deferredCount = Number(event.deferredToolCount ?? 0)
+              const skillCount = Array.isArray(event.skillDiscoveryDelta)
+                ? event.skillDiscoveryDelta.length
+                : Number(event.skillDiscoveryCount ?? 0)
               updateMessage(message => ({
                 ...message,
                 activityLabel: loadedCount > 0
-                  ? `已加载 ${loadedCount} 个延迟工具，剩余 ${deferredCount} 个`
-                  : `已同步工具摘要，延迟工具 ${deferredCount} 个`,
+                  ? `已加载 ${loadedCount} 个延迟工具，剩余 ${deferredCount} 个，技能 ${skillCount} 个`
+                  : `已同步工具摘要，延迟工具 ${deferredCount} 个，技能 ${skillCount} 个`,
+              }))
+              break
+            }
+
+            case 'skill_loaded': {
+              const displayName = String(event.displayName || event.skill || 'Skill')
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `已加载技能 ${displayName}，正在继续...`,
+              }))
+              break
+            }
+
+            case 'memory_context_loaded': {
+              const selectedCount = Number(event.selectedCount ?? 0)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: selectedCount > 0
+                  ? `已加载 ${selectedCount} 个工作区记忆`
+                  : '已同步工作区记忆索引',
+              }))
+              break
+            }
+
+            case 'plan_question': {
+              const plan = normalizePlanRecord(event.plan)
+              if (plan) setCurrentPlan(plan)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '计划需要你先选择一个方向...',
+              }))
+              break
+            }
+
+            case 'plan_pending_approval': {
+              const plan = normalizePlanRecord(event.plan)
+              if (plan) setCurrentPlan(plan)
+              updateMessage(message => ({
+                ...message,
+                activityLabel: '计划已生成，等待你批准或退回。',
+              }))
+              break
+            }
+
+            case 'plan_blocked_tool': {
+              updateMessage(message => ({
+                ...message,
+                activityLabel: `Plan Mode 已阻断 ${String(event.toolName ?? '写入工具')}。`,
               }))
               break
             }
@@ -3863,7 +4078,10 @@ export default function AISidebar({
                 }
                 updateMessage(message => {
                   let nextMessage = message
-                  if (String(event.reason ?? '') === 'max_rounds') {
+                  const reason = String(event.reason ?? '')
+                  if (reason === 'stopped_by_client') {
+                    nextMessage = appendContentChunk(nextMessage, nextMessage.text ? '' : '（已取消）')
+                  } else if (reason === 'max_rounds') {
                     nextMessage = appendContentChunk(nextMessage, `${nextMessage.text ? '\n\n' : ''}已执行 ${roundNumber} 轮操作，已停止当前自动链路。请根据当前结果继续下达下一步指令。`)
                   }
                   return { ...nextMessage, streaming: false, activityLabel: '' }
@@ -4022,11 +4240,13 @@ export default function AISidebar({
       }
     } finally {
       setLoading(false)
+      setCancelRequested(false)
+      cancelRequestedRef.current = false
       abortRef.current = null
       activeRunSessionIdRef.current = null
       void loadConversations()
     }
-  }, [activeProviderId, activeTemplate, applyServerDocumentEvents, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, syncDocumentSession, templates, viewMode])
+  }, [activeProviderId, activeTemplate, applyServerDocumentEvents, applyTaskState, assistantMode, editorState, editorView, fetchTasksForConversation, getContext, includeSelection, input, loadConversations, loading, modelName, onActivateTemplate, operationMode, pageConfig, pendingAttachments, requestOcrAnalysis, resetTextareaHeight, selectedModel, sidebarWidth, syncDocumentSession, templates, viewMode])
 
   const setInputAndFocus = useCallback((nextInput: string) => {
     setInput(nextInput)
@@ -4038,6 +4258,73 @@ export default function AISidebar({
       autoResize(textarea)
     }, 0)
   }, [autoResize])
+
+  const answerPlanQuestion = useCallback(async (question: PlanQuestion, option: PlanQuestionOption) => {
+    const conversationId = currentConversationIdRef.current
+    if (!conversationId || planBusy) return
+    setPlanBusy(true)
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/plan/questions/${encodeURIComponent(question.id)}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer: option.value }),
+      })
+      const payload = await response.json() as PlanResponse & { detail?: string }
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`)
+      setCurrentPlan(normalizePlanRecord(payload.plan))
+      setOperationMode('plan')
+      setInputAndFocus(`我的选择是：${question.question} → ${option.label}。请基于这个选择继续完善计划。`)
+    } catch (error) {
+      window.alert(`保存计划选择失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setPlanBusy(false)
+    }
+  }, [planBusy, setInputAndFocus])
+
+  const approveCurrentPlan = useCallback(async () => {
+    const conversationId = currentConversationIdRef.current
+    if (!conversationId || planBusy) return
+    setPlanBusy(true)
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/plan/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      const payload = await response.json() as PlanResponse & { detail?: string }
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`)
+      setCurrentPlan(normalizePlanRecord(payload.plan))
+      setOperationMode('build')
+      await handleSend('请按照已批准计划执行。', 'build')
+    } catch (error) {
+      window.alert(`批准计划失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setPlanBusy(false)
+    }
+  }, [handleSend, planBusy])
+
+  const rejectCurrentPlan = useCallback(async () => {
+    const conversationId = currentConversationIdRef.current
+    if (!conversationId || planBusy) return
+    const feedback = window.prompt('请输入退回意见，AI 会按这个方向重新规划：', currentPlan?.feedback || '')
+    if (feedback === null) return
+    setPlanBusy(true)
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}/plan/reject`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedback }),
+      })
+      const payload = await response.json() as PlanResponse & { detail?: string }
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`)
+      setCurrentPlan(normalizePlanRecord(payload.plan))
+      setOperationMode('plan')
+      setInputAndFocus(feedback ? `请根据这些退回意见重新规划：${feedback}` : '请重新规划一个更合适的方案。')
+    } catch (error) {
+      window.alert(`退回计划失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setPlanBusy(false)
+    }
+  }, [currentPlan?.feedback, planBusy, setInputAndFocus])
 
   const insertTemplateLayoutPrompt = useCallback(() => {
     if (!selectedTemplate || loading) return
@@ -4315,6 +4602,90 @@ export default function AISidebar({
             {messages.length === 0 && (
               <div className="text-sm text-gray-400 text-center py-8">开始一段新的排版对话</div>
             )}
+
+            {/* Plan Panel */}
+            {currentPlan && (
+              <div className="sticky top-0 z-30 -mx-1 -mt-3 px-1 pb-1">
+                <div className="overflow-hidden rounded-xl border border-amber-200 bg-amber-50/95 shadow-sm backdrop-blur-sm">
+                  <div className="flex items-center justify-between gap-2 bg-amber-100 px-3 py-2">
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold tracking-wide text-amber-800">AI 规划</div>
+                      <div className="mt-0.5 truncate text-[11px] text-amber-700">
+                        {currentPlan.status === 'pending_approval'
+                          ? '计划待批准'
+                          : currentPlan.status === 'approved'
+                            ? '计划已批准，Build 模式会按此执行'
+                            : currentPlan.status === 'needs_user_input'
+                              ? '需要你选择后继续规划'
+                              : currentPlan.status === 'rejected'
+                                ? '计划已退回'
+                                : '计划草稿'}
+                      </div>
+                    </div>
+                    <span className="rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                      {operationMode === 'plan' ? 'Plan' : 'Build'}
+                    </span>
+                  </div>
+
+                  {currentPlan.questions.some(question => !question.answered) && (
+                    <div className="space-y-2 border-t border-amber-200 px-3 py-2">
+                      {currentPlan.questions.filter(question => !question.answered).map(question => (
+                        <div key={question.id} className="space-y-1.5">
+                          <div className="text-xs font-medium text-amber-900">{question.question}</div>
+                          <div className="grid gap-1.5">
+                            {question.options.map(option => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                disabled={planBusy || loading}
+                                onClick={() => void answerPlanQuestion(question, option)}
+                                className="rounded-lg border border-amber-200 bg-white px-2.5 py-2 text-left text-xs text-slate-700 transition-colors hover:border-amber-300 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-60"
+                              >
+                                <span className="block font-medium text-slate-800">{option.label}</span>
+                                {option.description && <span className="mt-0.5 block text-[11px] text-slate-500">{option.description}</span>}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {currentPlan.content.trim() && (
+                    <div className="max-h-72 overflow-y-auto border-t border-amber-200 bg-white/70 px-3 py-2">
+                      <div
+                        className="ai-markdown text-xs leading-5 text-slate-700"
+                        dangerouslySetInnerHTML={{
+                          __html: toHtml(currentPlan.content.replace(/<\/?proposed_plan>/g, '').trim()),
+                        }}
+                      />
+                    </div>
+                  )}
+
+                  {currentPlan.status === 'pending_approval' && (
+                    <div className="flex gap-2 border-t border-amber-200 px-3 py-2">
+                      <button
+                        type="button"
+                        disabled={planBusy || loading}
+                        onClick={() => void approveCurrentPlan()}
+                        className="flex-1 rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-700 disabled:cursor-not-allowed disabled:bg-amber-300"
+                      >
+                        批准并执行
+                      </button>
+                      <button
+                        type="button"
+                        disabled={planBusy || loading}
+                        onClick={() => void rejectCurrentPlan()}
+                        className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        退回
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            {/* End Plan Panel */}
 
             {/* Task Panel */}
             {tasks.length > 0 && (
@@ -4944,7 +5315,9 @@ export default function AISidebar({
                   className="w-full resize-none border-0 bg-transparent text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400"
                   rows={3}
                   placeholder={
-                    assistantMode === 'agent'
+                    operationMode === 'plan'
+                      ? (viewMode === 'history' ? '描述目标，AI 会先只读调研并给出可批准计划…' : '继续补充规划要求，批准前不会改正文…')
+                      : assistantMode === 'agent'
                       ? (viewMode === 'history' ? '输入写作或排版需求，Agent 会边写边排…' : '继续让 Agent 写内容、调样式或处理分页…')
                       : assistantMode === 'layout'
                         ? (viewMode === 'history' ? '输入排版指令，自动新建会话…' : '继续输入排版指令…')
@@ -5036,14 +5409,29 @@ export default function AISidebar({
                     </select>
                   </label>
 
+                  <label className="flex shrink-0 items-center gap-2 rounded-full border border-slate-200 bg-white pl-3 pr-2 py-1.5 text-[11px] text-slate-500">
+                    <span className="shrink-0">流程</span>
+                    <select
+                      value={operationMode}
+                      onChange={event => setOperationMode(event.target.value as OperationMode)}
+                      disabled={loading}
+                      className="bg-transparent pr-1 text-slate-700 outline-none"
+                      title="Plan 只读规划，Build 允许执行写入"
+                    >
+                      <option value="build">Build</option>
+                      <option value="plan">Plan</option>
+                    </select>
+                  </label>
+
                   <div className="ml-auto shrink-0">
                     {loading ? (
                       <button
                         onClick={handleCancel}
-                        className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-red-500 px-3 text-sm text-white transition-colors hover:bg-red-600"
-                        title="取消"
+                        disabled={cancelRequested}
+                        className="inline-flex h-9 min-w-9 items-center justify-center rounded-full bg-red-500 px-3 text-sm text-white transition-colors hover:bg-red-600 disabled:cursor-wait disabled:bg-red-300"
+                        title={cancelRequested ? '正在中断当前会话' : '中断当前会话'}
                       >
-                        ⏹
+                        {cancelRequested ? '…' : '⏹'}
                       </button>
                     ) : (
                       <button

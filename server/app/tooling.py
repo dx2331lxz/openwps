@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .skills import build_skill_discovery_delta
 from .tool_registry import (
     TOOL_SEARCH_DEFINITION,
     TOOL_SEARCH_NAME,
     ToolDefinition,
     build_tool_definitions,
+    definition_available_in_operation_mode,
     definition_available_in_mode,
 )
 
@@ -162,6 +164,83 @@ TOOLS = [
                     },
                 },
                 "required": ["taskId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "AskUserQuestion",
+            "description": (
+                "Plan Mode 专用：当关键需求、范围或实现路径有非显然取舍时，向用户提交结构化多选问题。"
+                "不要用它询问用户是否批准计划。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "context": {"type": "string", "description": "提问前的简短上下文，可包含当前理解和为什么需要选择。"},
+                    "questions": {
+                        "type": "array",
+                        "description": "1-3 个问题，每个问题 2-4 个互斥选项。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "稳定问题 ID，例如 scope 或 approach。"},
+                                "header": {"type": "string", "description": "12 字以内的短标签。"},
+                                "question": {"type": "string", "description": "面向用户的一句话问题。"},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "value": {"type": "string", "description": "稳定选项值。"},
+                                            "label": {"type": "string", "description": "1-5 个词的选项标题。"},
+                                            "description": {"type": "string", "description": "选择该项的影响或取舍。"},
+                                        },
+                                        "required": ["label", "description"],
+                                    },
+                                },
+                            },
+                            "required": ["id", "question", "options"],
+                        },
+                    },
+                },
+                "required": ["questions"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "SubmitPlanForApproval",
+            "description": (
+                "Plan Mode 专用：提交最终可审批计划。content 必须是完整计划，建议包含 Summary、Key Changes、Test Plan、Assumptions。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "完整计划正文。使用 Markdown，可包含 <proposed_plan> 包裹。"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Skill",
+            "description": (
+                "加载一个 OpenWPS skill 的完整 SKILL.md 指令。"
+                "当用户请求匹配 tooling_delta.skillDiscoveryDelta 中的 skill 名称、描述或 when_to_use 时，必须先调用本工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "skill 名称、目录名或 skillDiscoveryDelta 中的 id。"},
+                    "arguments": {"type": "string", "description": "传给 skill 的原始参数字符串，用于替换 $ARGUMENTS、$0 或命名参数。"},
+                    "reason": {"type": "string", "description": "为什么当前请求需要加载这个 skill。"},
+                },
+                "required": ["skill"],
             },
         },
     },
@@ -1068,6 +1147,9 @@ TOOLS = [
 ]
 
 LAYOUT_TOOL_NAMES = {
+    "AskUserQuestion",
+    "SubmitPlanForApproval",
+    "Skill",
     "get_document_info",
     "get_document_outline",
     "get_document_content",
@@ -1095,6 +1177,9 @@ LAYOUT_TOOL_NAMES = {
 }
 
 EDIT_TOOL_NAMES = {
+    "AskUserQuestion",
+    "SubmitPlanForApproval",
+    "Skill",
     "get_document_info",
     "get_document_outline",
     "get_document_content",
@@ -1150,6 +1235,14 @@ def get_tool_definitions(mode: str | None) -> list[ToolDefinition]:
         definition
         for name, definition in TOOL_DEFINITIONS.items()
         if name in selected_names and definition_available_in_mode(definition, mode)
+    ]
+
+
+def get_tool_definitions_for_operation_mode(mode: str | None, operation_mode: str | None) -> list[ToolDefinition]:
+    return [
+        definition
+        for definition in get_tool_definitions(mode)
+        if definition_available_in_operation_mode(definition, operation_mode)
     ]
 
 
@@ -1261,6 +1354,7 @@ def build_tooling_delta_attachment(
 ) -> str:
     loaded = sorted(set(loaded_deferred_tools or set()))
     deferred = get_deferred_tool_summaries(mode, set(loaded))
+    skill_delta = build_skill_discovery_delta()
     available = [
         {
             "name": definition.name,
@@ -1272,7 +1366,7 @@ def build_tooling_delta_attachment(
         }
         for definition in get_tool_definitions(mode)
     ]
-    if not deferred and not loaded:
+    if not deferred and not loaded and not skill_delta:
         return ""
     payload = {
         "type": "tooling_delta",
@@ -1281,7 +1375,7 @@ def build_tooling_delta_attachment(
         "deferredTools": deferred,
         "loadedDeferredTools": loaded,
         "mcpInstructionsDelta": [],
-        "skillDiscoveryDelta": [],
+        "skillDiscoveryDelta": skill_delta,
     }
     lines = [
         "[系统附件] type=tooling_delta",
@@ -1295,4 +1389,12 @@ def build_tooling_delta_attachment(
             for item in deferred
         )
         lines.append("需要其中任一工具时，先调用 ToolSearch 加载完整 schema。")
+    if payload["skillDiscoveryDelta"]:
+        lines.append("")
+        lines.append("[Skill 摘要]")
+        lines.extend(
+            f"- {item['name']} ({item.get('context') or 'inline'}): {item.get('whenToUse') or item.get('description')}"
+            for item in payload["skillDiscoveryDelta"]
+        )
+        lines.append("用户请求匹配某个 Skill 时，先调用 Skill 加载完整 SKILL.md。")
     return "\n".join(lines)

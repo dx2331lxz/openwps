@@ -36,6 +36,8 @@ MEMORY_ENTRYPOINT_MAX_BYTES = 25_000
 MEMORY_FILE_MAX_LINES = 200
 MEMORY_FILE_MAX_BYTES = 4_096
 MEMORY_SELECTED_LIMIT = 5
+MEMORY_FALLBACK_RECENT_LIMIT = 3
+MEMORY_FALLBACK_TOTAL_BYTES = 12_000
 MEMORY_SCAN_LIMIT = 200
 SYSTEM_ROOT_DIR_ORDER = {
     INTERNAL_DIRNAME: 0,
@@ -156,6 +158,77 @@ def _workspace_entry(workspace_id: str, name: str | None = None) -> dict[str, An
     }
 
 
+def _workspace_sort_key(workspace_id: str) -> tuple[int, str]:
+    return (0 if workspace_id == DEFAULT_WORKSPACE_ID else 1, workspace_id.lower())
+
+
+def _discover_workspace_ids() -> list[str]:
+    if not WORKSPACES_DIR.exists():
+        return []
+    ids: list[str] = []
+    for path in WORKSPACES_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        if not (path / FILES_DIRNAME).is_dir():
+            continue
+        workspace_id = path.name.strip()
+        if workspace_id:
+            ids.append(workspace_id)
+    return sorted(set(ids), key=_workspace_sort_key)
+
+
+def _repair_workspaces_meta(meta: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    dirty = False
+    repaired: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in meta["workspaces"]:
+        workspace_id = str(item.get("id") or "").strip()
+        if not workspace_id or workspace_id in seen:
+            dirty = True
+            continue
+        entry = dict(item)
+        entry["id"] = workspace_id
+        if not str(entry.get("name") or "").strip():
+            entry["name"] = "默认工作区" if workspace_id == DEFAULT_WORKSPACE_ID else workspace_id
+            dirty = True
+        if not str(entry.get("createdAt") or "").strip():
+            entry["createdAt"] = utc_now()
+            dirty = True
+        if not str(entry.get("updatedAt") or "").strip():
+            entry["updatedAt"] = entry["createdAt"]
+            dirty = True
+        repaired.append(entry)
+        seen.add(workspace_id)
+
+    if DEFAULT_WORKSPACE_ID not in seen:
+        repaired.insert(0, _workspace_entry(DEFAULT_WORKSPACE_ID))
+        seen.add(DEFAULT_WORKSPACE_ID)
+        dirty = True
+
+    for workspace_id in _discover_workspace_ids():
+        if workspace_id in seen:
+            continue
+        repaired.append(_workspace_entry(workspace_id))
+        seen.add(workspace_id)
+        dirty = True
+
+    repaired.sort(key=lambda item: _workspace_sort_key(str(item.get("id") or "")))
+    active_workspace_id = str(meta.get("activeWorkspaceId") or "").strip()
+    if active_workspace_id not in seen:
+        active_workspace_id = DEFAULT_WORKSPACE_ID if DEFAULT_WORKSPACE_ID in seen else (repaired[0]["id"] if repaired else DEFAULT_WORKSPACE_ID)
+        dirty = True
+
+    next_meta = {
+        "version": int(meta.get("version") or 1),
+        "activeWorkspaceId": active_workspace_id,
+        "workspaces": repaired,
+    }
+    if next_meta != meta:
+        dirty = True
+    return next_meta, dirty
+
+
 def _ensure_workspace_dirs(workspace_id: str) -> None:
     files_root = _workspace_files_root(workspace_id)
     (files_root / REFERENCES_DIRNAME).mkdir(parents=True, exist_ok=True)
@@ -171,13 +244,14 @@ def _ensure_workspace_dirs(workspace_id: str) -> None:
 
 
 def ensure_default_workspace() -> None:
-    meta = _load_workspaces_meta()
-    workspace_ids = {str(item.get("id") or "") for item in meta["workspaces"]}
-    if DEFAULT_WORKSPACE_ID not in workspace_ids:
-        meta["workspaces"].insert(0, _workspace_entry(DEFAULT_WORKSPACE_ID))
-        meta["activeWorkspaceId"] = DEFAULT_WORKSPACE_ID
+    meta, dirty = _repair_workspaces_meta(_load_workspaces_meta())
     _ensure_workspace_dirs(DEFAULT_WORKSPACE_ID)
-    _save_workspaces_meta(meta)
+    for item in meta["workspaces"]:
+        workspace_id = str(item.get("id") or "").strip()
+        if workspace_id != DEFAULT_WORKSPACE_ID:
+            _ensure_workspace_dirs(workspace_id)
+    if dirty:
+        _save_workspaces_meta(meta)
 
 
 def _require_workspace(workspace_id: str | None = None) -> str:
@@ -220,6 +294,63 @@ def create_workspace(name: str | None = None, workspace_id: str | None = None) -
     _ensure_workspace_dirs(candidate)
     _save_workspaces_meta(meta)
     return entry
+
+
+def _resolved_workspace_root(workspace_id: str) -> Path:
+    root = _workspace_root(workspace_id).resolve()
+    base = WORKSPACES_DIR.resolve()
+    try:
+        root.relative_to(base)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="工作区 ID 无效") from exc
+    return root
+
+
+def delete_workspace(workspace_id: str) -> dict[str, Any]:
+    ensure_default_workspace()
+    target = str(workspace_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="工作区 ID 不能为空")
+
+    meta = _load_workspaces_meta()
+    entries = [dict(item) for item in meta.get("workspaces", []) if isinstance(item, dict)]
+    if not any(str(item.get("id") or "") == target for item in entries):
+        raise HTTPException(status_code=404, detail="工作区不存在")
+
+    root = _resolved_workspace_root(target)
+    if root.exists():
+        shutil.rmtree(root)
+
+    if target == DEFAULT_WORKSPACE_ID:
+        _ensure_workspace_dirs(DEFAULT_WORKSPACE_ID)
+        next_entries = []
+        found_default = False
+        for item in entries:
+            if str(item.get("id") or "") == DEFAULT_WORKSPACE_ID:
+                next_entries.append({**item, "updatedAt": utc_now()})
+                found_default = True
+            else:
+                next_entries.append(item)
+        if not found_default:
+            next_entries.insert(0, _workspace_entry(DEFAULT_WORKSPACE_ID))
+        meta["workspaces"] = next_entries
+        meta["activeWorkspaceId"] = DEFAULT_WORKSPACE_ID
+    else:
+        meta["workspaces"] = [item for item in entries if str(item.get("id") or "") != target]
+        if str(meta.get("activeWorkspaceId") or "") == target:
+            meta["activeWorkspaceId"] = DEFAULT_WORKSPACE_ID
+        if not any(str(item.get("id") or "") == DEFAULT_WORKSPACE_ID for item in meta["workspaces"]):
+            meta["workspaces"].insert(0, _workspace_entry(DEFAULT_WORKSPACE_ID))
+            _ensure_workspace_dirs(DEFAULT_WORKSPACE_ID)
+
+    meta["workspaces"].sort(key=lambda item: _workspace_sort_key(str(item.get("id") or "")))
+    _save_workspaces_meta(meta)
+    return {
+        "success": True,
+        "workspaceId": target,
+        "activeWorkspaceId": meta.get("activeWorkspaceId") or DEFAULT_WORKSPACE_ID,
+        "workspaces": meta.get("workspaces", []),
+    }
 
 
 def set_active_workspace(workspace_id: str) -> dict[str, Any]:
@@ -702,6 +833,15 @@ def _select_memory_files(
     return [item for _score, _updated, item in scored[:MEMORY_SELECTED_LIMIT]]
 
 
+def _fallback_memory_files(manifest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not manifest:
+        return []
+    total_size = sum(int(item.get("size") or 0) for item in manifest)
+    if len(manifest) <= MEMORY_SELECTED_LIMIT or total_size <= MEMORY_FALLBACK_TOTAL_BYTES:
+        return manifest[:MEMORY_SELECTED_LIMIT]
+    return manifest[:MEMORY_FALLBACK_RECENT_LIMIT]
+
+
 def _read_selected_memory_files(workspace_id: str, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for item in selected:
@@ -744,6 +884,8 @@ def get_workspace_memory(workspace_id: str | None = None, *, query: str | None =
     manifest.sort(key=lambda item: str(item.get("updatedAt") or ""), reverse=True)
     manifest = manifest[:MEMORY_SCAN_LIMIT]
     selected_headers = _select_memory_files(query, entrypoint_text, manifest)
+    if not selected_headers:
+        selected_headers = _fallback_memory_files(manifest)
     return {
         "workspaceId": target,
         "entrypoint": {
@@ -751,6 +893,7 @@ def get_workspace_memory(workspace_id: str | None = None, *, query: str | None =
             "memoryPath": MEMORY_ENTRYPOINT_FILENAME,
             "content": entrypoint_limited["content"],
             "updatedAt": _document_timestamp(entrypoint),
+            "contentHash": _hash_file(entrypoint),
             "truncated": entrypoint_limited["truncated"],
             "lineCount": entrypoint_limited["lineCount"],
             "byteCount": entrypoint_limited["byteCount"],

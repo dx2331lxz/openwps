@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from .config import CONVERSATIONS_DIR
+from .plans import delete_plan
 from .tasks import delete_task_list
 
 
@@ -80,3 +81,4 @@ def delete_conversation(conv_id: str) -> None:
         raise HTTPException(status_code=404, detail="会话不存在")
     path.unlink()
     delete_task_list(conv_id)
+    delete_plan(conv_id)

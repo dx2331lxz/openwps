@@ -167,6 +167,7 @@ def build_system_content(
 
 def build_initial_context_content(context: dict[str, Any]) -> ContentBuildResult:
     content = build_initial_context_attachment(context or {})
+    memory_loaded = "type=workspace_memory_delta" in content
     return ContentBuildResult(
         content=content,
         trace={
@@ -174,6 +175,10 @@ def build_initial_context_content(context: dict[str, Any]) -> ContentBuildResult
             "hasContent": bool(content),
             "contentChars": len(content),
             "contextKeys": sorted(str(key) for key in (context or {}).keys()),
+            "memoryContextLoaded": memory_loaded,
+            "memorySelectedCount": len(
+                (((context or {}).get("workspaceManifest") or {}).get("memory") or {}).get("selected") or []
+            ) if isinstance(((context or {}).get("workspaceManifest") or {}).get("memory"), dict) else 0,
         },
     )
 
@@ -191,6 +196,7 @@ def build_delta_content(
         force_full=force_full,
         previous_workspace_docs=previous_workspace_docs,
     )
+    memory_delta_count = sum(1 for delta in deltas if "type=workspace_memory_delta" in delta)
     return ContentBuildResult(
         content=deltas,
         trace={
@@ -199,6 +205,11 @@ def build_delta_content(
             "forceFull": force_full,
             "contentChars": sum(len(delta) for delta in deltas),
             "contextKeys": sorted(str(key) for key in (context or {}).keys()),
+            "memoryContextLoaded": memory_delta_count > 0,
+            "memoryDeltaCount": memory_delta_count,
+            "memorySelectedCount": len(
+                (((context or {}).get("workspaceManifest") or {}).get("memory") or {}).get("selected") or []
+            ) if isinstance(((context or {}).get("workspaceManifest") or {}).get("memory"), dict) else 0,
         },
     )
 

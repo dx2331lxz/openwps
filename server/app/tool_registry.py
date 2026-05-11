@@ -85,6 +85,7 @@ WRITE_ACCESS = {"write", "style", "delete", "task_write"}
 EXECUTOR_SERVER = "server"
 EXECUTOR_CLIENT = "client"
 TOOL_SEARCH_NAME = "ToolSearch"
+PLAN_ONLY_TOOL_NAMES = {"AskUserQuestion", "SubmitPlanForApproval"}
 
 
 MODE_LAYOUT = frozenset({"layout"})
@@ -100,6 +101,9 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "TaskGet": ToolMetadata("task", "task_read", "更新任务前读取最新任务状态，避免 stale update。", subagent_ok=True, executor_location=EXECUTOR_SERVER, available_in_modes=MODE_AGENT),
     "TaskList": ToolMetadata("task", "task_read", "查看当前内部任务列表和剩余工作；复杂任务完成前用它确认状态。", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, available_in_modes=MODE_AGENT),
     "TaskUpdate": ToolMetadata("task", "task_write", "任务开始、完成或状态变化时更新内部任务。", "不要把未完成、失败或未验证的任务标记 completed。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_AGENT),
+    "AskUserQuestion": ToolMetadata("plan", "system", "Plan Mode 中需要用户决定需求、范围或方案取舍时，提交 1-3 个结构化多选问题。", "不要用它询问“是否批准计划”；计划审批必须用 SubmitPlanForApproval。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_ALL),
+    "SubmitPlanForApproval": ToolMetadata("plan", "system", "Plan Mode 调研和必要提问完成后，提交可审批的最终计划。", "不要在尚有关键歧义时提交；先 AskUserQuestion。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_ALL),
+    "Skill": ToolMetadata("skill", "system", "当用户请求匹配 tooling_delta.skillDiscoveryDelta 中某个 skill 时，先加载该 skill 的完整指令。", "不要只凭 skill 摘要执行；必须先调用 Skill 获取完整 SKILL.md。", executor_location=EXECUTOR_SERVER, available_in_modes=MODE_ALL),
     "Agent": ToolMetadata("agent", "agent", "启动只读子代理做调研、规划、排版分析或验收。", "简单定位、少量读取或主流程下一步能直接完成时不要调用。", executor_location=EXECUTOR_SERVER, parallel_safe=True, available_in_modes=MODE_AGENT),
     "get_document_info": ToolMetadata("read", "read", "快速了解文档统计、页数和整体状态。", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, available_in_modes=MODE_ALL),
     "get_document_outline": ToolMetadata("read", "read", "长文档或结构不确定时先用它导航页码和段落范围。", "不要一开始就读取全文。", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, available_in_modes=MODE_ALL),
@@ -141,7 +145,7 @@ TOOL_METADATA: dict[str, ToolMetadata] = {
     "workspace_search": ToolMetadata("search", "search", "在工作区普通文件或 _references/ 参考资料中定位关键词、条款、数据或范文。", "工作区能回答时不要先联网；先用 scope 控制搜索范围。", search_hint="工作区 搜索 references", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
     "workspace_read": ToolMetadata("read", "read", "按工作区相对路径读取文件提取文本或行范围。", "先用 workspace_tree 或 workspace_search 确认路径；PDF/PPT 只能读取提取文本；记忆文件位于 .openwps/memory。", search_hint="读取工作区文件 path memory", subagent_ok=True, executor_location=EXECUTOR_SERVER, parallel_safe=True, should_defer=True, available_in_modes=MODE_AGENT),
     "workspace_open": ToolMetadata("read", "read", "打开 DOCX/MD/TXT 工作区文件或 .openwps/memory Markdown 记忆文件并切换为当前活动文档，之后文档编辑工具会写回该文件。", "修改非当前文件前必须先 workspace_open(path)。不要对 _references/ 资料调用。", search_hint="打开 工作区 文件 编辑 memory", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
-    "workspace_memory_write": ToolMetadata("edit", "write", "创建或更新 .openwps/memory 记忆文件，并维护 MEMORY.md 索引。", "只保存对后续会话有长期价值的用户偏好、项目背景、反馈或参考位置。", search_hint="记忆 memory 写入 remember", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
+    "workspace_memory_write": ToolMetadata("edit", "write", "创建或更新 .openwps/memory 记忆文件，并维护 MEMORY.md 索引。", "只保存对后续会话有长期价值的用户偏好、项目背景、世界观、人物一致性或明确反馈；不要保存临时任务进度、完成日志或大段正文。", search_hint="记忆 memory 写入 remember", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
     "workspace_memory_delete": ToolMetadata("edit", "delete", "删除 .openwps/memory 记忆文件，并清理 MEMORY.md 索引。", "用户要求忘记某条记忆时使用；不能删除 MEMORY.md。", search_hint="记忆 memory 删除 forget", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
     "web_search": ToolMetadata("search", "web", "任务依赖最新信息、公开网页或工作区外事实时使用。", "当前文档或工作区资料足够时不要联网。", search_hint="联网 搜索 网页 最新 新闻", subagent_ok=True, executor_location=EXECUTOR_SERVER, should_defer=True, available_in_modes=MODE_AGENT),
 }
@@ -203,6 +207,23 @@ def mode_name(mode: str | None) -> str:
 
 def definition_available_in_mode(definition: ToolDefinition, mode: str | None) -> bool:
     return mode_name(mode) in definition.metadata.available_in_modes
+
+
+def operation_mode_name(operation_mode: str | None) -> str:
+    return "plan" if str(operation_mode or "").strip().lower() == "plan" else "build"
+
+
+def definition_available_in_operation_mode(definition: ToolDefinition, operation_mode: str | None) -> bool:
+    current_mode = operation_mode_name(operation_mode)
+    if current_mode == "plan":
+        if definition.name in PLAN_ONLY_TOOL_NAMES:
+            return True
+        if definition.name == TOOL_SEARCH_NAME:
+            return True
+        if definition.name == "Agent":
+            return True
+        return definition.is_read_only()
+    return definition.name not in PLAN_ONLY_TOOL_NAMES
 
 
 def is_tool_read_only(tool_name: str) -> bool:
@@ -269,12 +290,17 @@ def build_tool_guidance_section(
         if enabled & {"apply_style_batch", "set_text_style", "set_paragraph_style", "clear_formatting", "set_page_config", "insert_table_of_contents"}:
             lines.append("- 排版阶梯：全文或多范围样式优先 apply_style_batch；只改文字片段用 set_text_style；改对齐/缩进/标题级别用 set_paragraph_style；目录必须 insert_table_of_contents。")
         if enabled & {"workspace_tree", "workspace_search", "workspace_read", "workspace_open", "workspace_memory_write", "workspace_memory_delete", "web_search"}:
-            lines.append("- 工作区：当前活动文档优先；需要修改其他 DOCX/MD/TXT 或 .openwps/memory 记忆文件时先 workspace_tree 确认路径，再 workspace_open(path) 切换；_references/ 默认只作资料检索；长期记忆用 workspace_memory_write/delete 维护。")
+            lines.append("- 工作区：当前活动文档优先；.openwps/memory 是长期记忆。写作、规划、人物一致性、项目背景类任务若已有记忆上下文，必须先使用记忆；只有索引/manifest 不足时再 workspace_read(path) 读取具体记忆。")
+            lines.append("- 记忆写入：workspace_memory_write 只保存长期有用的用户偏好、项目背景、世界观、人物一致性和明确反馈；不要保存临时任务进度、完成日志或大段正文。")
         if "Agent" in enabled:
             lines.append("- 子代理调度：简单定位直接用读取/搜索工具；多源证据用 document-research，写作规划用 writing-plan，排版分析用 layout-plan，文档内图片语义用 image-analysis，复杂验收用 verification。")
             lines.append("- 多页视觉验收时，先读取页数；然后在同一轮并行发起多个 Agent(subagent_type='verification')，每个委托只指定一个页码和对应验收标准。")
         if enabled & {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}:
             lines.append("- 任务工具只用于 AI 内部多步计划；用户说任务列表/checklist 时默认是文档正文需求，不要误用内部任务工具。")
+        if enabled & PLAN_ONLY_TOOL_NAMES:
+            lines.append("- Plan Mode：需要用户选择时调用 AskUserQuestion；计划可审批时调用 SubmitPlanForApproval，不要把计划只写成普通回复。")
+        if "Skill" in enabled:
+            lines.append("- Skills：tooling_delta.skillDiscoveryDelta 只提供 skill 名称和触发摘要；用户意图匹配时必须先调用 Skill 读取完整 SKILL.md，再按其指令继续。")
         if TOOL_SEARCH_NAME in enabled:
             lines.append("- 如果需要的工具只在延迟工具摘要中出现，先用 ToolSearch 加载完整 schema，再在下一轮调用该工具。")
 

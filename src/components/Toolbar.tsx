@@ -78,8 +78,9 @@ import PageSettingsPanel, { type PageSettingsSection } from './PageSettingsPanel
 interface ToolbarProps {
   view: EditorView | null
   editorState: EditorState | null
+  documentMode?: 'document' | 'markdown'
   documentTitle?: string
-  onDocumentTitleChange?: (title: string) => void
+  onDocumentTitleChange?: (title: string) => void | Promise<void>
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
   onToggleSidebar?: () => void
@@ -1135,6 +1136,7 @@ function formatDocumentTitle(title?: string) {
 export const Toolbar: React.FC<ToolbarProps> = ({
   view,
   editorState,
+  documentMode = 'document',
   documentTitle,
   onDocumentTitleChange,
   pageConfig,
@@ -1178,6 +1180,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const topBarRef = React.useRef<HTMLDivElement | null>(null)
   const titleInputRef = React.useRef<HTMLInputElement | null>(null)
   const [topBarWidth, setTopBarWidth] = React.useState(0)
+  const markdownMode = documentMode === 'markdown'
   const [titleEditing, setTitleEditing] = React.useState(false)
   const [titleDraft, setTitleDraft] = React.useState('')
   const scrollContainerRef = React.useRef<HTMLDivElement>(null)
@@ -1199,6 +1202,15 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     if (titleEditing) titleInputRef.current?.select()
   }, [titleEditing])
 
+  React.useEffect(() => {
+    if (markdownMode && activeTab !== 'home') setActiveTab('home')
+    if (markdownMode) {
+      setAiCopilotMenu(null)
+      setPagePopover(null)
+      setTablePickerOpen(false)
+    }
+  }, [activeTab, markdownMode])
+
   const startTitleEdit = () => {
     setTitleDraft(displayDocumentTitle)
     setTitleEditing(true)
@@ -1213,7 +1225,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     const nextTitle = titleDraft.trim() || '未命名文档'
     setTitleDraft(nextTitle)
     setTitleEditing(false)
-    onDocumentTitleChange?.(nextTitle)
+    void onDocumentTitleChange?.(nextTitle)
   }
 
   React.useEffect(() => {
@@ -1317,13 +1329,14 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   const imageInputRef = React.useRef<HTMLInputElement>(null)
 
   type FileMenuAction = 'open' | 'save' | 'import' | 'export' | 'templates'
-  const fileMenuItems: Array<{ title: string; label: string; icon: typeof FolderOpen; action: FileMenuAction }> = [
+  const fileMenuItems = ([
     { title: '打开文档目录文件', label: '打开', icon: FolderOpen, action: 'open' },
     { title: '保存到文档目录 (Ctrl/⌘+S)', label: '保存', icon: Save, action: 'save' },
     { title: '导入 .docx / .md', label: '导入', icon: FileInput, action: 'import' },
     { title: '导出 .docx', label: '导出', icon: FileOutput, action: 'export' },
     { title: '打开模板库', label: '模板', icon: BookOpen, action: 'templates' },
-  ]
+  ] satisfies Array<{ title: string; label: string; icon: typeof FolderOpen; action: FileMenuAction }>)
+    .filter(item => !markdownMode || item.action !== 'export')
 
   const handleFileMenuAction = (action: FileMenuAction) => {
     if (action === 'open') {
@@ -1332,7 +1345,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       void onSaveServerFile?.()
     } else if (action === 'import') {
       fileInputRef.current?.click()
-    } else if (action === 'export') {
+    } else if (action === 'export' && !markdownMode) {
       void onExportDocx?.()
     } else {
       void onOpenTemplates?.()
@@ -1518,8 +1531,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         {/* 标签区 */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: topBarCompact ? 14 : 26, minWidth: 126, overflow: 'hidden' }}>
-          {(['home', 'insert', 'page'] as const).map(tab => {
-            const label = tab === 'home' ? '开始' : tab === 'insert' ? '插入' : '页面'
+          {(markdownMode ? (['home'] as const) : (['home', 'insert', 'page'] as const)).map(tab => {
+            const label = markdownMode ? 'Markdown' : tab === 'home' ? '开始' : tab === 'insert' ? '插入' : '页面'
             const active = activeTab === tab
             return (
               <button
@@ -1564,42 +1577,44 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             compact={topBarCompact}
             onMouseDown={e => { e.preventDefault(); onToggleSidebar?.() }}
           />
-          <div style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0, borderRadius: 8, background: aiCopilotEnabled ? '#e8f1ff' : 'transparent' }}>
-            <TopBarAction
-              title={aiCopilotEnabled ? '关闭 AI 伴写' : '开启 AI 伴写'}
-              icon={Sparkles}
-              label="伴写"
-              active={Boolean(aiCopilotEnabled)}
-              compact={topBarVeryCompact}
-              onMouseDown={e => { e.preventDefault(); onToggleAICopilot?.() }}
-            />
-            <button
-              type="button"
-              title="AI 伴写设置"
-              data-openwps-ai-copilot-settings="true"
-              onMouseDown={(event) => {
-                event.preventDefault()
-                event.stopPropagation()
-                const rect = event.currentTarget.getBoundingClientRect()
-                setAiCopilotMenu(current => current ? null : { rect })
-              }}
-              style={{
-                width: 28,
-                height: 34,
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                border: 'none',
-                borderLeft: aiCopilotEnabled ? '1px solid #cfe0ff' : '1px solid transparent',
-                borderRadius: '0 8px 8px 0',
-                background: aiCopilotMenu ? '#dbeafe' : 'transparent',
-                color: aiCopilotEnabled || aiCopilotMenu ? '#2563eb' : '#374151',
-                cursor: 'pointer',
-              }}
-            >
-              <SlidersHorizontal size={15} strokeWidth={2} />
-            </button>
-          </div>
+          {!markdownMode && (
+            <div style={{ display: 'inline-flex', alignItems: 'center', flexShrink: 0, borderRadius: 8, background: aiCopilotEnabled ? '#e8f1ff' : 'transparent' }}>
+              <TopBarAction
+                title={aiCopilotEnabled ? '关闭 AI 伴写' : '开启 AI 伴写'}
+                icon={Sparkles}
+                label="伴写"
+                active={Boolean(aiCopilotEnabled)}
+                compact={topBarVeryCompact}
+                onMouseDown={e => { e.preventDefault(); onToggleAICopilot?.() }}
+              />
+              <button
+                type="button"
+                title="AI 伴写设置"
+                data-openwps-ai-copilot-settings="true"
+                onMouseDown={(event) => {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  const rect = event.currentTarget.getBoundingClientRect()
+                  setAiCopilotMenu(current => current ? null : { rect })
+                }}
+                style={{
+                  width: 28,
+                  height: 34,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  border: 'none',
+                  borderLeft: aiCopilotEnabled ? '1px solid #cfe0ff' : '1px solid transparent',
+                  borderRadius: '0 8px 8px 0',
+                  background: aiCopilotMenu ? '#dbeafe' : 'transparent',
+                  color: aiCopilotEnabled || aiCopilotMenu ? '#2563eb' : '#374151',
+                  cursor: 'pointer',
+                }}
+              >
+                <SlidersHorizontal size={15} strokeWidth={2} />
+              </button>
+            </div>
+          )}
           <TopBarAction
             title={isFullscreen ? '退出全屏 (F11)' : '全屏模式 (F11)'}
             icon={isFullscreen ? Shrink : Expand}
@@ -1770,7 +1785,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
       )}
 
       {/* ── 工具栏行（可折叠） ── */}
-      {!collapsed && (
+      {!collapsed && !markdownMode && (
         <div style={{
           display: 'flex',
           alignItems: 'stretch',

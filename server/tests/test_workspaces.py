@@ -76,6 +76,66 @@ class WorkspaceDirectoryTest(unittest.TestCase):
         self.assertEqual(docs[0]["role"], "reference")
         self.assertEqual(docs[0]["id"], "_references/spec.txt")
 
+    def test_list_workspaces_repairs_orphan_workspace_directories(self) -> None:
+        workspace._ensure_workspace_dirs("orphan")
+
+        workspaces = workspace.list_workspaces()
+
+        workspace_ids = {item["id"] for item in workspaces["workspaces"]}
+        self.assertIn("default", workspace_ids)
+        self.assertIn("orphan", workspace_ids)
+        repaired = workspace._read_json(self.workspaces_dir / "meta.json", {})
+        repaired_ids = {item["id"] for item in repaired["workspaces"]}
+        self.assertIn("orphan", repaired_ids)
+
+    def test_delete_non_default_workspace_removes_directory_and_switches_to_default(self) -> None:
+        created = workspace.create_workspace("Project", "project")
+        self.assertEqual(created["id"], "project")
+        workspace.save_file("project", "docs/report.txt", b"hello")
+        self.assertTrue((self.workspaces_dir / "project" / "files" / "docs" / "report.txt").exists())
+
+        deleted = workspace.delete_workspace("project")
+
+        self.assertTrue(deleted["success"])
+        self.assertEqual(deleted["workspaceId"], "project")
+        self.assertEqual(deleted["activeWorkspaceId"], "default")
+        self.assertFalse((self.workspaces_dir / "project").exists())
+        workspace_ids = {item["id"] for item in deleted["workspaces"]}
+        self.assertIn("default", workspace_ids)
+        self.assertNotIn("project", workspace_ids)
+        self.assertEqual(workspace.list_workspaces()["activeWorkspaceId"], "default")
+
+    def test_delete_default_workspace_clears_contents_and_rebuilds_system_dirs(self) -> None:
+        workspace.save_file("default", "docs/report.txt", b"hello")
+        workspace.save_memory_file("default", "notes.md", "temporary memory")
+
+        deleted = workspace.delete_workspace("default")
+
+        files_root = self.workspaces_dir / "default" / "files"
+        self.assertTrue(deleted["success"])
+        self.assertEqual(deleted["workspaceId"], "default")
+        self.assertEqual(deleted["activeWorkspaceId"], "default")
+        self.assertTrue((files_root / "_references").is_dir())
+        self.assertTrue((files_root / ".openwps" / "memory" / "MEMORY.md").exists())
+        self.assertFalse((files_root / "docs" / "report.txt").exists())
+        self.assertFalse((files_root / ".openwps" / "memory" / "notes.md").exists())
+        workspace_ids = {item["id"] for item in deleted["workspaces"]}
+        self.assertIn("default", workspace_ids)
+
+    def test_delete_unknown_workspace_raises_404(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            workspace.delete_workspace("missing")
+
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_ensure_default_workspace_does_not_rewrite_clean_meta(self) -> None:
+        workspace.list_workspaces()
+
+        with patch.object(workspace, "_save_workspaces_meta") as save_meta:
+            workspace.ensure_default_workspace()
+
+        save_meta.assert_not_called()
+
     def test_rejects_unsafe_paths_and_internal_directory_writes(self) -> None:
         with self.assertRaises(HTTPException):
             workspace.save_file("default", "../escape.txt", b"bad")
@@ -120,6 +180,31 @@ class WorkspaceDirectoryTest(unittest.TestCase):
         deleted = workspace.delete_memory_file("default", "notes/preferences.md")
         self.assertTrue(deleted["success"])
         self.assertNotIn("notes/preferences.md", workspace.get_workspace_memory("default")["entrypoint"]["content"])
+
+    def test_workspace_memory_fallback_selects_small_memory_set_for_generic_query(self) -> None:
+        workspace.save_memory_file(
+            "default",
+            "novel-character-consistency.md",
+            "江南：冷静、克制、外热内慎。",
+            name="人物一致性",
+            description="主角性格与关系约束",
+            memory_type="project",
+        )
+        workspace.save_memory_file(
+            "default",
+            "novel-chapter-outline-vol1-ch1.md",
+            "第一章需要以案件切入，并埋下逆光入局线索。",
+            name="第一章规划",
+            description="第一章内容结构",
+            memory_type="project",
+        )
+
+        memory = workspace.get_workspace_memory("default", query="编写小说第一章内容")
+
+        selected_paths = {item["path"] for item in memory["selected"]}
+        self.assertEqual(len(memory["manifest"]), 2)
+        self.assertIn(".openwps/memory/novel-character-consistency.md", selected_paths)
+        self.assertIn(".openwps/memory/novel-chapter-outline-vol1-ch1.md", selected_paths)
 
     def test_root_openwps_is_plain_workspace_file_not_memory_source(self) -> None:
         root = self.workspaces_dir / "default" / "files"
