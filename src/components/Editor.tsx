@@ -51,6 +51,7 @@ const PAGE_GAP = 32 // px gap between A4 cards
 const DOCX_PUNCTUATION_COMPRESSION_PX = -0.34
 const DEFAULT_SERVER_DOCUMENT_NAME = 'document.docx'
 const EDITOR_DRAFT_STORAGE_KEY = 'openwps.editor.draft.v1'
+const MARGIN_GUIDES_STORAGE_KEY = 'openwps.editor.marginGuides'
 const EDITOR_DRAFT_VERSION = 1
 const EDITOR_DRAFT_SAVE_DELAY_MS = 500
 const SERVER_DOCUMENT_SYNC_DELAY_MS = 800
@@ -1330,6 +1331,14 @@ function getInitialAICopilotCandidateCount() {
   }
 }
 
+function getInitialMarginGuidesVisible() {
+  try {
+    return window.localStorage.getItem(MARGIN_GUIDES_STORAGE_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
 function getActiveAICopilotCompletion(preview: AICopilotPreview) {
   return preview.completions[preview.activeIndex] ?? preview.completions[0] ?? ''
 }
@@ -2057,6 +2066,7 @@ export const Editor: React.FC = () => {
   const [aiCopilotEnabled, setAiCopilotEnabled] = useState(getInitialAICopilotEnabled)
   const [aiCopilotActivity, setAiCopilotActivity] = useState<AICopilotActivity>(getInitialAICopilotActivity)
   const [aiCopilotCandidateCount, setAiCopilotCandidateCount] = useState(getInitialAICopilotCandidateCount)
+  const [showMarginGuides, setShowMarginGuides] = useState(getInitialMarginGuidesVisible)
   const [aiCopilotState, setAICopilotState] = useState<AICopilotState>({ status: 'idle' })
   const [templateExtractionState, setTemplateExtractionState] = useState<TemplateExtractionState>(IDLE_TEMPLATE_EXTRACTION_STATE)
   const [templateNotice, setTemplateNotice] = useState<TemplateNotice | null>(null)
@@ -4238,6 +4248,13 @@ export const Editor: React.FC = () => {
   // Canvas height = all A4 cards stacked with gaps
   const cfg = pageConfig  // ← 用 state 而非 ref，确保 React 重渲染时拿到最新值
   const canvasH = pageCount * cfg.pageHeight + (pageCount - 1) * PAGE_GAP
+  const marginGuideLeft = Math.max(0, Math.min(cfg.pageWidth, cfg.marginLeft))
+  const marginGuideTop = Math.max(0, Math.min(cfg.pageHeight, cfg.marginTop))
+  const marginGuideRight = Math.max(marginGuideLeft, Math.min(cfg.pageWidth, cfg.pageWidth - cfg.marginRight))
+  const marginGuideBottom = Math.max(marginGuideTop, Math.min(cfg.pageHeight, cfg.pageHeight - cfg.marginBottom))
+  const marginGuideWidth = Math.max(0, marginGuideRight - marginGuideLeft)
+  const marginGuideHeight = Math.max(0, marginGuideBottom - marginGuideTop)
+  const marginGuideCornerSize = Math.max(18, Math.min(48, marginGuideWidth / 3, marginGuideHeight / 3))
   const selectedNodePos = React.useMemo(() => {
     if (!(editorState?.selection instanceof NodeSelection)) return null
     return editorState.selection.node.type.name === 'horizontal_rule'
@@ -4424,6 +4441,18 @@ export const Editor: React.FC = () => {
     cancelAICopilot()
   }, [cancelAICopilot])
 
+  const handleToggleMarginGuides = useCallback(() => {
+    setShowMarginGuides((current) => {
+      const next = !current
+      try {
+        window.localStorage.setItem(MARGIN_GUIDES_STORAGE_KEY, next ? 'true' : 'false')
+      } catch {
+        // ignore storage failures
+      }
+      return next
+    })
+  }, [])
+
   const handleAICopilotCandidateSelect = useCallback((candidateIndex: number) => {
     setAICopilotState((current) => {
       if (current.status !== 'preview') return current
@@ -4505,6 +4534,8 @@ export const Editor: React.FC = () => {
             pageConfigRef.current = newCfg
             repaginate()
           }}
+          showMarginGuides={showMarginGuides}
+          onToggleMarginGuides={handleToggleMarginGuides}
           onToggleSidebar={() => setSidebarOpen(o => !o)}
           sidebarOpen={sidebarOpen}
           aiCopilotEnabled={aiCopilotEnabled}
@@ -4613,6 +4644,46 @@ export const Editor: React.FC = () => {
                   zIndex: 0,
                 }}
               >
+                {showMarginGuides && documentMode !== 'markdown' && (
+                  <div
+                    aria-hidden="true"
+                    data-openwps-margin-guide="true"
+                    style={{
+                      position: 'absolute',
+                      left: marginGuideLeft,
+                      top: marginGuideTop,
+                      width: marginGuideWidth,
+                      height: marginGuideHeight,
+                      boxSizing: 'border-box',
+                      pointerEvents: 'none',
+                      zIndex: 1,
+                    }}
+                  >
+                    {([
+                      { key: 'top-left', top: -marginGuideCornerSize, right: undefined, bottom: undefined, left: -marginGuideCornerSize, borderTop: false, borderRight: true, borderBottom: true, borderLeft: false },
+                      { key: 'top-right', top: -marginGuideCornerSize, right: -marginGuideCornerSize, bottom: undefined, left: undefined, borderTop: false, borderRight: false, borderBottom: true, borderLeft: true },
+                      { key: 'bottom-left', top: undefined, right: undefined, bottom: -marginGuideCornerSize, left: -marginGuideCornerSize, borderTop: true, borderRight: true, borderBottom: false, borderLeft: false },
+                      { key: 'bottom-right', top: undefined, right: -marginGuideCornerSize, bottom: -marginGuideCornerSize, left: undefined, borderTop: true, borderRight: false, borderBottom: false, borderLeft: true },
+                    ] as const).map(corner => (
+                      <span
+                        key={corner.key}
+                        style={{
+                          position: 'absolute',
+                          top: corner.top,
+                          right: corner.right,
+                          bottom: corner.bottom,
+                          left: corner.left,
+                          width: marginGuideCornerSize,
+                          height: marginGuideCornerSize,
+                          borderColor: 'rgba(156, 163, 175, 0.42)',
+                          borderStyle: 'solid',
+                          borderWidth: [corner.borderTop ? 1 : 0, corner.borderRight ? 1 : 0, corner.borderBottom ? 1 : 0, corner.borderLeft ? 1 : 0].map(width => String(width) + 'px').join(' '),
+                          boxSizing: 'border-box',
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
                 <div
                   style={{
                     position: 'absolute',

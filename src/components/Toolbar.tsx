@@ -83,6 +83,8 @@ interface ToolbarProps {
   onDocumentTitleChange?: (title: string) => void | Promise<void>
   pageConfig: PageConfig
   onPageConfigChange: (cfg: PageConfig) => void
+  showMarginGuides?: boolean
+  onToggleMarginGuides?: () => void
   onToggleSidebar?: () => void
   sidebarOpen?: boolean
   aiCopilotEnabled?: boolean
@@ -1090,11 +1092,13 @@ function PageToolbarButton({
   label,
   icon,
   active,
+  showChevron = true,
   onMouseDown,
 }: {
   label: string
   icon: LucideIcon
   active: boolean
+  showChevron?: boolean
   onMouseDown: React.MouseEventHandler<HTMLButtonElement>
 }) {
   const Icon = icon
@@ -1119,7 +1123,7 @@ function PageToolbarButton({
     >
       <Icon size={18} strokeWidth={2} />
       <span style={{ fontSize: 13 }}>{label}</span>
-      <ChevronDown size={14} strokeWidth={2} />
+      {showChevron && <ChevronDown size={14} strokeWidth={2} />}
     </button>
   )
 }
@@ -1141,6 +1145,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onDocumentTitleChange,
   pageConfig,
   onPageConfigChange,
+  showMarginGuides,
+  onToggleMarginGuides,
   onToggleSidebar,
   sidebarOpen,
   aiCopilotEnabled,
@@ -2304,6 +2310,17 @@ export const Toolbar: React.FC<ToolbarProps> = ({
                     e.stopPropagation()
                     const rect = e.currentTarget.getBoundingClientRect()
                     setPagePopover(current => current?.section === 'margins' ? null : { section: 'margins', rect })
+                  }}
+                />
+                <PageToolbarButton
+                  label="辅助线"
+                  icon={Ruler}
+                  active={Boolean(showMarginGuides)}
+                  showChevron={false}
+                  onMouseDown={e => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    onToggleMarginGuides?.()
                   }}
                 />
                 {sep}
